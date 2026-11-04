@@ -72,10 +72,8 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
             }
             if !ctx.json {
                 outln!(
-                    "Landed {} on {target_ref}{} ({attempts} attempt{})",
-                    short(landed),
-                    if rebased { " (rebased)" } else { "" },
-                    if attempts == 1 { "" } else { "s" },
+                    "{}",
+                    landed_line(landed, base, rebased, &target_ref, attempts)
                 );
             }
             Ok(0)
@@ -131,17 +129,57 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
                 } else {
                     "`leep commit -m MESSAGE`"
                 };
+                let replaced = resolving_names(ctx);
                 outln!(
                     "Your working copy is now on {} with your changes applied.\n\
                      Resolve the conflicts (`leep resolve PATH` once chosen), then run {commit} and `leep land`.\n\
-                     The commit records that it replaces {} (`leep.rebased_from`).",
+                     The commit records that it replaces {replaced} (`leep.rebased_from`).\n\
+                     Reviews of {replaced} carry only where your resolution is its change rebased onto {} \
+                     (ADR 0089); other paths need review again.",
                     short(onto),
-                    resolving_names(ctx)
+                    short(onto),
                 );
             }
             Ok(exit::CONFLICT)
         }
     }
+}
+
+/// What a successful land says. A server-side rebase gives the copy a new
+/// id; the land policy judged the original, so its reviews count.
+fn landed_line(
+    landed: ChangesetId,
+    base: ChangesetId,
+    rebased: bool,
+    target_ref: &str,
+    attempts: u32,
+) -> String {
+    format!(
+        "Landed {} on {target_ref}{} ({attempts} attempt{})",
+        short(landed),
+        if rebased && landed != base {
+            format!(
+                " (rebased from {}; reviews of the original count)",
+                short(base)
+            )
+        } else if rebased {
+            " (rebased)".to_string()
+        } else {
+            String::new()
+        },
+        if attempts == 1 { "" } else { "s" },
+    )
+}
+
+/// The changeset a `needs review` refusal names (`changeset <id> needs
+/// review: ...`), for the hint's commands.
+fn refused_changeset(message: &str) -> Option<ChangesetId> {
+    let rest = message.split("changeset ").nth(1)?;
+    let (id, after) = rest.split_once(' ')?;
+    if !after.starts_with(NEEDS_REVIEW_MARKER) {
+        return None;
+    }
+    id.parse().ok()
 }
 
 /// Most changesets a land's stack is followed back through for
@@ -373,11 +411,17 @@ fn hint_policy(e: CliError, target_ref: &str) -> CliError {
         return e;
     }
     if e.is_server(error_code::NEEDS_REVIEW, NEEDS_REVIEW_MARKER) {
-        return e.map_message(|m| format!(
-            "{m}\n{target_ref} needs approval from the owners of the paths a changeset changes: \
-             ask one to run `leep review approve <changeset>` (`leep review request @ --ref {target_ref}` asks them for you); \
-             `leep review status <changeset> --ref {target_ref} --wait` shows what is missing and waits for it."
-        ));
+        return e.map_message(|m| {
+            let (approve, request) = match refused_changeset(&m) {
+                Some(id) => (short(id), short(id)),
+                None => ("<changeset>".to_string(), "@".to_string()),
+            };
+            format!(
+                "{m}\n{target_ref} needs approval from the owners of the paths a changeset changes: \
+                 ask one to run `leep review approve {approve}` (`leep review request {request} --ref {target_ref}` asks them for you); \
+                 `leep review status {approve} --ref {target_ref} --wait` shows what is missing and waits for it."
+            )
+        });
     }
     if e.is_server(error_code::NOT_SIGNED, NOT_SIGNED_MARKER) {
         return e.map_message(|m| format!(
@@ -579,6 +623,50 @@ mod tests {
         let never = || -> Result<bool> { unreachable!() };
         assert_eq!(pending(Some(&p), b, "main", never).ok(), Some(Pending::New));
         assert_eq!(pending(Some(&p), a, "dev", never).ok(), Some(Pending::New));
+    }
+
+    #[test]
+    fn a_review_refusal_names_the_changeset_in_its_commands() {
+        let id = ChangesetId(Hash::of_blob(b"refused"));
+        let e = CliError::user(format!(
+            "changeset {id} needs review: path a needs approval from any reviewer"
+        ))
+        .with_server_code(Some(error_code::NEEDS_REVIEW.into()));
+        let msg = hint_policy(e, "main").to_string();
+        let s = short(id);
+        assert!(msg.contains(&format!("`leep review approve {s}`")), "{msg}");
+        assert!(
+            msg.contains(&format!(
+                "`leep review request {s} --ref main` asks them for you"
+            )),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&format!("`leep review status {s} --ref main --wait`")),
+            "{msg}"
+        );
+        assert_eq!(refused_changeset("changeset abc needs review: x"), None);
+        assert_eq!(refused_changeset(&format!("changeset {id} is fine")), None);
+    }
+
+    #[test]
+    fn a_rebased_land_names_the_original_whose_reviews_count() {
+        let (a, b) = (
+            ChangesetId(Hash::of_blob(b"a")),
+            ChangesetId(Hash::of_blob(b"b")),
+        );
+        assert_eq!(
+            landed_line(a, b, true, "main", 1),
+            format!(
+                "Landed {} on main (rebased from {}; reviews of the original count) (1 attempt)",
+                short(a),
+                short(b)
+            )
+        );
+        assert_eq!(
+            landed_line(a, a, false, "main", 2),
+            format!("Landed {} on main (2 attempts)", short(a))
+        );
     }
 
     #[test]

@@ -2161,3 +2161,410 @@ async fn a_reject_takes_back_every_approved_copy_it_names() {
         .await;
     assert_eq!(rules(&c.api.status(z).await), [("src/a.rs", "rejected")]);
 }
+
+/// ADR 0089: `main` holds `src/a.rs` (owned by alice) and a changelog. `x`
+/// changes `a.rs` (`x_a`) and appends to the changelog; alice approves it.
+/// Then `head_a`, approved too, lands first, with its own changelog line,
+/// so `x` conflicts and the client resolves it on the new head.
+struct Moved {
+    api: Api,
+    head: ChangesetId,
+    x: ChangesetId,
+}
+
+async fn moved_setup(policy: &'static str, a0: &str, x_a: &str, head_a: &str) -> Moved {
+    moved_on(Api::with(policy), a0, x_a, head_a).await
+}
+
+async fn moved_on(api: Api, a0: &str, x_a: &str, head_a: &str) -> Moved {
+    let base = api
+        .seed_main(&[
+            ("OWNERS", Some("alice\n")),
+            ("src/a.rs", Some(a0)),
+            ("CHANGELOG.md", Some("# log\n")),
+        ])
+        .await;
+    let x = api
+        .commit(
+            &[base],
+            &[
+                ("src/a.rs", Some(x_a)),
+                ("CHANGELOG.md", Some("# log\n- x\n")),
+            ],
+        )
+        .await;
+    api.approve(x, "alice").await;
+    let other = api
+        .commit(
+            &[base],
+            &[
+                ("src/a.rs", Some(head_a)),
+                ("CHANGELOG.md", Some("# log\n- other\n")),
+            ],
+        )
+        .await;
+    api.approve(other, "alice").await;
+    assert_eq!(api.land(other, "bob").await.status, StatusCode::OK);
+    Moved {
+        head: api.main_ref().await.unwrap(),
+        api,
+        x,
+    }
+}
+
+impl Moved {
+    /// The client's resolution on the head, naming `x`, with `a` as
+    /// `src/a.rs` and both changelog lines.
+    async fn resolve(&self, a: &str) -> ChangesetId {
+        self.api
+            .commit_from(
+                &[self.head],
+                &[
+                    ("src/a.rs", Some(a)),
+                    ("CHANGELOG.md", Some("# log\n- other\n- x\n")),
+                ],
+                Some(&self.x.to_string()),
+            )
+            .await
+    }
+}
+
+const F0: &str = "fn a() {\n    one();\n}\n\nfn b() {\n    two();\n}\n";
+/// `x`: a check added at the end of `b`.
+const FX: &str = "fn a() {\n    one();\n}\n\nfn b() {\n    two();\n    check();\n}\n";
+/// The head: `a` changed.
+const FH: &str = "fn a() {\n    uno();\n}\n\nfn b() {\n    two();\n}\n";
+/// The server's rebase of `x`'s change onto the head.
+const FR: &str = "fn a() {\n    uno();\n}\n\nfn b() {\n    two();\n    check();\n}\n";
+
+#[tokio::test]
+async fn an_approval_carries_to_a_resolution_equal_to_the_servers_rebase() {
+    let m = moved_setup(POLICY_AUTO, F0, FX, FH).await;
+    let api = &m.api;
+    // The server itself would make FR, but the changelog conflicts.
+    let r = api.land(m.x, "bob").await;
+    assert!(matches!(
+        r.json::<LandResponse>(),
+        LandResponse::Conflicts { .. }
+    ));
+    let y = m.resolve(FR).await;
+    let s = api.status(y).await;
+    assert!(s.approved, "{s:?}");
+    assert_eq!(
+        rules(&s),
+        [("CHANGELOG.md", "auto:docs_only"), ("src/a.rs", "owner")]
+    );
+    assert_eq!(
+        (s.paths[1].carried_from, s.paths[1].carried_rule.as_deref()),
+        (Some(m.x), Some("rebased"))
+    );
+    assert_eq!(s.paths[0].carried_rule, None);
+    assert_eq!(s.origins.len(), 1);
+    assert!(s.origins[0].carried && s.origins[0].differs.is_empty());
+    let raw: serde_json::Value = api
+        .get(&format!("/v1/changesets/{y}/review-status"))
+        .await
+        .json();
+    assert_eq!(raw["paths"][1]["carried_rule"], "rebased");
+    assert!(raw["paths"][0].get("carried_rule").is_none());
+    assert_eq!(raw["origins"][0]["reviews"][0]["reviewer"], "alice");
+    // `review list` shows it as carried, and it lands.
+    assert_eq!(api.reviews(y).await.reviews[0].carried_from, Some(m.x));
+    assert_eq!(api.land(y, "bob").await.status, StatusCode::OK);
+    assert_eq!(api.main_ref().await, Some(y));
+}
+
+/// The motivating case: two tests appended at the end of one module.
+const T0: &str = "mod tests {\n    fn t0() {}\n}\n";
+const TX: &str = "mod tests {\n    fn t0() {}\n    fn dee() {}\n}\n";
+const TH: &str = "mod tests {\n    fn t0() {}\n    fn cy() {}\n}\n";
+
+#[tokio::test]
+async fn an_approval_carries_to_a_union_of_two_appends_in_either_order() {
+    // No auto rule: the changelog's two lines are a union too.
+    let m = moved_setup(POLICY, T0, TX, TH).await;
+    for a in [
+        "mod tests {\n    fn t0() {}\n    fn cy() {}\n    fn dee() {}\n}\n",
+        "mod tests {\n    fn t0() {}\n    fn dee() {}\n    fn cy() {}\n}\n",
+    ] {
+        let y = m.resolve(a).await;
+        let s = m.api.status(y).await;
+        assert!(s.approved, "{s:?}");
+        assert_eq!(
+            rules(&s),
+            [("CHANGELOG.md", "owner"), ("src/a.rs", "owner")]
+        );
+        for p in &s.paths {
+            assert_eq!(p.carried_rule.as_deref(), Some("union"), "{p:?}");
+        }
+    }
+    // The changelog's lines in the other order than the code's is fine
+    // too: each region picks its own side, here two separate files.
+    let y = m
+        .api
+        .commit_from(
+            &[m.head],
+            &[
+                (
+                    "src/a.rs",
+                    Some("mod tests {\n    fn t0() {}\n    fn dee() {}\n    fn cy() {}\n}\n"),
+                ),
+                ("CHANGELOG.md", Some("# log\n- x\n- other\n")),
+            ],
+            Some(&m.x.to_string()),
+        )
+        .await;
+    assert!(m.api.status(y).await.approved);
+    assert_eq!(m.api.land(y, "bob").await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_union_that_edits_a_base_line_stays_pending() {
+    // Both sides edit `t0` and append: the conflict has a base line.
+    let m = moved_setup(
+        POLICY_AUTO,
+        T0,
+        "mod tests {\n    fn t0() { x() }\n    fn dee() {}\n}\n",
+        "mod tests {\n    fn t0() { h() }\n    fn cy() {}\n}\n",
+    )
+    .await;
+    for a in [
+        "mod tests {\n    fn t0() { h() }\n    fn cy() {}\n    fn t0() { x() }\n    fn dee() {}\n}\n",
+        "mod tests {\n    fn t0() { x() }\n    fn dee() {}\n    fn cy() {}\n}\n",
+    ] {
+        let y = m.resolve(a).await;
+        let s = m.api.status(y).await;
+        assert!(!s.approved);
+        assert_eq!(rules(&s)[1], ("src/a.rs", "pending"));
+    }
+}
+
+#[tokio::test]
+async fn a_resolution_with_one_extra_line_stays_pending() {
+    let m = moved_setup(POLICY_AUTO, T0, TX, TH).await;
+    let y = m
+        .resolve(
+            "mod tests {\n    fn t0() {}\n    fn cy() {}\n    fn dee() {}\n    fn evil() {}\n}\n",
+        )
+        .await;
+    assert!(!m.api.status(y).await.approved);
+    // Nor one line dropped from either side.
+    let y = m.resolve(TX).await;
+    assert!(!m.api.status(y).await.approved);
+    // The rebased case with one extra line.
+    let m = moved_setup(POLICY_AUTO, F0, FX, FH).await;
+    let y = m.resolve(&format!("{FR}fn evil() {{}}\n")).await;
+    let s = m.api.status(y).await;
+    assert!(!s.approved);
+    assert_eq!(rules(&s)[1], ("src/a.rs", "pending"));
+    assert_eq!(
+        m.api.land(y, "bob").await.status,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+#[tokio::test]
+async fn reviewed_lines_moved_to_another_function_stay_pending() {
+    // Alice approved an `unsafe` call in `b`, after its check. The
+    // resolution puts the same line, with the same hunk, into `a`.
+    let m = moved_setup(
+        POLICY_AUTO,
+        F0,
+        "fn a() {\n    one();\n}\n\nfn b() {\n    two();\n    unsafe { poke() }\n}\n",
+        FH,
+    )
+    .await;
+    let y = m
+        .resolve("fn a() {\n    uno();\n    unsafe { poke() }\n}\n\nfn b() {\n    two();\n}\n")
+        .await;
+    let s = m.api.status(y).await;
+    assert!(!s.approved);
+    assert_eq!(rules(&s)[1], ("src/a.rs", "pending"));
+}
+
+#[tokio::test]
+async fn a_rebased_kind_change_stays_pending() {
+    // `x` makes the file executable as well; a reviewed kind change carries
+    // only identically, never through a merge.
+    let api = Api::with(POLICY_AUTO);
+    let base = api
+        .seed_main(&[("OWNERS", Some("alice\n")), ("run.sh", Some(F0))])
+        .await;
+    let put = |text: &'static str, kind: FileKind| {
+        let api = &api;
+        async move {
+            let content = api
+                .repo
+                .blobs()
+                .put(Bytes::from_static(text.as_bytes()))
+                .await
+                .unwrap();
+            FileChange::Modify {
+                content,
+                kind,
+                size: text.len() as u64,
+            }
+        }
+    };
+    let make = |parent: ChangesetId, change: FileChange, from: Option<ChangesetId>| {
+        let api = &api;
+        async move {
+            api.repo
+                .create_changeset(Changeset {
+                    parents: vec![parent],
+                    author: "t".into(),
+                    timestamp: 1,
+                    message: "m".into(),
+                    changes: BTreeMap::from([(RepoPath::new("run.sh").unwrap(), change)]),
+                    extra: from
+                        .map(|f| BTreeMap::from([(EXTRA_REBASED_FROM.into(), f.to_string())]))
+                        .unwrap_or_default(),
+                })
+                .await
+                .unwrap()
+        }
+    };
+    let x = make(base, put(FX, FileKind::Executable).await, None).await;
+    api.approve(x, "alice").await;
+    let head = api.commit(&[base], &[("run.sh", Some(FH))]).await;
+    api.approve(head, "alice").await;
+    assert_eq!(api.land(head, "bob").await.status, StatusCode::OK);
+    let y = make(head, put(FR, FileKind::Executable).await, Some(x)).await;
+    let s = api.status(y).await;
+    assert!(!s.approved, "{s:?}");
+    assert_eq!(s.origins[0].differs, [RepoPath::new("run.sh").unwrap()]);
+}
+
+#[tokio::test]
+async fn a_reject_takes_back_through_a_rebased_carry() {
+    let m = moved_setup(POLICY_AUTO, F0, FX, FH).await;
+    let y = m.resolve(FR).await;
+    assert!(m.api.status(y).await.approved);
+    let r = m.api.review(y, "alice", Verdict::Reject).await;
+    assert_eq!(r.json::<AddReviewResponse>().taken_back, [m.x]);
+    // Another copy of the same resolution naming only `x` carries the
+    // reject now, not the approval.
+    let z = m
+        .api
+        .commit_from(
+            &[m.head],
+            &[
+                ("src/a.rs", Some(FR)),
+                ("CHANGELOG.md", Some("# log\n- other\n- x\n\n")),
+            ],
+            Some(&m.x.to_string()),
+        )
+        .await;
+    let s = m.api.status(z).await;
+    assert_eq!(rules(&s)[1], ("src/a.rs", "rejected"));
+    assert_eq!(s.paths[1].carried_rule.as_deref(), Some("rebased"));
+}
+
+#[tokio::test]
+async fn too_many_merged_paths_carry_nothing() {
+    let api = Api::with(POLICY);
+    let n = leep_derive::review::MAX_CARRY_MERGED_PATHS + 1;
+    let names: Vec<String> = (0..n).map(|i| format!("f{i:02}.rs")).collect();
+    let mut seed = vec![("OWNERS", Some("alice\n"))];
+    seed.extend(names.iter().map(|p| (p.as_str(), Some(F0))));
+    let base = api.seed_main(&seed).await;
+    let all = |text: &'static str, count: usize| -> Vec<(&str, Option<&str>)> {
+        names[..count]
+            .iter()
+            .map(|p| (p.as_str(), Some(text)))
+            .collect()
+    };
+    // `x` and the head each change every file, in different functions.
+    for count in [n, n - 1] {
+        let x = api.commit(&[base], &all(FX, count)).await;
+        api.approve(x, "alice").await;
+        let head = api.commit(&[base], &all(FH, n)).await;
+        let y = api
+            .commit_from(&[head], &all(FR, count), Some(&x.to_string()))
+            .await;
+        let s = api.status(y).await;
+        assert_eq!(s.approved, count < n, "{count}: {s:?}");
+        if count == n {
+            assert_eq!(
+                s.origins[0].reason.as_deref(),
+                Some("more than 32 of its paths moved under it")
+            );
+        } else {
+            assert!(s
+                .paths
+                .iter()
+                .all(|p| p.carried_rule.as_deref() == Some("rebased")));
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_oversized_blob_is_not_merged() {
+    // Each side just past the content rules' 2 MiB: a human looks again.
+    let filler = "// padding line\n".repeat(2 * 1024 * 1024 / 16 + 1);
+    let big = |s: &str| -> &'static str { Box::leak(format!("{s}{filler}").into_boxed_str()) };
+    let m = moved_setup(POLICY_AUTO, big(F0), big(FX), big(FH)).await;
+    let y = m.resolve(big(FR)).await;
+    let s = m.api.status(y).await;
+    assert!(!s.approved);
+    assert_eq!(rules(&s)[1], ("src/a.rs", "pending"));
+}
+
+#[tokio::test]
+async fn status_names_the_origin_that_did_not_carry_and_why() {
+    let m = moved_setup(POLICY_AUTO, F0, FX, FH).await;
+    let y = m.resolve(&FR.replace("check", "chek")).await;
+    let s = m.api.status(y).await;
+    assert!(!s.approved);
+    assert_eq!(
+        s.origins,
+        [OriginStatus {
+            from: m.x,
+            reviews: vec![OriginReview {
+                reviewer: "alice".into(),
+                verdict: Verdict::Approve,
+            }],
+            carried: false,
+            differs: vec![RepoPath::new("src/a.rs").unwrap()],
+            reason: None,
+        }]
+    );
+    // A reviewer with a review of `y` itself is not listed for `x`; with
+    // no one left, `x` is not an origin worth naming.
+    m.api.review(y, "alice", Verdict::Withdrawn).await;
+    assert!(m.api.status(y).await.origins.is_empty());
+    // A changeset with no hint has no origins, and the field is left out.
+    let raw: serde_json::Value = m
+        .api
+        .get(&format!("/v1/changesets/{}/review-status", m.head))
+        .await
+        .json();
+    assert!(raw.get("origins").is_none());
+}
+
+#[tokio::test]
+async fn a_strict_ref_carries_only_identical_changes() {
+    // Lands on a strict ref never merge file contents, so a carry does not
+    // rest on a merge there either.
+    let mut repo = Repo::new(
+        Arc::new(MemoryBlobStore::new()),
+        Arc::new(MemoryMetaStore::new()),
+    )
+    .with_land_conflicts(leep_derive::LandConflicts::new(
+        leep_derive::ConflictPolicy::Merge,
+        ["main".to_string()],
+    ));
+    let policy = ReviewPolicy::parse(POLICY_AUTO).unwrap();
+    let svc = Arc::new(ReviewService::new(auth().reviewers(), policy.rules));
+    repo = repo.with_land_policy(Arc::new(RequireReview::new(svc.clone(), policy.refs)));
+    let api = Api {
+        app: leep_server::router_with_review(repo.clone(), 1 << 20, Some(auth()), None, Some(svc)),
+        repo,
+    };
+    let m = moved_on(api, F0, FX, FH).await;
+    let y = m.resolve(FR).await;
+    let s = m.api.status(y).await;
+    assert!(!s.approved, "{s:?}");
+    assert_eq!(rules(&s)[1], ("src/a.rs", "pending"));
+    assert_eq!(s.origins[0].differs, [RepoPath::new("src/a.rs").unwrap()]);
+}

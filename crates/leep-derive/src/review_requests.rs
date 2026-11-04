@@ -12,17 +12,21 @@
 use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
-use leep_core::api::ReviewRequestEntry;
+use leep_core::api::{ReviewRequestEntry, REQUEST_ENTRY_PATHS};
 use leep_core::changeset::EXTRA_REBASED_FROM;
 use leep_core::review_request::{
     check_request, CreatedBy, NewReviewRequest, ReviewRequest, ReviewRequestFilter,
     ReviewRequestState, CREATED_BY_KIND, MAX_OPEN_REQUESTS, TOO_MANY_REQUESTS_MARKER,
 };
 use leep_core::store::unix_now;
-use leep_core::{refname, Changeset, ChangesetId, DerivedRow, Error, Result};
+use leep_core::{refname, Changeset, ChangesetId, DerivedRow, Error, RepoPath, Result};
 
 use crate::review::ReviewRules;
 use crate::Repo;
+
+/// What a request entry shows about its changeset: creator, title, the
+/// first paths and how many it changes.
+type About = (Option<CreatedBy>, Option<String>, Vec<RepoPath>, usize);
 
 /// Open requests of one ref a land looks at; more stay open until listed.
 const LAND_CLOSE_LIMIT: usize = 500;
@@ -241,7 +245,12 @@ impl Repo {
                     if h.origin == Some(r.changeset)
                         || (h.candidates.contains(&r.changeset)
                             && self
-                                .lands_reviewed_change(r.changeset, h.id, rules)
+                                .lands_reviewed_change(
+                                    r.changeset,
+                                    h.id,
+                                    rules,
+                                    self.carry_merges(&r.target_ref),
+                                )
                                 .await
                                 .unwrap_or(false))
                     {
@@ -391,6 +400,7 @@ impl Repo {
         // older entry by someone else (a re-land of their changeset) or no
         // entry at all grants nothing beyond content.
         let requester_rule = actor.is_some() && logged_by.as_deref() == actor;
+        let merges = self.carry_merges(target_ref);
         for z in added {
             if let Some(origin) = self.rebased_origin(z).await? {
                 copies.entry(origin).or_insert(z);
@@ -426,7 +436,7 @@ impl Repo {
                 }
                 if (requester_rule && actor == Some(r.requester.as_str()))
                     || self
-                        .lands_reviewed_change(r.changeset, *z, rules)
+                        .lands_reviewed_change(r.changeset, *z, rules, merges)
                         .await
                         .unwrap_or(false)
                 {
@@ -523,7 +533,7 @@ impl Repo {
     }
 
     /// `reqs` with what a reviewer wants to see about each changeset: who
-    /// created it and its title, read in two batches.
+    /// created it, its title and the paths it changes, read in two batches.
     pub async fn review_request_entries(
         &self,
         reqs: Vec<ReviewRequest>,
@@ -534,16 +544,27 @@ impl Repo {
         let changesets = self.meta().get_changesets(&ids).await?;
         let keys: Vec<_> = ids.iter().map(|id| id.0).collect();
         let rows = self.meta().get_derived_many(CREATED_BY_KIND, &keys).await?;
-        let mut about: HashMap<ChangesetId, (Option<CreatedBy>, Option<String>)> = HashMap::new();
+        let mut about: HashMap<ChangesetId, About> = HashMap::new();
         for ((id, cs), row) in ids.iter().zip(changesets).zip(rows) {
-            let title = cs.map(|c| c.message.lines().next().unwrap_or("").to_string());
+            let title = cs
+                .as_ref()
+                .map(|c| c.message.lines().next().unwrap_or("").to_string());
+            let (paths, changed) = cs.map_or((Vec::new(), 0), |c| {
+                let paths = c
+                    .changes
+                    .keys()
+                    .take(REQUEST_ENTRY_PATHS)
+                    .cloned()
+                    .collect();
+                (paths, c.changes.len())
+            });
             let by = row.and_then(|b| CreatedBy::decode(&b).ok());
-            about.insert(*id, (by, title));
+            about.insert(*id, (by, title, paths, changed));
         }
         Ok(reqs
             .into_iter()
             .map(|request| {
-                let (created_by, title) =
+                let (created_by, title, paths, changed) =
                     about.get(&request.changeset).cloned().unwrap_or_default();
                 ReviewRequestEntry {
                     request,
@@ -551,6 +572,8 @@ impl Repo {
                     title,
                     approved_by: Vec::new(),
                     rejected_by: Vec::new(),
+                    paths,
+                    changed,
                 }
             })
             .collect())
@@ -665,7 +688,9 @@ mod tests {
     /// The client resolves X's changelog conflict in a commit of its own
     /// that names X: the reviewed code is byte for byte X's, so the land
     /// closes the request by content, whoever ran it. Without the policy's
-    /// docs rule the changelog counts as reviewed and nothing closes.
+    /// docs rule the changelog counts as reviewed, and this resolution
+    /// (neither the server's merge nor a union of the two lines) closes
+    /// nothing.
     #[tokio::test]
     async fn a_client_resolution_naming_the_request_closes_it() {
         let r = repo();
@@ -681,7 +706,7 @@ mod tests {
         let z = naming(
             &r,
             m,
-            &[("a.rs", Some("2\n")), ("CHANGELOG.md", Some("c\nm\nx\n"))],
+            &[("a.rs", Some("2\n")), ("CHANGELOG.md", Some("c\nm, x\n"))],
             &[x],
         )
         .await;
@@ -700,6 +725,103 @@ mod tests {
             1
         );
         assert_eq!(state(&r, &q).await, (ReviewRequestState::Landed, Some(z)));
+    }
+
+    /// The client's resolution makes X's reviewed change to `a.rs` again on
+    /// a base where `a.rs` moved: it is the server's own rebase of X's change
+    /// there, and the changelog keeps both appended lines. That lands the
+    /// reviewed change (ADR 0089), so the request closes, even with no auto
+    /// rule. One extra line closes nothing, and neither does any merge on a
+    /// ref whose lands never merge contents.
+    #[tokio::test]
+    async fn a_request_closes_when_its_change_lands_rebased_by_the_client() {
+        for strict in [false, true] {
+            let mut r = repo();
+            if strict {
+                r = r.with_land_conflicts(crate::LandConflicts::strict());
+            }
+            const A: &str = "top\n\nmid\n\nend\n";
+            let base = files_commit(
+                &r,
+                &[],
+                &[("a.rs", Some(A)), ("CHANGELOG.md", Some("c\n"))],
+                "base",
+            )
+            .await;
+            r.meta().cas_ref("main", None, Some(base)).await.unwrap();
+            let x = files_commit(
+                &r,
+                &[base],
+                &[
+                    ("a.rs", Some("top\n\nmid\n\nend\nx\n")),
+                    ("CHANGELOG.md", Some("c\nx\n")),
+                ],
+                "x",
+            )
+            .await;
+            let m = files_commit(
+                &r,
+                &[base],
+                &[
+                    ("a.rs", Some("TOP\n\nmid\n\nend\n")),
+                    ("CHANGELOG.md", Some("c\nm\n")),
+                ],
+                "m",
+            )
+            .await;
+            landed_by(&r, m, "bo").await;
+            let (q, _) = r
+                .request_review(ask(x, "ada", &["rhea"]), None)
+                .await
+                .unwrap();
+            let rules = ReviewRules::default();
+            let evil = naming(
+                &r,
+                m,
+                &[
+                    ("a.rs", Some("TOP\n\nmid\n\nend\nx\nevil\n")),
+                    ("CHANGELOG.md", Some("c\nm\nx\n")),
+                ],
+                &[x],
+            )
+            .await;
+            assert!(!r
+                .lands_reviewed_change(x, evil, &rules, true)
+                .await
+                .unwrap());
+            let good = naming(
+                &r,
+                m,
+                &[
+                    ("a.rs", Some("TOP\n\nmid\n\nend\nx\n")),
+                    ("CHANGELOG.md", Some("c\nm\nx\n")),
+                ],
+                &[x],
+            )
+            .await;
+            assert!(r
+                .lands_reviewed_change(x, good, &rules, true)
+                .await
+                .unwrap());
+            assert!(!r
+                .lands_reviewed_change(x, good, &rules, false)
+                .await
+                .unwrap());
+            assert_eq!(landed_by(&r, good, "cy").await, good);
+            assert_eq!(
+                r.close_landed_review_requests("main", good, good, Some("cy"), None)
+                    .await
+                    .unwrap(),
+                u64::from(!strict),
+                "strict: {strict}"
+            );
+            let want = if strict {
+                (ReviewRequestState::Open, None)
+            } else {
+                (ReviewRequestState::Landed, Some(good))
+            };
+            assert_eq!(state(&r, &q).await, want);
+        }
     }
 
     /// One changed byte in a reviewed file: the resolution is not the
@@ -760,7 +882,7 @@ mod tests {
                 .unwrap(),
             0
         );
-        let z = naming(&r, elsewhere, &[("CHANGELOG.md", Some("c\nm\nx\n"))], &[x]).await;
+        let z = naming(&r, elsewhere, &[("CHANGELOG.md", Some("c\nm, x\n"))], &[x]).await;
         landed_by(&r, z, "cy").await;
         // Without the docs rule the changelog is reviewed content that
         // differs.
@@ -812,7 +934,7 @@ mod tests {
         let r = repo();
         let (q1, q2, z) = resolved_stack(&r).await;
         assert!(!r
-            .lands_reviewed_change(q2.changeset, z, &docs())
+            .lands_reviewed_change(q2.changeset, z, &docs(), true)
             .await
             .unwrap());
         landed_by(&r, z, "ada").await;
@@ -870,7 +992,7 @@ mod tests {
         let z = naming(
             &r,
             m,
-            &[("a.rs", Some("2\n")), ("CHANGELOG.md", Some("c\nm\nx\n"))],
+            &[("a.rs", Some("2\n")), ("CHANGELOG.md", Some("c\nm, x\n"))],
             &[x],
         )
         .await;

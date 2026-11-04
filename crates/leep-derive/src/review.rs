@@ -15,7 +15,8 @@
 //! A changeset is approved when no path is pending or rejected.
 //!
 //! Verdicts on another changeset X can carry to this one (ADR 0085), but only
-//! for paths whose change is identical in both: see [`Repo::carried_paths`].
+//! for paths whose change is identical in both, or what the server's own
+//! rebase of X's change would make (ADR 0089): see [`Repo::carried_paths`].
 
 use std::collections::btree_map::Entry as BTreeEntry;
 use std::collections::hash_map::Entry;
@@ -27,6 +28,7 @@ use leep_core::changeset::EXTRA_REBASED_FROM;
 use leep_core::review::{Review, Verdict, OWNERS_FILE};
 use leep_core::{ChangesetId, Error, FileChange, FileKind, RepoPath, Result};
 
+use crate::carry::{self, CarryRule};
 use crate::comments::strip_comments;
 use crate::owners::OwnersResolver;
 use crate::Repo;
@@ -42,6 +44,40 @@ pub const MAX_CARRY_CANDIDATES: usize = 64;
 /// Most changed paths a candidate may have for [`Repo::carried_paths`] to
 /// compare it; a bigger one carries nothing, so its cost stays bounded.
 pub const MAX_CARRY_PATHS: usize = 1024;
+
+/// Most paths of one candidate [`Repo::carried_paths`] merges to compare
+/// (ADR 0089): each is one three-way text merge. With more, nothing carries.
+pub const MAX_CARRY_MERGED_PATHS: usize = 32;
+
+/// Why [`Repo::carry_check`] carries nothing from a candidate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CarryRefusal {
+    /// The candidate is a merge; its paths are not compared.
+    Merge,
+    /// It changes more than [`MAX_CARRY_PATHS`] paths.
+    TooManyPaths,
+    /// More than [`MAX_CARRY_MERGED_PATHS`] of its paths would need a merge.
+    TooManyMerges,
+    /// This reviewed path is missing from the judged changeset or changed
+    /// differently there.
+    Differs(RepoPath),
+}
+
+impl std::fmt::Display for CarryRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CarryRefusal::Merge => write!(f, "it is a merge"),
+            CarryRefusal::TooManyPaths => {
+                write!(f, "it changes more than {MAX_CARRY_PATHS} paths")
+            }
+            CarryRefusal::TooManyMerges => write!(
+                f,
+                "more than {MAX_CARRY_MERGED_PATHS} of its paths moved under it"
+            ),
+            CarryRefusal::Differs(p) => write!(f, "{p} differs"),
+        }
+    }
+}
 
 /// A rule that approves a path without a human.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -205,14 +241,17 @@ pub struct PathStatus {
     /// The changeset whose verdicts this path counted besides its own, when
     /// one of them is in `approved_by` or `rejected_by`.
     pub carried_from: Option<ChangesetId>,
+    /// How this path reproduces `carried_from`'s change, when that is set.
+    pub carried_rule: Option<CarryRule>,
 }
 
 /// Verdicts on `from` that count for the paths in `paths` of the changeset
-/// being judged, because it makes exactly the change `from` made there.
+/// being judged, because it makes the change `from` made there (each with
+/// how, see [`Repo::carried_paths`]).
 #[derive(Clone, Debug)]
 pub struct Carried {
     pub from: ChangesetId,
-    pub paths: BTreeSet<RepoPath>,
+    pub paths: BTreeMap<RepoPath, CarryRule>,
     /// Reviews of `from`, withdrawals included, by reviewers with no review
     /// of their own of the changeset being judged.
     pub reviews: Vec<Review>,
@@ -326,25 +365,26 @@ impl Repo {
             // Carried verdicts count only where the change is the one they
             // were given on, and never for a dropped side change. Callers
             // leave out reviewers with a review of `id` itself.
-            let mut newest: BTreeMap<&str, (&Review, ChangesetId)> = BTreeMap::new();
-            for c in carried
-                .iter()
-                .filter(|c| change.is_some() && c.paths.contains(path))
-            {
+            let mut newest: BTreeMap<&str, (&Review, ChangesetId, CarryRule)> = BTreeMap::new();
+            for (c, how) in carried.iter().filter_map(|c| {
+                let how = c.paths.get(path).filter(|_| change.is_some())?;
+                Some((c, *how))
+            }) {
                 for r in &c.reviews {
                     match newest.entry(r.reviewer.as_str()) {
                         BTreeEntry::Vacant(e) => {
-                            e.insert((r, c.from));
+                            e.insert((r, c.from, how));
                         }
                         BTreeEntry::Occupied(mut e) if later(r, e.get().0) => {
-                            e.insert((r, c.from));
+                            e.insert((r, c.from, how));
                         }
                         BTreeEntry::Occupied(_) => {}
                     }
                 }
             }
             let mut carried_from = None;
-            for (who, (r, from)) in newest {
+            let mut carried_rule = None;
+            for (who, (r, from, how)) in newest {
                 if !counts(who) {
                     continue;
                 }
@@ -353,8 +393,9 @@ impl Repo {
                     Verdict::Reject => &mut rejected,
                     Verdict::Withdrawn => continue,
                 };
-                if set.insert(who.to_string()) {
-                    carried_from.get_or_insert(from);
+                if set.insert(who.to_string()) && carried_from.is_none() {
+                    carried_from = Some(from);
+                    carried_rule = Some(how);
                 }
             }
             let (approved_by, rejected_by): (Vec<String>, Vec<String>) = (
@@ -391,6 +432,7 @@ impl Repo {
                 approved_by,
                 rejected_by,
                 carried_from,
+                carried_rule,
             });
         }
         Ok(ChangesetReview { id, paths })
@@ -434,36 +476,72 @@ impl Repo {
         Ok(out)
     }
 
-    /// The paths where `id` makes exactly the change `from` made (the same
-    /// old content and kind, each relative to its own first parent, and the
-    /// same new content and kind), when every other path `from` changed is
-    /// one an auto rule approves in `from`. Same old and new means the file
-    /// is byte for byte what was reviewed and the base did not move under
-    /// it. `None` when a path of `from` that needed a reviewer is changed
-    /// differently in `id`, or missing from it (so a reviewed path never
+    /// The paths where `id` makes the change `from` made, each with how,
+    /// when every other path `from` changed is one an auto rule approves in
+    /// `from`. A path reproduces the change when (ADR 0085, 0089):
+    ///
+    /// - **identical**: the same old content and kind, each relative to its
+    ///   own first parent, and the same new content and kind, so the file is
+    ///   byte for byte what was reviewed and the base did not move under it;
+    /// - with `merges`, **rebased**: the base moved, and `id`'s new content
+    ///   is exactly what the server's rebase of `from`'s change onto `id`'s
+    ///   first parent makes (`diffy::merge(from's old, id's old, from's
+    ///   new)`, clean); or **union**: that merge conflicts only where both
+    ///   sides inserted lines at one place, and `id` keeps both insertions,
+    ///   one side's first in every region. Text files on both sides with
+    ///   one kind throughout (no symlinks, no kind change), each at most
+    ///   [`MAX_AUTO_BYTES`], never `OWNERS`, at most
+    ///   [`MAX_CARRY_MERGED_PATHS`] per candidate. `merges` is off on refs
+    ///   whose lands never merge file contents (`--strict-land-ref`).
+    ///
+    /// `None` when a path of `from` that needed a reviewer is changed
+    /// otherwise in `id`, or missing from it (so a reviewed path never
     /// carries without the others it was approved with), when `from` is a
-    /// merge or changes more than [`MAX_CARRY_PATHS`] paths. An empty set
+    /// merge or changes more than [`MAX_CARRY_PATHS`] paths. An empty map
     /// means every path of `from` is one an auto rule approves there and
     /// none is reproduced: nothing carries a verdict (callers that carry
     /// verdicts skip it), but nothing reviewed was lost either, which is
     /// what closing a review request asks (ADR 0087). Paths only `id`
     /// changes are judged on their own.
-    ///
-    /// Cheap by construction: a path whose new content differs is refused
-    /// before any read unless an auto rule could hold for it, then each
-    /// matching path costs two file lookups, and only the paths that differ
-    /// read contents, for the content rules.
     pub async fn carried_paths(
         &self,
         from: ChangesetId,
         id: ChangesetId,
         rules: &ReviewRules,
-    ) -> Result<Option<BTreeSet<RepoPath>>> {
+        merges: bool,
+    ) -> Result<Option<BTreeMap<RepoPath, CarryRule>>> {
+        Ok(self.carry_check(from, id, rules, merges).await?.ok())
+    }
+
+    /// Whether verdicts carried to a land on `target_ref` may rest on a
+    /// merge (ADR 0089): only where the server's own lands merge file
+    /// contents, so a carry never trusts a merge the ref would refuse.
+    pub fn carry_merges(&self, target_ref: &str) -> bool {
+        self.land_conflicts().for_ref(target_ref) == crate::ConflictPolicy::Merge
+    }
+
+    /// [`Self::carried_paths`], saying why nothing carries when it does not.
+    ///
+    /// Cheap by construction: a path whose new content differs is refused
+    /// before any read unless an auto rule could hold for it or it could be
+    /// merged, then each matching path costs two file lookups, only the
+    /// paths that differ read contents, for the content rules, and a merge
+    /// reads three blobs once per process (outcomes are cached by content).
+    pub async fn carry_check(
+        &self,
+        from: ChangesetId,
+        id: ChangesetId,
+        rules: &ReviewRules,
+        merges: bool,
+    ) -> Result<std::result::Result<BTreeMap<RepoPath, CarryRule>, CarryRefusal>> {
         let theirs = self.get_changeset(from).await?;
         // A merge's changes are not all its own (`merge_parent`, dropped
         // side changes); its paths are not compared.
-        if theirs.parents.len() > 1 || theirs.changes.len() > MAX_CARRY_PATHS {
-            return Ok(None);
+        if theirs.parents.len() > 1 {
+            return Ok(Err(CarryRefusal::Merge));
+        }
+        if theirs.changes.len() > MAX_CARRY_PATHS {
+            return Ok(Err(CarryRefusal::TooManyPaths));
         }
         let mine = self.get_changeset(id).await?;
         let new_key = |c: &FileChange| match c {
@@ -479,21 +557,36 @@ impl Repo {
                 && ((rules.enabled(AutoRule::DocsOnly) && rules.is_docs(p.as_str()))
                     || (content_rules && matches!(c, FileChange::Modify { .. })))
         };
+        let (px, py) = (
+            theirs.parents.first().copied(),
+            mine.parents.first().copied(),
+        );
+        // Could a merge reproduce it? Both modify the file, never `OWNERS`,
+        // on different bases (on the same one the merge is `from`'s file).
+        let may_merge = |p: &RepoPath, c: &FileChange| {
+            merges
+                && px != py
+                && p.file_name() != OWNERS_FILE
+                && matches!(c, FileChange::Modify { .. })
+                && matches!(mine.changes.get(p), Some(FileChange::Modify { .. }))
+        };
         let mut same_new = Vec::new();
         let mut differ = Vec::new();
+        let mut merge = Vec::new();
         for (p, c) in &theirs.changes {
             if mine.changes.get(p).map(new_key) == Some(new_key(c)) {
                 same_new.push((p, c));
             } else if may_be_auto(p, c) {
                 differ.push((p, c));
+            } else if may_merge(p, c) {
+                merge.push(p);
             } else {
-                return Ok(None);
+                return Ok(Err(CarryRefusal::Differs(p.clone())));
             }
         }
-        let (px, py) = (
-            theirs.parents.first().copied(),
-            mine.parents.first().copied(),
-        );
+        if merge.len() > MAX_CARRY_MERGED_PATHS {
+            return Ok(Err(CarryRefusal::TooManyMerges));
+        }
         let old = |parent: Option<ChangesetId>, p: &RepoPath| {
             let p = p.clone();
             async move {
@@ -506,27 +599,130 @@ impl Repo {
                 })
             }
         };
-        let mut out = BTreeSet::new();
+        let mut out = BTreeMap::new();
         for (p, c) in same_new {
             if old(px, p).await? == old(py, p).await? {
-                out.insert(p.clone());
+                out.insert(p.clone(), CarryRule::Identical);
             } else if may_be_auto(p, c) {
                 differ.push((p, c));
+            } else if may_merge(p, c) {
+                merge.push(p);
             } else {
-                return Ok(None);
+                return Ok(Err(CarryRefusal::Differs(p.clone())));
             }
         }
         for (p, c) in differ {
-            if self.auto_rule(rules, p, px, c).await?.is_none() {
-                return Ok(None);
+            if self.auto_rule(rules, p, px, c).await?.is_some() {
+                continue;
+            }
+            if !may_merge(p, c) {
+                return Ok(Err(CarryRefusal::Differs(p.clone())));
+            }
+            merge.push(p);
+        }
+        if merge.len() > MAX_CARRY_MERGED_PATHS {
+            return Ok(Err(CarryRefusal::TooManyMerges));
+        }
+        for p in merge {
+            let (Some(x_new), Some(y_new)) = (theirs.changes.get(p), mine.changes.get(p)) else {
+                return Ok(Err(CarryRefusal::Differs(p.clone())));
+            };
+            match self.rebased_rule(px, py, p, x_new, y_new).await? {
+                Some(rule) => {
+                    out.insert(p.clone(), rule);
+                }
+                None => return Ok(Err(CarryRefusal::Differs(p.clone()))),
             }
         }
-        Ok(Some(out))
+        Ok(Ok(out))
+    }
+
+    /// How `y_new`, made on `py`, reproduces the change `x_new` made to `p`
+    /// on `px` though the file differs between them (ADR 0089): the
+    /// server's rebase result, or a union of insertions. `None` for anything
+    /// else, and for files the merge does not take: a missing side, a kind
+    /// that differs anywhere or is a symlink, more than [`MAX_AUTO_BYTES`],
+    /// a blob that cannot be read or is not UTF-8.
+    async fn rebased_rule(
+        &self,
+        px: Option<ChangesetId>,
+        py: Option<ChangesetId>,
+        p: &RepoPath,
+        x_new: &FileChange,
+        y_new: &FileChange,
+    ) -> Result<Option<CarryRule>> {
+        let (
+            FileChange::Modify {
+                content: xn,
+                kind: xk,
+                size: xs,
+            },
+            FileChange::Modify {
+                content: yn,
+                kind: yk,
+                ..
+            },
+        ) = (x_new, y_new)
+        else {
+            return Ok(None);
+        };
+        let (Some(px), Some(py)) = (px, py) else {
+            return Ok(None);
+        };
+        let (Some(xo), Some(yo)) = (
+            self.lookup_file(px, p).await?,
+            self.lookup_file(py, p).await?,
+        ) else {
+            return Ok(None);
+        };
+        let one_kind = [xo.kind, yo.kind, *yk].iter().all(|k| k == xk);
+        if !one_kind || *xk == FileKind::Symlink {
+            return Ok(None);
+        }
+        if [xo.size, yo.size, *xs].iter().any(|s| *s > MAX_AUTO_BYTES) {
+            return Ok(None);
+        }
+        // The file did not move: the merge is `from`'s new file, which
+        // `y_new` is not (it would have matched as identical).
+        if xo.content == yo.content {
+            return Ok(None);
+        }
+        let key = [xo.content, yo.content, *xn];
+        let merged = match carry::cached(key) {
+            Some(m) => m,
+            None => {
+                let mut texts = Vec::with_capacity(3);
+                for h in key {
+                    let text = self
+                        .read_content(&h)
+                        .await?
+                        .and_then(|b| String::from_utf8(b.to_vec()).ok());
+                    match text {
+                        Some(t) => texts.push(t),
+                        // Unreadable or binary: no text merge, as for the
+                        // server's rebase.
+                        None => return Ok(None),
+                    }
+                }
+                // A large merge is CPU work; keep it off the async workers.
+                let m = tokio::task::spawn_blocking(move || {
+                    carry::merge_outcome(&texts[0], &texts[1], &texts[2])
+                })
+                .await;
+                let Ok(m) = m else {
+                    return Ok(None);
+                };
+                carry::remember(key, m);
+                m
+            }
+        };
+        Ok(merged.rule_for(*yn))
     }
 
     /// Whether `id` puts the reviewed change of `from` on its ref, the
     /// content rule a review request for `from` closes by (ADR 0087):
-    /// [`Self::carried_paths`] holds and reproduces at least one path, or
+    /// [`Self::carried_paths`] (with `merges`) holds and reproduces at least
+    /// one path, or
     /// every path of `from` is one an auto rule approves there and `id`
     /// changes each of them in a form an auto rule approves in `id`. Like
     /// carrying, it is decided by content alone, so a forged hint closes
@@ -536,8 +732,9 @@ impl Repo {
         from: ChangesetId,
         id: ChangesetId,
         rules: &ReviewRules,
+        merges: bool,
     ) -> Result<bool> {
-        let paths = match self.carried_paths(from, id, rules).await {
+        let paths = match self.carried_paths(from, id, rules, merges).await {
             Ok(Some(paths)) => paths,
             Ok(None) | Err(Error::NotFound(_)) => return Ok(false),
             Err(e) => return Err(e),

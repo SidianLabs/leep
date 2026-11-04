@@ -702,9 +702,43 @@ pub struct PathReview {
     pub rejected_by: Vec<String>,
     /// Set when some of `approved_by` or `rejected_by` reviewed this
     /// changeset's original rather than this changeset: the path's change is
-    /// identical in both, so their verdict carries (ADR 0085).
+    /// identical in both, so their verdict carries (ADR 0085), or is what
+    /// the server's rebase of it would make (ADR 0089).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carried_from: Option<ChangesetId>,
+    /// How the path reproduces `carried_from`'s change, when that is set:
+    /// `identical`, `rebased` (the server's rebase of it onto this
+    /// changeset's base) or `union` (both sides' insertions at one place,
+    /// kept whole). ADR 0089; older servers leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_rule: Option<String>,
+}
+
+/// One changeset a judged changeset names as its origin
+/// (`leep.rebased_from`, ADR 0085) whose reviews could carry to it, and
+/// whether they do (ADR 0089).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OriginStatus {
+    pub from: ChangesetId,
+    /// The verdicts on `from` that would carry, by reviewers with no
+    /// review of the judged changeset itself.
+    pub reviews: Vec<OriginReview>,
+    /// Whether they count on at least one path.
+    pub carried: bool,
+    /// When not carried: paths of `from` that needed a reviewer and that
+    /// the judged changeset does not reproduce.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub differs: Vec<RepoPath>,
+    /// When not carried for another reason (`from` is a merge, too many
+    /// paths, too many reviewed origins), that reason in words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OriginReview {
+    pub reviewer: String,
+    pub verdict: Verdict,
 }
 
 /// Whether a changeset could land on `target_ref` now, per path.
@@ -719,6 +753,11 @@ pub struct ReviewStatusResponse {
     /// so `approved` no longer decides anything on them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub on_refs: Vec<String>,
+    /// The origins the changeset names whose reviews could carry to it,
+    /// nearest first, with whether they do (ADR 0089): so a client can say
+    /// why an approval of the original did not carry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub origins: Vec<OriginStatus>,
 }
 
 /// `POST /v1/review-requests`: ask for a review (ADR 0086).
@@ -764,6 +803,19 @@ pub struct ReviewRequestEntry {
     pub approved_by: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rejected_by: Vec<String>,
+    /// The first [`REQUEST_ENTRY_PATHS`] paths the changeset changes, in
+    /// path order (ADR 0089); `changed` counts them all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<RepoPath>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub changed: usize,
+}
+
+/// Most paths a [`ReviewRequestEntry`] lists.
+pub const REQUEST_ENTRY_PATHS: usize = 16;
+
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2430,6 +2482,58 @@ mod tests {
                     ),
                     ("renames_truncated", json!(true)),
                     ("next", json!("n")),
+                ],
+                true,
+            );
+        }
+
+        /// ADR 0089: how a verdict carried, why one did not, and what a
+        /// request changes. Absent fields decode empty and are not written.
+        #[test]
+        fn carry_fields_added_later_decode_when_absent_and_keep_their_names() {
+            check_added::<PathReview>(
+                "PathReview",
+                json!({ "path": "a.txt", "rule": "owner", "owners": [],
+                        "approved_by": ["rhea"] }),
+                &[
+                    ("carried_from", json!(id("x"))),
+                    ("carried_rule", json!("rebased")),
+                ],
+                true,
+            );
+            check_added::<ReviewStatusResponse>(
+                "ReviewStatusResponse",
+                json!({ "changeset": id("y"), "target_ref": "main", "approved": false,
+                        "paths": [] }),
+                &[
+                    ("on_refs", json!(["main"])),
+                    (
+                        "origins",
+                        json!([{ "from": id("x"),
+                                 "reviews": [{ "reviewer": "rhea", "verdict": "approve" }],
+                                 "carried": false, "differs": ["a.txt"] }]),
+                    ),
+                ],
+                true,
+            );
+            check_added::<OriginStatus>(
+                "OriginStatus",
+                json!({ "from": id("x"), "reviews": [], "carried": true }),
+                &[
+                    ("differs", json!(["a.txt"])),
+                    ("reason", json!("it is a merge")),
+                ],
+                true,
+            );
+            check_added::<ReviewRequestEntry>(
+                "ReviewRequestEntry",
+                json!({ "id": 1, "changeset": id("c"), "target_ref": "main",
+                        "requester": "dee", "created": 1_700_000_000, "state": "open" }),
+                &[
+                    ("approved_by", json!(["rhea"])),
+                    ("rejected_by", json!(["bo"])),
+                    ("paths", json!(["a.txt", "b/c.rs"])),
+                    ("changed", json!(3)),
                 ],
                 true,
             );

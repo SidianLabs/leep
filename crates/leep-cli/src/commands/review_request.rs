@@ -2,12 +2,17 @@
 //! ask for a review through the server and see what waits for you
 //! (ADR 0086).
 
+use std::time::Instant;
+
 use clap::Args;
-use leep_core::api::{CreateReviewRequest, ReviewRequestEntry, ReviewRequestState};
+use leep_core::api::{
+    CreateReviewRequest, ReviewRequestEntry, ReviewRequestState, ReviewRequestsResponse,
+};
 use leep_core::outln;
 
+use super::review::Backoff;
 use super::{print_json, Remote};
-use crate::error::{CliError, ErrorKind, Result};
+use crate::error::{exit, CliError, ErrorKind, Result};
 use crate::fmt::{plural, short, utc_time};
 
 #[derive(Args, Debug)]
@@ -47,6 +52,16 @@ pub struct InboxArgs {
     /// Show at most this many (default 50).
     #[arg(short = 'n', long, value_name = "N")]
     pub limit: Option<usize>,
+    /// Wait until something is listed, up to SECS (default 3600; 0 means
+    /// no limit): exit 0 with the list, or 1 when the time runs out.
+    #[arg(
+        long,
+        value_name = "SECS",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "3600"
+    )]
+    pub wait: Option<u64>,
 }
 
 #[derive(Args, Debug)]
@@ -120,24 +135,16 @@ pub fn inbox(r: &Remote, args: &InboxArgs) -> Result<i32> {
         .whoami()?
         .name
         .ok_or_else(|| CliError::user("review requests need a token: set LEEP_TOKEN"))?;
-    let mut query = vec![(if args.mine { "requester" } else { "reviewer" }, me.clone())];
-    if !args.all {
-        query.push(("open", "true".into()));
-    }
-    if let Some(n) = args.limit {
-        query.push(("limit", n.to_string()));
-    }
-    let mut resp = r.client.review_requests(&query).map_err(unsupported)?;
-    // What waits for you is what you have not answered yet. A withdrawn
-    // verdict is no answer, so the request comes back.
-    let before = resp.requests.len();
-    if !args.mine && !args.all {
-        resp.requests.retain(|e| !answered_by(e, &me));
-    }
-    let hidden = before - resp.requests.len();
+    let (resp, hidden, code) = match args.wait {
+        None => {
+            let (resp, hidden) = inbox_page(r, args, &me)?;
+            (resp, hidden, exit::OK)
+        }
+        Some(secs) => wait_for_inbox(r, args, &me, &Backoff::waiting(secs))?,
+    };
     if r.json {
         print_json(&resp)?;
-        return Ok(0);
+        return Ok(code);
     }
     if resp.requests.is_empty() {
         outln!(
@@ -161,7 +168,71 @@ pub fn inbox(r: &Remote, args: &InboxArgs) -> Result<i32> {
             plural(hidden, "request")
         );
     }
-    Ok(0)
+    Ok(code)
+}
+
+/// One page of the inbox, without the requests `me` already answered
+/// (unless `--mine` or `--all`), and how many those were.
+fn inbox_page(r: &Remote, args: &InboxArgs, me: &str) -> Result<(ReviewRequestsResponse, usize)> {
+    let mut query = vec![(
+        if args.mine { "requester" } else { "reviewer" },
+        me.to_string(),
+    )];
+    if !args.all {
+        query.push(("open", "true".into()));
+    }
+    if let Some(n) = args.limit {
+        query.push(("limit", n.to_string()));
+    }
+    let mut resp = r.client.review_requests(&query).map_err(unsupported)?;
+    // What waits for you is what you have not answered yet. A withdrawn
+    // verdict is no answer, so the request comes back.
+    let before = resp.requests.len();
+    if !args.mine && !args.all {
+        resp.requests.retain(|e| !answered_by(e, me));
+    }
+    let hidden = before - resp.requests.len();
+    Ok((resp, hidden))
+}
+
+/// `--wait`: ask until a page lists something (exit 0) or the limit passes
+/// (exit 1, with the last, empty, page), backing off as `review status
+/// --wait` does.
+fn wait_for_inbox(
+    r: &Remote,
+    args: &InboxArgs,
+    me: &str,
+    b: &Backoff,
+) -> Result<(ReviewRequestsResponse, usize, i32)> {
+    let start = Instant::now();
+    let mut delay = b.first;
+    let mut said = false;
+    loop {
+        let (resp, hidden) = inbox_page(r, args, me)?;
+        if !resp.requests.is_empty() {
+            return Ok((resp, hidden, exit::OK));
+        }
+        let left = b.limit.map(|l| l.saturating_sub(start.elapsed()));
+        if left == Some(std::time::Duration::ZERO) {
+            eprintln!(
+                "timed out after {}s waiting for review requests",
+                start.elapsed().as_secs()
+            );
+            return Ok((resp, hidden, exit::USER));
+        }
+        if !said {
+            said = true;
+            eprintln!(
+                "waiting for review requests{}...",
+                match b.limit {
+                    Some(l) => format!(" (up to {}s)", l.as_secs()),
+                    None => String::new(),
+                }
+            );
+        }
+        std::thread::sleep(left.map_or(delay, |l| l.min(delay)));
+        delay = (delay * 2).min(b.max);
+    }
 }
 
 /// Whether `me` has approved or rejected the request's changeset.
@@ -183,6 +254,24 @@ pub fn cancel(r: &Remote, args: &CancelArgs) -> Result<i32> {
         s => outln!("Review request #{} is already {}", e.request.id, s.as_str()),
     }
     Ok(0)
+}
+
+/// Most paths an inbox entry names before `(+N)`.
+const ENTRY_FILES: usize = 5;
+
+/// `a.rs, b.rs (+3)`: the first paths a request's changeset changes and how
+/// many more. `None` from an older server, which sends no paths.
+fn files_line(paths: &[leep_core::RepoPath], changed: usize) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+    let shown: Vec<&str> = paths.iter().take(ENTRY_FILES).map(|p| p.as_str()).collect();
+    let more = changed.max(paths.len()) - shown.len();
+    let mut line = shown.join(", ");
+    if more > 0 {
+        line.push_str(&format!(" (+{more})"));
+    }
+    Some(line)
 }
 
 fn who_reviews(reviewers: &[String]) -> String {
@@ -217,11 +306,14 @@ pub fn entry_lines(e: &ReviewRequestEntry, me: Option<&str>) -> Vec<String> {
     if let Some(c) = e.created_by.as_ref().filter(|c| c.principal != q.requester) {
         head.push_str(&format!(" (created by {})", c.principal));
     }
-    head.push_str(&format!(
-        ", for {} ({})",
-        who_reviews(&q.reviewers),
-        utc_time(q.created)
-    ));
+    // ADR 0086 asks the pending paths' owners; none were asked when no
+    // pending path had one.
+    let whom = if q.reviewers.is_empty() {
+        "any reviewer, no owner pending".to_string()
+    } else {
+        q.reviewers.join(", ")
+    };
+    head.push_str(&format!(", for {whom} ({})", utc_time(q.created)));
     if let Some(at) = q.landed_as.filter(|l| *l != q.changeset) {
         head.push_str(&format!(", landed as {}", short(at)));
     }
@@ -239,6 +331,9 @@ pub fn entry_lines(e: &ReviewRequestEntry, me: Option<&str>) -> Vec<String> {
     let mut out = vec![head];
     if let Some(t) = e.title.as_deref().filter(|t| !t.is_empty()) {
         out.push(format!("    {t}"));
+    }
+    if let Some(files) = files_line(&e.paths, e.changed) {
+        out.push(format!("    files: {files}"));
     }
     for line in q.message.lines() {
         out.push(format!("    > {line}"));
@@ -276,6 +371,8 @@ mod tests {
             title: Some("core: add a field".into()),
             approved_by: Default::default(),
             rejected_by: Default::default(),
+            paths: vec![],
+            changed: 0,
         };
         let lines = entry_lines(&e, Some("bo"));
         assert_eq!(
@@ -299,7 +396,7 @@ mod tests {
         assert_eq!(
             entry_lines(&e, None)[0],
             format!(
-                "#7 landed {} -> main by ada (created by cy), for any reviewer ({}), landed as {}",
+                "#7 landed {} -> main by ada (created by cy), for any reviewer, no owner pending ({}), landed as {}",
                 short(c),
                 utc_time(0),
                 short(copy)
@@ -327,6 +424,8 @@ mod tests {
             title: None,
             approved_by: vec!["rhea".into()],
             rejected_by: vec!["bo".into()],
+            paths: vec![],
+            changed: 0,
         };
         let base = format!(
             "#3 open {} -> main by ada, for rhea ({})",
@@ -367,6 +466,8 @@ mod tests {
             title: None,
             approved_by: vec![],
             rejected_by: vec![],
+            paths: vec![],
+            changed: 0,
         };
         let s = short(c);
         assert_eq!(
@@ -385,6 +486,43 @@ mod tests {
             [format!(
                 "Already requested review of {s} on main from any reviewer (#4)"
             )]
+        );
+    }
+
+    #[test]
+    fn entries_name_the_first_files_and_how_many_more() {
+        let p = |s: &str| leep_core::RepoPath::new(s).unwrap();
+        assert_eq!(files_line(&[], 4), None);
+        assert_eq!(files_line(&[p("a.rs")], 1).as_deref(), Some("a.rs"));
+        let many: Vec<_> = (0..16).map(|i| p(&format!("f{i:02}"))).collect();
+        assert_eq!(
+            files_line(&many, 40).as_deref(),
+            Some("f00, f01, f02, f03, f04 (+35)")
+        );
+        let c = ChangesetId(Hash::of_blob(b"c"));
+        let e = ReviewRequestEntry {
+            request: ReviewRequest {
+                id: 9,
+                changeset: c,
+                target_ref: "main".into(),
+                requester: "ada".into(),
+                reviewers: vec!["rhea".into()],
+                message: String::new(),
+                created: 0,
+                state: ReviewRequestState::Open,
+                closed: None,
+                landed_as: None,
+            },
+            created_by: None,
+            title: Some("core: x".into()),
+            approved_by: vec![],
+            rejected_by: vec![],
+            paths: vec![p("a.rs"), p("b.rs")],
+            changed: 5,
+        };
+        assert_eq!(
+            entry_lines(&e, None)[1..],
+            ["    core: x", "    files: a.rs, b.rs (+3)"]
         );
     }
 }

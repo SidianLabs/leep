@@ -20,11 +20,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use leep_core::api::{PathReview, ReviewEntry, ReviewStatusResponse, ReviewsResponse};
+use leep_core::api::{
+    OriginReview, OriginStatus, PathReview, ReviewEntry, ReviewStatusResponse, ReviewsResponse,
+};
 use leep_core::review::{Review, ReviewSource, Verdict, NEEDS_REVIEW_MARKER};
 use leep_core::{ChangesetId, Error, Result};
 use leep_derive::owners::OwnersResolver;
-use leep_derive::review::{AutoRule, Carried, ChangesetReview, PathRule, ReviewRules};
+use leep_derive::review::{
+    AutoRule, Carried, CarryRefusal, ChangesetReview, PathRule, ReviewRules,
+};
 use leep_derive::{LandPolicy, Repo};
 use serde::Deserialize;
 
@@ -161,8 +165,16 @@ impl ReviewService {
     pub async fn describe(&self, repo: &Repo, id: ChangesetId) -> Result<ReviewsResponse> {
         let mut own = self.entries_for(repo, id).await?;
         let mine: Vec<Review> = own.iter().map(|e| e.review.clone()).collect();
+        // A listing names no ref: judge as the server's default lands do.
         let carried = self
-            .carried(repo, id, &mine, &mut CarryCache::default())
+            .carried(
+                repo,
+                id,
+                &mine,
+                repo.carry_merges(""),
+                &mut CarryCache::default(),
+                None,
+            )
             .await?;
         for c in carried {
             for review in c.reviews {
@@ -199,19 +211,25 @@ impl ReviewService {
         })
     }
 
-    /// Judge `id` with its own reviews and those carried from the
-    /// changesets it names as its origins whose reviewed changes it
-    /// reproduces exactly (ADR 0085). `seen` keeps each candidate's reviews
-    /// for the rest of the request or land check.
+    /// Judge `id` for a land on `target_ref` with its own reviews and those
+    /// carried from the changesets it names as its origins whose reviewed
+    /// changes it reproduces (ADR 0085, 0089). `seen` keeps each
+    /// candidate's reviews for the rest of the request or land check;
+    /// `origins`, when given, gets what was found about each candidate.
     async fn judge(
         &self,
         repo: &Repo,
         id: ChangesetId,
+        target_ref: &str,
         owners: &mut OwnersResolver<'_>,
         seen: &mut CarryCache,
+        origins: Option<&mut Vec<OriginStatus>>,
     ) -> Result<ChangesetReview> {
         let reviews = self.reviews_for(repo, id).await?;
-        let carried = self.carried(repo, id, &reviews, seen).await?;
+        let merges = repo.carry_merges(target_ref);
+        let carried = self
+            .carried(repo, id, &reviews, merges, seen, origins)
+            .await?;
         repo.review_changeset_carried(id, &self.rules, &reviews, &carried, owners)
             .await
     }
@@ -226,13 +244,18 @@ impl ReviewService {
     ///
     /// At most [`MAX_CARRY_CHECKS`] candidates with reviews are compared.
     /// One more and nothing carries at all: stopping early could drop a
-    /// newer reject that a later candidate holds.
+    /// newer reject that a later candidate holds. `merges` lets a path carry
+    /// as the server's rebase or a union of insertions (ADR 0089).
+    /// `origins`, when given, gets each compared candidate with its
+    /// verdicts and why it did not carry.
     async fn carried(
         &self,
         repo: &Repo,
         id: ChangesetId,
         own: &[Review],
+        merges: bool,
         seen: &mut CarryCache,
+        mut origins: Option<&mut Vec<OriginStatus>>,
     ) -> Result<Vec<Carried>> {
         let mut out = Vec::new();
         let mine: HashSet<&str> = own.iter().map(|r| r.reviewer.as_str()).collect();
@@ -256,19 +279,51 @@ impl ReviewService {
             checks += 1;
             if checks > MAX_CARRY_CHECKS {
                 tracing::info!(%id, "review carry: too many reviewed candidates, none carried");
+                if let Some(o) = origins {
+                    for s in o.iter_mut() {
+                        s.carried = false;
+                        s.differs.clear();
+                        s.reason = Some(format!(
+                            "more than {MAX_CARRY_CHECKS} reviewed origins; none carry"
+                        ));
+                    }
+                }
                 return Ok(Vec::new());
             }
+            let check = repo.carry_check(from, id, &self.rules, merges).await?;
+            if let Some(o) = origins.as_deref_mut() {
+                let (carried, differs, reason) = match &check {
+                    Ok(paths) if !paths.is_empty() => (true, Vec::new(), None),
+                    Ok(_) => (
+                        false,
+                        Vec::new(),
+                        Some("every path of it is approved by an auto rule".to_string()),
+                    ),
+                    Err(CarryRefusal::Differs(p)) => (false, vec![p.clone()], None),
+                    Err(why) => (false, Vec::new(), Some(why.to_string())),
+                };
+                o.push(OriginStatus {
+                    from,
+                    reviews: reviews
+                        .iter()
+                        .map(|r| OriginReview {
+                            reviewer: r.reviewer.clone(),
+                            verdict: r.verdict,
+                        })
+                        .collect(),
+                    carried,
+                    differs,
+                    reason,
+                });
+            }
             // An empty set reproduces nothing a verdict could count on.
-            if let Some(paths) = repo
-                .carried_paths(from, id, &self.rules)
-                .await?
-                .filter(|p| !p.is_empty())
-            {
-                out.push(Carried {
+            match check {
+                Ok(paths) if !paths.is_empty() => out.push(Carried {
                     from,
                     paths,
                     reviews,
-                });
+                }),
+                _ => {}
             }
         }
         Ok(out)
@@ -305,8 +360,10 @@ impl ReviewService {
             if theirs.verdict != Verdict::Approve {
                 continue;
             }
+            // With merges whatever the ref: taking back more than any ref
+            // would carry is the safe side.
             if !repo
-                .carried_paths(from, id, &self.rules)
+                .carried_paths(from, id, &self.rules, true)
                 .await?
                 .is_some_and(|p| !p.is_empty())
             {
@@ -360,8 +417,16 @@ impl ReviewService {
         repo.get_changeset(id).await?;
         let head = repo.meta().get_ref(target_ref).await?;
         let mut owners = OwnersResolver::new(repo, head).await?;
+        let mut origins = Vec::new();
         let review = self
-            .judge(repo, id, &mut owners, &mut CarryCache::default())
+            .judge(
+                repo,
+                id,
+                target_ref,
+                &mut owners,
+                &mut CarryCache::default(),
+                Some(&mut origins),
+            )
             .await?;
         Ok(ReviewStatusResponse {
             changeset: id,
@@ -382,8 +447,10 @@ impl ReviewService {
                     approved_by: p.approved_by,
                     rejected_by: p.rejected_by,
                     carried_from: p.carried_from,
+                    carried_rule: p.carried_rule.map(|r| r.name().to_string()),
                 })
                 .collect(),
+            origins,
         })
     }
 }
@@ -438,7 +505,7 @@ impl LandPolicy for RequireReview {
         for id in new_history {
             let review = self
                 .service
-                .judge(repo, *id, &mut owners, &mut seen)
+                .judge(repo, *id, target_ref, &mut owners, &mut seen, None)
                 .await?;
             if let Some(p) = review.first_blocker() {
                 tracing::info!(%id, target_ref, path = %p.path, "land refused: needs review");
