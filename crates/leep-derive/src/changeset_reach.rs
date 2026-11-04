@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use bytes::Bytes;
+use leep_core::check::{Check, CHECK_KIND};
 use leep_core::review::{Review, REVIEW_KIND};
 use leep_core::signature::{Signature, SIGNATURE_KIND};
 use leep_core::{ChangesetId, DerivedRow, Error, Hash, Result};
@@ -361,7 +362,7 @@ pub async fn mark(repo: &Repo, opts: &ReachOptions) -> Result<Reach> {
     Ok(reach)
 }
 
-/// Those of `ids` some signature or review names.
+/// Those of `ids` some signature, review or check result names.
 async fn attested(repo: &Repo, ids: &[ChangesetId]) -> Result<Vec<ChangesetId>> {
     let mut out = Vec::new();
     let mut signers = HashSet::new();
@@ -392,7 +393,27 @@ async fn attested(repo: &Repo, ids: &[ChangesetId]) -> Result<Vec<ChangesetId>> 
             .await?,
         );
     }
+    for k in &check_names(repo).await? {
+        out.extend(
+            having(repo, CHECK_KIND, ids, |id| {
+                crate::checks::storage_key(id, k)
+            })
+            .await?,
+        );
+    }
     Ok(out)
+}
+
+/// Every check name some `check-v1` row holds (ADR 0091): rows are keyed by
+/// a hash of (changeset, name), so the names come from the values.
+pub(crate) async fn check_names(repo: &Repo) -> Result<HashSet<String>> {
+    let mut names = HashSet::new();
+    for (_, v) in all_rows(repo, CHECK_KIND).await? {
+        if let Ok(c) = Check::decode(&v) {
+            names.insert(c.check);
+        }
+    }
+    Ok(names)
 }
 
 /// Those of `ids` the git mirror maps to a commit.

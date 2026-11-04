@@ -18,6 +18,7 @@ pub mod carry;
 pub mod changeset_gc;
 pub mod changeset_reach;
 pub mod changeset_sweep;
+pub mod checks;
 mod comments;
 mod cursor;
 pub mod derived;

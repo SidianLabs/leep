@@ -494,6 +494,14 @@ pub async fn report(repo: &Repo, opts: &UnreachableOptions) -> Result<Unreachabl
             .await?,
         );
     }
+    for k in &crate::changeset_reach::check_names(repo).await? {
+        attested.extend(
+            having_rows(repo, leep_core::check::CHECK_KIND, &cands, &g, |id| {
+                crate::checks::storage_key(id, k)
+            })
+            .await?,
+        );
+    }
     r.attested = attested.len() as u64;
     extra.extend(&attested);
     let mirrored = having_rows(repo, LEEP_TO_GIT, &cands, &g, |id| id.0).await?;

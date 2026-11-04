@@ -1982,6 +1982,17 @@ impl Repo {
         new: Option<ChangesetId>,
         ctx: &RefUpdateContext,
     ) -> Result<bool> {
+        if self
+            .land_policy
+            .as_ref()
+            .is_some_and(|p| p.promotion_only(name))
+        {
+            return Err(Error::Policy(format!(
+                "{name:?} {}: the server moves it when every required check passes \
+                 (ADR 0091); post check results instead",
+                leep_core::check::PROMOTION_ONLY_MARKER
+            )));
+        }
         // Deletes skip the name check so a ref that predates the validator
         // can still be removed.
         if let Some(new) = new {

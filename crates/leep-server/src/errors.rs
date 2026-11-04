@@ -13,6 +13,7 @@ use http_body_util::{BodyExt, Limited};
 use leep_core::api::{
     error_code, ErrorResponse, CURSOR_UNREPRESENTABLE_MARKER, FORWARD_FAILED_MARKER,
 };
+use leep_core::check::PROMOTION_ONLY_MARKER;
 use leep_core::refname::{MISSING_REF_MARKER, NOT_FORWARD_MARKER};
 use leep_core::review::NEEDS_REVIEW_MARKER;
 use leep_core::signature::NOT_SIGNED_MARKER;
@@ -61,6 +62,7 @@ pub(crate) fn code_of(e: &Error) -> &'static str {
         Error::Policy(m) if m.contains(NEEDS_REVIEW_MARKER) => error_code::NEEDS_REVIEW,
         Error::Policy(m) if m.contains(NOT_SIGNED_MARKER) => error_code::NOT_SIGNED,
         Error::Policy(m) if m.contains(NOT_FORWARD_MARKER) => error_code::NOT_FORWARD,
+        Error::Policy(m) if m.contains(PROMOTION_ONLY_MARKER) => error_code::PROMOTION_ONLY,
         Error::Policy(_) => error_code::INVALID,
         Error::LandIdReused { .. } => error_code::LAND_ID_REUSED,
         Error::InvalidPath(..) | Error::InvalidHash(_) => error_code::INVALID,

@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use leep_core::changeset::EXTRA_REBASED_FROM;
+use leep_core::check::{Check, CHECK_KIND};
 use leep_core::review::{
     check_comment, check_source, Review, ReviewSource, REVIEW_KIND, REVIEW_SOURCE_KIND,
 };
@@ -1118,6 +1119,37 @@ impl Verifier<'_> {
                 self.tick();
             }
         }
+        let mut check_rows: HashSet<Hash> = HashSet::new();
+        let mut check_names: HashSet<String> = HashSet::new();
+        if self.has(CHECK_KIND) {
+            let mut scan = RowScan::new(CHECK_KIND, full, self.opts.sample);
+            while let Some(page) = scan.next(&*meta).await? {
+                for (key, value) in page {
+                    self.kstats(CHECK_KIND).checked += 1;
+                    let bad = match Check::decode(&value) {
+                        Err(e) => Some(format!("does not decode: {e}")),
+                        Ok(c) => match c.validate() {
+                            Err(e) => Some(format!("is not a valid check result: {e}")),
+                            Ok(()) => {
+                                if full {
+                                    check_names.insert(c.check);
+                                    check_rows.insert(key);
+                                }
+                                None
+                            }
+                        },
+                    };
+                    if let Some(why) = bad {
+                        self.attestation_problem(
+                            CHECK_KIND,
+                            &key,
+                            format!("check row {key} {why}"),
+                        );
+                    }
+                }
+                self.tick();
+            }
+        }
         if self.has(CREATED_BY_KIND) {
             let mut scan = RowScan::new(CREATED_BY_KIND, full, self.opts.sample);
             while let Some(page) = scan.next(&*meta).await? {
@@ -1134,7 +1166,7 @@ impl Verifier<'_> {
                 self.tick();
             }
         }
-        if !full || (sig_rows.is_empty() && review_rows.is_empty()) {
+        if !full || (sig_rows.is_empty() && review_rows.is_empty() && check_rows.is_empty()) {
             return Ok(());
         }
 
@@ -1160,6 +1192,9 @@ impl Verifier<'_> {
                 for who in &reviewers {
                     review_rows.remove(&reviews::storage_key(id, who));
                 }
+                for name in &check_names {
+                    check_rows.remove(&crate::checks::storage_key(id, name));
+                }
             }
             self.tick();
         }
@@ -1175,6 +1210,13 @@ impl Verifier<'_> {
                 REVIEW_KIND,
                 &key,
                 format!("review row {key} belongs to no stored changeset"),
+            );
+        }
+        for key in check_rows {
+            self.attestation_problem(
+                CHECK_KIND,
+                &key,
+                format!("check row {key} belongs to no stored changeset"),
             );
         }
         Ok(())

@@ -33,6 +33,10 @@
 //! | POST | `/v1/changesets/{id}/reviews` | [`AddReviewRequest`] | [`AddReviewResponse`] (the reviewer is the token's name, or the body's `reviewer` for a `review_for` token and 403 for any other; 400 without authentication; 404 if the changeset is unknown) |
 //! | GET  | `/v1/changesets/{id}/reviews` | – | [`ReviewsResponse`] |
 //! | GET  | `/v1/changesets/{id}/review-status?ref=main` | – | [`ReviewStatusResponse`] (`ref` defaults to `main`) |
+//! | POST | `/v1/changesets/{id}/checks` | [`PostCheckRequest`] | [`PostCheckResponse`] (records a check result; the poster is the token's name; 403 unless the token's `checks` names the check, or if the token created the changeset; 400 without authentication; 404 if the changeset is unknown; a pass that completes a ref's required checks promotes `green/<ref>`; ADR 0091) |
+//! | GET  | `/v1/changesets/{id}/checks` | – | [`ChecksResponse`] (the newest result of every check the server knows by name, and the green refs that hold the changeset) |
+//! | GET  | `/v1/refs/{name}/checks` | – | [`RefChecksResponse`] (the ref's head, its known-good `green/<name>`, how far green is behind, and whether the head is red; 404 if the ref does not exist; a ref literally named `{name}/checks` is answered as that ref; ADR 0091) |
+//! | GET  | `/v1/refs/{name}/culprits?bad=rev` | – | [`CulpritsResponse`] (the ref log entries of `name` above `green/<name>` up to the one that brought `bad`, newest first, at most 4096 entries read; `bad` defaults to the head; 400 if `bad` is at or below green or not on the ref; a ref literally named `{name}/culprits` is answered as that ref; ADR 0091) |
 //! | POST | `/v1/review-requests` | [`CreateReviewRequest`] | [`CreateReviewRequestResponse`] (ask for a review of `changeset` before it lands on `target_ref`; the requester is the token's name; `reviewers` must be tokens that may review, and default to the owners of the paths the changeset still needs approved; an open request of the same requester, changeset, ref and reviewers is answered instead of a second one; 400 without authentication; 404 if the changeset is unknown, or `target_ref` is missing and no land policy covers it; 400 `too_many_review_requests` when the requester already has `MAX_OPEN_REQUESTS` (100) open; ADR 0086) |
 //! | GET  | `/v1/review-requests?reviewer=n&requester=n&changeset=id&ref=r&state=s&open=bool&before=id&limit=n` | – | [`ReviewRequestsResponse`] (newest first; `reviewer` matches requests that name it and requests open to any reviewer made by someone else; `state` is `open`, `landed` or `withdrawn`, `open=true` is `state=open` and `open=false` every closed state; `limit` defaults to 50, capped at 500; `before` pages by id; ADR 0086) |
 //! | GET  | `/v1/review-requests/{id}` | – | [`ReviewRequestEntry`] (404 if unknown) |
@@ -78,6 +82,7 @@
 //! | 400 | `needs_review` | a land onto a ref whose review policy some changeset does not meet |
 //! | 400 | `not_signed` | a land onto a ref that needs every changeset signed by a trusted key |
 //! | 400 | `not_forward` | a move of a land-policy-protected ref, or of a protected ref (`--protect-ref`), that is not a fast-forward |
+//! | 422 | `promotion_only` | a land onto, move or delete of a known-good ref `green/<ref>`, which only the server moves (ADR 0091) |
 //! | 400 | `tag_immutable` | a move of a tag, or a land onto one |
 //! | 400 | `land_id_reused` | a land id the ref already recorded for another changeset (ADR 0057); `land` ([`LandRefusal`]) carries the record |
 //! | 400 | `invalid_name` | a ref name [`crate::refname::validate`] refuses |
@@ -87,7 +92,7 @@
 //! | 400 | `invalid` | any other bad request |
 //! | 401 | `unauthorized` | no token, or an unknown one |
 //! | 401 | `token_expired` | a known token past its `expires` (ADR 0007): fetch a new one; retrying will not help |
-//! | 403 | `forbidden` | a `read` token on a write, or a `"review": false` token posting a review |
+//! | 403 | `forbidden` | a `read` token on a write, a `"review": false` token posting a review, or a check result from a token whose `checks` does not name that check or that created the changeset (ADR 0091) |
 //! | 404 | `ref_missing` | a land onto a missing ref with `create: false` (ADR 0036) |
 //! | 404 | `not_found` | anything else that does not exist |
 //! | 408 | `timeout` | the request timeout ran out; the request may or may not have applied |
@@ -196,6 +201,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::check::Outcome;
 use crate::review::{Review, Verdict};
 pub use crate::review_request::{CreatedBy, ReviewRequest, ReviewRequestState};
 pub use crate::store::{LandId, RefLogEntry};
@@ -274,6 +280,10 @@ pub mod error_code {
     /// of a protected ref (`--protect-ref`), that is not a fast-forward
     /// ([`crate::refname::NOT_FORWARD_MARKER`]).
     pub const NOT_FORWARD: &str = "not_forward";
+    /// 422: a land, ref move or delete of a known-good ref (`green/<ref>`),
+    /// which only the server moves, by promotion
+    /// ([`crate::check::PROMOTION_ONLY_MARKER`], ADR 0091).
+    pub const PROMOTION_ONLY: &str = "promotion_only";
     /// 400: a tag move, or a land onto a tag. Tags are created and deleted,
     /// never moved.
     pub const TAG_IMMUTABLE: &str = "tag_immutable";
@@ -345,6 +355,7 @@ pub mod error_code {
         NEEDS_REVIEW,
         NOT_SIGNED,
         NOT_FORWARD,
+        PROMOTION_ONLY,
         TAG_IMMUTABLE,
         LAND_ID_REUSED,
         INVALID_NAME,
@@ -636,6 +647,168 @@ pub struct AddReviewResponse {
     /// same reviewer's approval of them carried to this one (ADR 0085).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub taken_back: Vec<ChangesetId>,
+}
+
+/// `POST /v1/changesets/{id}/checks`: one check run's result (ADR 0091).
+/// The poster is the token, never the body.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostCheckRequest {
+    /// The check's name; the token's `checks` must list it.
+    pub check: String,
+    pub outcome: Outcome,
+    /// Where the run's log is.
+    #[serde(default)]
+    pub url: String,
+    /// One short line about the run.
+    #[serde(default)]
+    pub summary: String,
+}
+
+/// A known-good ref the server moved because of a check result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Promotion {
+    /// The ref whose required checks passed, such as `main`.
+    #[serde(rename = "ref")]
+    pub target_ref: String,
+    /// The known-good ref that moved, such as `green/main`.
+    pub green_ref: String,
+    /// Where it was; `None` when this created it.
+    pub from: Option<ChangesetId>,
+    pub to: ChangesetId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostCheckResponse {
+    pub check: String,
+    pub outcome: Outcome,
+    /// Known-good refs this result moved; usually empty.
+    #[serde(default)]
+    pub promoted: Vec<Promotion>,
+}
+
+/// One stored check result, as `GET .../checks` reports it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckEntry {
+    pub check: String,
+    pub outcome: Outcome,
+    /// Token that posted it.
+    pub by: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub summary: String,
+    /// Unix seconds when the server stored it.
+    pub timestamp: i64,
+}
+
+impl From<crate::check::Check> for CheckEntry {
+    fn from(c: crate::check::Check) -> Self {
+        CheckEntry {
+            check: c.check,
+            outcome: c.outcome,
+            by: c.by,
+            url: c.url,
+            summary: c.summary,
+            timestamp: c.timestamp,
+        }
+    }
+}
+
+/// `GET /v1/changesets/{id}/checks`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChecksResponse {
+    /// The newest result of each check, sorted by name.
+    pub checks: Vec<CheckEntry>,
+    /// Refs whose `green/<ref>` holds the changeset, sorted.
+    #[serde(default)]
+    pub green_on: Vec<String>,
+}
+
+/// Why a ref is red: the newest attested changeset on its first-parent
+/// chain above green failed a required check.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedState {
+    /// The oldest changeset of the failing run, above green: where to start
+    /// looking for the culprit.
+    pub first_failed: ChangesetId,
+    /// The failing check.
+    pub check: String,
+    /// The ref log entry that brought `first_failed`, if the walk found it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_seq: Option<u64>,
+}
+
+/// `GET /v1/refs/{name}/checks`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefChecksResponse {
+    pub name: String,
+    pub head: ChangesetId,
+    /// `green/<name>`.
+    pub green_ref: String,
+    /// Its target; `None` before the first promotion.
+    pub green: Option<ChangesetId>,
+    /// The checks the server requires before promoting; empty when the ref
+    /// has no known-good ref.
+    #[serde(default)]
+    pub required: Vec<String>,
+    /// Generations between green and the head (the number of lands for a
+    /// linear ref); `None` without green or when green is off the head's
+    /// history.
+    #[serde(default)]
+    pub behind: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub red: Option<RedState>,
+}
+
+/// One ref move between green and a bad changeset.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Suspect {
+    /// What the move put on the ref (a land's rebased copy, for instance).
+    pub changeset: ChangesetId,
+    pub seq: u64,
+    pub operation: String,
+    /// Token that moved the ref.
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// Unix seconds of the move.
+    pub time: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub land_id: Option<LandId>,
+    /// The changeset the land asked for, when it named a land id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub land_changeset: Option<ChangesetId>,
+    /// Token that created the changeset (or the one the land asked for).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    pub author: String,
+    /// First line of the message.
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_model: Option<String>,
+    /// Paths the move changed on its first-parent chain, sorted; at most
+    /// [`MAX_SUSPECT_PATHS`].
+    #[serde(default)]
+    pub paths: Vec<RepoPath>,
+    /// Whether `paths` stopped at the bound.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub more_paths: bool,
+}
+
+/// Most paths one [`Suspect`] lists.
+pub const MAX_SUSPECT_PATHS: usize = 1000;
+
+/// `GET /v1/refs/{name}/culprits`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CulpritsResponse {
+    pub name: String,
+    /// `green/<name>`'s target; `None` before the first promotion.
+    pub good: Option<ChangesetId>,
+    pub bad: ChangesetId,
+    /// Newest first: the moves that brought everything above `good` up to
+    /// and including `bad`.
+    pub suspects: Vec<Suspect>,
+    /// Whether the walk stopped at its bound before reaching `good`.
+    pub truncated: bool,
 }
 
 /// A stored review as listed: the review's own fields plus, when a
