@@ -200,13 +200,18 @@ pub(crate) async fn post(
     };
     check.validate()?;
     repo.get_changeset(id).await?;
-    // A token never attests what it created, even one CI also commits with.
-    let creator = repo
-        .meta()
-        .get_derived(CREATED_BY_KIND, &id.0)
-        .await?
-        .and_then(|b| CreatedBy::decode(&b).ok());
-    if creator.is_some_and(|c| c.principal == who.name) {
+    // A token never attests what it created, even one CI also commits with,
+    // nor the copy the server made of it when it landed.
+    let mut made = vec![id];
+    made.extend(repo.rebase_chain(id).await?);
+    let keys: Vec<leep_core::Hash> = made.iter().map(|c| c.0).collect();
+    let created = repo.meta().get_derived_many(CREATED_BY_KIND, &keys).await?;
+    if created
+        .into_iter()
+        .flatten()
+        .filter_map(|b| CreatedBy::decode(&b).ok())
+        .any(|c| c.principal == who.name)
+    {
         return Ok(forbidden(
             "a token may not post check results for a changeset it created",
         ));

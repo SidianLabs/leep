@@ -778,7 +778,8 @@ pub struct Suspect {
     /// The changeset the land asked for, when it named a land id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub land_changeset: Option<ChangesetId>,
-    /// Token that created the changeset (or the one the land asked for).
+    /// Token that created the changeset the land asked for (the original of
+    /// a server-made rebased copy).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
     pub author: String,

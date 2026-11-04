@@ -410,7 +410,12 @@ impl Repo {
     async fn suspect(&self, e: RefLogEntry) -> Result<Suspect> {
         let new = e.new.expect("suspects are moves to a changeset");
         let cs = self.get_changeset(new).await?;
-        let about = e.land_changeset.unwrap_or(new);
+        // Who made it: the changeset the land asked for, else the original
+        // a server-made rebased copy came from.
+        let about = match e.land_changeset {
+            Some(c) => c,
+            None => self.rebased_origin(new).await?.unwrap_or(new),
+        };
         let created_by = match self.meta().get_derived(CREATED_BY_KIND, &about.0).await? {
             Some(b) => CreatedBy::decode(&b).ok().map(|c| c.principal),
             None => None,
