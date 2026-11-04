@@ -1,5 +1,6 @@
 //! Argument parsing and dispatch.
 
+use std::ffi::OsString;
 use std::process::ExitCode;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -151,7 +152,7 @@ pub fn command() -> clap::Command {
 
 pub fn main() -> ExitCode {
     let parsed = command()
-        .try_get_matches()
+        .try_get_matches_from(join_wait_values(std::env::args_os().collect()))
         .and_then(|m| Cli::from_arg_matches(&m));
     let cli = match parsed {
         Ok(cli) => cli,
@@ -166,6 +167,110 @@ pub fn main() -> ExitCode {
             ExitCode::from(e.exit_code() as u8)
         }
     }
+}
+
+/// `--wait SECS` for the `review` commands whose `--wait` takes an
+/// optional value. clap takes such a value only as `--wait=SECS`, since a
+/// bare `--wait` may come right before the positional revision. Here a
+/// `--wait` followed by a duration ([`parse_secs`]) becomes `--wait=SECS`
+/// when the command still has its revision elsewhere (`inbox` has none), so
+/// `review status --wait 600 REV`, `review status REV --wait 600` and
+/// `review status --wait REV` all mean what they say.
+pub fn join_wait_values(args: Vec<OsString>) -> Vec<OsString> {
+    /// Options that take their value as the next argument.
+    const VALUED: &[&str] = &[
+        "--server",
+        "--token",
+        "--color",
+        "--ref",
+        "--to",
+        "-m",
+        "--message",
+        "-n",
+        "--limit",
+    ];
+    let text = |a: &OsString| a.to_str().map(str::to_string);
+    // Positional words before `--`, skipping option values, with indices.
+    let mut words: Vec<(usize, String)> = Vec::new();
+    let mut i = 1;
+    while i < args.len() {
+        let Some(a) = text(&args[i]) else {
+            words.push((i, String::new()));
+            i += 1;
+            continue;
+        };
+        if a == "--" {
+            break;
+        }
+        if VALUED.contains(&a.as_str()) {
+            i += 2;
+            continue;
+        }
+        if !a.starts_with('-') || a == "-" {
+            words.push((i, a));
+        }
+        i += 1;
+    }
+    let sub = match words.as_slice() {
+        [(_, cmd), (_, sub), ..] if cmd == "review" => sub.as_str(),
+        _ => return args,
+    };
+    let needs_rev = match sub {
+        "status" | "request" => true,
+        "inbox" => false,
+        _ => return args,
+    };
+    let after_sub = words[1].0;
+    let waits: Vec<usize> = (after_sub + 1..args.len().saturating_sub(1))
+        .take_while(|&i| args[i] != "--")
+        .filter(|&i| {
+            args[i] == "--wait" && text(&args[i + 1]).is_some_and(|v| parse_secs(&v).is_ok())
+        })
+        .collect();
+    if waits.is_empty() {
+        return args;
+    }
+    let others = words
+        .iter()
+        .filter(|(i, _)| *i > after_sub && !waits.contains(&(i - 1)))
+        .count();
+    if needs_rev && others == 0 {
+        return args;
+    }
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        if waits.contains(&i) {
+            let mut joined = OsString::from("--wait=");
+            joined.push(&args[i + 1]);
+            out.push(joined);
+            i += 2;
+        } else {
+            out.push(args[i].clone());
+            i += 1;
+        }
+    }
+    out
+}
+
+/// A `--wait` duration: seconds, or a number with `s`, `m` or `h`.
+pub fn parse_secs(s: &str) -> std::result::Result<u64, String> {
+    let (num, unit) = match s.char_indices().last() {
+        Some((i, c @ ('s' | 'm' | 'h'))) => (&s[..i], c),
+        _ => (s, 's'),
+    };
+    let n: u64 = num
+        .parse()
+        .ok()
+        .filter(|_| !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()))
+        .ok_or_else(|| format!("{s:?} is no duration: give seconds, or a number with s, m or h"))?;
+    let mul = match unit {
+        'm' => 60,
+        'h' => 3600,
+        _ => 1,
+    };
+    n.checked_mul(mul)
+        .ok_or_else(|| format!("{s:?} is too long a wait"))
 }
 
 /// clap's own output for help and version; for a real usage error also the
@@ -320,5 +425,93 @@ fn read_only_cmd(cmd: &Command, r: &Remote) -> Result<i32> {
         Command::Reviews(a) => review::list(r, a),
         Command::Checks(c) => checks::run(r, c),
         _ => unreachable!("not a read-only command"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn join(args: &[&str]) -> Vec<String> {
+        let args = std::iter::once("leep")
+            .chain(args.iter().copied())
+            .map(OsString::from)
+            .collect();
+        join_wait_values(args)
+            .into_iter()
+            .skip(1)
+            .map(|a| a.into_string().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_wait_value_after_a_space_is_joined_only_when_it_is_no_revision() {
+        assert_eq!(
+            join(&["review", "status", "abc", "--wait", "600"]),
+            ["review", "status", "abc", "--wait=600"]
+        );
+        assert_eq!(
+            join(&["review", "status", "--wait", "10m", "abc", "--ref", "main"]),
+            ["review", "status", "--wait=10m", "abc", "--ref", "main"]
+        );
+        // The number is the revision: nothing else is.
+        assert_eq!(
+            join(&["review", "status", "--wait", "1234"]),
+            ["review", "status", "--wait", "1234"]
+        );
+        // No duration: a bare --wait before the revision.
+        assert_eq!(
+            join(&["review", "request", "--wait", "abc", "-m", "5"]),
+            ["review", "request", "--wait", "abc", "-m", "5"]
+        );
+        assert_eq!(
+            join(&["--server", "x", "review", "inbox", "--wait", "1"]),
+            ["--server", "x", "review", "inbox", "--wait=1"]
+        );
+        assert_eq!(
+            join(&["review", "inbox", "--wait", "--mine"]),
+            ["review", "inbox", "--wait", "--mine"]
+        );
+        // Other commands, and anything after `--`, are left alone.
+        for args in [
+            &["log", "--wait", "5"][..],
+            &["review", "approve", "abc", "--wait", "5"],
+            &["review", "status", "abc", "--", "--wait", "5"],
+        ] {
+            assert_eq!(join(args), args);
+        }
+    }
+
+    #[test]
+    fn joined_waits_parse() {
+        let parse = |args: &[&str]| {
+            let args = std::iter::once("leep").chain(args.iter().copied());
+            let args = join_wait_values(args.map(OsString::from).collect());
+            Cli::from_arg_matches(&command().try_get_matches_from(args).unwrap()).unwrap()
+        };
+        let Command::Review(review::ReviewCmd::Status(s)) =
+            parse(&["review", "status", "--wait", "2m", "abc"]).command
+        else {
+            panic!()
+        };
+        assert_eq!((s.rev.as_str(), s.wait), ("abc", Some(120)));
+        let Command::Review(review::ReviewCmd::Status(s)) =
+            parse(&["review", "status", "--wait", "abc"]).command
+        else {
+            panic!()
+        };
+        assert_eq!((s.rev.as_str(), s.wait), ("abc", Some(3600)));
+    }
+
+    #[test]
+    fn durations_take_seconds_minutes_and_hours() {
+        assert_eq!(parse_secs("90"), Ok(90));
+        assert_eq!(parse_secs("90s"), Ok(90));
+        assert_eq!(parse_secs("2m"), Ok(120));
+        assert_eq!(parse_secs("1h"), Ok(3600));
+        assert_eq!(parse_secs("0"), Ok(0));
+        for bad in ["", "m", "-5", "+5", "1.5", "abc", "5d", "1 m"] {
+            assert!(parse_secs(bad).is_err(), "{bad}");
+        }
     }
 }

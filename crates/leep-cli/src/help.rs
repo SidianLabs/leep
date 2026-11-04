@@ -29,7 +29,10 @@ pub const COMMIT: &str = "\
 Examples:
   leep commit -m \"parse: accept empty input\"
   id=$(leep commit -m wip)              # the full id is printed on stdout
-  leep commit -m \"retry on 503\" --agent-model M --agent-session S";
+  leep commit -m \"retry on 503\" --agent-model M --agent-session S
+  leep commit -m \"cli: x\" --trailer \"Co-Authored-By=Claude <noreply@anthropic.com>\"
+Default trailers: `commit.trailers` in .leep/config.json. A file holding a whole
+conflict (`<<<<<<<`, `=======`, `>>>>>>>`) is warned about; --allow-markers silences it.";
 
 pub const LAND: &str = "\
 Examples:
@@ -124,8 +127,10 @@ Examples:
   leep review reject 2a954d8ef7c7 -m \"breaks the parser\"
   leep review request @ -m \"new API field\"   # ask the owners of what is still pending
   leep review request @ --to rhea       # or name the reviewers
-  leep review status @ --wait           # until approved (exit 0), rejected or an hour passes (1)
-  leep review inbox                     # requests waiting for you (--mine: the ones you made)";
+  leep review status @ --wait 600       # until approved (0), rejected (1) or time is up (7)
+  leep review inbox                     # requests waiting for you (--mine: the ones you made)
+  leep review inbox --wait 30m          # until one comes (0), or nothing yet (7)
+  leep review show 4                    # request #4: message, files, status, stat (--diff)";
 pub const CHECKS: &str = "\
 Examples:
   leep checks post @ test pass --url https://ci.example/run/1   # CI, with a checks token
@@ -147,6 +152,7 @@ Exit codes (ADR 0034):
   4  not found (revision, ref, branch, tag, file, stash)
   5  conflict: resolve the conflicts, or retry a lost race
   6  nothing to do (`commit`, `amend`, `stash push` with nothing to record)
+  7  nothing yet: a `review ... --wait` ran out of time
   130 interrupted";
 
 /// Every command, by task, for the top-level help. A test checks that each
@@ -320,9 +326,9 @@ mod tests {
                 if line.contains("$(") || line.contains("&&") {
                     continue;
                 }
-                let args = words(line.trim());
+                let args = words(line.trim()).into_iter().map(Into::into).collect();
                 crate::cli::command()
-                    .try_get_matches_from(&args)
+                    .try_get_matches_from(crate::cli::join_wait_values(args))
                     .unwrap_or_else(|e| panic!("{line}: {e}"));
                 checked += 1;
             }

@@ -38,6 +38,10 @@ pub enum ReviewCmd {
     Inbox(super::review_request::InboxArgs),
     /// Withdraw a review request you made.
     Cancel(super::review_request::CancelArgs),
+    /// Everything a reviewer needs in one place: the changeset's requests,
+    /// message and author, each file's review status, and the diff stat
+    /// (`--diff` for the whole diff).
+    Show(super::review_show::ShowArgs),
 }
 
 #[derive(Args, Debug)]
@@ -64,14 +68,15 @@ pub struct StatusArgs {
     #[arg(long = "ref")]
     pub target_ref: Option<String>,
     /// Ask again, less and less often, until it is approved (exit 0), a
-    /// path is rejected or SECS pass (exit 1). Default 3600; 0 waits
-    /// without limit.
+    /// path is rejected (exit 1) or SECS pass (exit 7). Default 3600; 0
+    /// waits without limit. `--wait SECS` works too.
     #[arg(
         long,
         value_name = "SECS",
         num_args = 0..=1,
         require_equals = true,
-        default_missing_value = "3600"
+        default_missing_value = "3600",
+        value_parser = crate::cli::parse_secs
     )]
     pub wait: Option<u64>,
 }
@@ -91,6 +96,7 @@ pub fn run(r: &Remote, cmd: &ReviewCmd) -> Result<i32> {
         ReviewCmd::Request(a) => super::review_request::request(r, a),
         ReviewCmd::Inbox(a) => super::review_request::inbox(r, a),
         ReviewCmd::Cancel(a) => super::review_request::cancel(r, a),
+        ReviewCmd::Show(a) => super::review_show::show(r, a),
     }
 }
 
@@ -175,7 +181,15 @@ fn report(r: &Remote, resp: &ReviewStatusResponse) -> Result<()> {
     if r.json {
         print_json(resp)?;
     } else {
-        for line in status_lines(resp) {
+        // Its parent is where a carried origin was rebased onto; best effort.
+        let onto = resp
+            .origins
+            .iter()
+            .any(|o| o.carried)
+            .then(|| r.cache.changeset(r.client, &resp.changeset).ok())
+            .flatten()
+            .and_then(|info| info.changeset.parents.first().copied());
+        for line in status_lines_onto(resp, onto) {
             outln!("{line}");
         }
     }
@@ -223,7 +237,8 @@ impl Backoff {
 
 /// Ask for the review status of `id` on `target` until it is approved or
 /// the ref holds it (0), a path is rejected (1, at once: someone has to act
-/// first) or the limit passes (1). Prints the last status either way.
+/// first) or the limit passes (7, nothing yet). Prints the last status
+/// either way.
 pub fn wait(r: &Remote, id: ChangesetId, target: &str, b: &Backoff) -> Result<i32> {
     let start = Instant::now();
     let mut delay = b.first;
@@ -249,7 +264,7 @@ pub fn wait(r: &Remote, id: ChangesetId, target: &str, b: &Backoff) -> Result<i3
                 start.elapsed().as_secs(),
                 short(id)
             );
-            return Ok(exit::USER);
+            return Ok(exit::NOTHING_YET);
         }
         if !said {
             said = true;
@@ -286,6 +301,12 @@ pub fn list(r: &Remote, args: &ListArgs) -> Result<i32> {
 /// see the change. The server's rule names stay in `--json`; here each path
 /// says what satisfied it or what it still needs.
 pub fn status_lines(resp: &ReviewStatusResponse) -> Vec<String> {
+    status_lines_onto(resp, None)
+}
+
+/// [`status_lines`], naming `onto` (the changeset's parent) as the base a
+/// carried origin was rebased onto.
+pub fn status_lines_onto(resp: &ReviewStatusResponse, onto: Option<ChangesetId>) -> Vec<String> {
     let mut out = vec![format!(
         "changeset {} on {}: {}",
         short(resp.changeset),
@@ -314,6 +335,7 @@ pub fn status_lines(resp: &ReviewStatusResponse) -> Vec<String> {
     }
     for o in &resp.origins {
         out.push(origin_line(resp.changeset, o));
+        out.extend(rebase_note(resp, o, onto));
     }
     if let Some(why) = &resp.refused {
         out.push(format!("refused: {why}"));
@@ -368,6 +390,44 @@ fn origin_line(id: ChangesetId, o: &OriginStatus) -> String {
     line
 }
 
+/// Most paths a rebase note names before `(+N)`.
+const NOTE_PATHS: usize = 5;
+
+/// What a rebase that carried verdicts did to the change: nothing a
+/// reviewer has to look at again, by rule (ADR 0089), so an author does
+/// not diff the two ids by hand.
+fn rebase_note(
+    resp: &ReviewStatusResponse,
+    o: &OriginStatus,
+    onto: Option<ChangesetId>,
+) -> Option<String> {
+    if !o.carried {
+        return None;
+    }
+    let carried: Vec<String> = resp
+        .paths
+        .iter()
+        .filter(|p| p.carried_from == Some(o.from))
+        .map(|p| match p.carried_rule.as_deref() {
+            Some(rule) => format!("{} {rule}", p.path),
+            None => p.path.to_string(),
+        })
+        .collect();
+    if carried.is_empty() {
+        return None;
+    }
+    let mut named = carried[..carried.len().min(NOTE_PATHS)].join(", ");
+    if carried.len() > NOTE_PATHS {
+        named.push_str(&format!(" (+{})", carried.len() - NOTE_PATHS));
+    }
+    Some(format!(
+        "  rebased from {}{}: your changes are unchanged ({named})",
+        short(o.from),
+        onto.map(|b| format!(" onto {}", short(b)))
+            .unwrap_or_default(),
+    ))
+}
+
 /// How a carried verdict's path reproduces the reviewed change, in words.
 fn carried_note(p: &PathReview) -> Option<String> {
     let from = p.carried_from?;
@@ -380,9 +440,19 @@ fn carried_note(p: &PathReview) -> Option<String> {
     Some(format!("; carried from {}{how}", short(from)))
 }
 
+/// ` (from src/OWNERS, OWNERS)`: the files that name a path's owners, from
+/// servers that say.
+fn owners_from(p: &PathReview) -> String {
+    if p.owners_files.is_empty() {
+        String::new()
+    } else {
+        format!(" (from {})", p.owners_files.join(", "))
+    }
+}
+
 /// The state column and the explanation for one path, saying where a
 /// carried verdict came from.
-fn path_state(p: &PathReview) -> (&'static str, String) {
+pub(crate) fn path_state(p: &PathReview) -> (&'static str, String) {
     let (state, mut why) = path_rule_state(p);
     if matches!(p.rule.as_str(), "owner" | "rejected") {
         if let Some(note) = carried_note(p) {
@@ -410,7 +480,10 @@ fn path_rule_state(p: &PathReview) -> (&'static str, String) {
         "pending" if p.owners.is_empty() => {
             ("PENDING", "needs an approval from any reviewer".into())
         }
-        "pending" => ("PENDING", format!("needs one of: {}", who(&p.owners))),
+        "pending" => (
+            "PENDING",
+            format!("needs one of: {}{}", who(&p.owners), owners_from(p)),
+        ),
         "rejected" => ("REJECTED", rejected()),
         "owner" => (
             "ok",
@@ -741,6 +814,7 @@ mod tests {
                 ),
                 "  PENDING  b.rs  needs one of: rhea".to_string(),
                 format!("replaces {sx}, approved by rhea, rejected by bo; carried"),
+                format!("  rebased from {sx}: your changes are unchanged (a.rs rebased)"),
                 format!(
                     "replaces {sx2}, approved by rhea, rejected by bo; not carried: b.rs differs \
                      (leep diff {sx2}; leep diff {y})"
@@ -755,6 +829,10 @@ mod tests {
                 ),
                 format!("diff: leep diff {y}"),
             ]
+        );
+        assert_eq!(
+            status_lines_onto(&resp, Some(x2))[4],
+            format!("  rebased from {sx} onto {sx2}: your changes are unchanged (a.rs rebased)")
         );
     }
 

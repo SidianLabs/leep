@@ -1172,11 +1172,37 @@ fn review_owners_and_auto_approval_gate_landing_on_a_protected_ref() {
     bob.ok(&wc_b, &["review", "approve", "@"]);
     let out = bob.run(&wc_b, &["land"]);
     assert_eq!(out.status.code(), Some(1));
+    // Guidance, not an error report: each waiting path, whom it needs and
+    // the OWNERS file that says so; no HTTP status or request id.
+    let err = stderr(&out);
     assert!(
-        stderr(&out).contains("needs approval from one of [alice]"),
-        "{}",
-        stderr(&out)
+        err.contains("needs review before it can land on main:\n")
+            && err.contains("PENDING  src/lib.rs  needs one of: alice (from OWNERS)"),
+        "{err}"
     );
+    assert!(!err.contains("422") && !err.contains("request id"), "{err}");
+    let out = bob.run(&wc_b, &["--json", "land"]);
+    let e: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(e["error"]["server_code"], "needs_review");
+    assert!(
+        e["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("needs approval from one of [alice] (422 Unprocessable Entity)"),
+        "{e}"
+    );
+    assert!(e["error"]["request_id"].is_string(), "{e}");
+    // One page for the reviewer, from outside any working copy.
+    let show = alice.ok(root, &["review", "show", &code]);
+    assert!(
+        show.contains("Author: ")
+            && show.contains("    code\n")
+            && show.contains("PENDING  src/lib.rs  +1 -1       needs one of: alice (from OWNERS)")
+            && show.contains("1 file changed, 1 insertion(+), 1 deletion(-)"),
+        "{show}"
+    );
+    let diff = alice.ok(root, &["review", "show", &code, "--diff"]);
+    assert!(diff.contains("\n+fn a() { 1 } // trailing\n"), "{diff}");
 
     // An owner's rejection blocks it; a reject needs a reason.
     let out = alice.run(root, &["review", "reject", &code]);
@@ -1212,7 +1238,7 @@ fn review_owners_and_auto_approval_gate_landing_on_a_protected_ref() {
     bob.ok(&wc_b, &["review", "approve", "@"]);
     let out = bob.run(&wc_b, &["land"]);
     assert!(
-        stderr(&out).contains("path OWNERS needs approval from one of [alice]"),
+        stderr(&out).contains("PENDING  OWNERS  needs one of: alice (from OWNERS)"),
         "{}",
         stderr(&out)
     );
@@ -1234,7 +1260,7 @@ fn review_owners_and_auto_approval_gate_landing_on_a_protected_ref() {
     let out = bob.run(&wc_b, &["land", "--ref", "release", "--create"]);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(
-        stderr(&out).contains("path src/lib.rs needs approval from any reviewer"),
+        stderr(&out).contains("PENDING  src/lib.rs  needs an approval from any reviewer"),
         "{}",
         stderr(&out)
     );

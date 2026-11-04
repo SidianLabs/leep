@@ -387,6 +387,7 @@ mod tests {
                 prefixes: vec![],
                 token: None,
                 author: None,
+                commit: Default::default(),
             },
         )
         .unwrap()

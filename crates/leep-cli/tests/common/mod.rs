@@ -85,6 +85,15 @@ pub struct Data {
     pub report_on_refs: bool,
     /// What a reject or withdrawal answers as `taken_back`.
     pub taken_back: Vec<ChangesetId>,
+    /// Refs that refuse (422 `needs_review`) to land a changeset whose
+    /// newest review is not an approval, like a server with a review policy.
+    pub require_review: HashSet<String>,
+    /// Owners, and the `OWNERS` files naming them, that review status
+    /// reports for every path.
+    pub review_owners: (Vec<String>, Vec<String>),
+    /// Review requests `GET /v1/review-requests` lists (by `changeset`
+    /// only) and `GET /v1/review-requests/{id}` answers.
+    pub review_requests: Vec<ReviewRequestEntry>,
 }
 
 pub type Shared = Arc<Mutex<Data>>;
@@ -267,7 +276,9 @@ impl Mock {
             .route("/v1/blame/{id}", get(blame))
             .route("/v1/provenance/{id}", get(provenance))
             .route("/v1/search/{id}", get(search))
-            .route("/v1/land", post(land));
+            .route("/v1/land", post(land))
+            .route("/v1/review-requests", get(list_review_requests))
+            .route("/v1/review-requests/{id}", get(get_review_request));
         let app = match tokens {
             Some(t) => router.layer(axum::middleware::from_fn_with_state(t, gate)),
             None => router,
@@ -506,6 +517,7 @@ async fn review_status(
         .rev()
         .find(|(c, _)| *c == id)
         .map(|(_, v)| *v);
+    let (owners, owners_files) = d.review_owners.clone();
     let (rule, ok, no) = match last {
         Some(Verdict::Approve) => ("owner", vec!["mock".to_string()], vec![]),
         Some(Verdict::Reject) => ("rejected", vec![], vec!["mock".to_string()]),
@@ -517,13 +529,13 @@ async fn review_status(
         .map(|p| PathReview {
             path: p.clone(),
             rule: rule.into(),
-            owners: vec![],
+            owners: owners.clone(),
             approved_by: ok.clone(),
             rejected_by: no.clone(),
             carried_from: None,
             carried_rule: None,
             carry: None,
-            owners_files: vec![],
+            owners_files: owners_files.clone(),
             carry_source: None,
         })
         .collect();
@@ -1120,6 +1132,32 @@ async fn land(State(s): State<Shared>, Json(r): Json<LandRequest>) -> Resp<LandR
             &format!("changeset {} is not signed by a trusted key", r.changeset),
         ));
     }
+    let approved = d
+        .reviews
+        .iter()
+        .rev()
+        .find(|(c, _)| *c == r.changeset)
+        .is_some_and(|(_, v)| *v == leep_core::review::Verdict::Approve);
+    if d.require_review.contains(&r.target_ref) && !approved {
+        let path = cs
+            .changes
+            .keys()
+            .next()
+            .map(|p| p.to_string())
+            .unwrap_or_default();
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(
+                ErrorResponse::new(format!(
+                    "changeset {} {}: path {path} needs approval from one of [{}]",
+                    r.changeset,
+                    leep_core::review::NEEDS_REVIEW_MARKER,
+                    d.review_owners.0.join(", ")
+                ))
+                .with_code(error_code::NEEDS_REVIEW),
+            ),
+        ));
+    }
     let head = d.refs.get(&r.target_ref).copied();
     if head.is_none() && r.create == Some(false) {
         return Err(err(
@@ -1550,4 +1588,37 @@ async fn provenance(
         scanned,
         truncated: false,
     }))
+}
+
+async fn list_review_requests(
+    State(s): State<Shared>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Json<ReviewRequestsResponse> {
+    let d = s.lock().unwrap();
+    let requests = d
+        .review_requests
+        .iter()
+        .filter(|e| {
+            q.get("changeset")
+                .is_none_or(|c| *c == e.request.changeset.to_string())
+        })
+        .cloned()
+        .collect();
+    Json(ReviewRequestsResponse {
+        requests,
+        next: None,
+    })
+}
+
+async fn get_review_request(
+    State(s): State<Shared>,
+    Path(id): Path<u64>,
+) -> Resp<ReviewRequestEntry> {
+    let d = s.lock().unwrap();
+    d.review_requests
+        .iter()
+        .find(|e| e.request.id == id)
+        .cloned()
+        .map(Json)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such review request"))
 }
