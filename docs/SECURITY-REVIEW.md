@@ -68,7 +68,7 @@ change with a regression test.
 | S-21 | Auth | Low | Tokens had no time bound, so a token made for a short-lived agent stayed valid until removed by hand | Fixed 2026-10-21, `expires`, ADR 0007 |
 | S-23 | Review | High | A merge that kept its first parent's version dropped a side parent's change without review; an empty merge with an old first parent could rewind a reviewed ref | Fixed 2026-10-28, ADR 0011 |
 | S-22 | Review | Medium | Every write token was a reviewer, so one agent could approve another's change, or its own on unowned paths | Fixed 2026-10-21, `"review": false`, ADR 0011 |
-| S-24 | Review | Info | Verdicts carried to a re-committed changeset (ADR 0085) must not follow a forged `leep.rebased_from`, a moved base or a dropped path; the clean-replay trust of ADR 0011 remains | Designed in 2026-11-03, ADR 0085; review requests close by the same rule, 2026-11-04, ADR 0087; carrying across the server's own rebase result and unions of insertions, 2026-11-04, ADR 0089 |
+| S-24 | Review | Info | Verdicts carried to a re-committed changeset (ADR 0085) must not follow a forged `leep.rebased_from`, a moved base or a dropped path; the clean-replay trust of ADR 0011 remains | Designed in 2026-11-03, ADR 0085; review requests close by the same rule, 2026-11-04, ADR 0087; carrying across the server's own rebase result and unions of insertions, 2026-11-04, ADR 0089; identical-only paths, 2026-11-04, ADR 0092 |
 
 ### S-01: merge-parent laundering (High, fixed)
 
@@ -252,6 +252,40 @@ instead of answering 404 or 500 (`texts_over_the_line_budget_are_not_merged`,
 `a_strict_ref_carries_only_identical_changes`; in `leep-derive`,
 `a_request_closes_when_its_change_lands_rebased_by_the_client` and
 `carry::tests::marker_lookalikes_in_the_texts_do_not_confuse_the_union`.
+
+*Fourth follow-up: identical-only paths (ADR 0092).* Owners may turn the
+rebased and union carries off per directory (`OWNERS` line `carry
+identical`, strictest line on the walk up to `noparent` wins, so a
+subdirectory can tighten but never loosen) and operators per
+glob (`identical_only_globs`). The risk is a change that loosens the rule
+it is judged under. The rule is read from the target ref's head, never
+from the judged changeset or its stack, and is monotone: strict ref, glob
+and `OWNERS` can each only make a path identical-only, so a `carry merged`
+line cannot undo a glob or a strict ref, and one added by a change applies
+only once that change has landed with its owners' approval. Carrying and
+request closing take one `CarryScope`, so a request closes exactly when the
+verdict carries; taking back still considers merges everywhere, the safe
+side. An unreadable head while closing requests counts as identical-only.
+Accepted: on such a path any concurrent edit, auto-approved ones included,
+forces re-approval of a pending client resolution, at most as often as the
+editor may land. *Found in review:* the first version let the nearest
+`carry` line decide, so a subdirectory's `carry merged` undid a parent's
+`carry identical` though its owners need not own the parent; now
+`carry identical` anywhere on the walk wins. And a misspelled directive
+(`carry identically`) parsed as an owner name, silently leaving the
+directory merged; lines starting with `carry` that are no directive are now
+refused at land (422) and shown in `review-status`. Tests:
+`a_subdirectory_cannot_loosen_an_ancestors_carry_identical`,
+`a_misspelled_carry_line_is_refused_and_status_says_why`,
+`a_change_adding_carry_merged_is_judged_under_the_heads_identical`,
+`a_policy_glob_outranks_carry_merged`,
+`an_identical_only_path_keeps_a_rebased_resolution_pending_and_says_why`,
+`an_identical_only_path_refuses_a_union_but_carries_an_identical_change`;
+in `leep-derive`,
+`identical_only_is_strict_ref_or_glob_or_owners_and_only_stricter`,
+`the_strictest_carry_line_decides_and_noparent_stops_the_walk`,
+`a_subdirectory_cannot_loosen_an_ancestors_carry_identical`,
+`a_request_closes_exactly_when_its_verdict_carries_under_the_carry_line`.
 
 ### S-02: checkout writes outside the working copy (High, fixed)
 

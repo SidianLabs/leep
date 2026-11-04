@@ -1563,9 +1563,14 @@ where the merge conflicts only between pure insertions at one place
 never `OWNERS`, at most 32 merged paths per candidate, each merge computed
 once (single-flight, on a blocking thread, at most half the cores at once)
 and cached in process by content hash, and never on a strict land ref
-(ADR 0066). `review-status` names the
+(ADR 0066), a path a policy `identical_only_globs` entry matches, or one
+where an `OWNERS` file on its walk in the head says `carry identical`
+([ADR 0092](adr/0092-identical-only-review-carry.md); each source can only
+make a path stricter, and `CarryScope` carries all three, so carrying and
+request closing judge alike; taking back ignores them). `review-status` names the
 source in `carried_from` and how in `carried_rule`, and lists the
-candidates it compared in `origins`, with why one did not carry. It is a second
+candidates it compared in `origins`, with why one did not carry, and each
+path's effective rule in `carry`. It is a second
 `LandPolicy`: `Repo::with_land_policy` composes policies (all must pass), and
 `check_land` now receives the head so owners and new history agree.
 `GET .../review-status?ref=` shows the per-path state (and `on_refs`, the

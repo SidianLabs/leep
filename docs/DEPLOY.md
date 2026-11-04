@@ -495,8 +495,10 @@ docker run -d -p 127.0.0.1:7070:7070 -v leep-data:/var/lib/leep \
   -e LEEP_REVIEW_POLICY_FILE=/etc/leep/review-policy.json leep:dev
 ```
 
-`--review-policy-file` sets the auto-approval rules and lists `refs` that
-require review; `--require-review REF` (repeatable; the environment variable is
+`--review-policy-file` sets the auto-approval rules, optional
+`identical_only_globs` (paths whose verdicts carry only to identical
+changes, ADR 0092; an `OWNERS` line `carry identical` does the same per
+directory), and lists `refs` that require review; `--require-review REF` (repeatable; the environment variable is
 comma-separated) adds more refs with the same rules. Both need the tokens file.
 The policy file is re-read on SIGHUP, so its `refs` and rules change without a
 restart; `--require-review` refs are flags and need one. `land` onto a protected ref fails with 400 unless

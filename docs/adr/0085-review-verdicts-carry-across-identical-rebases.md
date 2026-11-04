@@ -188,3 +188,8 @@ at most 2 MiB and 10,000 lines a side, never `OWNERS`, at most 32 merged paths p
 candidate, and not on strict land refs. The "compare diffs (hunks)"
 alternative stays rejected. `PathReview` gains `carried_rule`, and
 `review-status` gains `origins`.
+
+*Amended by [ADR 0092](0092-identical-only-review-carry.md):* paths an
+`OWNERS` `carry identical` line or the policy's `identical_only_globs`
+declare carry identical changes only, on every ref; taking back is
+unchanged.

@@ -21,7 +21,8 @@ use leep_core::review_request::{
 use leep_core::store::unix_now;
 use leep_core::{refname, Changeset, ChangesetId, DerivedRow, Error, RepoPath, Result};
 
-use crate::review::ReviewRules;
+use crate::owners::OwnersResolver;
+use crate::review::{CarryScope, ReviewRules};
 use crate::Repo;
 
 /// What a request entry shows about its changeset: creator, title, the
@@ -209,6 +210,9 @@ impl Repo {
             .filter(|_| filter.limit > 0 && reqs.len() >= filter.limit);
         let mut heads: HashMap<String, Option<ChangesetId>> = HashMap::new();
         let mut walks: HashMap<String, Vec<Hinted>> = HashMap::new();
+        // One per walked ref: the `carry` lines of its head, as a land
+        // there judges a carried verdict (ADR 0092).
+        let mut owners: HashMap<String, Option<OwnersResolver<'_>>> = HashMap::new();
         let now = unix_now();
         for r in reqs.iter_mut() {
             if r.state != ReviewRequestState::Open {
@@ -239,18 +243,24 @@ impl Repo {
                     }
                     let walk = self.hinted_below(head).await;
                     walks.insert(r.target_ref.clone(), walk);
+                    owners.insert(
+                        r.target_ref.clone(),
+                        OwnersResolver::new(self, Some(head)).await.ok(),
+                    );
                 }
+                let merges = self.carry_merges(&r.target_ref);
+                let mut scope = match owners.get_mut(&r.target_ref).and_then(Option::as_mut) {
+                    Some(resolver) => CarryScope::for_ref(merges, Some(resolver)),
+                    // The head's tree is unreadable: identical changes only,
+                    // the strictest any `OWNERS` file could ask for.
+                    None => CarryScope::for_ref(false, None),
+                };
                 // Oldest first: the changeset that first put it there.
                 for h in walks[&r.target_ref].iter().rev() {
                     if h.origin == Some(r.changeset)
                         || (h.candidates.contains(&r.changeset)
                             && self
-                                .lands_reviewed_change(
-                                    r.changeset,
-                                    h.id,
-                                    rules,
-                                    self.carry_merges(&r.target_ref),
-                                )
+                                .lands_reviewed_change(r.changeset, h.id, rules, &mut scope)
                                 .await
                                 .unwrap_or(false))
                     {
@@ -395,12 +405,23 @@ impl Repo {
         }
         let mut copies = HashMap::new();
         let mut named = Vec::new();
-        let (added, logged_by) = self.land_added(target_ref, landed).await?;
+        let (added, logged_by, from) = self.land_added(target_ref, landed).await?;
         // The requester rule needs the move to be this actor's own: an
         // older entry by someone else (a re-land of their changeset) or no
         // entry at all grants nothing beyond content.
         let requester_rule = actor.is_some() && logged_by.as_deref() == actor;
-        let merges = self.carry_merges(target_ref);
+        // The ref's carry rules as the land was judged: the head it moved
+        // from, so a stack that adds `carry identical` (or `carry merged`)
+        // closes requests as its own land carried verdicts (ADR 0092).
+        // Without the log entry, the head the land made.
+        let pre_land = from.unwrap_or(Some(landed));
+        let mut owners = OwnersResolver::new(self, pre_land).await.ok();
+        let mut scope = match owners.as_mut() {
+            Some(o) => CarryScope::for_ref(self.carry_merges(target_ref), Some(o)),
+            // Unreadable: identical changes only, the strictest any
+            // `OWNERS` file could ask for.
+            None => CarryScope::for_ref(false, None),
+        };
         for z in added {
             if let Some(origin) = self.rebased_origin(z).await? {
                 copies.entry(origin).or_insert(z);
@@ -436,7 +457,7 @@ impl Repo {
                 }
                 if (requester_rule && actor == Some(r.requester.as_str()))
                     || self
-                        .lands_reviewed_change(r.changeset, *z, rules, merges)
+                        .lands_reviewed_change(r.changeset, *z, rules, &mut scope)
                         .await
                         .unwrap_or(false)
                 {
@@ -468,12 +489,17 @@ impl Repo {
     /// [`COPY_WALK_LIMIT`]. Without such an entry among the newest
     /// [`LAND_LOG_LOOKBACK`] (the land moved nothing, or the log is out of
     /// reach), `landed` and the server copies directly below it, with no
-    /// actor.
+    /// actor. Also the head the entry moved from (`Some(None)` for a ref the
+    /// land created), `None` without an entry.
     async fn land_added(
         &self,
         target_ref: &str,
         landed: ChangesetId,
-    ) -> Result<(Vec<ChangesetId>, Option<String>)> {
+    ) -> Result<(
+        Vec<ChangesetId>,
+        Option<String>,
+        Option<Option<ChangesetId>>,
+    )> {
         let log = self
             .meta()
             .ref_log(Some(target_ref), None, LAND_LOG_LOOKBACK)
@@ -501,7 +527,7 @@ impl Repo {
                 Err(e) => return Err(e),
             };
         }
-        Ok((out, logged_by))
+        Ok((out, logged_by, from))
     }
 
     /// The refs among `names` whose first-parent chain holds `id`, in the
@@ -786,7 +812,7 @@ mod tests {
             )
             .await;
             assert!(!r
-                .lands_reviewed_change(x, evil, &rules, true)
+                .lands_reviewed_change(x, evil, &rules, &mut CarryScope::for_ref(true, None))
                 .await
                 .unwrap());
             let good = naming(
@@ -800,11 +826,11 @@ mod tests {
             )
             .await;
             assert!(r
-                .lands_reviewed_change(x, good, &rules, true)
+                .lands_reviewed_change(x, good, &rules, &mut CarryScope::for_ref(true, None))
                 .await
                 .unwrap());
             assert!(!r
-                .lands_reviewed_change(x, good, &rules, false)
+                .lands_reviewed_change(x, good, &rules, &mut CarryScope::for_ref(false, None))
                 .await
                 .unwrap());
             assert_eq!(landed_by(&r, good, "cy").await, good);
@@ -822,6 +848,203 @@ mod tests {
             };
             assert_eq!(state(&r, &q).await, want);
         }
+    }
+
+    /// ADR 0092: under the head's `carry identical`, a request for X closes
+    /// by content exactly when X's verdict would carry to the resolution
+    /// that landed: an identical change closes it, a rebased one does not,
+    /// at land and at listing alike; under `carry merged` both close.
+    #[tokio::test]
+    async fn a_request_closes_exactly_when_its_verdict_carries_under_the_carry_line() {
+        const A: &str = "top\n\nmid\n\nend\n";
+        for (directive, via_listing) in [
+            ("carry merged", false),
+            ("carry merged", true),
+            ("carry identical", false),
+            ("carry identical", true),
+        ] {
+            let what = format!("{directive}, listing: {via_listing}");
+            let r = repo();
+            let owners_text = format!("rhea\n{directive}\n");
+            let base = files_commit(
+                &r,
+                &[],
+                &[
+                    ("src/OWNERS", Some(owners_text.as_str())),
+                    ("src/a.rs", Some(A)),
+                    ("src/b.rs", Some("b\n")),
+                    ("CHANGELOG.md", Some("c\n")),
+                ],
+                "base",
+            )
+            .await;
+            r.meta().cas_ref("main", None, Some(base)).await.unwrap();
+            // X changes both files; the head moved under `a.rs` only.
+            let x = files_commit(
+                &r,
+                &[base],
+                &[
+                    ("src/a.rs", Some("top\n\nmid\n\nend\nx\n")),
+                    ("src/b.rs", Some("bx\n")),
+                ],
+                "x",
+            )
+            .await;
+            let m = files_commit(
+                &r,
+                &[base],
+                &[("src/a.rs", Some("TOP\n\nmid\n\nend\n"))],
+                "m",
+            )
+            .await;
+            landed_by(&r, m, "bo").await;
+            let (q, _) = r
+                .request_review(ask(x, "ada", &["rhea"]), None)
+                .await
+                .unwrap();
+            let good = naming(
+                &r,
+                m,
+                &[
+                    ("src/a.rs", Some("TOP\n\nmid\n\nend\nx\n")),
+                    ("src/b.rs", Some("bx\n")),
+                ],
+                &[x],
+            )
+            .await;
+            let rules = ReviewRules::default();
+            let mut o = OwnersResolver::new(&r, Some(m)).await.unwrap();
+            let carries = r
+                .carry_check(
+                    x,
+                    good,
+                    &rules,
+                    &mut CarryScope::for_ref(true, Some(&mut o)),
+                )
+                .await
+                .unwrap()
+                .is_ok();
+            assert_eq!(carries, directive == "carry merged", "{what}");
+            // Landed by someone other than the requester: content only.
+            if via_listing {
+                r.meta().cas_ref("main", Some(m), Some(good)).await.unwrap();
+                let open = ReviewRequestFilter {
+                    states: vec![ReviewRequestState::Open],
+                    limit: 10,
+                    ..Default::default()
+                };
+                let listed = r.review_requests(&open, None).await.unwrap().0;
+                assert_eq!(listed.is_empty(), carries, "{what}");
+            } else {
+                assert_eq!(landed_by(&r, good, "cy").await, good);
+                assert_eq!(
+                    r.close_landed_review_requests("main", good, good, Some("cy"), None)
+                        .await
+                        .unwrap(),
+                    u64::from(carries),
+                    "{what}"
+                );
+            }
+            let want = if carries {
+                (ReviewRequestState::Landed, Some(good))
+            } else {
+                (ReviewRequestState::Open, None)
+            };
+            assert_eq!(state(&r, &q).await, want, "{what}");
+        }
+        // An identical change still closes it under `carry identical`.
+        let r = repo();
+        let base = files_commit(
+            &r,
+            &[],
+            &[
+                ("OWNERS", Some("rhea\ncarry identical\n")),
+                ("a.rs", Some(A)),
+                ("b.rs", Some("b\n")),
+            ],
+            "base",
+        )
+        .await;
+        r.meta().cas_ref("main", None, Some(base)).await.unwrap();
+        let x = files_commit(&r, &[base], &[("a.rs", Some("x\n"))], "x").await;
+        let m = files_commit(&r, &[base], &[("b.rs", Some("m\n"))], "m").await;
+        landed_by(&r, m, "bo").await;
+        let (q, _) = r
+            .request_review(ask(x, "ada", &["rhea"]), None)
+            .await
+            .unwrap();
+        let same = naming(&r, m, &[("a.rs", Some("x\n"))], &[x]).await;
+        assert_eq!(landed_by(&r, same, "cy").await, same);
+        assert_eq!(
+            r.close_landed_review_requests("main", same, same, Some("cy"), None)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            state(&r, &q).await,
+            (ReviewRequestState::Landed, Some(same))
+        );
+
+        // The landed stack itself adds `carry identical` below the rebased
+        // resolution: its land was judged under the head it moved from
+        // (`carry merged`), so the request closes as the verdict carried.
+        let r = repo();
+        let base = files_commit(
+            &r,
+            &[],
+            &[
+                ("src/OWNERS", Some("rhea\ncarry merged\n")),
+                ("src/a.rs", Some(A)),
+            ],
+            "base",
+        )
+        .await;
+        r.meta().cas_ref("main", None, Some(base)).await.unwrap();
+        let x = files_commit(
+            &r,
+            &[base],
+            &[("src/a.rs", Some("top\n\nmid\n\nend\nx\n"))],
+            "x",
+        )
+        .await;
+        let m = files_commit(
+            &r,
+            &[base],
+            &[("src/a.rs", Some("TOP\n\nmid\n\nend\n"))],
+            "m",
+        )
+        .await;
+        landed_by(&r, m, "bo").await;
+        let (q, _) = r
+            .request_review(ask(x, "ada", &["rhea"]), None)
+            .await
+            .unwrap();
+        let tighten = files_commit(
+            &r,
+            &[m],
+            &[("src/OWNERS", Some("rhea\ncarry identical\n"))],
+            "tighten",
+        )
+        .await;
+        let good = naming(
+            &r,
+            tighten,
+            &[("src/a.rs", Some("TOP\n\nmid\n\nend\nx\n"))],
+            &[x],
+        )
+        .await;
+        assert_eq!(landed_by(&r, good, "cy").await, good);
+        assert_eq!(
+            r.close_landed_review_requests("main", good, good, Some("cy"), None)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            state(&r, &q).await,
+            (ReviewRequestState::Landed, Some(good))
+        );
     }
 
     /// One changed byte in a reviewed file: the resolution is not the
@@ -934,7 +1157,12 @@ mod tests {
         let r = repo();
         let (q1, q2, z) = resolved_stack(&r).await;
         assert!(!r
-            .lands_reviewed_change(q2.changeset, z, &docs(), true)
+            .lands_reviewed_change(
+                q2.changeset,
+                z,
+                &docs(),
+                &mut CarryScope::for_ref(true, None)
+            )
             .await
             .unwrap());
         landed_by(&r, z, "ada").await;

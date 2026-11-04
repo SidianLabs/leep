@@ -209,8 +209,9 @@ verdict carried from the changeset's original ends `; carried from X
 kept)`. Before the `diff:` line, each original the changeset names
 (`leep.rebased_from`) whose reviews could carry gets a line:
 `replaces X, approved by rhea; carried`, or `replaces X, approved by rhea;
-not carried: PATH differs (leep diff X; leep diff ID)`, so a reviewer can
-compare the two and approve again
+not carried: PATH differs (leep diff X; leep diff ID)` (or `PATH is
+identical-only (src/OWNERS)` where only identical changes carry, ADR
+0092), so a reviewer can compare the two and approve again
 ([ADR 0089](adr/0089-review-verdicts-carry-across-client-rebases.md)). Once the ref
 holds the changeset (the server's `on_refs` names it,
 [ADR 0087](adr/0087-review-requests-close-by-content.md)), the first line

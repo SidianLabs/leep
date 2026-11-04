@@ -2177,9 +2177,14 @@ async fn moved_setup(policy: &'static str, a0: &str, x_a: &str, head_a: &str) ->
 }
 
 async fn moved_on(api: Api, a0: &str, x_a: &str, head_a: &str) -> Moved {
+    moved_owned(api, "alice\n", a0, x_a, head_a).await
+}
+
+/// [`moved_on`] with `owners` as the root `OWNERS` file.
+async fn moved_owned(api: Api, owners: &str, a0: &str, x_a: &str, head_a: &str) -> Moved {
     let base = api
         .seed_main(&[
-            ("OWNERS", Some("alice\n")),
+            ("OWNERS", Some(owners)),
             ("src/a.rs", Some(a0)),
             ("CHANGELOG.md", Some("# log\n")),
         ])
@@ -2259,6 +2264,7 @@ async fn an_approval_carries_to_a_resolution_equal_to_the_servers_rebase() {
         (Some(m.x), Some("rebased"))
     );
     assert_eq!(s.paths[0].carried_rule, None);
+    assert_eq!(s.paths[1].carry.as_deref(), Some("merged"));
     assert_eq!(s.origins.len(), 1);
     assert!(s.origins[0].carried && s.origins[0].differs.is_empty());
     let raw: serde_json::Value = api
@@ -2567,6 +2573,11 @@ async fn a_strict_ref_carries_only_identical_changes() {
     assert!(!s.approved, "{s:?}");
     assert_eq!(rules(&s)[1], ("src/a.rs", "pending"));
     assert_eq!(s.origins[0].differs, [RepoPath::new("src/a.rs").unwrap()]);
+    assert_eq!(
+        s.origins[0].reason.as_deref(),
+        Some("src/a.rs is identical-only (strict land ref)")
+    );
+    assert_eq!(s.paths[1].carry.as_deref(), Some("identical"));
 }
 
 #[tokio::test]
@@ -2610,4 +2621,247 @@ async fn a_reviewed_origin_that_is_gone_carries_nothing_and_fails_nothing() {
     assert!(!o.carried);
     assert_eq!(o.reason.as_deref(), Some("it is no longer stored"));
     assert_eq!(m.api.land(y, "bob").await.status, StatusCode::OK);
+}
+
+/// ADR 0092: the root `OWNERS` says `carry identical`, so a resolution
+/// equal to the server's rebase keeps alice's approval no longer, and
+/// status says which file declared it.
+#[tokio::test]
+async fn an_identical_only_path_keeps_a_rebased_resolution_pending_and_says_why() {
+    let m = moved_owned(
+        Api::with(POLICY_AUTO),
+        "alice\ncarry identical\n",
+        F0,
+        FX,
+        FH,
+    )
+    .await;
+    let y = m.resolve(FR).await;
+    let s = m.api.status(y).await;
+    assert!(!s.approved, "{s:?}");
+    assert_eq!(rules(&s)[1], ("src/a.rs", "pending"));
+    assert_eq!(s.paths[1].carry.as_deref(), Some("identical"));
+    assert_eq!(s.origins[0].differs, [RepoPath::new("src/a.rs").unwrap()]);
+    assert_eq!(
+        s.origins[0].reason.as_deref(),
+        Some("src/a.rs is identical-only (OWNERS)")
+    );
+    let r = m.api.land(y, "bob").await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        r.error(),
+        needs_review(y, "src/a.rs", "needs approval from one of [alice]")
+    );
+    // Taking back still reaches through the merge: a reject on `y`
+    // rejects `x`, whose approval a merging ref would carry.
+    let r = m.api.review(y, "alice", Verdict::Reject).await;
+    assert_eq!(r.json::<AddReviewResponse>().taken_back, [m.x]);
+}
+
+/// A union resolution of two appends stays pending too, and an identical
+/// change still carries under `carry identical`.
+#[tokio::test]
+async fn an_identical_only_path_refuses_a_union_but_carries_an_identical_change() {
+    let m = moved_owned(Api::with(POLICY), "alice\ncarry identical\n", T0, TX, TH).await;
+    let y = m
+        .resolve("mod tests {\n    fn t0() {}\n    fn cy() {}\n    fn dee() {}\n}\n")
+        .await;
+    let s = m.api.status(y).await;
+    assert!(!s.approved);
+    assert_eq!(
+        s.origins[0].reason.as_deref(),
+        Some("CHANGELOG.md is identical-only (OWNERS)")
+    );
+    // `x2` changes only `src/a.rs` and the head did not move under it.
+    let x2 = m
+        .api
+        .commit(&[m.head], &[("src/a.rs", Some("changed\n"))])
+        .await;
+    m.api.approve(x2, "alice").await;
+    let other = m.api.commit(&[m.head], &[("b.rs", Some("b\n"))]).await;
+    m.api.approve(other, "alice").await;
+    assert_eq!(m.api.land(other, "bob").await.status, StatusCode::OK);
+    let head = m.api.main_ref().await.unwrap();
+    let y2 = m
+        .api
+        .commit_from(
+            &[head],
+            &[("src/a.rs", Some("changed\n"))],
+            Some(&x2.to_string()),
+        )
+        .await;
+    let s = m.api.status(y2).await;
+    assert!(s.approved, "{s:?}");
+    assert_eq!(s.paths[0].carried_rule.as_deref(), Some("identical"));
+    assert_eq!(m.api.land(y2, "bob").await.status, StatusCode::OK);
+}
+
+/// A policy glob makes a path identical-only whatever `OWNERS` says.
+#[tokio::test]
+async fn a_policy_glob_outranks_carry_merged() {
+    const GLOBBED: &str = r#"{ "refs": ["main"],
+        "auto_approve": ["comment_only", "whitespace_only", "docs_only"],
+        "docs_globs": ["**/*.md", "docs/**"],
+        "identical_only_globs": ["src/**"] }"#;
+    let m = moved_owned(Api::with(GLOBBED), "alice\ncarry merged\n", F0, FX, FH).await;
+    let y = m.resolve(FR).await;
+    let s = m.api.status(y).await;
+    assert!(!s.approved, "{s:?}");
+    assert_eq!(
+        s.origins[0].reason.as_deref(),
+        Some("src/a.rs is identical-only (policy glob src/**)")
+    );
+    assert_eq!(
+        (s.paths[0].carry.as_deref(), s.paths[1].carry.as_deref()),
+        (Some("merged"), Some("identical"))
+    );
+}
+
+/// Security (ADR 0092): a change that adds `carry merged` is judged under
+/// the head's `carry identical`, alone or below the resolution in a stack,
+/// so it cannot loosen the rule for its own land.
+#[tokio::test]
+async fn a_change_adding_carry_merged_is_judged_under_the_heads_identical() {
+    let m = moved_owned(
+        Api::with(POLICY_AUTO),
+        "alice\ncarry identical\n",
+        F0,
+        FX,
+        FH,
+    )
+    .await;
+    let api = &m.api;
+    // In the resolution itself.
+    let y = api
+        .commit_from(
+            &[m.head],
+            &[
+                ("OWNERS", Some("alice\ncarry merged\n")),
+                ("src/a.rs", Some(FR)),
+                ("CHANGELOG.md", Some("# log\n- other\n- x\n")),
+            ],
+            Some(&m.x.to_string()),
+        )
+        .await;
+    let s = api.status(y).await;
+    assert_eq!(
+        rules(&s),
+        [
+            ("CHANGELOG.md", "auto:docs_only"),
+            ("OWNERS", "pending"),
+            ("src/a.rs", "pending"),
+        ]
+    );
+    assert_eq!(
+        s.origins[0].reason.as_deref(),
+        Some("src/a.rs is identical-only (OWNERS)")
+    );
+    // Below it, approved by the owner: the land is still judged under the
+    // head's rule, so the resolution above it needs its own approval.
+    let loosen = api
+        .commit(&[m.head], &[("OWNERS", Some("alice\ncarry merged\n"))])
+        .await;
+    api.approve(loosen, "alice").await;
+    let y = api
+        .commit_from(
+            &[loosen],
+            &[
+                ("src/a.rs", Some(FR)),
+                ("CHANGELOG.md", Some("# log\n- other\n- x\n")),
+            ],
+            Some(&m.x.to_string()),
+        )
+        .await;
+    let r = api.land(y, "bob").await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.error());
+    assert_eq!(
+        r.error(),
+        needs_review(y, "src/a.rs", "needs approval from one of [alice]")
+    );
+    assert_eq!(api.main_ref().await, Some(m.head));
+    // Once the looser rule is on the head, it applies.
+    assert_eq!(api.land(loosen, "bob").await.status, StatusCode::OK);
+    let s = api.status(y).await;
+    assert!(s.approved, "{s:?}");
+    assert_eq!(s.paths[1].carried_rule.as_deref(), Some("rebased"));
+}
+
+/// ADR 0092: an `OWNERS` line that starts with `carry` but is no directive
+/// is neither an owner name nor ignored: a land writing it is refused with
+/// 422 naming the line, even when approved, and status says the same.
+#[tokio::test]
+async fn a_misspelled_carry_line_is_refused_and_status_says_why() {
+    let api = Api::with(POLICY);
+    let base = api
+        .seed_main(&[("OWNERS", Some("alice\n")), ("src/a.rs", Some("a\n"))])
+        .await;
+    let typo = api
+        .commit(
+            &[base],
+            &[(
+                "src/OWNERS",
+                Some("bob\ncarry identically  # meant identical\nCarry identical\n"),
+            )],
+        )
+        .await;
+    api.approve(typo, "alice").await;
+    let s = api.status(typo).await;
+    assert!(!s.approved, "{s:?}");
+    let why = s.refused.expect("refused");
+    assert!(why.contains(r#"src/OWNERS: "carry identically""#), "{why}");
+    let r = api.land(typo, "bob").await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(r.error(), why);
+    assert_eq!(api.main_ref().await, Some(base));
+    // A directive in another case is no directive either.
+    let cased = api
+        .commit(&[base], &[("src/OWNERS", Some("bob\nCarry identical\n"))])
+        .await;
+    api.approve(cased, "alice").await;
+    let r = api.land(cased, "bob").await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        r.error().contains(r#"src/OWNERS: "Carry identical""#),
+        "{}",
+        r.error()
+    );
+    // Fixed, it lands, and the directory is identical-only.
+    let fixed = api
+        .commit(&[base], &[("src/OWNERS", Some("bob\ncarry identical\n"))])
+        .await;
+    api.approve(fixed, "alice").await;
+    let s = api.status(fixed).await;
+    assert!(s.approved && s.refused.is_none(), "{s:?}");
+    assert_eq!(api.land(fixed, "bob").await.status, StatusCode::OK);
+    // A changeset already on the ref (here put there past the policy) has
+    // nothing left to refuse: status reports it landed, not refused.
+    let head = api.main_ref().await.unwrap();
+    let late = api
+        .commit(&[head], &[("lib/OWNERS", Some("carry identically\n"))])
+        .await;
+    assert!(api
+        .repo
+        .meta()
+        .cas_ref("main", Some(head), Some(late))
+        .await
+        .unwrap());
+    let s = api.status(late).await;
+    assert_eq!(s.on_refs, ["main"]);
+    assert_eq!(s.refused, None, "{s:?}");
+}
+
+/// An oversized `OWNERS` file in a submitted changeset is a policy refusal
+/// (422) like the rest of the land check, not a malformed request (400).
+#[tokio::test]
+async fn an_oversized_owners_file_is_refused_with_422() {
+    let api = Api::with(POLICY);
+    let base = api.seed_main(&[("OWNERS", Some("alice\n"))]).await;
+    let big = "a\n".repeat(600 * 1024);
+    let id = api
+        .commit(&[base], &[("src/OWNERS", Some(big.as_str()))])
+        .await;
+    api.approve(id, "alice").await;
+    let r = api.land(id, "bob").await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.error());
+    assert!(r.error().contains("the limit is"), "{}", r.error());
 }

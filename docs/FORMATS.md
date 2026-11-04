@@ -139,6 +139,19 @@ the files in its directory and every ancestor up to the first `noparent`
 Owners are always read from the head of the ref being landed on. No file
 covering a path (or no names in the covering files) means no owners: any one
 approval from any principal satisfies the path.
+A line that is exactly `carry identical` or `carry merged` (ADR 0092) is a
+directive, not a name: on the same walk (`noparent`'s file included),
+`carry identical` in any file, else the nearest `carry merged`, decides
+whether verdicts carry to a
+re-committed change of a path only when it is identical; both lines in one
+file mean `carry identical`. Any other line whose first word is `carry`
+in any case (`Carry identical` included) is neither a name nor a
+directive, and a review-protected land writing one is refused (422). An
+ownerless `noparent` file such as `noparent` + `carry merged` makes its
+directory approvable by anyone, so the parent's owners approving it
+approve an unbounded delegation. Older servers read either line as an owner
+name nobody has (in a file with no other names, nobody can approve the
+directory there), so upgrade servers before writing them.
 
 **Review policy file** (`--review-policy-file`, JSON, unknown fields are
 rejected, every field optional):
@@ -146,13 +159,18 @@ rejected, every field optional):
 ```json
 { "refs": ["main"],
   "auto_approve": ["comment_only", "whitespace_only", "docs_only"],
-  "docs_globs": ["**/*.md", "docs/**"] }
+  "docs_globs": ["**/*.md", "docs/**"],
+  "identical_only_globs": ["**/Cargo.lock"] }
 ```
 `refs` are refs that require review (added to `--require-review`);
 `auto_approve` names the rules that approve a path without a human;
 `docs_globs` (required by `docs_only`, rejected without it) are `globset`
 patterns with `*` limited to one path level. The comment languages are
 selected by file extension (case-insensitive).
+`identical_only_globs` (ADR 0092, needs no auto rule) are patterns of the
+same kind naming paths whose verdicts carry only to identical changes; an
+older server refuses a file with the key (at startup, or keeps its old
+config on reload).
 
 ## Code search index (new derived kinds, no other format change)
 
@@ -764,6 +782,15 @@ omitted when empty:
   changes, in path order) and `changed` (how many it changes).
 
 Nothing persisted changed.
+
+Later still (ADR 0092), optional and `#[serde(default)]`: `PathReview`
+gains `carry`, the path's effective carry rule on the asked ref,
+`identical` (a strict ref, a policy glob or an `OWNERS` `carry identical`
+line) or `merged`; older servers leave it out. `ReviewStatusResponse`
+gains `refused`, why a land is refused whatever the reviews (an `OWNERS`
+line starting with `carry` that is no directive), with `approved` false. An identical-only refusal
+fills the existing `OriginStatus.differs` and `reason`
+(`P is identical-only (src/OWNERS)`). Nothing persisted changed.
 
 ## Index leases and bounded queries (additive, ADR 0058)
 

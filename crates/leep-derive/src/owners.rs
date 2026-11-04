@@ -5,6 +5,14 @@
 //! directories. The owners of a path are the union over its directory and
 //! every ancestor up to the first `noparent` or the root.
 //!
+//! A line `carry identical` or `carry merged` says how review verdicts carry
+//! to a re-committed change of the directory's files (ADR 0092).
+//! `carry identical` keeps carrying to identical changes only, never to a
+//! rebase or union (ADR 0089). On the owners walk the strictest line wins:
+//! `carry identical` in any file, else the nearest `carry merged`, so a
+//! subdirectory can tighten its ancestors' rule, never loosen it. It can
+//! only make carrying stricter than the server's other rules, never looser.
+//!
 //! Owners are always read from a tree the caller names (the target ref's
 //! head), never from the change being judged, so a change cannot grant itself
 //! ownership. A path no file covers has no owners.
@@ -12,21 +20,51 @@
 use std::collections::{BTreeSet, HashMap};
 
 use leep_core::review::OWNERS_FILE;
-use leep_core::{ChangesetId, Error, FileKind, Hash, RepoPath, Result};
+use leep_core::{ChangesetId, Error, FileChange, FileKind, Hash, RepoPath, Result};
 
 use crate::Repo;
 
 /// Largest `OWNERS` file read, in bytes.
 const MAX_OWNERS_BYTES: u64 = 1024 * 1024;
 
+/// How verdicts carry to the files under an `OWNERS` file that says so
+/// (ADR 0092).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CarryDirective {
+    /// `carry identical`: only an identical change carries a verdict.
+    Identical,
+    /// `carry merged`: the server's rebase and unions carry too, where the
+    /// ref and the policy file allow them (the default).
+    Merged,
+}
+
+impl CarryDirective {
+    /// The line that states it.
+    pub fn line(self) -> &'static str {
+        match self {
+            CarryDirective::Identical => "carry identical",
+            CarryDirective::Merged => "carry merged",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OwnersFile {
     pub owners: BTreeSet<String>,
     pub noparent: bool,
+    /// The file's `carry` line; with both, `carry identical`, the stricter.
+    pub carry: Option<CarryDirective>,
+    /// Lines whose first word is `carry`, in any ASCII case, that are no
+    /// exact directive (`carry identically`, `Carry identical`), as written
+    /// after trimming. Never owner names: a typo must not silently leave
+    /// the directory on the default rule while naming a principal nobody
+    /// is.
+    pub unknown: Vec<String>,
 }
 
 /// Parse the text of one `OWNERS` file. Never fails: a line is a name unless
-/// it is blank, a comment or `noparent`.
+/// it is blank, a comment, `noparent`, a `carry` directive or another line
+/// whose first word is `carry` in any ASCII case (kept in `unknown`).
 pub fn parse_owners(text: &str) -> OwnersFile {
     let mut f = OwnersFile::default();
     for line in text.trim_start_matches('\u{feff}').lines() {
@@ -34,6 +72,17 @@ pub fn parse_owners(text: &str) -> OwnersFile {
         match line {
             "" => {}
             "noparent" => f.noparent = true,
+            "carry identical" => f.carry = Some(CarryDirective::Identical),
+            "carry merged" => {
+                f.carry.get_or_insert(CarryDirective::Merged);
+            }
+            line if line
+                .split_whitespace()
+                .next()
+                .is_some_and(|w| w.eq_ignore_ascii_case("carry")) =>
+            {
+                f.unknown.push(line.to_string());
+            }
             name => {
                 f.owners.insert(name.to_string());
             }
@@ -130,6 +179,83 @@ impl<'a> OwnersResolver<'a> {
         }
         Ok(owners)
     }
+
+    /// The `carry` directive for `path` and the `OWNERS` file that states
+    /// it, the strictest on the owners walk (deepest first, up to the first
+    /// `noparent` or the root): `carry identical` anywhere on the walk wins,
+    /// named by the deepest file saying it, so a subdirectory can tighten
+    /// its ancestors' rule but never loosen it; otherwise the nearest
+    /// `carry merged`. `None` when no file on the walk has a `carry` line.
+    pub async fn carry_of(&mut self, path: &RepoPath) -> Result<Option<(CarryDirective, String)>> {
+        let mut merged = None;
+        for dir in ancestor_dirs(path) {
+            if let Some(f) = self.file_in(dir).await? {
+                let file = || {
+                    if dir.is_empty() {
+                        OWNERS_FILE.to_string()
+                    } else {
+                        format!("{dir}/{OWNERS_FILE}")
+                    }
+                };
+                match f.carry {
+                    Some(CarryDirective::Identical) => {
+                        return Ok(Some((CarryDirective::Identical, file())));
+                    }
+                    Some(CarryDirective::Merged) if merged.is_none() => {
+                        merged = Some((CarryDirective::Merged, file()));
+                    }
+                    _ => {}
+                }
+                if f.noparent {
+                    break;
+                }
+            }
+        }
+        Ok(merged)
+    }
+}
+
+impl Repo {
+    /// The first `OWNERS` line `id` writes that starts with `carry` but is
+    /// no directive, as `path: "line"`, so a land can refuse it (ADR 0092):
+    /// a misspelled `carry identical` would otherwise leave the directory
+    /// on the looser default unnoticed. Reads only the `OWNERS` files `id`
+    /// adds or modifies (not symlinks), each at most [`MAX_OWNERS_BYTES`].
+    pub async fn unknown_carry_line(&self, id: ChangesetId) -> Result<Option<String>> {
+        let cs = self.get_changeset(id).await?;
+        for (path, change) in &cs.changes {
+            let FileChange::Modify {
+                content,
+                kind,
+                size,
+            } = change
+            else {
+                continue;
+            };
+            if path.file_name() != OWNERS_FILE || *kind == FileKind::Symlink {
+                continue;
+            }
+            if *size > MAX_OWNERS_BYTES {
+                // Refused like the rest of a land check (422), not as a
+                // malformed request.
+                return Err(Error::Policy(format!(
+                    "{path} is {size} bytes; the limit is {MAX_OWNERS_BYTES}"
+                )));
+            }
+            let data = self
+                .read_content(content)
+                .await?
+                .ok_or_else(|| Error::Storage(format!("blob {content} missing for {path}")))?;
+            if let Some(line) = parse_owners(&String::from_utf8_lossy(&data))
+                .unknown
+                .into_iter()
+                .next()
+            {
+                return Ok(Some(format!("{path}: {line:?}")));
+            }
+        }
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -165,6 +291,45 @@ mod tests {
             names(&parse_owners("ci bot\nweird#name\n")),
             ["ci bot", "weird"]
         );
+    }
+
+    #[test]
+    fn carry_directives_are_whole_lines_and_identical_wins() {
+        let f = parse_owners("alice\ncarry identical  # strict\n");
+        assert_eq!(names(&f), ["alice"]);
+        assert_eq!(f.carry, Some(CarryDirective::Identical));
+        assert_eq!(
+            parse_owners("carry merged\n").carry,
+            Some(CarryDirective::Merged)
+        );
+        for both in [
+            "carry merged\ncarry identical\n",
+            "carry identical\ncarry merged\n",
+        ] {
+            assert_eq!(parse_owners(both).carry, Some(CarryDirective::Identical));
+        }
+        // Any other line starting with the word `carry` is no name and no
+        // directive: a misspelling the land check refuses.
+        let f = parse_owners(
+            "carry\ncarry identically\ncarry  merged\ncarry\tmerged\ncarrying\n\
+             Carry identical\nCARRY merged\n",
+        );
+        assert_eq!(f.carry, None);
+        assert_eq!(names(&f), ["carrying"]);
+        assert_eq!(
+            f.unknown,
+            [
+                "carry",
+                "carry identically",
+                "carry  merged",
+                "carry\tmerged",
+                "Carry identical",
+                "CARRY merged"
+            ]
+        );
+        for d in [CarryDirective::Identical, CarryDirective::Merged] {
+            assert_eq!(parse_owners(d.line()).carry, Some(d));
+        }
     }
 
     #[test]
