@@ -572,7 +572,7 @@ fn git_import_swarm_and_export_round_trip() {
 fn git_import_swarm_and_export_round_trip_postgres() {
     let _g = serial();
     // Declared first so it drops after the server has been killed.
-    let Some(db) = PgDb::create() else {
+    let Some(db) = PgDb::create("leep_e2e") else {
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
@@ -1717,7 +1717,7 @@ fn branches_switching_and_immutable_tags() {
 #[test]
 fn branches_switching_and_immutable_tags_postgres() {
     let _g = serial();
-    let Some(db) = PgDb::create() else {
+    let Some(db) = PgDb::create("leep_e2e") else {
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
@@ -1955,7 +1955,7 @@ fn everyday_workflow_sync_stash_restore_amend_reset() {
 #[test]
 fn everyday_workflow_sync_stash_restore_amend_reset_postgres() {
     let _g = serial();
-    let Some(db) = PgDb::create() else {
+    let Some(db) = PgDb::create("leep_e2e") else {
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
@@ -2153,7 +2153,7 @@ fn reflog_and_undo() {
 #[test]
 fn reflog_and_undo_postgres() {
     let _g = serial();
-    let Some(db) = PgDb::create() else {
+    let Some(db) = PgDb::create("leep_e2e") else {
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
@@ -2426,7 +2426,7 @@ fn merge_rebase_cherry_pick_and_revert() {
 #[test]
 fn merge_rebase_cherry_pick_and_revert_postgres() {
     let _g = serial();
-    let Some(db) = PgDb::create() else {
+    let Some(db) = PgDb::create("leep_e2e") else {
         return;
     };
     let tmp = tempfile::tempdir().unwrap();

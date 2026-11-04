@@ -16,6 +16,7 @@ use leep_core::{
 use leep_derive::derived::{DerivedKind, HistoryTree};
 use leep_derive::warm::{Warmer, TAIL_PAGE};
 use leep_derive::Repo;
+use leep_meta::pg_test::TestSchema;
 use leep_meta::{PostgresMetaStore, SqliteMetaStore};
 
 async fn commit(r: &Repo, parent: Option<ChangesetId>, msg: &str) -> ChangesetId {
@@ -120,11 +121,11 @@ async fn tail(meta: Arc<dyn MetaStore>, expect_gap: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tail_on_postgres() {
-    let Ok(url) = std::env::var("LEEP_TEST_POSTGRES_URL") else {
-        eprintln!("skipping: LEEP_TEST_POSTGRES_URL not set");
+    let Some(guard) = TestSchema::create("leep_test_warm_tail") else {
         return;
     };
-    let schema = format!("leep_test_warm_tail_{}", std::process::id());
+    let url = guard.url.clone();
+    let schema = guard.name.clone();
     let meta = PostgresMetaStore::connect_with_schema(&url, &schema)
         .await
         .unwrap();
@@ -146,11 +147,11 @@ async fn tail_on_sqlite() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn warmer_derives_while_the_shared_pool_is_saturated() {
     use leep_core::lane::{scope, Lane};
-    let Ok(url) = std::env::var("LEEP_TEST_POSTGRES_URL") else {
-        eprintln!("skipping: LEEP_TEST_POSTGRES_URL not set");
+    let Some(guard) = TestSchema::create("leep_test_warm_index_lane") else {
         return;
     };
-    let schema = format!("leep_test_warm_index_lane_{}", std::process::id());
+    let url = guard.url.clone();
+    let schema = guard.name.clone();
     // One shared connection, one for the land lane (which this test reads
     // through to watch), two for the warmer.
     let pg = Arc::new(

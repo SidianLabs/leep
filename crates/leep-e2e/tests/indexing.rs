@@ -165,7 +165,7 @@ fn check_log(tag: &str, addr: SocketAddr, landed: &Mutex<Landed>, header: Option
 /// stale time (6 s) plus a renewal (3 s), then catches the index up.
 #[test]
 fn killed_index_holder_is_replaced_and_queries_keep_answering_postgres() {
-    let Some(db) = PgDb::create() else {
+    let Some(db) = PgDb::create("leep_e2e") else {
         return;
     };
     let _g = serial();
@@ -277,7 +277,7 @@ fn killed_index_holder_is_replaced_and_queries_keep_answering_postgres() {
 /// lives, the same query derives inline and succeeds.
 #[test]
 fn the_cli_reports_an_indexing_503_and_takes_stale_answers_postgres() {
-    let Some(db) = PgDb::create() else {
+    let Some(db) = PgDb::create("leep_e2e") else {
         return;
     };
     let _g = serial();

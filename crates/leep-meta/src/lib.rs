@@ -18,6 +18,8 @@ mod drop;
 pub mod features;
 mod leases;
 pub mod migrate;
+#[doc(hidden)]
+pub mod pg_test;
 mod pool_floor;
 mod postgres;
 mod review_requests;

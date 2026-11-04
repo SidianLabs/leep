@@ -101,14 +101,23 @@ pub(crate) async fn pg_get(
     Ok(row.map(|r| lease(key, &r, r.get("now"), timing)))
 }
 
+/// The claim and the read of the row it settled share one transaction and
+/// one `now`, as in the memory store: `remaining` is counted from the
+/// instant the claim stamped, not from a later read. Read by a separate
+/// statement, a commit slowed by load past `stale_after` reported a lease
+/// just taken as already free.
 pub(crate) async fn pg_acquire(
     pool: &PgPool,
     claim: &LeaseClaim<'_>,
     timing: LeaseTiming,
 ) -> Result<Lease> {
     let key = claim.key;
-    sqlx::query(AssertSqlSafe(format!(
-        "WITH now AS (SELECT {PG_NOW} AS ms) \
+    let mut tx = pool.begin().await.map_err(storage)?;
+    // The data-modifying CTE runs whatever the outer query reads. The row is
+    // locked from here to the commit, whether or not the claim updated it,
+    // so the read below sees the version the claim judged.
+    let now: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "WITH now AS (SELECT {PG_NOW} AS ms), claim AS ( \
          INSERT INTO leases AS l (scope, repo_id, name, shard, {COLUMNS}) \
          SELECT $1, $2, $3, $4, $5, $6, $7, $8, 1, now.ms, now.ms + $9 FROM now \
          ON CONFLICT (scope, repo_id, name, shard) DO UPDATE SET \
@@ -117,7 +126,8 @@ pub(crate) async fn pg_acquire(
            protocol = EXCLUDED.protocol, meta = EXCLUDED.meta, \
            renewed_at = EXCLUDED.renewed_at, expires_at = EXCLUDED.expires_at \
          WHERE l.holder = EXCLUDED.holder OR l.expires_at <= EXCLUDED.renewed_at \
-           OR l.renewed_at + $10 <= EXCLUDED.renewed_at"
+           OR l.renewed_at + $10 <= EXCLUDED.renewed_at) \
+         SELECT ms FROM now"
     )))
     .bind(&key.scope)
     .bind(key.repo_id)
@@ -129,12 +139,23 @@ pub(crate) async fn pg_acquire(
     .bind(claim.meta)
     .bind(ms(timing.ttl))
     .bind(ms(timing.stale_after))
-    .execute(pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(storage)?;
-    pg_get(pool, key, timing)
-        .await?
-        .ok_or_else(|| storage("lease vanished after it was claimed"))
+    let row = sqlx::query(AssertSqlSafe(format!(
+        "SELECT {COLUMNS} FROM leases \
+         WHERE scope = $1 AND repo_id = $2 AND name = $3 AND shard = $4"
+    )))
+    .bind(&key.scope)
+    .bind(key.repo_id)
+    .bind(&key.name)
+    .bind(key.shard)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(storage)?
+    .ok_or_else(|| storage("lease vanished after it was claimed"))?;
+    tx.commit().await.map_err(storage)?;
+    Ok(lease(key, &row, now, timing))
 }
 
 pub(crate) async fn pg_renew(
@@ -242,6 +263,9 @@ pub(crate) async fn sqlite_acquire(
 ) -> Result<Lease> {
     let key = claim.key;
     let now = now_ms();
+    // One transaction and one `now` for the claim and its read, as on
+    // Postgres: `remaining` counts from the claim's own stamp.
+    let mut tx = pool.begin().await.map_err(storage)?;
     sqlx::query(AssertSqlSafe(format!(
         "INSERT INTO leases (scope, repo_id, name, shard, {COLUMNS}) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?9 + ?10) \
@@ -266,12 +290,23 @@ pub(crate) async fn sqlite_acquire(
     .bind(now)
     .bind(ms(timing.ttl))
     .bind(ms(timing.stale_after))
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(storage)?;
-    sqlite_get(pool, key, timing)
-        .await?
-        .ok_or_else(|| storage("lease vanished after it was claimed"))
+    let row = sqlx::query(AssertSqlSafe(format!(
+        "SELECT {COLUMNS} FROM leases \
+         WHERE scope = ? AND repo_id = ? AND name = ? AND shard = ?"
+    )))
+    .bind(&key.scope)
+    .bind(key.repo_id)
+    .bind(&key.name)
+    .bind(key.shard)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(storage)?
+    .ok_or_else(|| storage("lease vanished after it was claimed"))?;
+    tx.commit().await.map_err(storage)?;
+    Ok(lease(key, &row, now, timing))
 }
 
 pub(crate) async fn sqlite_renew(
