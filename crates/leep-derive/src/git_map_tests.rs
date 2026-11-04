@@ -221,3 +221,62 @@ async fn verify_checks_the_git_rows() {
         report.problems
     );
 }
+
+/// Of first writers racing with different styles, one style is stored and
+/// exactly the writers that asked for it succeed (ADR 0090).
+#[tokio::test]
+async fn racing_first_writers_agree_on_one_style() {
+    let r = repo();
+    let plain = CommitStyle {
+        changeset_trailer: false,
+        provenance_trailers: false,
+    };
+    let handles: Vec<(Repo, CommitStyle)> = (0..16)
+        .map(|i| {
+            let h = Repo::new(r.blobs().clone(), r.meta().clone());
+            (
+                h,
+                if i % 2 == 0 {
+                    plain
+                } else {
+                    CommitStyle::default()
+                },
+            )
+        })
+        .collect();
+    let results =
+        futures_util::future::join_all(handles.iter().map(|(h, s)| h.set_git_style(*s))).await;
+    let stored = r.git_style().await.unwrap().unwrap();
+    for ((_, asked), got) in handles.iter().zip(results) {
+        match got {
+            Ok(s) => assert_eq!((s, *asked), (stored, stored)),
+            Err(e) => {
+                assert!(matches!(e, Error::Conflict(_)), "{e}");
+                assert_ne!(*asked, stored);
+            }
+        }
+    }
+}
+
+/// A style recorded by mistake is undone by dropping it, which takes every
+/// id derived under it, so another style can be chosen.
+#[tokio::test]
+async fn dropping_the_style_drops_its_ids_and_frees_the_choice() {
+    use crate::integrity::drop_kinds;
+    let r = repo();
+    let a = commit(&r, &[], &[("f", Some("1"))], "one").await;
+    let under_default = r.git_commit_id(a).await.unwrap();
+    drop_kinds(&r, &[GIT_STYLE_KIND], false, &Quiet)
+        .await
+        .unwrap();
+    for k in KINDS.into_iter().chain([GIT_STYLE_KIND]) {
+        assert_eq!(r.meta().count_derived(k).await.unwrap(), 0, "{k}");
+    }
+    let fresh = Repo::new(r.blobs().clone(), r.meta().clone());
+    let plain = CommitStyle {
+        changeset_trailer: false,
+        provenance_trailers: false,
+    };
+    fresh.set_git_style(plain).await.unwrap();
+    assert_ne!(fresh.git_commit_id(a).await.unwrap(), under_default);
+}

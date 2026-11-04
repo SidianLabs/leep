@@ -832,8 +832,11 @@ fn hex(o: Option<impl std::fmt::Display>) -> Option<String> {
 pub fn style_mismatch(have: &str, want: &str) -> String {
     format!(
         "the server's store records git commit style {have:?} but this mirror's flags give \
-         {want:?}; a changeset would get a second commit id. Set --provenance-trailers and \
-         --no-changeset-trailer to match the store (ADR 0090)"
+         {want:?}; a changeset would get a second commit id. Either set \
+         --provenance-trailers and --no-changeset-trailer to match the store, or, if the \
+         store's style is the mistake, drop it on the server with `leep-server repair drop \
+         --kind git-style-v1` (which drops every git id derived under it) and start the \
+         mirror again (ADR 0090)"
     )
 }
 

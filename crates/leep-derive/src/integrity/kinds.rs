@@ -263,10 +263,11 @@ static KINDS: &[KindInfo] = &[
         class: KindClass::Bookkeeping,
         summary: "the store's git commit style, chosen once (ADR 0090)",
         rederive: Rederive::No("the commit style is a choice, not derived"),
-        drop: DropPolicy::Refused(
-            "the commit style is chosen once (ADR 0090); without it the next git id derived \
-             could pick another style and give changesets second commit ids",
-        ),
+        // The way out of a wrong choice: every id derived under the style
+        // goes with it, so none survives under another.
+        drop: DropPolicy::Allowed {
+            also: &[GIT_COMMIT_KIND, GIT_TREE_KIND, GIT_BLOB_KIND, GIT_OID_KIND],
+        },
     },
     KindInfo {
         name: BLOB_CLAIM,
@@ -558,6 +559,8 @@ mod tests {
                     && k.name != LOG_FILTER_NAME_KIND
                     // Dropped with `git-commit-v1`, all four together.
                     && ![GIT_BLOB_KIND, GIT_TREE_KIND, GIT_OID_KIND].contains(&k.name)
+                    // The one choice that may be undone, with every id under it.
+                    || k.name == GIT_STYLE_KIND
             );
         }
         assert!(check_droppable("ref_log").is_err());

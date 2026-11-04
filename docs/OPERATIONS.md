@@ -799,6 +799,16 @@ recorded before anything else derives git ids:
 `--no-changeset-trailer`, `trailer` otherwise, `+provenance` appended for
 `--provenance-trailers`). Restarting the mirror records the same thing.
 
+A style recorded by mistake can be undone: `leep-server repair drop --kind
+git-style-v1` removes it together with every git id derived under it
+(`git-commit-v1`, `git-tree-v1`, `git-blob-v1`, `git-oid-v1`), so no id
+survives under another style. Restart the servers afterwards (each keeps
+the style it read), then start the mirror with the flags you want, which
+records them. A remote the mirror already pushed to under the old style
+holds those commits; changesets exported again under a new style get new
+commit ids there, so do this before a mirror's first push, or expect its
+refs to report `diverged`.
+
 **Webhooks.** To skip the `--git-poll` delay, point a push webhook from
 GitHub or GitLab at `POST http://<mirror>/poke`, through a proxy that only
 forwards that path. The poke carries no data and needs no secret: at worst
