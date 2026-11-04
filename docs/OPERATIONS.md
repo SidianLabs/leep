@@ -776,7 +776,7 @@ leep-git mirror run \
 | `--github-api-token-file FILE` | – | A GitHub token with read access to pull requests (`LEEP_GITHUB_TOKEN` also works). Not the deploy key. |
 | `--github-repo OWNER/REPO` | from `--remote` | The repository on GitHub, when the remote URL does not say. |
 | `--github-api-url` | `https://api.github.com` | A GitHub Enterprise server's API root. |
-| `--provenance-trailers`, `--no-changeset-trailer` | off | Change commit messages, and so commit ids. Choose once, before the first push. |
+| `--provenance-trailers`, `--no-changeset-trailer` | off | Change commit messages, and so commit ids. Choose once, before the first push: the first start records them as the store's git commit style (ADR 0090), and a mirror started later with other flags refuses to start. |
 | `--listen ADDR` | off | Serve `GET /metrics`, `GET /status`, `GET /health` and `POST /poke`. |
 | `--once` | off | Run until nothing changes, then exit 0 if healthy and 1 if not (for cron or a check). |
 
@@ -786,6 +786,18 @@ exports Leep's history over HTTP. Imported changesets reproduce their
 original commits, so the first push is a fast-forward. If the remote was
 filled by `leep-git export`, add `--no-changeset-trailer` to produce the
 same commits. Without it, the ref reports `diverged` on the first run.
+
+**The store's git commit style** (ADR 0090). The server derives git ids
+for its objects (`git-commit-v1` and its kin) under one commit style per
+store, kept at `GET /v1/git/style`. The first mirror start records its
+flags there; so does the first derivation of a commit id, with the
+mirror's defaults. A store that already runs a mirror with
+`--provenance-trailers` or `--no-changeset-trailer` should have that style
+recorded before anything else derives git ids:
+`curl -X POST -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" \
+-d '{"style":"plain"}' $SERVER/v1/git/style` (`plain` for
+`--no-changeset-trailer`, `trailer` otherwise, `+provenance` appended for
+`--provenance-trailers`). Restarting the mirror records the same thing.
 
 **Webhooks.** To skip the `--git-poll` delay, point a push webhook from
 GitHub or GitLab at `POST http://<mirror>/poke`, through a proxy that only

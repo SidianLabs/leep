@@ -61,6 +61,11 @@ skill.
 | retired `history-tree-v3`, `history-node-v3` | — | written by servers from ADR 0037 to ADR 0045 (one content-addressed postcard row per node, chunk, list or patch, keyed by `Hash::of_object("history-node-v3", bytes)`); never read by current servers; removed with `repair drop --kind history-tree-v3` |
 | derived `blame-v2` | — | `MetaStore.derived`, key = `Hash::of_object("blame", changeset id ‖ path bytes)`, value = postcard `(RepoPath, Vec<BlameLine>)`: a complete blame following renames and merged branches (ADR 0065), written for the blamed changeset and its newest changer, at the starts of walks below merges and renames, and as checkpoints every 256 versions of a long replay (ADR 0078) |
 | retired `blame` | — | the same key and encoding, credited over first parents only; written by servers before ADR 0065; never read by current servers; removed with `repair drop --kind blame` |
+| derived `git-blob-v1` | — | `MetaStore.derived`, key = blob hash, value = the 20-byte sha1 git gives the blob (ADR 0090) |
+| derived `git-tree-v1` | — | `MetaStore.derived`, key = tree node hash (`TreeNode::hash()`), value = the 20-byte sha1 of the node's git tree: one entry per file (`100644`, `100755` or `120000` by `FileKind`, the blob's `git-blob-v1` id) and per directory (`40000`, its `git-tree-v1` id) whose tree is not git's empty tree, in git's order |
+| derived `git-commit-v1` | — | `MetaStore.derived`, key = changeset id, value = the 20-byte sha1 of the changeset's git commit: `leep_gitobj::commit_for` of the changeset, its root tree's `git-tree-v1` id, its parents' `git-commit-v1` ids and the store's `git-style-v1` |
+| derived `git-oid-v1` | — | `MetaStore.derived`, key = `Hash::of_object("git-oid", sha1 bytes)`, value = one kind byte (1 blob, 2 tree, 3 commit) then the 32-byte Leep hash (blob hash, tree node hash, changeset id) |
+| derived `git-style-v1` | — | `MetaStore.derived`, one row, key = `Hash::of_object("git-style", "")`, value = UTF-8 `plain` or `trailer`, optionally followed by `+provenance`; written once |
 | other derived kinds | — | owned and versioned by `leep-derive` |
 
 ## Integrity on read
@@ -369,6 +374,28 @@ addresses), keyed by `Hash::of_object("history-node-v1", bytes)`.
 successor), each keyed by `Hash::of_object` of its kind and bytes, with a
 `history-tree-v*` value of 32 bytes, the root's row hash. Current servers
 neither read nor write any of them.
+
+## Git ids (new derived kinds and API, ADR 0090)
+
+The first step of the git wire protocol. Five derived kinds (table above)
+and one endpoint; no change to `Changeset`, `TreeNode`, hashing or the SQL
+schema.
+
+- **Commit bytes** are `leep_gitobj::commit_for`, the mirror's rule (ADR
+  0049): the plain encoding (author, committer, time zones, encoding and
+  extra headers from the `git.*` extras an import wrote) when it hashes to
+  the changeset's `git.commit`; otherwise, under the `trailer` style, the
+  message gets `Leep-Changeset: <id>` in its final trailer paragraph. Under
+  `+provenance`, `agent.*` extras become `Leep-Agent-*` trailers first. A
+  changeset with no files has git's empty tree.
+- **The style is part of every native commit id**, so it is written once.
+  Changing it means new kinds (`git-commit-v2`), not rewriting the row.
+- **Not the bridge's maps.** `leep-to-git-v1` and `git-to-leep-v1` keep
+  their meaning: what an import or a mirror recorded (and a GC root, ADR
+  0059). For a commit the export reproduces, the two agree.
+- `GET /v1/git/style` → `{"style": null | "<style>"}`; `POST /v1/git/style`
+  with `{"style": "<style>"}` records it or answers the same one; another
+  is 409, an unknown one 400.
 
 ## Rename detection (no persisted change)
 

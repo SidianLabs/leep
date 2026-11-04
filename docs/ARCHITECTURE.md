@@ -76,11 +76,12 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 | `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC, a changeset id prefix lookup for short ids, listing and dropping derived rows by kind for repair, batched changeset and derived reads for history walks, derived reads of several kinds in one call, and batched derived writes and changeset-with-rows writes for changeset creation), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
 | `leep-store` | `BlobStore` backends: filesystem (loose objects plus delta-compressed packs, the repack writer, and packs written by `put_many`, ADR 0029, ADR 0039, ADR 0068), `object_store` (S3/MinIO; loose objects plus the same packs, ADR 0040), `CachedBlobStore`, `open_blob_store(url)`, and the incremental blob and pack copy backup and restore use (`sync`, `packfiles`, ADR 0026, ADR 0039) | core |
 | `leep-meta` | `MetaStore` backends: SQLite, Postgres, `open_meta_store(url)`, the versioned schema migrator (`migrate`, ADR 0023), metadata snapshots and their import (`snapshot`, ADR 0026), and `analyze_meta_store`, which bulk loaders call to refresh Postgres planner statistics (ADR 0042) | core |
-| `leep-derive` | `Repo`: derived data framework and kinds, plus all operations, blob garbage collection (`gc`), the delta-base walks for `repack` (`pack_order`, full or loose-only) and store verification and repair (`integrity`) | core (traits only, never a concrete backend) |
+| `leep-derive` | `Repo`: derived data framework and kinds (including the git ids of ADR 0090, through `leep-gitobj`), plus all operations, blob garbage collection (`gc`), the delta-base walks for `repack` (`pack_order`, full or loose-only) and store verification and repair (`integrity`) | core (traits only, never a concrete backend) |
 | `leep-server` | HTTP server binary `leep-server`, and its offline subcommands (`gc`, `migrate`, `verify`, `repair`, `backup`, `restore`, `backup-verify`) | core, store, meta, derive |
 | `leep-cli` | Client binary `leep` | core only |
 | `leep-mcp` | MCP server binary `leep-mcp` for AI agents (stdio JSON-RPC; talks to `leep-server` over HTTP) | core and the `leep-cli` library (its HTTP client); never derive, store, meta or server outside dev-dependencies |
-| `leep-git` | Git bridge: library plus the `leep-git` admin binary (offline `import` and `export`, which open the stores; the `mirror` daemon, which uses only the HTTP API and the system `git`) | core, derive, and the `leep-cli` library (its HTTP client, for the mirror); store and meta only to open stores by URL in the binary |
+| `leep-gitobj` | Pure git object encoding: commits and trees of changesets and tree nodes, git ids, the commit style, `changeset_for` (ADR 0090). No repository or store access | core, and gix's object encoder (`gix-object`), so its bytes are git's |
+| `leep-git` | Git bridge: library plus the `leep-git` admin binary (offline `import` and `export`, which open the stores; the `mirror` daemon, which uses only the HTTP API and the system `git`) | core, derive, gitobj, and the `leep-cli` library (its HTTP client, for the mirror); store and meta only to open stores by URL in the binary |
 | `leep-fuzz-targets` | Test-only (`publish = false`): fuzz harness functions and the seed corpus loader for every decoder and parser (`docs/FUZZING.md`) | core, derive, server (to drive the real router and config parsers); nothing depends on it except the `fuzz/` crate |
 | `leep-testkit` | Fault-injecting `BlobStore`/`MetaStore` wrappers and a seeded fault plan, for tests (ADR 0021), and `Budget`, a wrapper of both stores that counts what a flow asks of them for the operation budget tests (ADR 0081) | core; a dev-dependency only, never a normal dependency of any crate |
 | `leep-soak` | Soak test binary (`publish = false`): an agent swarm against a real `leep-server`, invariant checks, GC and restarts beside it, a trend report (ADR 0022). Starts the `leep` and `leep-server` binaries; talks to the server over HTTP only | core only (types); nothing depends on it |
@@ -217,6 +218,10 @@ way.
 | `cs-reach-v1` | per changeset id, one byte: "a ref or ref log entry reaches it, and every parent has a row"; written parents first, plus a progress row at the zero key (ADR 0059 section 4) | the changeset sweep's incremental reachability mark |
 | `gc-mark-v1` | per changeset id, tree node hash or blob hash, one byte: "referenced by a stored changeset, and everything below has a row"; written by GC marks in post-order (ADR 0033) | incremental GC marks, which skip covered changesets and stop at marked tree nodes |
 | `blob-trigrams-v1` | per blob hash: sorted trigram set of a UTF-8 text blob up to 1 MiB (delta varints), or a "not indexed" marker (ADR 0014) | code search |
+| `git-blob-v1` / `git-tree-v1` | per blob hash / tree node hash: the 20-byte sha1 git gives the blob, or the git tree of the node (a subtree with no files left out); pure functions of content (ADR 0090) | git ids of a store's objects, the coming git wire protocol |
+| `git-commit-v1` | per changeset: the 20-byte sha1 of its git commit under the store's commit style, from its root tree's and its parents' git ids. Imported changesets reproduce their original commit; others carry `Leep-Changeset:` under the `trailer` style, the mirror's rule (ADR 0049, 0090). Derived on demand; deleted with its changeset by the sweep | as above |
+| `git-oid-v1` | per `Hash::of_object("git-oid", sha)`: kind byte (1 blob, 2 tree, 3 commit) and the 32-byte Leep hash; written beside each forward row; a lookup checks the forward row, so one whose changeset was swept answers "unknown" (ADR 0090) | finding the Leep object a git id names |
+| `git-style-v1` | one row: the store's commit style (`plain`/`trailer`, optionally `+provenance`), written once by the first derivation or mirror start (ADR 0090) | every git commit id of a changeset made in Leep |
 | `tree-trigrams-v1` | per tree node hash: fixed-size bloom filter (2^19 bits) over every trigram below the directory, the OR of its children's filters; shared by every revision with the same subtree (ADR 0014) | code search directory pruning |
 
 **Unstored trees** ([ADR 0069](adr/0069-lazy-create-trees.md)). The
@@ -1056,7 +1061,11 @@ to the same walk.
 
 **Git mirror** (`leep-git mirror run`, [ADR 0046](adr/0046-live-git-mirror.md)).
 A daemon outside the server, one per git remote, on the `/v1` API and the
-system `git`; the server has no git code and holds no git credentials. Every
+system `git`; the server holds no git credentials, and its only git code is
+the pure encoding of `leep-gitobj` behind its derived git ids (ADR 0090).
+The mirror records its commit style in the store on first start
+(`POST /v1/git/style`) and refuses to start against another, so its
+commits are the ids the server derives. Every
 cycle (1 s) it reads the newest ref log `seq`, and `GET /v1/refs` when it
 moved; the remote's refs come from `git ls-remote` every 15 s or on
 `POST /poke`. Per mirrored ref it compares the export `E` of the Leep ref `L`
