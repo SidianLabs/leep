@@ -1370,9 +1370,9 @@ content, with at most half the cores merging at a time on blocking threads;
 nothing to configure.
 
 **Identical-only paths** (ADR 0092). Owners can keep merged carries off
-for a directory with an `OWNERS` line `carry identical` (the nearest
-`carry identical` or `carry merged` line up to `noparent` decides), and
-operators for any path with the review policy's `identical_only_globs`
+for a directory with an `OWNERS` line `carry identical` (it covers
+every directory below up to a `noparent` file, and a `carry merged` below
+cannot undo it), and operators for any path with the review policy's `identical_only_globs`
 (`["**/Cargo.lock", "migrations/**"]`); a strict ref still covers every
 path, and nothing loosens another source. Both are read from the target
 ref's head. `leep review status` says `not carried: P is identical-only

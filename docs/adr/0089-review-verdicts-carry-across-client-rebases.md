@@ -78,8 +78,8 @@ verdict as carried that a land on that strict ref does not count (the land
 and `review-status?ref=` are what decide).
 
 *Amended by [ADR 0092](0092-identical-only-review-carry.md):* merged carries
-are not used either on a path the policy's `identical_only_globs` or the nearest `OWNERS`
-`carry identical` line in the target ref's head declare identical-only;
+are not used either on a path the policy's `identical_only_globs` or an `OWNERS`
+`carry identical` line on its walk in the target ref's head declare identical-only;
 the refusal names which (`P is identical-only (src/OWNERS)`), and request
 closing uses the same scope.
 

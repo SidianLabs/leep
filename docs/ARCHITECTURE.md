@@ -1564,7 +1564,7 @@ never `OWNERS`, at most 32 merged paths per candidate, each merge computed
 once (single-flight, on a blocking thread, at most half the cores at once)
 and cached in process by content hash, and never on a strict land ref
 (ADR 0066), a path a policy `identical_only_globs` entry matches, or one
-whose nearest `OWNERS` `carry` line in the head says `carry identical`
+where an `OWNERS` file on its walk in the head says `carry identical`
 ([ADR 0092](adr/0092-identical-only-review-carry.md); each source can only
 make a path stricter, and `CarryScope` carries all three, so carrying and
 request closing judge alike; taking back ignores them). `review-status` names the

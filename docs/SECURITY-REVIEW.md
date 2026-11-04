@@ -255,7 +255,8 @@ instead of answering 404 or 500 (`texts_over_the_line_budget_are_not_merged`,
 
 *Fourth follow-up: identical-only paths (ADR 0092).* Owners may turn the
 rebased and union carries off per directory (`OWNERS` line `carry
-identical`, nearest `carry` line up to `noparent` wins) and operators per
+identical`, strictest line on the walk up to `noparent` wins, so a
+subdirectory can tighten but never loosen) and operators per
 glob (`identical_only_globs`). The risk is a change that loosens the rule
 it is judged under. The rule is read from the target ref's head, never
 from the judged changeset or its stack, and is monotone: strict ref, glob
@@ -274,7 +275,8 @@ editor may land. Tests:
 `an_identical_only_path_refuses_a_union_but_carries_an_identical_change`;
 in `leep-derive`,
 `identical_only_is_strict_ref_or_glob_or_owners_and_only_stricter`,
-`the_nearest_carry_line_decides_and_noparent_stops_the_walk`,
+`the_strictest_carry_line_decides_and_noparent_stops_the_walk`,
+`a_subdirectory_cannot_loosen_an_ancestors_carry_identical`,
 `a_request_closes_exactly_when_its_verdict_carries_under_the_carry_line`.
 
 ### S-02: checkout writes outside the working copy (High, fixed)

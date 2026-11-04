@@ -140,8 +140,9 @@ Owners are always read from the head of the ref being landed on. No file
 covering a path (or no names in the covering files) means no owners: any one
 approval from any principal satisfies the path.
 A line that is exactly `carry identical` or `carry merged` (ADR 0092) is a
-directive, not a name: the nearest file on the same walk that has one
-(`noparent`'s file included) decides whether verdicts carry to a
+directive, not a name: on the same walk (`noparent`'s file included),
+`carry identical` in any file, else the nearest `carry merged`, decides
+whether verdicts carry to a
 re-committed change of a path only when it is identical; both lines in one
 file mean `carry identical`. Older servers read either line as an owner
 name nobody has (in a file with no other names, nobody can approve the

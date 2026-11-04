@@ -27,10 +27,15 @@ to say so.
 - **`OWNERS` lines.** A line that is exactly `carry identical` or
   `carry merged` (after trimming and dropping a `#` comment, as names are)
   is a directive, not an owner name. It applies to the directory of the
-  file and everything below it. The directive for a path is that of the
-  **nearest** `OWNERS` file that states one, on the walk owners use
-  (deepest directory first, up to the first `noparent`, that file
-  included, or the root). A file with both lines means `carry identical`.
+  file and everything below it. The directive for a path is the
+  **strictest on the walk** owners use (deepest directory first, up to the
+  first `noparent`, that file included, or the root): `carry identical` in
+  any file on the walk wins, and the deepest file saying it is the one
+  named; otherwise the nearest `carry merged`. A subdirectory can tighten
+  its ancestors' rule, never loosen it: its owners need not own the parent
+  directory, so they cannot undo what the parent's owners asked for; only
+  a `noparent` file, which already cuts the parent's owners off, ends its
+  reach. A file with both lines means `carry identical`.
   Directory level only; per-file patterns inside `OWNERS` are not offered.
 - **Review policy file.** `identical_only_globs`: `globset` patterns,
   matched as `docs_globs` are (`*` stays within one path level), for files
@@ -39,12 +44,12 @@ to say so.
 - **Strict refs** (ADR 0066, 0089), unchanged.
 
 **The effective rule** for a path on a target ref is identical-only when
-the ref is strict, or a policy glob matches, or the nearest `OWNERS`
-directive is `carry identical`; otherwise rebased and union carries are
+the ref is strict, or a policy glob matches, or an `OWNERS` file on the
+walk says `carry identical`; otherwise rebased and union carries are
 allowed as in ADR 0089. Each source can only make a path stricter: a
-`carry merged` line cannot undo a policy glob or a strict ref, it only
-overrides a `carry identical` further up. `OWNERS` files themselves never
-merge (ADR 0089).
+`carry merged` line cannot undo a policy glob, a strict ref or a
+`carry identical` further up. `OWNERS` files themselves never merge (ADR
+0089).
 
 **Read from the target ref's head**, like owners (ADR 0011): a change that
 adds `carry merged` is judged under the head's `carry identical`, so it
@@ -119,7 +124,8 @@ already chooses which auto rules run.
   `a_change_adding_carry_merged_is_judged_under_the_heads_identical`,
   `a_strict_ref_carries_only_identical_changes` (now with the reason text);
   in `leep-derive`, `owners::tests::carry_directives_are_whole_lines_and_identical_wins`,
-  `the_nearest_carry_line_decides_and_noparent_stops_the_walk`,
+  `the_strictest_carry_line_decides_and_noparent_stops_the_walk`,
+  `a_subdirectory_cannot_loosen_an_ancestors_carry_identical`,
   `identical_only_is_strict_ref_or_glob_or_owners_and_only_stricter`,
   `an_identical_only_path_carries_identical_changes_only`,
   `review_requests::tests::a_request_closes_exactly_when_its_verdict_carries_under_the_carry_line`.

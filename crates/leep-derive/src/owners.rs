@@ -6,11 +6,12 @@
 //! every ancestor up to the first `noparent` or the root.
 //!
 //! A line `carry identical` or `carry merged` says how review verdicts carry
-//! to a re-committed change of the directory's files (ADR 0092): the nearest
-//! file on the same walk that says either decides, and `carry identical`
-//! keeps carrying to identical changes only, never to a rebase or union
-//! (ADR 0089). It can only make carrying stricter than the server's other
-//! rules, never looser.
+//! to a re-committed change of the directory's files (ADR 0092).
+//! `carry identical` keeps carrying to identical changes only, never to a
+//! rebase or union (ADR 0089). On the owners walk the strictest line wins:
+//! `carry identical` in any file, else the nearest `carry merged`, so a
+//! subdirectory can tighten its ancestors' rule, never loosen it. It can
+//! only make carrying stricter than the server's other rules, never looser.
 //!
 //! Owners are always read from a tree the caller names (the target ref's
 //! head), never from the change being judged, so a change cannot grant itself
@@ -166,26 +167,37 @@ impl<'a> OwnersResolver<'a> {
     }
 
     /// The `carry` directive for `path` and the `OWNERS` file that states
-    /// it: the nearest file on the owners walk (deepest first, up to the
-    /// first `noparent` or the root) with a `carry` line. `None` when no
-    /// file on the walk has one.
+    /// it, the strictest on the owners walk (deepest first, up to the first
+    /// `noparent` or the root): `carry identical` anywhere on the walk wins,
+    /// named by the deepest file saying it, so a subdirectory can tighten
+    /// its ancestors' rule but never loosen it; otherwise the nearest
+    /// `carry merged`. `None` when no file on the walk has a `carry` line.
     pub async fn carry_of(&mut self, path: &RepoPath) -> Result<Option<(CarryDirective, String)>> {
+        let mut merged = None;
         for dir in ancestor_dirs(path) {
             if let Some(f) = self.file_in(dir).await? {
-                if let Some(c) = f.carry {
-                    let file = if dir.is_empty() {
+                let file = || {
+                    if dir.is_empty() {
                         OWNERS_FILE.to_string()
                     } else {
                         format!("{dir}/{OWNERS_FILE}")
-                    };
-                    return Ok(Some((c, file)));
+                    }
+                };
+                match f.carry {
+                    Some(CarryDirective::Identical) => {
+                        return Ok(Some((CarryDirective::Identical, file())));
+                    }
+                    Some(CarryDirective::Merged) if merged.is_none() => {
+                        merged = Some((CarryDirective::Merged, file()));
+                    }
+                    _ => {}
                 }
                 if f.noparent {
                     break;
                 }
             }
         }
-        Ok(None)
+        Ok(merged)
     }
 }
 

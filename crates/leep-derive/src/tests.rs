@@ -3232,10 +3232,11 @@ mod review {
         assert_eq!(carried(on_x, true).await, None);
     }
 
-    /// ADR 0092: the nearest `carry` line on the owners walk decides, up to
-    /// the first `noparent`.
+    /// ADR 0092: the strictest `carry` line on the owners walk decides
+    /// (`carry identical` anywhere, named by the deepest file saying it,
+    /// else the nearest `carry merged`), up to the first `noparent`.
     #[tokio::test]
-    async fn the_nearest_carry_line_decides_and_noparent_stops_the_walk() {
+    async fn the_strictest_carry_line_decides_and_noparent_stops_the_walk() {
         use crate::owners::CarryDirective::{Identical, Merged};
         let r = repo();
         let head = commit(
@@ -3258,8 +3259,8 @@ mod review {
         for (p, want) in [
             ("top.rs", at(Identical, "OWNERS")),
             ("d/x.rs", at(Identical, "OWNERS")),
-            ("a/x.rs", at(Merged, "a/OWNERS")),
-            ("a/b/x.rs", at(Merged, "a/OWNERS")),
+            ("a/x.rs", at(Identical, "OWNERS")),
+            ("a/b/x.rs", at(Identical, "OWNERS")),
             ("a/b/c/d/x.rs", at(Identical, "a/b/c/OWNERS")),
             ("n/x.rs", None),
             ("m/x.rs", at(Merged, "m/OWNERS")),
@@ -3275,6 +3276,40 @@ mod review {
         assert_eq!(none.carry_of(&rp("top.rs")).await.unwrap(), None);
     }
 
+    /// Security (ADR 0092): a subdirectory's `carry merged` cannot undo an
+    /// ancestor's `carry identical`; the source named is the deepest file
+    /// saying `carry identical`. Only `noparent` ends the ancestor's reach.
+    #[tokio::test]
+    async fn a_subdirectory_cannot_loosen_an_ancestors_carry_identical() {
+        use crate::owners::CarryDirective::{Identical, Merged};
+        let r = repo();
+        let head = commit(
+            &r,
+            &[],
+            &[
+                ("src/OWNERS", Some("rhea\ncarry identical\n")),
+                ("src/api/OWNERS", Some("bo\ncarry merged\n")),
+                ("src/api/v1/OWNERS", Some("carry identical\n")),
+                ("src/api/v1/x/OWNERS", Some("carry merged\n")),
+                ("src/free/OWNERS", Some("cy\nnoparent\ncarry merged\n")),
+                ("lib/OWNERS", Some("carry merged\n")),
+            ],
+            "head",
+        )
+        .await;
+        let mut o = OwnersResolver::new(&r, Some(head)).await.unwrap();
+        let at = |d, f: &str| Some((d, f.to_string()));
+        for (p, want) in [
+            ("src/api/a.rs", at(Identical, "src/OWNERS")),
+            ("src/api/v1/a.rs", at(Identical, "src/api/v1/OWNERS")),
+            ("src/api/v1/x/a.rs", at(Identical, "src/api/v1/OWNERS")),
+            ("src/free/a.rs", at(Merged, "src/free/OWNERS")),
+            ("lib/a.rs", at(Merged, "lib/OWNERS")),
+        ] {
+            assert_eq!(o.carry_of(&rp(p)).await.unwrap(), want, "{p}");
+        }
+    }
+
     /// ADR 0092: the effective rule is strict ref, then policy glob, then
     /// `OWNERS`, and each can only make a path stricter.
     #[tokio::test]
@@ -3286,7 +3321,7 @@ mod review {
             &[],
             &[
                 ("OWNERS", Some("root\ncarry identical\n")),
-                ("free/OWNERS", Some("carry merged\n")),
+                ("free/OWNERS", Some("noparent\ncarry merged\n")),
             ],
             "head",
         )

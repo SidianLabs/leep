@@ -71,7 +71,8 @@ clean replay already has), or keep both sides' insertions where the only
 conflicts are pure insertions.
 *Amended by [ADR 0092](0092-identical-only-review-carry.md):* an `OWNERS`
 line `carry identical` or `carry merged` is a directive, not a name; the
-nearest one on the owners walk decides whether only identical changes carry
+strictest on the owners walk (`carry identical` anywhere up to
+`noparent`) decides whether only identical changes carry
 verdicts there, read from the target ref's head like the names.
 
 **Decision per path.** For each path a changeset changes (relative to its first

@@ -81,8 +81,8 @@ pub enum CarrySource {
     StrictRef,
     /// The review policy file's `identical_only_globs` entry that matches.
     Policy(String),
-    /// The `OWNERS` file, read from the target ref's head, whose
-    /// `carry identical` line is the nearest `carry` line for the path.
+    /// The deepest `OWNERS` file on the path's owners walk, read from the
+    /// target ref's head, with a `carry identical` line.
     Owners(String),
 }
 
