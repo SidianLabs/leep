@@ -292,15 +292,21 @@ pub(crate) async fn for_ref(
 #[derive(Deserialize)]
 pub(crate) struct CulpritsQuery {
     bad: Option<String>,
+    good: Option<String>,
 }
 
-/// `GET /v1/refs/{name}/culprits?bad=rev`.
+/// `GET /v1/refs/{name}/culprits?bad=rev&good=rev`: the suspects, the lands
+/// in the range, never a verdict on one of them.
 pub(crate) async fn culprits(repo: &Repo, name: &str, q: CulpritsQuery) -> ApiResult<Response> {
     let bad = match q.bad.as_deref().filter(|b| !b.is_empty()) {
         Some(rev) => Some(repo.resolve(rev).await?),
         None => None,
     };
-    Ok(Json(repo.culprits(name, bad).await?).into_response())
+    let good = match q.good.as_deref().filter(|g| !g.is_empty()) {
+        Some(rev) => Some(repo.resolve(rev).await?),
+        None => None,
+    };
+    Ok(Json(repo.culprits(name, bad, good).await?).into_response())
 }
 
 /// The query of a `GET /v1/refs/...` that may be a culprits request.

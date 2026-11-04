@@ -36,7 +36,7 @@
 //! | POST | `/v1/changesets/{id}/checks` | [`PostCheckRequest`] | [`PostCheckResponse`] (records a check result; the poster is the token's name; 403 unless the token's `checks` names the check, or if the token created the changeset; 400 without authentication; 404 if the changeset is unknown; a pass that completes a ref's required checks promotes `green/<ref>`; ADR 0091) |
 //! | GET  | `/v1/changesets/{id}/checks` | – | [`ChecksResponse`] (the newest result of every check the server knows by name, and the green refs that hold the changeset) |
 //! | GET  | `/v1/refs/{name}/checks` | – | [`RefChecksResponse`] (the ref's head, its known-good `green/<name>`, how far green is behind, and whether the head is red; 404 if the ref does not exist; a ref literally named `{name}/checks` is answered as that ref; ADR 0091) |
-//! | GET  | `/v1/refs/{name}/culprits?bad=rev` | – | [`CulpritsResponse`] (the ref log entries of `name` above `green/<name>` up to the one that brought `bad`, newest first, at most 4096 entries read; `bad` defaults to the head; 400 if `bad` is at or below green or not on the ref; a ref literally named `{name}/culprits` is answered as that ref; ADR 0091) |
+//! | GET  | `/v1/refs/{name}/culprits?bad=rev&good=rev` | – | [`CulpritsResponse`] (suspects: the lands in the range, the ref log entries of `name` above `good` up to the one that brought `bad`, newest first, at most 4096 entries read; `good` defaults to `green/<name>` and `bad` to the head; never a verdict: a land whose test fails only together with a later one shows that later one as a suspect too; 400 if `bad` is at or below green (without `good`), `good` is not below `bad`, or `bad` is not on the ref; a ref literally named `{name}/culprits` is answered as that ref; ADR 0091) |
 //! | POST | `/v1/review-requests` | [`CreateReviewRequest`] | [`CreateReviewRequestResponse`] (ask for a review of `changeset` before it lands on `target_ref`; the requester is the token's name; `reviewers` must be tokens that may review, and default to the owners of the paths the changeset still needs approved; an open request of the same requester, changeset, ref and reviewers is answered instead of a second one; 400 without authentication; 404 if the changeset is unknown, or `target_ref` is missing and no land policy covers it; 400 `too_many_review_requests` when the requester already has `MAX_OPEN_REQUESTS` (100) open; ADR 0086) |
 //! | GET  | `/v1/review-requests?reviewer=n&requester=n&changeset=id&ref=r&state=s&open=bool&before=id&limit=n` | – | [`ReviewRequestsResponse`] (newest first; `reviewer` matches requests that name it and requests open to any reviewer made by someone else; `state` is `open`, `landed` or `withdrawn`, `open=true` is `state=open` and `open=false` every closed state; `limit` defaults to 50, capped at 500; `before` pages by id; ADR 0086) |
 //! | GET  | `/v1/review-requests/{id}` | – | [`ReviewRequestEntry`] (404 if unknown) |
@@ -729,7 +729,7 @@ pub struct ChecksResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedState {
     /// The oldest changeset of the failing run, above green: where to start
-    /// looking for the culprit.
+    /// looking through the suspects.
     pub first_failed: ChangesetId,
     /// The failing check.
     pub check: String,
@@ -760,7 +760,8 @@ pub struct RefChecksResponse {
     pub red: Option<RedState>,
 }
 
-/// One ref move between green and a bad changeset.
+/// One ref move between a good and a bad changeset: a suspect, a land in
+/// the range, never a verdict that it broke anything.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Suspect {
     /// What the move put on the ref (a land's rebased copy, for instance).
@@ -797,11 +798,15 @@ pub struct Suspect {
 /// Most paths one [`Suspect`] lists.
 pub const MAX_SUSPECT_PATHS: usize = 1000;
 
-/// `GET /v1/refs/{name}/culprits`.
+/// `GET /v1/refs/{name}/culprits`: the suspects for a failure, the lands in
+/// the range. A land whose test fails only together with a later land shows
+/// that later land as a suspect, so a planted tripwire can frame an innocent
+/// land; read the paths and rerun before blaming anyone.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CulpritsResponse {
     pub name: String,
-    /// `green/<name>`'s target; `None` before the first promotion.
+    /// The `good` asked for, else `green/<name>`'s target; `None` before the
+    /// first promotion.
     pub good: Option<ChangesetId>,
     pub bad: ChangesetId,
     /// Newest first: the moves that brought everything above `good` up to

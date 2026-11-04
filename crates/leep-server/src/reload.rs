@@ -238,7 +238,14 @@ impl ReloadSources {
         if !self.protect_refs.is_empty() {
             policies.push(Arc::new(ProtectOnly::new(self.protect_refs.clone())));
         }
+        // A ref with a known-good ref is protected as a review ref is: were
+        // it rewound past green, green would stay ahead of it for good.
+        let checks_refs: Vec<String> = checks
+            .as_ref()
+            .map(|c| c.refs.keys().cloned().collect())
+            .unwrap_or_default();
         if let Some(c) = checks.as_ref().filter(|c| !c.refs.is_empty()) {
+            policies.push(Arc::new(ProtectOnly::new(checks_refs.clone())));
             policies.push(Arc::new(GreenRefs::new(c.green_refs())));
         }
         let land_policy: Option<Arc<dyn LandPolicy>> = match policies.len() {
@@ -280,8 +287,11 @@ impl ReloadSources {
                 checks,
                 land_policy,
                 protected_refs: sorted_union(
-                    &sorted_union(&self.require_signatures, &review_refs),
-                    &self.protect_refs,
+                    &sorted_union(
+                        &sorted_union(&self.require_signatures, &review_refs),
+                        &self.protect_refs,
+                    ),
+                    &checks_refs,
                 ),
                 review_rules: (policy.auto_approve, policy.docs_globs),
             },
@@ -773,6 +783,69 @@ mod tests {
         assert_eq!(c.protected_refs(), ["main", "release", "stable"]);
         let p = c.land_policy.as_ref().unwrap();
         assert!(p.applies_to("stable") && p.applies_to("main") && p.applies_to("release"));
+    }
+
+    #[test]
+    fn checks_policy_protects_its_refs_and_reloads() {
+        let f = files();
+        let mut s = f.sources.clone();
+        s.checks_policy_file = Some(write(
+            &f.dir,
+            "checks.json",
+            r#"{ "refs": { "dev": { "required": ["test"] } } }"#,
+        ));
+        let h = ConfigHandle::load(s).unwrap();
+        let c = h.current();
+        // The checked ref is forward-only and undeletable, like a review
+        // ref: rewound below green, green would never move again.
+        assert!(c.protected_refs().contains(&"dev".to_string()));
+        let p = c.land_policy.as_ref().unwrap();
+        assert!(p.protects("dev") && !p.promotion_only("dev"));
+        assert!(p.protects("green/dev") && p.promotion_only("green/dev"));
+        assert!(!p.promotion_only("green/main"));
+        assert_eq!(c.checks.as_ref().unwrap().required("dev"), ["test"]);
+        let before = c.fingerprint.clone();
+
+        f.put(
+            "checks.json",
+            r#"{ "refs": { "dev": { "required": ["test", "clippy"] } } }"#,
+        );
+        let r = h.reload().unwrap();
+        assert!(r.checks_policy_changed);
+        assert_ne!(r.fingerprint, before);
+        assert_eq!(
+            h.current().checks.as_ref().unwrap().required("dev"),
+            ["clippy", "test"]
+        );
+
+        for bad in [
+            r#"{ "refs": { "dev": { "required": [] } } }"#,
+            r#"{ "refs": { "dev": { "required": ["Test"] } } }"#,
+            r#"{ "refs": { "dev": { "required": ["test"], "any": true } } }"#,
+            r#"{ "refs": {}, "extra": 1 }"#,
+            r#"{ "refs": { "green/dev": { "required": ["test"] } } }"#,
+            r#"{ "refs": { "tags/v1": { "required": ["test"] } } }"#,
+            r#"{ "refs": { "a..b": { "required": ["test"] } } }"#,
+        ] {
+            f.put("checks.json", bad);
+            assert!(h.reload().is_err(), "{bad}");
+            assert_eq!(h.current().generation, 2, "{bad}");
+        }
+    }
+
+    #[test]
+    fn checks_policy_needs_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ReloadSources {
+            checks_policy_file: Some(write(
+                &dir,
+                "checks.json",
+                r#"{ "refs": { "main": { "required": ["test"] } } }"#,
+            )),
+            ..Default::default()
+        };
+        let e = ConfigHandle::load(s).err().unwrap();
+        assert!(e.contains("--tokens-file"), "{e}");
     }
 
     #[test]

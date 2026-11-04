@@ -936,6 +936,17 @@ impl Repo {
                 "cannot land onto {target_ref:?}: tags are immutable"
             )));
         }
+        if self
+            .land_policy
+            .as_ref()
+            .is_some_and(|p| p.promotion_only(target_ref))
+        {
+            return Err(Error::Policy(format!(
+                "cannot land on {target_ref:?}: it {} when every required check passes \
+                 (ADR 0091); land on the ref it follows",
+                leep_core::check::PROMOTION_ONLY_MARKER
+            )));
+        }
         let queue = self.land_queues.queue(target_ref);
         let admitted = match self.admit(&queue, cs, target_ref, &ctx, forwarded).await? {
             Ok(admitted) => admitted,

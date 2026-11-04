@@ -1,4 +1,4 @@
-//! Check attestations, known-good refs and culprit finding (ADR 0091).
+//! Check attestations, known-good refs and suspect finding (ADR 0091).
 //!
 //! A check result is a derived-data row beside the changeset, keyed by
 //! (changeset, check name) as reviews are keyed by reviewer, so a rerun
@@ -20,7 +20,7 @@ use leep_core::{ChangesetId, Error, Hash, RefLogEntry, RefUpdateContext, Result}
 use crate::changeset_gc::RescueBy;
 use crate::Repo;
 
-/// Most ref log entries one culprit or red walk reads.
+/// Most ref log entries one suspects or red walk reads.
 pub const MAX_LOG_WALK: usize = 4096;
 /// Ref log entries read per page of those walks.
 const LOG_PAGE: usize = 512;
@@ -302,13 +302,20 @@ impl Repo {
         Ok((None, walk))
     }
 
-    /// The ref moves of `name` above its known-good ref, from the one that
-    /// brought `bad` (default: the head) down to the first above green,
-    /// newest first: what a sheriff looks through when `bad` fails a check.
+    /// The suspects for a failure at `bad` (default: the head): the ref
+    /// moves of `name` that brought anything above `good` (default: the
+    /// known-good `green/<name>`) up to and including `bad`, newest first.
+    /// A suspect is a land in the range, not a verdict: a land whose test
+    /// fails only together with a later one shows the later one too.
     /// Reads at most [`MAX_LOG_WALK`] entries; `truncated` says it stopped
-    /// before reaching green (or the ref's first entry, without green).
-    pub async fn culprits(&self, name: &str, bad: Option<ChangesetId>) -> Result<CulpritsResponse> {
-        self.culprits_within(name, bad, MAX_LOG_WALK).await
+    /// before reaching `good` (or the ref's first entry, without one).
+    pub async fn culprits(
+        &self,
+        name: &str,
+        bad: Option<ChangesetId>,
+        good: Option<ChangesetId>,
+    ) -> Result<CulpritsResponse> {
+        self.culprits_within(name, bad, good, MAX_LOG_WALK).await
     }
 
     /// [`Repo::culprits`] reading at most `max` ref log entries.
@@ -316,6 +323,7 @@ impl Repo {
         &self,
         name: &str,
         bad: Option<ChangesetId>,
+        good: Option<ChangesetId>,
         max: usize,
     ) -> Result<CulpritsResponse> {
         let head = self
@@ -329,16 +337,30 @@ impl Repo {
                 "{bad} is not in the history of {name:?}"
             )));
         }
-        let good = self.meta().get_ref(&green_ref(name)).await?;
-        if let Some(g) = good {
-            if self.is_ancestor(bad, g).await? {
-                return Err(Error::Invalid(format!(
-                    "{bad} is at or below {}, which passed every required check; name a \
-                     changeset above it",
-                    green_ref(name)
-                )));
+        let good = match good {
+            // A sheriff looking below green names the last good run itself.
+            Some(g) => {
+                if g == bad || !self.is_ancestor(g, bad).await? {
+                    return Err(Error::Invalid(format!(
+                        "good {g} is not below bad {bad}: name an ancestor of it"
+                    )));
+                }
+                Some(g)
             }
-        }
+            None => {
+                let g = self.meta().get_ref(&green_ref(name)).await?;
+                if let Some(g) = g {
+                    if self.is_ancestor(bad, g).await? {
+                        return Err(Error::Invalid(format!(
+                            "{bad} is at or below {}, which passed every required check; \
+                             name a changeset above it, or pass good to look below it",
+                            green_ref(name)
+                        )));
+                    }
+                }
+                g
+            }
+        };
         let (start, mut walk) = self.introducing_entry(name, bad, max).await?;
         let Some(start) = start else {
             return Ok(CulpritsResponse {
@@ -485,5 +507,350 @@ impl LogWalk {
             self.read += 1;
         }
         Ok(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use leep_core::check::{PROMOTE_OPERATION, PROMOTION_ONLY_MARKER};
+
+    use super::*;
+    use crate::tests::{commit, repo};
+    use crate::LandPolicy;
+
+    /// `main` protected, `green/main` moved only by promotion.
+    struct Green;
+
+    #[async_trait]
+    impl LandPolicy for Green {
+        fn applies_to(&self, r: &str) -> bool {
+            r == "main" || r == "green/main"
+        }
+        fn promotion_only(&self, r: &str) -> bool {
+            r == "green/main"
+        }
+        async fn check_land(
+            &self,
+            _: &Repo,
+            _: &str,
+            _: Option<ChangesetId>,
+            _: &[ChangesetId],
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn ctx() -> RefUpdateContext {
+        RefUpdateContext::new(PROMOTE_OPERATION).actor(Some("ci"))
+    }
+
+    fn req(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    async fn post(r: &Repo, id: ChangesetId, name: &str, outcome: Outcome) {
+        r.put_check(
+            id,
+            &Check {
+                check: name.into(),
+                outcome,
+                by: "ci".into(),
+                url: String::new(),
+                summary: String::new(),
+                timestamp: 1,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// `main` with `n` lands on a base; the base and each land's head.
+    async fn landed(r: &Repo, n: usize) -> Vec<ChangesetId> {
+        let base = commit(r, &[], &[("f", Some("0"))], "base").await;
+        r.meta()
+            .cas_ref_logged("main", None, Some(base), &RefUpdateContext::new("cas"))
+            .await
+            .unwrap();
+        let mut heads = vec![base];
+        for i in 0..n {
+            let p = format!("d{i}/f");
+            let c = commit(r, &[base], &[(&p, Some("x"))], &format!("land {i}")).await;
+            r.land(c, "main").await.unwrap();
+            heads.push(r.meta().get_ref("main").await.unwrap().unwrap());
+        }
+        heads
+    }
+
+    async fn green(r: &Repo) -> Option<ChangesetId> {
+        r.meta().get_ref("green/main").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn promotion_needs_every_required_pass_and_only_goes_forward() {
+        let r = repo();
+        let h = landed(&r, 5).await;
+        let required = req(&["clippy", "test"]);
+        post(&r, h[3], "test", Outcome::Pass).await;
+        assert!(r
+            .promote_green("main", h[3], &required, &ctx())
+            .await
+            .unwrap()
+            .is_none());
+        post(&r, h[3], "clippy", Outcome::Fail).await;
+        assert!(r
+            .promote_green("main", h[3], &required, &ctx())
+            .await
+            .unwrap()
+            .is_none());
+        // A rerun replaces the earlier result.
+        post(&r, h[3], "clippy", Outcome::Pass).await;
+        let p = r
+            .promote_green("main", h[3], &required, &ctx())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (p.from, p.to, p.green_ref.as_str()),
+            (None, h[3], "green/main")
+        );
+        assert_eq!(green(&r).await, Some(h[3]));
+        // Out of order: an older pass arriving later never rewinds.
+        for n in ["clippy", "test"] {
+            post(&r, h[1], n, Outcome::Pass).await;
+        }
+        assert!(r
+            .promote_green("main", h[1], &required, &ctx())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(r
+            .promote_green("main", h[3], &required, &ctx())
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(green(&r).await, Some(h[3]));
+        for n in ["clippy", "test"] {
+            post(&r, h[5], n, Outcome::Pass).await;
+        }
+        let p = r
+            .promote_green("main", h[5], &required, &ctx())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((p.from, p.to), (Some(h[3]), h[5]));
+        // The log says who and how.
+        let log = r
+            .meta()
+            .ref_log(Some("green/main"), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(log.len(), 2);
+        assert!(log.iter().all(|e| e.operation == PROMOTE_OPERATION));
+        assert!(log.iter().all(|e| e.actor.as_deref() == Some("ci")));
+        // Every promotion moved forward.
+        for e in &log {
+            if let (Some(o), Some(n)) = (e.old, e.new) {
+                assert!(r.is_ancestor(o, n).await.unwrap());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn changesets_off_the_first_parent_chain_never_promote() {
+        let r = repo();
+        let h = landed(&r, 2).await;
+        let required = req(&["test"]);
+        // Unlanded: a child of the head nobody landed.
+        let wip = commit(&r, &[h[2]], &[("w", Some("1"))], "wip").await;
+        // A merge's second parent: on main's history, not its first-parent
+        // chain.
+        let side = commit(&r, &[h[0]], &[("s", Some("1"))], "side").await;
+        let merge = commit(&r, &[h[2], side], &[("s", Some("1"))], "merge").await;
+        r.land(merge, "main").await.unwrap();
+        assert_eq!(r.meta().get_ref("main").await.unwrap(), Some(merge));
+        assert!(r.is_ancestor(side, merge).await.unwrap());
+        for id in [wip, side] {
+            post(&r, id, "test", Outcome::Pass).await;
+            assert!(r
+                .promote_green("main", id, &required, &ctx())
+                .await
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(green(&r).await, None);
+        // A ref that does not exist promotes nothing either.
+        assert!(r
+            .promote_green("nope", h[1], &required, &ctx())
+            .await
+            .unwrap()
+            .is_none());
+        post(&r, merge, "test", Outcome::Pass).await;
+        assert!(r
+            .promote_green("main", merge, &required, &ctx())
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn concurrent_promotions_end_at_the_newest() {
+        let r = Arc::new(repo());
+        let h = landed(&r, 24).await;
+        let required = req(&["test"]);
+        for id in &h {
+            post(&r, *id, "test", Outcome::Pass).await;
+        }
+        let mut tasks = Vec::new();
+        // Newest last, so most tasks race a promotion that moved past them.
+        for id in h.iter().copied() {
+            let r = r.clone();
+            let required = required.clone();
+            tasks.push(tokio::spawn(async move {
+                r.promote_green("main", id, &required, &ctx()).await
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap().unwrap();
+        }
+        assert_eq!(green(&r).await, h.last().copied());
+        let log = r
+            .meta()
+            .ref_log(Some("green/main"), None, 100)
+            .await
+            .unwrap();
+        for e in &log {
+            if let (Some(o), Some(n)) = (e.old, e.new) {
+                assert!(o != n && r.is_ancestor(o, n).await.unwrap(), "rewound");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn green_refuses_land_cas_undo_and_delete() {
+        let r = repo().with_land_policy(Arc::new(Green));
+        let h = landed(&r, 3).await;
+        post(&r, h[2], "test", Outcome::Pass).await;
+        r.promote_green("main", h[2], &req(&["test"]), &ctx())
+            .await
+            .unwrap()
+            .unwrap();
+        let refused = |e: Error| {
+            assert!(
+                matches!(&e, Error::Policy(m) if m.contains(PROMOTION_ONLY_MARKER)),
+                "{e}"
+            );
+        };
+        refused(r.land(h[3], "green/main").await.unwrap_err());
+        let c = RefUpdateContext::new("cas");
+        // Forward, backward (what `leep undo` sends) and delete.
+        for new in [Some(h[3]), Some(h[1]), None] {
+            refused(
+                r.cas_ref_checked("green/main", Some(h[2]), new, &c)
+                    .await
+                    .unwrap_err(),
+            );
+        }
+        assert_eq!(green(&r).await, Some(h[2]));
+        // `main` itself is protected: a rewind past green is refused.
+        let e = r
+            .cas_ref_checked("main", Some(h[3]), Some(h[1]), &c)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, Error::Policy(m) if m.contains(leep_core::refname::NOT_FORWARD_MARKER)),
+            "{e}"
+        );
+    }
+
+    #[tokio::test]
+    async fn culprits_are_the_log_entries_between_good_and_bad() {
+        let r = repo();
+        let h = landed(&r, 10).await;
+        post(&r, h[3], "test", Outcome::Pass).await;
+        r.promote_green("main", h[3], &req(&["test"]), &ctx())
+            .await
+            .unwrap()
+            .unwrap();
+        let log = r.meta().ref_log(Some("main"), None, 100).await.unwrap();
+        // Newest first: entries 0..=9 are lands 10..=1; lands 4..=10 are
+        // above green.
+        let want: Vec<ChangesetId> = log[..7].iter().map(|e| e.new.unwrap()).collect();
+        let c = r.culprits("main", None, None).await.unwrap();
+        assert_eq!((c.good, c.bad, c.truncated), (Some(h[3]), h[10], false));
+        let got: Vec<ChangesetId> = c.suspects.iter().map(|s| s.changeset).collect();
+        assert_eq!(got, want);
+        assert_eq!(c.suspects[0].seq, log[0].seq);
+        assert_eq!(c.suspects[0].operation, "land");
+        assert_eq!(c.suspects[0].title, "land 9");
+        assert_eq!(
+            c.suspects[0].paths,
+            [leep_core::RepoPath::new("d9/f").unwrap()]
+        );
+        // A bad below the head: the suspects stop at the land that brought it.
+        let c = r.culprits("main", Some(h[6]), None).await.unwrap();
+        let got: Vec<ChangesetId> = c.suspects.iter().map(|s| s.changeset).collect();
+        assert_eq!(got, [h[6], h[5], h[4]]);
+        // `good` looks below green.
+        let c = r.culprits("main", Some(h[5]), Some(h[1])).await.unwrap();
+        let got: Vec<ChangesetId> = c.suspects.iter().map(|s| s.changeset).collect();
+        assert_eq!((c.good, got), (Some(h[1]), vec![h[5], h[4], h[3], h[2]]));
+        // Refusals: bad at or below green; good not below bad; bad off the ref.
+        assert!(matches!(
+            r.culprits("main", Some(h[2]), None).await,
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            r.culprits("main", Some(h[2]), Some(h[5])).await,
+            Err(Error::Invalid(_))
+        ));
+        let wip = commit(&r, &[h[10]], &[("w", Some("1"))], "wip").await;
+        assert!(matches!(
+            r.culprits("main", Some(wip), None).await,
+            Err(Error::Invalid(_))
+        ));
+        // Bounded: a short walk stops and says so.
+        let c = r.culprits_within("main", None, None, 3).await.unwrap();
+        assert_eq!(c.suspects.len(), 3);
+        assert!(c.truncated);
+        // Without green, the walk goes to the ref's first entry.
+        let r2 = repo();
+        let h2 = landed(&r2, 3).await;
+        let c = r2.culprits("main", None, None).await.unwrap();
+        let got: Vec<ChangesetId> = c.suspects.iter().map(|s| s.changeset).collect();
+        assert_eq!(
+            (got, c.truncated),
+            (vec![h2[3], h2[2], h2[1], h2[0]], false)
+        );
+    }
+
+    #[tokio::test]
+    async fn red_is_the_newest_attested_failure_above_green() {
+        let r = repo();
+        let h = landed(&r, 6).await;
+        let names = req(&["test"]);
+        post(&r, h[2], "test", Outcome::Pass).await;
+        r.promote_green("main", h[2], &names, &ctx())
+            .await
+            .unwrap()
+            .unwrap();
+        let s = r.ref_checks("main", &names, &names).await.unwrap();
+        assert_eq!((s.green, s.behind, s.red), (Some(h[2]), Some(4), None));
+        post(&r, h[4], "test", Outcome::Fail).await;
+        post(&r, h[6], "test", Outcome::Fail).await;
+        let s = r.ref_checks("main", &names, &names).await.unwrap();
+        let red = s.red.unwrap();
+        assert_eq!((red.first_failed, red.check.as_str()), (h[4], "test"));
+        let log = r.meta().ref_log(Some("main"), None, 100).await.unwrap();
+        assert_eq!(
+            red.since_seq,
+            log.iter().find(|e| e.new == Some(h[4])).map(|e| e.seq)
+        );
+        // A newer pass clears red.
+        post(&r, h[6], "test", Outcome::Pass).await;
+        let s = r.ref_checks("main", &names, &names).await.unwrap();
+        assert_eq!(s.red, None);
     }
 }

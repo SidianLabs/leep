@@ -674,6 +674,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_check_result_is_a_root() {
+        let meta = Arc::new(MemoryMetaStore::new());
+        let r = Repo::new(Arc::new(MemoryBlobStore::new()), meta.clone());
+        let base = commit(&r, &[], &[("f", Some("0"))], "base").await;
+        r.meta().cas_ref("main", None, Some(base)).await.unwrap();
+        let checked = commit(&r, &[base], &[("c", Some("1"))], "checked").await;
+        let child = commit(&r, &[checked], &[("d", Some("1"))], "child").await;
+        let plain = commit(&r, &[base], &[("p", Some("1"))], "plain").await;
+        r.put_check(
+            checked,
+            &leep_core::check::Check {
+                check: "test".into(),
+                outcome: leep_core::check::Outcome::Fail,
+                by: "ci".into(),
+                url: String::new(),
+                summary: String::new(),
+                timestamp: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let o = later();
+        let run = mark(&r, &o).await.unwrap();
+        // The attested changeset (ADR 0059 root 4) stays with its check;
+        // its unattested child and an unattested sibling do not.
+        let mut want = vec![child, plain];
+        want.sort_unstable();
+        assert_eq!(run.unreachable, want);
+        assert_eq!(run.unreachable, unreachable_oracle(&r, &o).await);
+        let report = crate::gc_unreachable::report(
+            &r,
+            &crate::gc_unreachable::UnreachableOptions {
+                now: o.now,
+                grace: o.grace,
+                ref_log_retention: Duration::from_secs(u64::MAX / 4),
+                exact_trees: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.attested, 1);
+    }
+
+    #[tokio::test]
     async fn a_missing_ancestor_gets_no_rows_and_holds_the_progress() {
         let meta = Arc::new(MemoryMetaStore::new());
         let r = Repo::new(Arc::new(MemoryBlobStore::new()), meta.clone());

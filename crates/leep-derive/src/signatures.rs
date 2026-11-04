@@ -47,8 +47,8 @@ pub trait LandPolicy: Send + Sync + 'static {
     }
 
     /// Whether only the server moves `target_ref` (a known-good ref,
-    /// ADR 0091): `cas_ref_checked` then refuses every create, move and
-    /// delete with `Error::Policy`, before any other rule.
+    /// ADR 0091): `land` and `cas_ref_checked` then refuse every land,
+    /// create, move and delete with `Error::Policy`, before any other rule.
     fn promotion_only(&self, target_ref: &str) -> bool {
         let _ = target_ref;
         false
