@@ -51,8 +51,12 @@ The design, phase by phase:
    the `trailer` style, one carrying `Leep-Changeset: <id>`. So imported
    history derives to its original shas with no recorded mapping, and the
    mirror's commits equal the derived ones. Rows are written parents first
-   by the derive framework (ADR 0003, 0050), reverse rows beside forward
-   ones, so a cold store derives them on demand with no backfill.
+   by the derive framework (ADR 0003, 0050), so a cold store derives them on
+   demand with no backfill. A reverse row is written just before its
+   forward row (a commit's inside its derivation, before the framework
+   stores the value), so a crash between the two leaves a reverse row with
+   no forward row; lookups and `verify` treat that as stale, and the next
+   derivation writes the forward row.
 
    **Commit style.** The bytes of a changeset made in Leep depend on whether
    `Leep-Changeset` and `Leep-Agent-*` trailers are written, so the style is
@@ -65,7 +69,9 @@ The design, phase by phase:
    derives git ids (open question 3); a mirror started with other flags
    refuses to start. `leep-git export` follows a recorded style; where none
    is recorded it keeps its old output (no `Leep-Changeset` trailer) and
-   records nothing, since its default is not the mirror's.
+   records nothing, since its default is not the mirror's. A style recorded
+   by mistake is undone by `repair drop --kind git-style-v1`, which drops
+   every git id derived under it with it (see "Repair" below).
 
 2. **Fetch and clone (phase 1).** `GET /git/{repo}.git/info/refs` and
    `POST .../git-upload-pack`, protocol v2 `ls-refs` and `fetch` (`want`,
@@ -102,19 +108,28 @@ The design, phase by phase:
 - **Where the style lives.** Not in `store_features` (ADR 0055): that table
   lists what a server must understand to read a store, and an older server
   refuses a store naming a feature it does not know. The style is a choice,
-  not a read requirement, so it is a derived-table row written once, with a
-  read back after the write. Two first writers that race with different
-  styles see the one that stuck and the loser refuses; a writer that read
-  its own value before being overwritten is the narrow remaining window,
-  which needs two operators starting differently configured tools at the
-  same moment.
-- **Reverse rows** are not deleted by the changeset sweep (their key is a
-  git id, which the sweep does not know). A lookup checks the forward row,
-  so a reverse row whose changeset is gone answers "unknown". Under the
-  `plain` style, two changesets differing only in extras that are not
-  exported have one commit; the reverse row names the first derived.
+  not a read requirement, so it is a derived-table row written once through
+  a new `MetaStore::put_derived_if_absent`, which stores a row only if none
+  is there and returns the row that won (one `INSERT ... ON CONFLICT DO
+  NOTHING` and a `SELECT` in one transaction on Postgres and SQLite). Of
+  first writers racing with different styles, a derivation recording the
+  default and a mirror's first start for example, exactly one style is
+  stored and every writer of another is refused.
+- **Reverse rows.** Under the `plain` style two changesets that differ only
+  in extras no commit shows have one commit. A commit's reverse row is
+  written with `put_derived_if_absent`, so it names the first changeset
+  derived to that commit and later ones leave it as it is. Blob and tree
+  reverse rows are functions of their keys (one content, one sha1), so they
+  are plain writes. The changeset sweep does not delete reverse rows (their
+  key is a git id, which it does not know); a lookup checks the forward
+  row, so a reverse row whose changeset was swept answers "unknown", also
+  for another changeset with the same commit, until the git maps are
+  dropped and derived again.
 - **Repair.** The git kinds derive on demand and are dropped together
-  (`repair drop --kind git-commit-v1` removes all four); `repair rederive`
+  (`repair drop --kind git-commit-v1` removes all four, and `repair drop
+  --kind git-style-v1` removes the style and all four, the way out of a
+  wrong style; servers keep the style they read, so restart them after);
+  `repair rederive`
   does not compute them, since that would read every blob of a store that
   never used git. `verify` recomputes stored rows (blob ids from the bytes,
   tree ids from their children's stored rows, commit ids by derivation) and

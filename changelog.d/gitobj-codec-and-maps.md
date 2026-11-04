@@ -10,4 +10,11 @@
   another style; `leep-git export` follows a recorded style.
 - **Changed.** The git object codec moved from `leep-git` into a new crate,
   `leep-gitobj`, shared by the importer, the exporter, the mirror and the
-  server. Commit bytes are unchanged.
+  server. The importer's and the mirror's commit bytes are unchanged.
+- **Changed.** `leep-git export` of a store that recorded its commit style
+  writes commits under it: under `trailer`, changesets made in Leep get a
+  `Leep-Changeset:` trailer they did not get before. Without a recorded
+  style its output is as before.
+- **Added.** `MetaStore::put_derived_if_absent`, a write that keeps the
+  first row; `repair drop --kind git-style-v1` undoes a wrong style with
+  every git id derived under it.
