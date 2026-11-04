@@ -967,3 +967,145 @@ async fn import_of_a_shallow_clone_fails_cleanly() {
         .unwrap();
     assert_eq!(r.commits_imported, 3);
 }
+
+/// Every imported commit, its tree and its blobs get their own git ids
+/// back from the derived maps (ADR 0090): no export, no recorded mapping.
+async fn assert_derived_ids_are_gits(repo: &Repo, dir: &Path) {
+    use leep_derive::git_map::GitObject;
+    let shas = git(dir, &["rev-list", "main"]);
+    for sha in shas.lines() {
+        let key = leep_core::Hash::of_object("git-commit", &hex(sha));
+        let id = repo
+            .meta()
+            .get_derived(leep_git::GIT_TO_LEEP, &key)
+            .await
+            .unwrap()
+            .expect("imported");
+        let id = ChangesetId(leep_core::Hash(id.as_ref().try_into().unwrap()));
+        let oid = repo.git_commit_id(id).await.unwrap();
+        assert_eq!(oid.to_string(), sha);
+        assert_eq!(
+            repo.git_object(&oid).await.unwrap(),
+            Some(GitObject::Commit(id))
+        );
+        let root = repo.root_tree(id).await.unwrap();
+        let tree = repo.git_tree_id(root).await.unwrap();
+        assert_eq!(
+            tree.to_string(),
+            git(dir, &["rev-parse", &format!("{sha}^{{tree}}")])
+        );
+    }
+    for line in git(dir, &["ls-tree", "-r", "main"]).lines() {
+        let (meta, path) = line.split_once('\t').unwrap();
+        let blob = meta.split(' ').nth(2).unwrap();
+        let data = Command::new("git")
+            .args(["cat-file", "blob", blob])
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .stdout;
+        let hash = leep_core::Hash::of_blob(&data);
+        let ids = repo.git_blob_ids(&[hash]).await.unwrap();
+        assert_eq!(ids[0].to_string(), blob, "{path}");
+        assert_eq!(
+            repo.git_object(&ids[0]).await.unwrap(),
+            Some(GitObject::Blob(hash))
+        );
+    }
+}
+
+fn hex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn derived_git_ids_equal_the_imported_history() {
+    let d = linear_fixture();
+    let p = d.path();
+    git(p, &["checkout", "-q", "-b", "side", "HEAD~1"]);
+    write(p, "side.txt", "side\n");
+    git(p, &["add", "-A"]);
+    git_env(p, &["commit", "-q", "-m", "side"], 1_700_001_000, "+0530");
+    git(p, &["checkout", "-q", "main"]);
+    git_env(
+        p,
+        &["merge", "-q", "--no-ff", "-m", "merge", "side"],
+        1_700_002_000,
+        "-0800",
+    );
+    // A commit git's porcelain would not write: `-0000` and Latin-1.
+    write(p, "z.txt", "z\n");
+    git(p, &["add", "-A"]);
+    let head = git(p, &["rev-parse", "main"]);
+    let odd = raw_commit(
+        p,
+        Some(&head),
+        &[
+            b"author Jos\xe9 <jose@example.com> 1700000000 -0000",
+            b"committer Ren\xe9e <renee@example.com> 1700000001 +0100",
+            b"encoding ISO-8859-1",
+        ],
+        b"caf\xe9\n",
+    );
+    git(p, &["update-ref", "refs/heads/main", &odd]);
+
+    let repo = new_repo();
+    import(&repo, &p.join(".git"), "main", &ImportOptions::default())
+        .await
+        .unwrap();
+    assert_derived_ids_are_gits(&repo, p).await;
+    // From a cold store: the same ids with every git row dropped.
+    for k in ["git-blob-v1", "git-tree-v1", "git-commit-v1", "git-oid-v1"] {
+        repo.meta().delete_derived_kind(k).await.unwrap();
+    }
+    let fresh = Repo::new(repo.blobs().clone(), repo.meta().clone());
+    assert_derived_ids_are_gits(&fresh, p).await;
+}
+
+/// `leep-git export` of a store that recorded its commit style writes the
+/// commits the store's git maps derive; one whose flags disagree is refused.
+#[tokio::test]
+async fn export_follows_the_recorded_style() {
+    let repo = new_repo();
+    let c1 = repo
+        .create_changeset(native(
+            vec![],
+            "initial\n",
+            BTreeMap::from([put_file(&repo, "README.md", "hi\n", FileKind::Regular).await]),
+            BTreeMap::from([("agent.model".to_string(), "m".to_string())]),
+        ))
+        .await
+        .unwrap();
+    repo.set_git_style(leep_gitobj::CommitStyle::default())
+        .await
+        .unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let bare = out.path().join("s.git");
+    let e = export(&repo, c1, &bare, "main", &ExportOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(e.head, Some(repo.git_commit_id(c1).await.unwrap()));
+    let body = git(&bare, &["log", "-1", "--format=%B", "main"]);
+    assert_eq!(body, format!("initial\n\nLeep-Changeset: {c1}"));
+    git(&bare, &["fsck", "--strict"]);
+
+    let other = tempfile::tempdir().unwrap();
+    let err = export(
+        &repo,
+        c1,
+        &other.path().join("p.git"),
+        "main",
+        &ExportOptions {
+            provenance_trailers: true,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("drop --provenance-trailers"),
+        "{err}"
+    );
+}

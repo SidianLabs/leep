@@ -1154,6 +1154,19 @@ impl Client {
         )
     }
 
+    /// `GET /v1/git/style` (ADR 0090).
+    pub fn git_style(&self) -> Result<leep_core::api::GitStyleResponse> {
+        self.json(self.http.get(self.url("/v1/git/style")))
+    }
+
+    /// `POST /v1/git/style`: record the store's commit style, or check it.
+    pub fn set_git_style(&self, style: &str) -> Result<leep_core::api::GitStyleResponse> {
+        let req = leep_core::api::GitStyleRequest {
+            style: style.to_string(),
+        };
+        self.json(self.http.post(self.url("/v1/git/style")).json(&req))
+    }
+
     pub fn merge(&self, req: &MergeRequest) -> Result<MergeResponse> {
         self.json(self.http.post(self.url("/v1/merge")).json(req))
     }

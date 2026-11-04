@@ -6,7 +6,7 @@ use gix::ObjectId;
 use leep_core::{ChangesetId, Error, FileKind, Hash, Result};
 use leep_derive::Repo;
 
-use leep_gitobj::{commit_object, sort_entries};
+use leep_gitobj::{commit_for, commit_object, sort_entries};
 
 use crate::{gerr, git_key, lookup_git, lookup_leep, GIT_TO_LEEP, LEEP_TO_GIT};
 
@@ -118,6 +118,25 @@ pub async fn export(
         gix::init_bare(git_dir).map_err(gerr)?
     }
     .into_sync();
+    // A store that recorded its commit style (ADR 0090) exports under it,
+    // so these commits are the ids its git maps derive. One without keeps
+    // this command's old output and records nothing: its default (no
+    // `Leep-Changeset:` trailer) is not the mirror's, and writing it would
+    // lock the store into it before anyone chose.
+    let style = repo.git_style().await?;
+    if let Some(s) = style {
+        if s.provenance_trailers != opts.provenance_trailers {
+            return Err(Error::Invalid(format!(
+                "this store's git commit style is {:?}; {} --provenance-trailers to match it",
+                s.encode(),
+                if s.provenance_trailers {
+                    "pass"
+                } else {
+                    "drop"
+                }
+            )));
+        }
+    }
     let (order, skipped) = plan(repo, &ts, rev).await?;
     let mut report = ExportReport {
         commits_skipped: skipped,
@@ -183,7 +202,10 @@ pub async fn export(
 
         let g = ts.to_thread_local();
         let tree = write_trees(&g, files)?;
-        let commit = commit_object(&cs, tree, parents, opts.provenance_trailers, None)?;
+        let commit = match style {
+            Some(s) => commit_for(&cs, id, tree, parents, s)?,
+            None => commit_object(&cs, tree, parents, opts.provenance_trailers, None)?,
+        };
         let oid =
             gix::prelude::Write::write_buf(&g, gix::objs::Kind::Commit, &commit).map_err(gerr)?;
         done.insert(id, oid);
