@@ -933,7 +933,8 @@ new labels and half-deleted conflicts all count. A conflicted `land` is
 remembered in `state.resolving` until a land lands or a checkout moves away,
 and the commit made on the head it rebased onto records the replaced stack in
 `leep.rebased_from` (comma-joined ids), a hint a server may use to carry
-review verdicts over to identical changes.
+review verdicts over to identical changes, or to the server's own rebase of
+them (ADR 0089).
 Conflicts with no text merge (binary, delete versus modify) keep the local
 version and are recorded in `state.unresolved`; they block the same way until
 `leep resolve PATH` or `leep restore PATH` clears them. If the
@@ -1544,8 +1545,16 @@ content and kind, old relative to each one's own first parent
 each reviewer's newest review among the candidates that reproduce a path
 decides, a reject or withdrawal on a copy is also written on the candidates
 whose approval carried to it, and at most 16 candidates with reviews are
-compared (with more, none carry). `review-status` names the source in
-`carried_from`. It is a second
+compared (with more, none carry). A path whose base moved also counts
+when Y's file is exactly the server's own rebase of X's change onto Y's base
+(`diffy::merge` as `rebase_as` calls it), or keeps both sides' insertions
+where the merge conflicts only between pure insertions at one place
+([ADR 0089](adr/0089-review-verdicts-carry-across-client-rebases.md),
+`leep_derive::carry`): text only, at most 2 MiB a side, never `OWNERS`, at
+most 32 merged paths per candidate, outcomes cached in process by content
+hash, and never on a strict land ref (ADR 0066). `review-status` names the
+source in `carried_from` and how in `carried_rule`, and lists the
+candidates it compared in `origins`, with why one did not carry. It is a second
 `LandPolicy`: `Repo::with_land_policy` composes policies (all must pass), and
 `check_land` now receives the head so owners and new history agree.
 `GET .../review-status?ref=` shows the per-path state (and `on_refs`, the
@@ -1572,8 +1581,8 @@ copies' server-written `rebased-origin-v1` rows, and anything else now on
 the head's first-parent chain). It also closes requests whose changeset a
 changeset the land added (from the ref log entry of the move down to the
 old head) names in `leep.rebased_from`, when that changeset lands the
-reviewed change byte for byte (ADR 0085's content rule, with the policy's
-auto rules) or the land's token made the request
+reviewed change (ADR 0085's content rule, with the policy's auto rules and
+ADR 0089's rebased and union rules) or the land's token made the request
 ([ADR 0087](adr/0087-review-requests-close-by-content.md)): the hint picks
 what to compare and content decides, so a forged hint closes nothing whose
 change did not land. It never changes the ref and its errors are only
@@ -1581,7 +1590,8 @@ logged, so it cannot fail a land. A listing closes what the task missed,
 for requests on the page, by a first-parent check against the ref's head
 and the content rule over the newest 64 changesets there. Entries carry
 `approved_by` and `rejected_by`, the reviewers' own verdicts, read in one
-batch per page.
+batch per page, and the changeset's first 16 `paths` and how many it
+`changed` (ADR 0089).
 An authenticated `POST /v1/changesets` writes a `created-by-v1` row only
 in the store write that inserts the changeset
 (`put_changeset_with_derived_if_new`), and `GET /v1/changesets/{id}` answers it as `created_by`, so

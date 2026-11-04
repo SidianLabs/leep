@@ -715,6 +715,25 @@ send them:
 
 Nothing persisted changed.
 
+Later additions (ADR 0089), likewise optional, `#[serde(default)]` and
+omitted when empty:
+
+- `PathReview` gains `carried_rule`, set with `carried_from`: `identical`
+  (same old and new contents), `rebased` (the server's rebase of the
+  original's change onto the judged changeset's base) or `union` (both
+  sides' insertions at one place, kept whole). A client that does not know
+  a value shows `carried_from` alone.
+- `ReviewStatusResponse` gains `origins`: `[OriginStatus {from, reviews:
+  [{reviewer, verdict}], carried, differs?, reason?}]`, the candidates named
+  by `leep.rebased_from` (and the server's rows) that were compared, nearest
+  first, each with the verdicts that would carry, whether they do, the
+  reviewed path not reproduced (`differs`) or another reason in words
+  (`reason`). Candidates without such verdicts are not listed.
+- `ReviewRequestEntry` gains `paths` (the first 16 paths the changeset
+  changes, in path order) and `changed` (how many it changes).
+
+Nothing persisted changed.
+
 ## Index leases and bounded queries (additive, ADR 0058)
 
 No table, column or stored encoding changed.

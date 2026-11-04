@@ -68,7 +68,7 @@ change with a regression test.
 | S-21 | Auth | Low | Tokens had no time bound, so a token made for a short-lived agent stayed valid until removed by hand | Fixed 2026-10-21, `expires`, ADR 0007 |
 | S-23 | Review | High | A merge that kept its first parent's version dropped a side parent's change without review; an empty merge with an old first parent could rewind a reviewed ref | Fixed 2026-10-28, ADR 0011 |
 | S-22 | Review | Medium | Every write token was a reviewer, so one agent could approve another's change, or its own on unowned paths | Fixed 2026-10-21, `"review": false`, ADR 0011 |
-| S-24 | Review | Info | Verdicts carried to a re-committed changeset (ADR 0085) must not follow a forged `leep.rebased_from`, a moved base or a dropped path; the clean-replay trust of ADR 0011 remains | Designed in 2026-11-03, ADR 0085; review requests close by the same rule, 2026-11-04, ADR 0087 |
+| S-24 | Review | Info | Verdicts carried to a re-committed changeset (ADR 0085) must not follow a forged `leep.rebased_from`, a moved base or a dropped path; the clean-replay trust of ADR 0011 remains | Designed in 2026-11-03, ADR 0085; review requests close by the same rule, 2026-11-04, ADR 0087; carrying across the server's own rebase result and unions of insertions, 2026-11-04, ADR 0089 |
 
 ### S-01: merge-parent laundering (High, fixed)
 
@@ -208,6 +208,41 @@ auto rule, a replayed land on top, the requester's later land on top, and a
 listing), `a_resolution_that_changed_a_reviewed_byte_stays_open`,
 `another_agents_land_naming_it_does_not`,
 `the_requesters_own_land_closes_a_stack_entry_the_content_rule_refuses`.
+
+*Third follow-up: client rebases (ADR 0089).* A reviewed path whose base
+moved now also carries when the judged changeset's file is exactly what
+the server's own rebase of the reviewed change onto its first parent makes
+(`diffy::merge(X.old, Y.old, X.new)`, clean, hash equal), or, where that
+merge conflicts only in regions with an empty base part, one of the two
+unions keeping both sides (one side first in every region). The risk is a
+laundered approval through a resolution that looks like the reviewed
+change: forged hints, a chosen base, reordered or moved hunks. The
+analysis: the hint only picks what to compare; the result is a function of
+three stored blobs, two of them what the reviewer saw and one Y's parent,
+which is on the ref or lands in Y's stack and is judged itself, so the
+rebased rule grants exactly the clean-replay trust ADR 0011 already gives
+the server's copies, and nothing on a strict land ref (where the server
+never merges contents, only identical paths carry). The union rule is the
+one extension: an order bit over two insertions, each already on the ref or
+reviewed, with nothing between them deleted or edited; accepted. Hunk
+comparison was rejected: identical `+` lines can sit in another function.
+Marker look-alikes in the texts cannot confuse the union parser (markers
+are longer than any run in the inputs, runs over 64 refuse, and a text
+without a final newline refuses). `OWNERS` files, symlinks, kind changes,
+non-UTF-8 and blobs over 2 MiB never merge, and a candidate needing more
+than 32 merges carries nothing. Requests close by the same check. Tests in
+`crates/leep-server/tests/reviews.rs`:
+`an_approval_carries_to_a_resolution_equal_to_the_servers_rebase`,
+`an_approval_carries_to_a_union_of_two_appends_in_either_order`,
+`a_union_that_edits_a_base_line_stays_pending`,
+`a_resolution_with_one_extra_line_stays_pending`,
+`reviewed_lines_moved_to_another_function_stay_pending`,
+`a_rebased_kind_change_stays_pending`,
+`a_reject_takes_back_through_a_rebased_carry`,
+`too_many_merged_paths_carry_nothing`, `an_oversized_blob_is_not_merged`,
+`a_strict_ref_carries_only_identical_changes`; in `leep-derive`,
+`a_request_closes_when_its_change_lands_rebased_by_the_client` and
+`carry::tests::marker_lookalikes_in_the_texts_do_not_confuse_the_union`.
 
 ### S-02: checkout writes outside the working copy (High, fixed)
 

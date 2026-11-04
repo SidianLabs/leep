@@ -134,7 +134,7 @@ names, as in `OWNERS` files.
 |---|---|
 | `leep review request REV [-m MSG]` | Ask for a review of `REV` before it lands on the target ref (`--ref` for another). With no `--to`, the server asks the owners of the paths still pending or rejected on that ref, or any reviewer when none is owned. Prints `Requested review of ID on REF from NAMES (#N)` and how to follow it up (`leep review status ID --ref REF --wait`, `leep review cancel N`); asking again for the same thing answers the open request (`Already requested ...`). `--wait[=SECS]` then waits for the verdict as `leep review status --wait` does. |
 | `leep review request REV --to NAME [--to NAME]...` | Ask these reviewers instead. Each must be a token that may review, and not you; anything else is refused (exit 1). |
-| `leep review inbox` | Open requests that name you, or that any reviewer may take and someone else made, newest first: `#N STATE ID -> REF by REQUESTER (created by CREATOR), for REVIEWERS (TIME)`, then the changeset's title and the note. The header ends with who answered (`, approved by you, rhea`, `, rejected by bo`: verdicts on the changeset itself; carried ones are judged by `review status`). Requests you already approved or rejected are left out, with a count of them at the end (also left out of `--json`); withdrawing your verdict brings one back. `--mine` lists the requests you made, `--all` adds closed ones and the ones you answered, `-n N` caps the list (50, counted before your answered ones are left out). |
+| `leep review inbox` | Open requests that name you, or that any reviewer may take and someone else made, newest first: `#N STATE ID -> REF by REQUESTER (created by CREATOR), for REVIEWERS (TIME)` (`for any reviewer, no owner pending` when no pending path had an owner to ask), then the changeset's title, its files (`files: a.rs, b.rs (+3)`, from servers with ADR 0089) and the note. The header ends with who answered (`, approved by you, rhea`, `, rejected by bo`: verdicts on the changeset itself; carried ones are judged by `review status`). Requests you already approved or rejected are left out, with a count of them at the end (also left out of `--json`); withdrawing your verdict brings one back. `--mine` lists the requests you made, `--all` adds closed ones and the ones you answered, `-n N` caps the list (50, counted before your answered ones are left out). `--wait[=SECS]` asks again, with `review status --wait`'s backoff, until something is listed (exit 0) or SECS pass (exit 1; default 3600, 0 for no limit). |
 | `leep review cancel N` | Withdraw request `N`, which you made. |
 
 The ref must exist (or be one the server protects), and you may have at most 100 open requests; one more
@@ -203,7 +203,15 @@ patch, and with `--json` puts it in a `patch` field beside the changeset.
 satisfied it (`approved by rhea (any reviewer)`, `approved by alice (owner)`,
 `needs no review (auto:docs_only)`) or what it still needs
 (`needs one of: alice, bob`), and ends with `diff: leep diff ID`. `--json`
-keeps the server's rule names (`owner`, `pending`, ...). Once the ref
+keeps the server's rule names (`owner`, `pending`, ...). A path whose
+verdict carried from the changeset's original ends `; carried from X
+(identical)`, `(rebased onto the new base)` or `(both sides' insertions
+kept)`. Before the `diff:` line, each original the changeset names
+(`leep.rebased_from`) whose reviews could carry gets a line:
+`replaces X, approved by rhea; carried`, or `replaces X, approved by rhea;
+not carried: PATH differs (leep diff X; leep diff ID)`, so a reviewer can
+compare the two and approve again
+([ADR 0089](adr/0089-review-verdicts-carry-across-client-rebases.md)). Once the ref
 holds the changeset (the server's `on_refs` names it,
 [ADR 0087](adr/0087-review-requests-close-by-content.md)), the first line
 says `landed on main` instead of `not approved` and the exit status is 0:
@@ -223,7 +231,8 @@ approved for the ref or the ref holds it (exit 0), a path is rejected
 default 3600; `--wait=0` waits without limit). It asks after 2 seconds,
 then twice as late each time, at most a minute apart, and prints the last
 status either way; what it is waiting for goes to stderr. A land refused
-for review names both `leep review request @ --ref REF` and this.
+for review names both `leep review request ID --ref REF` (the refused
+changeset, from the server's message; `@` when it names none) and this.
 
 ## Landing onto a new ref
 
@@ -299,8 +308,17 @@ carries it), and the commit made on that head records the changesets it
 replaces in `leep.rebased_from`: their ids, newest first and joined with
 commas when the land carried a stack. A server can use it to carry review
 verdicts over to the resolution where the reviewed changes are byte for byte
-the same; the ids are only a hint, and the server checks content. Any
+the same, or exactly what the server's own rebase of them onto the new head
+would have made, or keep both sides' lines where both only added lines at
+one place ([ADR 0089](adr/0089-review-verdicts-carry-across-client-rebases.md));
+the ids are only a hint, and the server checks content. The conflict report
+says so: other paths need review again. Any
 checkout, `sync`, `switch` or `reset --hard` forgets the land.
+
+A land the server replays onto a moved head gives the copy a new id and
+prints `Landed ID on REF (rebased from ORIGINAL; reviews of the original
+count)`: the copy's `leep.rebased_from` names the original, and the land
+policy judged the original, so its reviews count for the copy.
 
 ## Bisect
 
@@ -455,5 +473,7 @@ print their normal JSON result and exit 5 rather than an error.
   | `NO_COLOR`, `CLICOLOR_FORCE`, `CLICOLOR` | Colour, as above; output to a pipe is plain unless `CLICOLOR_FORCE` is set. |
   | `LEEP_PAGER`, `PAGER` | Pager for `log`, `diff` and `show` on a terminal; never used for a pipe. |
 
-- `leep commit` prints the new changeset's full id on stdout, so
-  `id=$(leep commit -m ...)` works.
+- `leep commit` prints the new changeset's full id on stdout when stdout is
+  not a terminal, so `id=$(leep commit -m ...)` works, with
+  `committed ID (N files)` on stderr; on a terminal it prints that one line
+  only.

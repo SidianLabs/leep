@@ -193,3 +193,9 @@ now names the original in `taken_back`, and the client can say so.
 - **Join verdicts into request rows.** Verdicts can change after the
   request is written and are per reviewer; reading them at listing is one
   batched query and never stale.
+
+*Amended by [ADR 0089](0089-review-verdicts-carry-across-client-rebases.md):*
+the content rule uses `carried_paths` with its rebased and union rules
+(identical only on a strict land ref), so a request also closes when its
+reviewed change lands as the server's rebase of it or as a union of
+insertions. `ReviewRequestEntry` gains `paths` and `changed`.
