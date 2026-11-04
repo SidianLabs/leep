@@ -106,6 +106,8 @@ struct CulpritsArgs {
     target_ref: Option<String>,
     bad: Option<String>,
     good: Option<String>,
+    limit: Option<usize>,
+    before: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -558,7 +560,13 @@ impl Server {
         let good = non_empty(a.good.as_deref())
             .map(|g| self.resolve_rev(Some(g)))
             .transpose()?;
-        let resp = self.client.culprits(target, bad.as_ref(), good.as_ref())?;
+        let resp = self.client.culprits(
+            target,
+            bad.as_ref(),
+            good.as_ref(),
+            a.before,
+            Some(a.limit.unwrap_or(50).clamp(1, 500)),
+        )?;
         let mut v = serde_json::to_value(&resp).map_err(|e| ToolError(e.to_string()))?;
         v["note"] = json!(
             "Suspects are the lands in the range, not a verdict: a land that fails only \

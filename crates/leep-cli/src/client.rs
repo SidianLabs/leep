@@ -735,8 +735,16 @@ impl Client {
         name: &str,
         bad: Option<&ChangesetId>,
         good: Option<&ChangesetId>,
+        before: Option<u64>,
+        limit: Option<usize>,
     ) -> Result<CulpritsResponse> {
         let mut query = Vec::new();
+        if let Some(b) = before {
+            query.push(("before", b.to_string()));
+        }
+        if let Some(l) = limit {
+            query.push(("limit", l.to_string()));
+        }
         if let Some(b) = bad {
             query.push(("bad", b.to_string()));
         }

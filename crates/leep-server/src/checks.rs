@@ -349,10 +349,12 @@ pub(crate) async fn for_ref(
 pub(crate) struct CulpritsQuery {
     bad: Option<String>,
     good: Option<String>,
+    limit: Option<usize>,
+    before: Option<u64>,
 }
 
-/// `GET /v1/refs/{name}/culprits?bad=rev&good=rev`: the suspects, the lands
-/// in the range, never a verdict on one of them.
+/// `GET /v1/refs/{name}/culprits?bad=rev&good=rev&limit=n&before=seq`: the
+/// suspects, the lands in the range, never a verdict on one of them.
 pub(crate) async fn culprits(repo: &Repo, name: &str, q: CulpritsQuery) -> ApiResult<Response> {
     let bad = match q.bad.as_deref().filter(|b| !b.is_empty()) {
         Some(rev) => Some(repo.resolve(rev).await?),
@@ -362,7 +364,11 @@ pub(crate) async fn culprits(repo: &Repo, name: &str, q: CulpritsQuery) -> ApiRe
         Some(rev) => Some(repo.resolve(rev).await?),
         None => None,
     };
-    Ok(Json(repo.culprits(name, bad, good).await?).into_response())
+    let limit = q
+        .limit
+        .unwrap_or(leep_core::api::DEFAULT_SUSPECTS)
+        .clamp(1, leep_core::api::MAX_SUSPECTS);
+    Ok(Json(repo.culprits(name, bad, good, q.before, limit).await?).into_response())
 }
 
 /// The query of a `GET /v1/refs/...` that may be a culprits request.

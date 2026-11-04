@@ -493,6 +493,16 @@ async fn suspects_are_the_lands_between_good_and_bad() {
         .ok();
     let got: Vec<ChangesetId> = c.suspects.iter().map(|s| s.changeset).collect();
     assert_eq!((c.good, got), (Some(h[1]), vec![h[4], h[3], h[2]]));
+    // Paged: two at a time.
+    let p: CulpritsResponse = api.get("/v1/refs/main/culprits?limit=2").await.ok();
+    assert_eq!(p.suspects.len(), 2);
+    let n = p.next.expect("more");
+    let p: CulpritsResponse = api
+        .get(&format!("/v1/refs/main/culprits?limit=2&before={n}"))
+        .await
+        .ok();
+    let got: Vec<ChangesetId> = p.suspects.iter().map(|s| s.changeset).collect();
+    assert_eq!((got, p.next), (vec![h[4], h[3]], None));
     let r = api
         .get(&format!("/v1/refs/main/culprits?bad={}", h[1]))
         .await;
@@ -548,6 +558,7 @@ fn wire_shapes_are_additive() {
     }))
     .unwrap();
     assert!(r.suspects[0].paths.is_empty() && r.suspects[0].actor.is_none());
+    assert_eq!(r.next, None);
     // Field names on the wire.
     let v = serde_json::to_value(Promotion {
         target_ref: "main".into(),

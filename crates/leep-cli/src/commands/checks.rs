@@ -75,6 +75,12 @@ pub struct CulpritsArgs {
     /// to look below green.
     #[arg(long, value_name = "REV")]
     pub good: Option<String>,
+    /// Most suspects to list (server default 100, at most 500).
+    #[arg(short = 'n', long)]
+    pub limit: Option<usize>,
+    /// Continue after a page: the `--before` it printed.
+    #[arg(long, value_name = "SEQ")]
+    pub before: Option<u64>,
 }
 
 pub fn run(r: &Remote, cmd: &ChecksCmd) -> Result<i32> {
@@ -205,7 +211,9 @@ fn culprits(r: &Remote, a: &CulpritsArgs) -> Result<i32> {
     let name = a.name.as_deref().unwrap_or(r.target_ref);
     let bad = a.bad.as_deref().map(|b| r.resolve(b)).transpose()?;
     let good = a.good.as_deref().map(|g| r.resolve(g)).transpose()?;
-    let resp = r.client.culprits(name, bad.as_ref(), good.as_ref())?;
+    let resp = r
+        .client
+        .culprits(name, bad.as_ref(), good.as_ref(), a.before, a.limit)?;
     if r.json {
         return print_json(&resp).map(|_| 0);
     }
@@ -257,9 +265,13 @@ fn culprit_lines(c: &CulpritsResponse) -> Vec<String> {
     }
     if c.truncated {
         out.push(
-            "(stopped at the walk's bound before reaching the good changeset; pass --bad lower)"
+            "(gave up looking for the land that brought it within 1024 ref moves; pass a \
+             newer --bad)"
                 .to_string(),
         );
+    }
+    if let Some(n) = c.next {
+        out.push(format!("(more: add --before {n})"));
     }
     out.push(
         "A suspect is a land in the range, not a verdict: a land that fails only together \
@@ -325,6 +337,7 @@ mod tests {
                 more_paths: false,
             }],
             truncated: true,
+            next: Some(6),
         };
         let text = culprit_lines(&c).join("\n");
         assert!(text.contains("Suspects for"), "{text}");
@@ -333,7 +346,10 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("not a verdict"), "{text}");
-        assert!(text.contains("bound"), "{text}");
+        assert!(
+            text.contains("1024") && text.contains("--before 6"),
+            "{text}"
+        );
         assert!(!text.to_lowercase().contains("the culprit"), "{text}");
     }
 }

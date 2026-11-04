@@ -36,7 +36,7 @@
 //! | POST | `/v1/changesets/{id}/checks` | [`PostCheckRequest`] | [`PostCheckResponse`] (records a check result; the poster is the token's name; 403 unless the token's `checks` names the check, or if the token created the changeset; 400 without authentication; 404 if the changeset is unknown; a pass that completes a ref's required checks promotes `green/<ref>`; ADR 0091) |
 //! | GET  | `/v1/changesets/{id}/checks` | – | [`ChecksResponse`] (the newest result of every check the server knows by name, and the green refs that hold the changeset) |
 //! | GET  | `/v1/refs/{name}/checks` | – | [`RefChecksResponse`] (the ref's head, its known-good `green/<name>`, how far green is behind, and whether the head is red; 404 if the ref does not exist; a ref literally named `{name}/checks` is answered as that ref; ADR 0091) |
-//! | GET  | `/v1/refs/{name}/culprits?bad=rev&good=rev` | – | [`CulpritsResponse`] (suspects: the lands in the range, the ref log entries of `name` above `good` up to the one that brought `bad`, newest first, at most 4096 entries read; `good` defaults to `green/<name>` and `bad` to the head; never a verdict: a land whose test fails only together with a later one shows that later one as a suspect too; 400 if `bad` is at or below green (without `good`), `good` is not below `bad`, or `bad` is not on the ref; a ref literally named `{name}/culprits` is answered as that ref; ADR 0091) |
+//! | GET  | `/v1/refs/{name}/culprits?bad=rev&good=rev&limit=n&before=seq` | – | [`CulpritsResponse`] (suspects: the lands in the range, the ref log entries of `name` above `good` up to the one that brought `bad`, newest first; `limit` defaults to 100, capped at 500, and `before` pages by the previous page's `next`; finding `bad`'s entry reads at most 1024 entries (`truncated`); `good` defaults to `green/<name>` and `bad` to the head; never a verdict: a land whose test fails only together with a later one shows that later one as a suspect too; 400 if `bad` is at or below green (without `good`), `good` is not below `bad`, or `bad` is not on the ref; a ref literally named `{name}/culprits` is answered as that ref; ADR 0091) |
 //! | POST | `/v1/review-requests` | [`CreateReviewRequest`] | [`CreateReviewRequestResponse`] (ask for a review of `changeset` before it lands on `target_ref`; the requester is the token's name; `reviewers` must be tokens that may review, and default to the owners of the paths the changeset still needs approved; an open request of the same requester, changeset, ref and reviewers is answered instead of a second one; 400 without authentication; 404 if the changeset is unknown, or `target_ref` is missing and no land policy covers it; 400 `too_many_review_requests` when the requester already has `MAX_OPEN_REQUESTS` (100) open; ADR 0086) |
 //! | GET  | `/v1/review-requests?reviewer=n&requester=n&changeset=id&ref=r&state=s&open=bool&before=id&limit=n` | – | [`ReviewRequestsResponse`] (newest first; `reviewer` matches requests that name it and requests open to any reviewer made by someone else; `state` is `open`, `landed` or `withdrawn`, `open=true` is `state=open` and `open=false` every closed state; `limit` defaults to 50, capped at 500; `before` pages by id; ADR 0086) |
 //! | GET  | `/v1/review-requests/{id}` | – | [`ReviewRequestEntry`] (404 if unknown) |
@@ -813,9 +813,18 @@ pub struct CulpritsResponse {
     /// Newest first: the moves that brought everything above `good` up to
     /// and including `bad`.
     pub suspects: Vec<Suspect>,
-    /// Whether the walk stopped at its bound before reaching `good`.
+    /// Whether finding the entry that brought `bad` gave up at its bound
+    /// (1024 ref moves); `suspects` is then empty.
     pub truncated: bool,
+    /// Pass as `before` for the next page; absent on the last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<u64>,
 }
+
+/// Suspects per culprits page unless `limit` says otherwise.
+pub const DEFAULT_SUSPECTS: usize = 100;
+/// Most suspects one culprits page holds.
+pub const MAX_SUSPECTS: usize = 500;
 
 /// A stored review as listed: the review's own fields plus, when a
 /// `review-source-v1` row exists (the review was posted on someone's behalf,

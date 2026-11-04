@@ -10,7 +10,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use bytes::Bytes;
 use leep_core::api::{
-    CulpritsResponse, Promotion, RedState, RefChecksResponse, Suspect, MAX_SUSPECT_PATHS,
+    CulpritsResponse, Promotion, RedState, RefChecksResponse, Suspect, MAX_SUSPECTS,
+    MAX_SUSPECT_PATHS,
 };
 use leep_core::changeset::EXTRA_AGENT_MODEL;
 use leep_core::check::{green_ref, Check, Outcome, CHECK_KIND};
@@ -20,14 +21,15 @@ use leep_core::{ChangesetId, Error, Hash, RefLogEntry, RefUpdateContext, Result}
 use crate::changeset_gc::RescueBy;
 use crate::Repo;
 
-/// Most ref log entries one suspects or red walk reads.
-pub const MAX_LOG_WALK: usize = 4096;
+/// Most ref log entries one request reads looking for the entry that
+/// brought a changeset: each costs up to two ancestry checks.
+pub const MAX_SEEK: usize = 1024;
 /// Ref log entries read per page of those walks.
 const LOG_PAGE: usize = 512;
 /// Most first-parent changesets the red walk looks at below the head.
 pub const MAX_RED_WALK: usize = 1024;
 /// Most changesets one suspect's paths are gathered from (a stack land).
-const MAX_SUSPECT_STACK: usize = 256;
+const MAX_SUSPECT_STACK: usize = 32;
 /// Compare-and-swap attempts one promotion makes. Each loss means another
 /// promotion moved green; only a newer one can keep it from being needed.
 const MAX_PROMOTE_ATTEMPTS: usize = 16;
@@ -280,31 +282,41 @@ impl Repo {
             cur = self.parents(id).await?.first().copied();
         }
         let rows = self.checks_by(&chain, names).await?;
-        let Some((newest, failing)) = chain.iter().find_map(|id| {
-            let rows = rows.get(id)?;
-            let fail = rows.iter().find(|c| c.outcome == Outcome::Fail);
-            Some((*id, fail.map(|c| c.check.clone())))
-        }) else {
-            return Ok(None);
-        };
-        let Some(check) = failing else {
-            return Ok(None);
-        };
-        // The failing run of that check: down from the newest attested
-        // changeset to the last one that passed it.
-        let mut first_failed = newest;
-        for id in chain.iter().skip_while(|id| **id != newest) {
-            match rows
-                .get(id)
-                .and_then(|r| r.iter().find(|c| c.check == check))
-            {
-                Some(c) if c.outcome == Outcome::Fail => first_failed = *id,
-                Some(_) => break,
-                None => {}
+        // Each check is judged by its own newest result above green; of the
+        // checks whose newest result failed, the one that has failed longest
+        // says since when the ref is red.
+        let mut red: Option<(usize, String)> = None;
+        for name in names {
+            let result = |id: &ChangesetId| {
+                rows.get(id)
+                    .and_then(|r| r.iter().find(|c| &c.check == name))
+                    .map(|c| c.outcome)
+            };
+            let Some(newest) = chain.iter().position(|id| result(id).is_some()) else {
+                continue;
+            };
+            if result(&chain[newest]) != Some(Outcome::Fail) {
+                continue;
+            }
+            // Down from the newest result to the last one that passed.
+            let mut first = newest;
+            for (i, id) in chain.iter().enumerate().skip(newest) {
+                match result(id) {
+                    Some(Outcome::Fail) => first = i,
+                    Some(_) => break,
+                    None => {}
+                }
+            }
+            if red.as_ref().is_none_or(|(at, _)| first > *at) {
+                red = Some((first, name.clone()));
             }
         }
+        let Some((at, check)) = red else {
+            return Ok(None);
+        };
+        let first_failed = chain[at];
         let since_seq = self
-            .introducing_entry(name, first_failed, MAX_LOG_WALK)
+            .introducing_entry(name, first_failed, MAX_SEEK)
             .await?
             .0
             .map(|e| e.seq);
@@ -316,7 +328,7 @@ impl Repo {
     }
 
     /// The ref log entry of `name` that brought `id` onto it, newest first
-    /// within [`MAX_LOG_WALK`] entries, the entries read above it, and where
+    /// within `max` entries, the entries read above it, and where
     /// the walk can go on. An entry brings `id` when it moved to `id`, or
     /// moved to a descendant of `id` from a changeset that did not hold it.
     async fn introducing_entry(
@@ -346,28 +358,35 @@ impl Repo {
 
     /// The suspects for a failure at `bad` (default: the head): the ref
     /// moves of `name` that brought anything above `good` (default: the
-    /// known-good `green/<name>`) up to and including `bad`, newest first.
-    /// A suspect is a land in the range, not a verdict: a land whose test
-    /// fails only together with a later one shows the later one too.
-    /// Reads at most [`MAX_LOG_WALK`] entries; `truncated` says it stopped
-    /// before reaching `good` (or the ref's first entry, without one).
+    /// known-good `green/<name>`) up to and including `bad`, newest first,
+    /// one page of at most `limit` at a time (`before`: the `next` of the
+    /// previous page). A suspect is a land in the range, not a verdict: a
+    /// land whose test fails only together with a later one shows the later
+    /// one too. Finding `bad`'s entry reads at most [`MAX_SEEK`] entries;
+    /// `truncated` says it gave up.
     pub async fn culprits(
         &self,
         name: &str,
         bad: Option<ChangesetId>,
         good: Option<ChangesetId>,
+        before: Option<u64>,
+        limit: usize,
     ) -> Result<CulpritsResponse> {
-        self.culprits_within(name, bad, good, MAX_LOG_WALK).await
+        self.culprits_within(name, bad, good, before, limit, MAX_SEEK)
+            .await
     }
 
-    /// [`Repo::culprits`] reading at most `max` ref log entries.
+    /// [`Repo::culprits`] seeking through at most `seek` ref log entries.
     pub(crate) async fn culprits_within(
         &self,
         name: &str,
         bad: Option<ChangesetId>,
         good: Option<ChangesetId>,
-        max: usize,
+        before: Option<u64>,
+        limit: usize,
+        seek: usize,
     ) -> Result<CulpritsResponse> {
+        let limit = limit.clamp(1, MAX_SUSPECTS);
         let head = self
             .meta()
             .get_ref(name)
@@ -403,50 +422,70 @@ impl Repo {
                 g
             }
         };
-        let (start, mut walk) = self.introducing_entry(name, bad, max).await?;
-        let Some(start) = start else {
-            return Ok(CulpritsResponse {
-                name: name.to_string(),
-                good,
-                bad,
-                suspects: Vec::new(),
-                truncated: true,
-            });
-        };
-        let mut entries = vec![start];
-        let truncated = loop {
-            let last = entries.last().expect("the walk starts with one entry");
-            // This entry began at or below green: it is the last suspect.
-            let reached = match (last.old, good) {
-                (None, _) => true,
-                (Some(old), Some(g)) => self.is_ancestor(old, g).await?,
-                (Some(_), None) => false,
-            };
-            if reached {
-                break false;
-            }
-            let Some(e) = walk.next(self, name).await? else {
-                // Out of entries: at the bound, or where logging began.
-                break walk.read >= walk.max;
-            };
-            match (e.new, good) {
-                // A delete, or a move to green or below it: nothing above.
-                (None, _) => break false,
-                (Some(new), Some(g)) if self.is_ancestor(new, g).await? => break false,
-                _ => entries.push(e),
-            }
-        };
-        let mut suspects = Vec::with_capacity(entries.len());
-        for e in entries {
-            suspects.push(self.suspect(e).await?);
-        }
-        Ok(CulpritsResponse {
+        let answer = |suspects, next, truncated| CulpritsResponse {
             name: name.to_string(),
             good,
             bad,
             suspects,
             truncated,
-        })
+            next,
+        };
+        // Where the page starts: the entry that brought `bad`, or the
+        // cursor of the previous page.
+        let (mut pending, mut walk) = match before {
+            None => {
+                let (start, mut walk) = self.introducing_entry(name, bad, seek).await?;
+                let Some(start) = start else {
+                    return Ok(answer(Vec::new(), None, true));
+                };
+                walk.max = walk.read + limit;
+                (Some(start), walk)
+            }
+            Some(b) => {
+                let mut walk = LogWalk::new(limit + 1);
+                walk.before = Some(b);
+                (None, walk)
+            }
+        };
+        let mut entries: Vec<RefLogEntry> = Vec::new();
+        let mut next = None;
+        loop {
+            let e = match pending.take() {
+                Some(e) => e,
+                None => match walk.next(self, name).await? {
+                    Some(e) => e,
+                    // Where logging began, or the page's one extra entry.
+                    None => break,
+                },
+            };
+            // A delete, or a move to good or below it: nothing above.
+            let Some(new) = e.new else { break };
+            if let Some(g) = good {
+                if self.is_ancestor(new, g).await? {
+                    break;
+                }
+            }
+            if entries.len() == limit {
+                next = entries.last().map(|l| l.seq);
+                break;
+            }
+            // This entry began at or below good: it is the last suspect.
+            let reached = match (e.old, good) {
+                (None, _) => true,
+                (Some(old), Some(g)) => self.is_ancestor(old, g).await?,
+                (Some(_), None) => false,
+            };
+            entries.push(e);
+            if reached {
+                break;
+            }
+        }
+        // Paths and creators for this page only.
+        let mut suspects = Vec::with_capacity(entries.len());
+        for e in entries {
+            suspects.push(self.suspect(e).await?);
+        }
+        Ok(answer(suspects, next, false))
     }
 
     async fn suspect(&self, e: RefLogEntry) -> Result<Suspect> {
@@ -454,14 +493,18 @@ impl Repo {
         let cs = self.get_changeset(new).await?;
         // Who made it: the changeset the land asked for, else the original
         // a server-made rebased copy came from.
-        let about = match e.land_changeset {
-            Some(c) => c,
-            None => self.rebased_origin(new).await?.unwrap_or(new),
-        };
-        let created_by = match self.meta().get_derived(CREATED_BY_KIND, &about.0).await? {
-            Some(b) => CreatedBy::decode(&b).ok().map(|c| c.principal),
-            None => None,
-        };
+        // The nearest one in the rebase chain with a recorded creator.
+        let about = e.land_changeset.unwrap_or(new);
+        let mut chain = vec![about];
+        chain.extend(self.rebase_chain(about).await?);
+        let keys: Vec<Hash> = chain.iter().map(|c| c.0).collect();
+        let created_by = self
+            .meta()
+            .get_derived_many(CREATED_BY_KIND, &keys)
+            .await?
+            .into_iter()
+            .flatten()
+            .find_map(|b| CreatedBy::decode(&b).ok().map(|c| c.principal));
         // Every changeset the move added on the first-parent chain: a land
         // of a stack moves the ref once.
         let floor = match e.old {
@@ -473,7 +516,11 @@ impl Repo {
         let mut steps = 0;
         let mut more_paths = false;
         while let Some(id) = cur {
-            if Some(id) == e.old || steps >= MAX_SUSPECT_STACK {
+            if Some(id) == e.old {
+                break;
+            }
+            if steps >= MAX_SUSPECT_STACK {
+                more_paths = true;
                 break;
             }
             // At or below the old head's generation the chain left the move.
@@ -848,7 +895,7 @@ mod tests {
         // Newest first: entries 0..=9 are lands 10..=1; lands 4..=10 are
         // above green.
         let want: Vec<ChangesetId> = log[..7].iter().map(|e| e.new.unwrap()).collect();
-        let c = r.culprits("main", None, None).await.unwrap();
+        let c = r.culprits("main", None, None, None, 100).await.unwrap();
         assert_eq!((c.good, c.bad, c.truncated), (Some(h[3]), h[10], false));
         let got: Vec<ChangesetId> = c.suspects.iter().map(|s| s.changeset).collect();
         assert_eq!(got, want);
@@ -860,35 +907,56 @@ mod tests {
             [leep_core::RepoPath::new("d9/f").unwrap()]
         );
         // A bad below the head: the suspects stop at the land that brought it.
-        let c = r.culprits("main", Some(h[6]), None).await.unwrap();
+        let c = r
+            .culprits("main", Some(h[6]), None, None, 100)
+            .await
+            .unwrap();
         let got: Vec<ChangesetId> = c.suspects.iter().map(|s| s.changeset).collect();
         assert_eq!(got, [h[6], h[5], h[4]]);
         // `good` looks below green.
-        let c = r.culprits("main", Some(h[5]), Some(h[1])).await.unwrap();
+        let c = r
+            .culprits("main", Some(h[5]), Some(h[1]), None, 100)
+            .await
+            .unwrap();
         let got: Vec<ChangesetId> = c.suspects.iter().map(|s| s.changeset).collect();
         assert_eq!((c.good, got), (Some(h[1]), vec![h[5], h[4], h[3], h[2]]));
         // Refusals: bad at or below green; good not below bad; bad off the ref.
         assert!(matches!(
-            r.culprits("main", Some(h[2]), None).await,
+            r.culprits("main", Some(h[2]), None, None, 100).await,
             Err(Error::Invalid(_))
         ));
         assert!(matches!(
-            r.culprits("main", Some(h[2]), Some(h[5])).await,
+            r.culprits("main", Some(h[2]), Some(h[5]), None, 100).await,
             Err(Error::Invalid(_))
         ));
         let wip = commit(&r, &[h[10]], &[("w", Some("1"))], "wip").await;
         assert!(matches!(
-            r.culprits("main", Some(wip), None).await,
+            r.culprits("main", Some(wip), None, None, 100).await,
             Err(Error::Invalid(_))
         ));
-        // Bounded: a short walk stops and says so.
-        let c = r.culprits_within("main", None, None, 3).await.unwrap();
-        assert_eq!(c.suspects.len(), 3);
-        assert!(c.truncated);
+        // Pages: three at a time, continued by `next`, give the same list.
+        let mut paged = Vec::new();
+        let mut before = None;
+        loop {
+            let c = r.culprits("main", None, None, before, 3).await.unwrap();
+            assert!(c.suspects.len() <= 3 && !c.truncated);
+            paged.extend(c.suspects.iter().map(|s| s.changeset));
+            match c.next {
+                Some(n) => before = Some(n),
+                None => break,
+            }
+        }
+        assert_eq!(paged, want);
+        // Bounded: a seek that cannot reach bad's land gives up and says so.
+        let c = r
+            .culprits_within("main", Some(h[5]), None, None, 100, 3)
+            .await
+            .unwrap();
+        assert!(c.suspects.is_empty() && c.truncated);
         // Without green, the walk goes to the ref's first entry.
         let r2 = repo();
         let h2 = landed(&r2, 3).await;
-        let c = r2.culprits("main", None, None).await.unwrap();
+        let c = r2.culprits("main", None, None, None, 100).await.unwrap();
         let got: Vec<ChangesetId> = c.suspects.iter().map(|s| s.changeset).collect();
         assert_eq!(
             (got, c.truncated),
@@ -965,5 +1033,16 @@ mod tests {
         post(&r, h[6], "test", Outcome::Pass).await;
         let s = r.ref_checks("main", &names, &names).await.unwrap();
         assert_eq!(s.red, None);
+        // Each check by its own newest result: lint failing on h[5] keeps
+        // the ref red even though h[6], newer, has only a test pass.
+        let both = req(&["lint", "test"]);
+        post(&r, h[5], "lint", Outcome::Fail).await;
+        let red = r
+            .ref_checks("main", &both, &both)
+            .await
+            .unwrap()
+            .red
+            .unwrap();
+        assert_eq!((red.first_failed, red.check.as_str()), (h[5], "lint"));
     }
 }

@@ -432,13 +432,16 @@ pub fn definitions() -> Vec<Value> {
              head), newest first, each with `changeset`, `seq`, `actor`, `created_by`, \
              `agent_model`, `title` and the `paths` it changed. A suspect is not a verdict: a \
              land whose test fails only together with a later one shows that later one too. \
-             `truncated` means the walk stopped at its bound (4096 ref moves).",
+             `truncated` means finding `bad`'s land gave up at 1024 ref moves; `next`, when \
+             present, continues the list as `before`.",
             json!({
                 "type": "object",
                 "properties": {
                     "ref": { "type": "string", "description": "Ref whose lands to list (default `main`)." },
                     "bad": { "type": "string", "description": "The failing changeset or rev (default: the ref's head)." },
-                    "good": { "type": "string", "description": "The last changeset known to pass (default: `green/<ref>`)." }
+                    "good": { "type": "string", "description": "The last changeset known to pass (default: `green/<ref>`)." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Max suspects (default 50)." },
+                    "before": { "type": "integer", "description": "The `next` value of the previous page, to continue it." }
                 },
                 "additionalProperties": false
             }),
