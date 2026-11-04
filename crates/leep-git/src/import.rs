@@ -490,17 +490,7 @@ pub async fn import(
     opts: &ImportOptions,
 ) -> Result<ImportReport> {
     let git = crate::open_git(git_dir)?;
-    // History cut at a shallow boundary would import as root commits whose
-    // ids differ from the full history's, so a later unshallowed import
-    // could not reuse them. Refuse instead of forking history.
-    if git.is_shallow().map_err(gerr)? {
-        return Err(Error::Invalid(format!(
-            "{} is a shallow git clone, so its history is incomplete and cannot \
-             be imported; run `git fetch --unshallow` in it (or clone without \
-             --depth) and import again",
-            git_dir.display()
-        )));
-    }
+    crate::refuse_shallow(&git, git_dir)?;
     let ts = git.into_sync();
     let head = {
         let g = ts.to_thread_local();

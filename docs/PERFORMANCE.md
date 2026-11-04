@@ -2601,13 +2601,21 @@ took the store from 104 GB of loose objects to one 2.74 GB pack plus a
 | Leep blobs: pack + index | 3.2 GB (plus loose objects of the last 42k commits until the next repack) |
 | Leep Postgres, before path history | 8.3 GB (`changesets` 2.9 GB, skiplists 0.9 GB) |
 | Leep Postgres, before path history, changesets compressed (ADR 0053, projected) | about 7.1 GB (`changesets` about 1.6-1.75 GB; see "Changeset compression") |
-| Leep Postgres, with the full path-history index | 27 GB (`history-node-v3`: 25.4M rows, 24 GB of values) |
+| Leep Postgres, with the full path-history index, v3 (retired) | 27 GB (`history-node-v3`: 25.4M rows, 24 GB of values) |
 | Leep Postgres, all indexes (v4, log filter, search), changesets compressed | 11 GB (`changesets` 1.86 GB; "After #93 to #98") |
 
-The path-history index costs about 16 KB per changeset on Linux against
+The v3 path-history index cost about 16 KB per changeset on Linux against
 1.9 KB on git/git: Linux's directories hold thousands of names and its merges
-bring in hundreds of paths from the second parent. It is now the largest
-thing Leep stores and the next storage target.
+bring in hundreds of paths from the second parent. It was the largest thing
+Leep stored, until path-history v4 (ADR 0045, "Index size: packs (ADR 0045)")
+replaced it. Measured on all of Linux, v4 is 2.68 GB of node parts plus
+1.63 GB of trees, 4.3 GB against v3's 24 GB of values (5.6x smaller; "After
+#84 to #91"), and 2.6 to 2.8 KB per changeset on Linux-shaped history
+(extrapolated from the slice and the synthetic history). On the synthetic
+one-million-changeset history the whole index is 1.19 GB ("One million
+changesets of history"). Later, in a 13.2 GB database, the largest kinds
+were `history-node-v4` 2.81 GB, `history-tree-v4` 1.93 GB and `skiplist`
+1.20 GB (logical sizes; "Unreachable changesets (E4)").
 
 **Repack after #80.** A second full repack over the finished store (10,358,516
 objects, 329,002 of them loose), `leep:a3a75de`, 4 threads:

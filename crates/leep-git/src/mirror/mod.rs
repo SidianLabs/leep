@@ -831,7 +831,9 @@ impl<'a> Mirror<'a> {
         }
         let git_dir = cfg.work_dir.join("git");
         let repo = if git_dir.exists() {
-            crate::open_git(&git_dir)?
+            let repo = crate::open_git(&git_dir)?;
+            crate::refuse_shallow(&repo, &git_dir)?;
+            repo
         } else {
             gix::init_bare(&git_dir).context("creating the mirror's git repository")?
         };
