@@ -28,6 +28,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use leep_core::lane::{self, Lane};
 use leep_core::prefix::IdPrefix;
+use leep_core::review_request::{
+    NewReviewRequest, ReviewRequest, ReviewRequestFilter, ReviewRequestState,
+};
 use leep_core::{
     BlobMeta, BlobStore, Changeset, ChangesetId, DeleteStep, DerivedRow, Hash, LandId, LandRecord,
     Lease, LeaseClaim, LeaseKey, LeaseTiming, MetaStore, RefLogEntry, RefStep, RefUpdateContext,
@@ -890,6 +893,29 @@ impl MetaStore for Budget {
         Ok(id)
     }
 
+    async fn put_changeset_with_derived_if_new(
+        &self,
+        cs: &Changeset,
+        rows: &[DerivedRow],
+        if_new: &[DerivedRow],
+    ) -> Result<bool> {
+        let inserted = self
+            .meta(
+                "meta.put_changeset_with_derived",
+                1 + n(rows.len() + if_new.len()),
+                cs_len(cs) + rows_len(rows) + rows_len(if_new),
+                self.meta
+                    .put_changeset_with_derived_if_new(cs, rows, if_new),
+                none,
+            )
+            .await?;
+        self.kind_rows(rows);
+        if inserted {
+            self.kind_rows(if_new);
+        }
+        Ok(inserted)
+    }
+
     async fn put_changesets_with_derived(
         &self,
         changesets: &[Changeset],
@@ -956,6 +982,63 @@ impl MetaStore for Budget {
 
     async fn schema_version(&self) -> Result<Option<u64>> {
         self.meta.schema_version().await
+    }
+
+    fn supports_review_requests(&self) -> bool {
+        self.meta.supports_review_requests()
+    }
+
+    async fn put_review_request(&self, req: &NewReviewRequest) -> Result<ReviewRequest> {
+        self.meta(
+            "meta.put_review_request",
+            1,
+            0,
+            self.meta.put_review_request(req),
+            none,
+        )
+        .await
+    }
+
+    async fn get_review_request(&self, id: u64) -> Result<Option<ReviewRequest>> {
+        self.meta(
+            "meta.get_review_request",
+            1,
+            0,
+            self.meta.get_review_request(id),
+            none,
+        )
+        .await
+    }
+
+    async fn list_review_requests(
+        &self,
+        filter: &ReviewRequestFilter,
+    ) -> Result<Vec<ReviewRequest>> {
+        self.meta(
+            "meta.list_review_requests",
+            1,
+            0,
+            self.meta.list_review_requests(filter),
+            none,
+        )
+        .await
+    }
+
+    async fn close_review_request(
+        &self,
+        id: u64,
+        state: ReviewRequestState,
+        landed_as: Option<ChangesetId>,
+        closed: i64,
+    ) -> Result<bool> {
+        self.meta(
+            "meta.close_review_request",
+            1,
+            0,
+            self.meta.close_review_request(id, state, landed_as, closed),
+            none,
+        )
+        .await
     }
 }
 

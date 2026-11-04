@@ -25,6 +25,42 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
   marker and without the `invalid input: ` prefix (`Error::Policy`). Older
   CLIs still exit 1 with the land hint, and the git mirror still counts the
   land refused.
+### Review requests, an inbox, and who created each change
+- **Added.** Review requests as server state (ADR 0086): `POST
+  /v1/review-requests` asks for a review of a changeset before it lands
+  on a ref, as the token's principal; with no reviewers named the server
+  asks the owners of the paths still pending or rejected, else any
+  reviewer. Named reviewers must be tokens that may review. `GET
+  /v1/review-requests` lists them by `reviewer`, `requester`, `changeset`,
+  `ref` and `state`/`open`, newest first and paged; `POST
+  /v1/review-requests/{id}/withdraw` withdraws one (its requester only).
+  A request closes as `landed` when its changeset, or the copy a land
+  replayed it as, lands on its ref: in a task after the land's answer that
+  can neither delay nor fail the land, and otherwise at the next listing.
+  New metrics `leep_review_requests_created_total`,
+  `leep_review_requests_closed_total{state}` and
+  `leep_review_request_close_errors_total`.
+- **Added.** `leep review request REV [--to NAME]... [-m MSG]`, `leep
+  review inbox [--mine] [--all]` and `leep review cancel N`.
+- **Added.** The creating principal: an authenticated `POST /v1/changesets`
+  writes a `created-by-v1` row (`{principal, timestamp}`) in the same store
+  write as the changeset; `GET /v1/changesets/{id}` answers it as
+  `created_by` (omitted when absent), review request listings carry it,
+  and `leep show` prints `Created-by:`. The first creator stays. Without
+  authentication nothing is recorded. DEPLOY.md now says to give every
+  agent its own token.
+- **Added.** A request needs its target ref to exist (or a land policy to cover
+  it), and one requester
+  may have at most 100 open requests (400, code
+  `too_many_review_requests`). Lands close requests only through the
+  server's own `rebased-origin-v1` links, never a client's
+  `leep.rebased_from`; a creator is recorded only by the store write that
+  inserts the changeset (`MetaStore::put_changeset_with_derived_if_new`),
+  so re-posting a stored changeset never claims it.
+- **Upgrade.** Migration 8 (`review_requests`) adds two empty tables; it
+  may run beside v7 servers, which never read them. There is no down
+  migration; OPERATIONS.md gives the SQL to drop it by hand. Backups copy
+  the tables.
 ### Snapshot tests keep the Postgres URL's query string
 - **Fixed.** The leep-meta snapshot tests' per-test database URL now swaps only the database name, so a Unix-socket `LEEP_TEST_POSTGRES_URL` (`?host=...&port=...`) works.
 

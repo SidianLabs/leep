@@ -3,6 +3,7 @@
 //! `repair rederive` and `repair drop`, and for the lists in the docs.
 
 use leep_core::review::{REVIEW_KIND, REVIEW_SOURCE_KIND};
+use leep_core::review_request::CREATED_BY_KIND;
 use leep_core::signature::SIGNATURE_KIND;
 use leep_core::Error;
 
@@ -196,6 +197,16 @@ static KINDS: &[KindInfo] = &[
         rederive: Rederive::No("review sources are not computed from history"),
         drop: DropPolicy::Refused(
             "review sources are audit records written with the reviews; they are not \
+             computed from history, so a dropped row is gone for good",
+        ),
+    },
+    KindInfo {
+        name: CREATED_BY_KIND,
+        class: KindClass::Attestation,
+        summary: "which token created a changeset, written with it",
+        rederive: Rederive::No("creators are not computed from history"),
+        drop: DropPolicy::Refused(
+            "the creator of a changeset is recorded once, when it is stored; it is not \
              computed from history, so a dropped row is gone for good",
         ),
     },

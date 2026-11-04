@@ -35,6 +35,7 @@ pub const PER_CHANGESET_KINDS: &[&str] = &[
     "skiplist",
     "last_merge-v1",
     REBASED_ORIGIN_KIND,
+    leep_core::review_request::CREATED_BY_KIND,
     "history-tree-v4",
     "log-filter-v1",
     crate::gc::GC_MARK,

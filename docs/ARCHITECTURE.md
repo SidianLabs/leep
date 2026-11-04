@@ -201,6 +201,7 @@ way.
 | `signature-v1` / `rebased-origin-v1` | attestations and server rebase links, keyed per (changeset, key) and per copy; not pure functions of the changeset, so written by `put_signature` and `rebase` rather than derived | signed-changeset listing and the land policy |
 | `review-v1` | review verdicts, keyed per (changeset, reviewer name) (`Hash::of_object("review", id‖name)`); attestations written by `put_review`, last write wins, listed with one lookup per reviewer (write tokens without `"review": false`) | review listing and the review land policy |
 | `review-source-v1` | which token posted a review for a named principal and the `source` it gave (`ReviewSource { via, source, timestamp }`), keyed as `review-v1` is; written by `put_review_source` beside the review (ADR 0063) | `source` and `via` in review listing, the audit trail |
+| `created-by-v1` | the token that first stored a changeset (`CreatedBy { principal, timestamp }`), keyed by changeset id; written in the changeset's own store write by an authenticated `POST /v1/changesets`, never replaced (ADR 0086) | `created_by` in `GET /v1/changesets/{id}`, `leep show` and review request listings |
 | `last_merge-v1` | generation of the nearest merge on the first-parent chain (0 if none) | lets `merge_base` answer from skiplists when no merge sits above the first-parent common ancestor |
 | `blob-claim-v1` / `blob-condemned-v1` / `blob-rescue-v1` / `blob-doom-v1` | per blob hash, 8-byte big-endian unix seconds (doom adds a state byte); GC bookkeeping, not derived from changesets: claims by uploads and dedup checks, condemnation by `gc condemn`, rescue by uploads of a condemned blob, doom by `gc collect` (ADR 0012) | blob garbage collection and the server's missing-blob checks |
 | `history-tree-v4` | the changeset's history pack (ADR 0045): the nodes of a tree parallel to `root_tree` recording for each path (including deleted ones) the newest changesets that changed it, as written by this changeset's derivation, and the address of its root. A pack is cut into parts of about 16 KB; this value is part 0 and `history-node-v4` rows hold the rest. Nodes are addressed by (writer, part, index) and name changesets through a table per part, so the hundreds of nodes a merge rewrites name its few dozen ids once; nodes of more than 64 entries are stored as content-defined chunks so an edit rewrites one chunk (ADR 0027), and a changed node, chunk or chunk list is stored as a patch on an earlier whole version that names the entries it replaces by position (ADR 0037). Built from the first parent's tree plus the spines of changed paths, and at merges the paths where the second parent's history differs from the merge base's (another parent's from the first's, for octopus or unrelated merges) (ADR 0013) | path log, `last-change` |
@@ -1402,6 +1403,7 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
 | Land CAS contention | Bounded retries, then an error | Client retries `land` |
 | Server started on a database from a newer release, or whose applied migration was edited | The store refuses to open (`database schema vN is newer than this server`), before any write | Upgrade the server; never edit an applied migration (ADR 0023) |
 | Server started on a store whose rows use a format feature it does not know (`store_features`) | The store refuses to open, naming the feature, before any read of a row | Upgrade the server (ADR 0055). Servers from before the table cannot check it, so finish a rollout before running `compact-changesets` |
+| A land's follow-up that closes review requests fails, times out or dies with the server | The land already answered and the ref already moved; the follow-up only updates `review_requests` rows, each in one conditional statement, so at worst some requests stay open (ADR 0086) | The next listing closes those whose changeset is on the ref's first-parent chain; a request for a replayed copy stays open until withdrawn |
 | Migration fails or the migrating process dies mid-run | Every pending migration and its `schema_migrations` row run in one transaction: the database stays at the version it started at | Fix the cause and start again; concurrent starters wait on the lock and find the work done |
 | Data damaged at rest (bit rot, a bad restore, a hand-edited table) | Content-addressed objects fail their hash check on read; derived rows without one can answer wrongly and silently (ADR 0021) | `leep-server verify` names every damaged object and row; `repair rederive` rewrites derived rows, and blobs and changesets are restored from backup (OPERATIONS.md, "Verify and repair") |
 | Backup taken while servers and GC run | The metadata snapshot is one instant; blobs are copied after it, and a blob the snapshot needs cannot have been deleted (ADR 0012), so the backup restores. A backup whose check finds a missing blob is sealed as failed, exits 1, and `restore` refuses it | Alert on `leep_backup_last_run_ok` and the last-success age; take another backup (ADR 0026) |
@@ -1544,6 +1546,28 @@ compared (with more, none carry). `review-status` names the source in
 `GET .../review-status?ref=` shows the per-path state, `GET .../reviews`
 lists verdicts (with `via` for rebased copies), and `leep review ...` and the
 `leep_review_status` MCP tool are the clients.
+
+**Review requests and creators** ([ADR 0086](adr/0086-review-requests-and-creators.md)).
+A review request is server state, not an attestation: rows of the
+`review_requests` and `review_request_reviewers` tables (migration 0008),
+written through `MetaStore::put_review_request` and closed by one
+conditional update from `open`. `POST /v1/review-requests` opens one for the
+token's principal; with no reviewers named, the server asks the owners of
+the paths `review-status` still finds pending or rejected on the target ref
+(any reviewer when none is owned). Named reviewers must be tokens that may
+review, the ref must exist, and a requester may have 100 open requests. `GET /v1/review-requests?reviewer=NAME&open=true` is a reviewer's
+inbox. After a land answers `landed`, a spawned task closes the ref's open
+requests that the land satisfied (the landed changeset, its stack by the
+copies' server-written `rebased-origin-v1` rows, never a client's
+`leep.rebased_from`, and anything else now on the head's
+first-parent chain); it never changes the ref and its errors are only
+logged, so it cannot fail a land. A listing closes what the task missed,
+for requests on the page, by a first-parent check against the ref's head.
+An authenticated `POST /v1/changesets` writes a `created-by-v1` row only
+in the store write that inserts the changeset
+(`put_changeset_with_derived_if_new`), and `GET /v1/changesets/{id}` answers it as `created_by`, so
+reviewers see which token made a change even when every agent uses the
+same author. `leep review request|inbox|cancel` are the clients.
 
 **Request path and limits** ([ADR 0020](adr/0020-request-limits.md)). A
 request passes, outermost first, through metrics, tracing, the request timeout,

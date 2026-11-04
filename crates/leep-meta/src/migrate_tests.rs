@@ -614,6 +614,12 @@ fn full_schema() -> BTreeSet<String> {
         "ref_log",
         "ref_log_name",
         "ref_log_land_id",
+        "review_requests",
+        "review_requests_open",
+        "review_requests_requester",
+        "review_requests_changeset",
+        "review_request_reviewers",
+        "review_request_reviewers_reviewer",
     ]
     .map(String::from)
     .into()
@@ -1007,7 +1013,12 @@ async fn upgrade_from_v4_adds_land_ids() {
         assert_eq!(plan.from, 4, "{kind}");
         assert_eq!(
             plan.pending.iter().map(|m| m.name).collect::<Vec<_>>(),
-            ["land_ids", "leases", "changeset_stored_at"],
+            [
+                "land_ids",
+                "leases",
+                "changeset_stored_at",
+                "review_requests"
+            ],
             "{kind}"
         );
         let s = db.open(db.compiled(), SchemaMode::Migrate).await.unwrap();
@@ -1063,7 +1074,7 @@ async fn upgrade_from_v6_adds_stored_at() {
         assert_eq!(plan.from, v6 as u64, "{kind}");
         assert_eq!(
             plan.pending.iter().map(|m| m.name).collect::<Vec<_>>(),
-            ["changeset_stored_at"],
+            ["changeset_stored_at", "review_requests"],
             "{kind}"
         );
         assert!(
@@ -1116,6 +1127,81 @@ async fn upgrade_from_v6_adds_stored_at() {
         assert_eq!(
             s.changesets_stored_at(&[skewed]).await.unwrap(),
             [Some(applied_at)],
+            "{kind}"
+        );
+        assert_eq!(db.objects().await, full_schema(), "{kind}");
+        drop(s);
+        db.cleanup().await;
+    }
+}
+
+/// A database at v7 upgrades to review requests (ADR 0086) beside a v7
+/// server that keeps running: everything it wrote reads back, it keeps
+/// working on the new schema (it never names the tables), and the new
+/// tables start empty and take requests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upgrade_from_v7_adds_review_requests() {
+    use leep_core::review_request::{NewReviewRequest, ReviewRequestFilter, ReviewRequestState};
+    for db in dbs("fromv7").await {
+        let kind = db.kind();
+        let d = data();
+        let old = db
+            .open(&db.compiled()[..7], SchemaMode::Migrate)
+            .await
+            .unwrap();
+        assert!(!old.supports_review_requests(), "{kind}");
+        load(&db, &STAGES[1], &d).await;
+        let plan = db.report(db.compiled()).await;
+        assert_eq!(plan.from, 7, "{kind}");
+        assert_eq!(
+            plan.pending.iter().map(|m| m.name).collect::<Vec<_>>(),
+            ["review_requests"],
+            "{kind}"
+        );
+        db.migrate(db.compiled(), false).await.unwrap();
+        let s = db
+            .open(db.compiled(), SchemaMode::RequireCurrent)
+            .await
+            .unwrap();
+        assert!(s.supports_review_requests(), "{kind}");
+        let all = ReviewRequestFilter {
+            limit: 100,
+            ..Default::default()
+        };
+        assert!(
+            s.list_review_requests(&all).await.unwrap().is_empty(),
+            "{kind}"
+        );
+        verify(&*s, &STAGES[1], &d, LATEST as u64).await;
+        // The v7 server still stores and moves refs on the new schema.
+        let late = old.put_changeset(&crate::tests::cs(717171)).await.unwrap();
+        let head = old.get_ref("feature/x").await.unwrap();
+        assert!(
+            old.cas_ref("feature/x", head, Some(late)).await.unwrap(),
+            "{kind}"
+        );
+        drop(old);
+        let r = s
+            .put_review_request(&NewReviewRequest {
+                changeset: late,
+                target_ref: "feature/x".into(),
+                requester: "ada".into(),
+                reviewers: vec!["rhea".into()],
+                message: "after the upgrade".into(),
+                created: 1_700_000_500,
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.state, ReviewRequestState::Open, "{kind}");
+        assert_eq!(
+            s.list_review_requests(&ReviewRequestFilter {
+                reviewer: Some("rhea".into()),
+                target_ref: Some("feature/x".into()),
+                ..all.clone()
+            })
+            .await
+            .unwrap(),
+            [r],
             "{kind}"
         );
         assert_eq!(db.objects().await, full_schema(), "{kind}");

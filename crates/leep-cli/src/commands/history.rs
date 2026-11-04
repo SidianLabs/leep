@@ -403,6 +403,9 @@ pub fn show(r: &Remote, args: &ShowArgs) -> Result<i32> {
 pub(crate) fn show_text(r: &Remote, info: &ChangesetInfo) -> Result<String> {
     let id = info.id;
     let mut out = header(info, Detail::SHOW);
+    if let Some(by) = &info.created_by {
+        out.push_str(&format!("Created-by: {}\n", by.principal));
+    }
     // Older servers lack the endpoint; a changeset is still worth showing.
     if let Ok(sigs) = r.client.signatures(&id) {
         for line in signature_lines(&sigs) {
@@ -734,6 +737,7 @@ mod tests {
             root_tree: Hash::of_blob(b""),
             path_at: None,
             renamed: None,
+            created_by: None,
         };
         assert!(follow_lines(&info).is_empty());
         info.path_at = Some(RepoPath::new("b.txt").unwrap());
@@ -769,6 +773,7 @@ mod tests {
             root_tree: Hash::of_blob(b""),
             path_at: None,
             renamed: None,
+            created_by: None,
         };
         let quiet = header(
             &info,

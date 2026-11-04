@@ -994,7 +994,7 @@ impl Repo {
     /// Idempotent. A blob that garbage collection has condemned counts as
     /// missing, so the client uploads it again (ADR 0012).
     pub async fn create_changeset(&self, cs: Changeset) -> Result<ChangesetId> {
-        self.store_changeset(cs, true, Vec::new()).await
+        self.store_changeset(cs, true, Vec::new(), Vec::new()).await
     }
 
     /// [`Repo::create_changeset`], also writing `rows` together with the
@@ -1006,7 +1006,7 @@ impl Repo {
         cs: Changeset,
         rows: Vec<DerivedRow>,
     ) -> Result<ChangesetId> {
-        self.store_changeset(cs, true, rows).await
+        self.store_changeset(cs, true, rows, Vec::new()).await
     }
 
     /// Like [`Repo::create_changeset`] for changesets the server builds from
@@ -1014,7 +1014,8 @@ impl Repo {
     /// stored changeset, so GC keeps them, or were just written through
     /// [`Repo::put_blob`], so a condemnation is already answered.
     pub(crate) async fn store_server_changeset(&self, cs: Changeset) -> Result<ChangesetId> {
-        self.store_changeset(cs, false, Vec::new()).await
+        self.store_changeset(cs, false, Vec::new(), Vec::new())
+            .await
     }
 
     /// [`Repo::store_server_changeset`] writing `rows` with the changeset, as
@@ -1024,7 +1025,7 @@ impl Repo {
         cs: Changeset,
         rows: Vec<DerivedRow>,
     ) -> Result<ChangesetId> {
-        self.store_changeset(cs, false, rows).await
+        self.store_changeset(cs, false, rows, Vec::new()).await
     }
 
     /// Validate `cs`, build its tree, and store it with its root tree,
@@ -1033,11 +1034,14 @@ impl Repo {
     /// batched round trips, one connection at a time; anything those miss is
     /// derived as before.
     /// Condemned parents are rescued before they are read (ADR 0059).
-    async fn store_changeset(
+    /// `if_new` rows are written only by the call that inserts the changeset
+    /// (ADR 0086), atomically with it on stores that can tell.
+    pub(crate) async fn store_changeset(
         &self,
         cs: Changeset,
         client_blobs: bool,
         extra: Vec<DerivedRow>,
+        if_new: Vec<DerivedRow>,
     ) -> Result<ChangesetId> {
         let id = cs.id();
         if client_blobs {
@@ -1234,7 +1238,13 @@ impl Repo {
             None => metrics::counter!("leep_create_last_merge_skipped_total").increment(1),
         }
         rows.extend(extra);
-        self.meta.put_changeset_with_derived(&cs, &rows).await?;
+        if if_new.is_empty() {
+            self.meta.put_changeset_with_derived(&cs, &rows).await?;
+        } else {
+            self.meta
+                .put_changeset_with_derived_if_new(&cs, &rows, &if_new)
+                .await?;
+        }
         if let (Some(depth), true) = (lazy_depth, lazily) {
             // Only the depth: keeping the nodes too churned the derived-node
             // cache with every create's, evicting the trees readers derive.
@@ -1413,6 +1423,8 @@ impl Repo {
             .ok_or_else(|| Error::NotFound(format!("changeset {id}")))
     }
 
+    /// What `GET /v1/changesets/{id}` answers, with who created it
+    /// (ADR 0086).
     pub async fn info(&self, id: ChangesetId) -> Result<ChangesetInfo> {
         Ok(ChangesetInfo {
             id,
@@ -1421,6 +1433,7 @@ impl Repo {
             root_tree: self.root_tree(id).await?,
             path_at: None,
             renamed: None,
+            created_by: self.created_by(id).await?,
         })
     }
 

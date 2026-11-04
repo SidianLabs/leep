@@ -226,7 +226,7 @@ impl Repo {
     /// Whether `ancestor`, of generation `target`, is on the first-parent
     /// chain of `descendant`: rides it down via skip pointers, so the cost is
     /// logarithmic in the distance.
-    async fn on_first_parent_chain(
+    pub(crate) async fn on_first_parent_chain(
         &self,
         ancestor: ChangesetId,
         target: u64,

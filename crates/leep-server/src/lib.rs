@@ -19,6 +19,7 @@ pub mod protect;
 pub mod read_limits;
 pub mod reload;
 pub mod review;
+mod review_requests;
 pub mod signing;
 pub mod timing;
 
@@ -311,6 +312,15 @@ pub fn router_with_read_classes(
             get(get_reviews).post(add_review),
         )
         .route("/v1/changesets/{id}/review-status", get(review_status))
+        .route(
+            "/v1/review-requests",
+            get(review_requests::list).post(review_requests::create),
+        )
+        .route("/v1/review-requests/{id}", get(review_requests::get_one))
+        .route(
+            "/v1/review-requests/{id}/withdraw",
+            post(review_requests::withdraw),
+        )
         .route("/v1/refs", get(list_refs))
         .route("/v1/refs/{*name}", get(get_ref).post(post_ref))
         .route("/v1/reflog", get(ref_log_all))
@@ -895,9 +905,16 @@ async fn missing_blobs(State(repo): S, body: Bytes) -> ApiResult<Json<MissingBlo
     Ok(Json(MissingBlobsResponse { missing }))
 }
 
-async fn create_changeset(State(repo): S, body: Bytes) -> ApiResult<Json<CreateChangesetResponse>> {
+/// The creating token is recorded with the changeset (ADR 0086).
+async fn create_changeset(
+    State(repo): S,
+    auth::MaybePrincipal(who): auth::MaybePrincipal,
+    body: Bytes,
+) -> ApiResult<Json<CreateChangesetResponse>> {
     let cs: Changeset = parse_json(&body)?;
-    let id = repo.create_changeset(cs).await?;
+    let id = repo
+        .create_changeset_by(cs, who.as_ref().map(|p| p.name.as_str()))
+        .await?;
     Ok(Json(CreateChangesetResponse { id }))
 }
 
@@ -1690,11 +1707,11 @@ async fn land(
     let create = req.create.unwrap_or(true);
     let Some(Extension(coordination)) = coordination.filter(|_| repo.land_coordinator().is_some())
     else {
-        return Ok(Json(
-            repo.land_keyed(req.changeset, &req.target_ref, actor, create, req.land_id)
-                .await?,
-        )
-        .into_response());
+        let resp = repo
+            .land_keyed(req.changeset, &req.target_ref, actor, create, req.land_id)
+            .await?;
+        review_requests::after_land(repo.clone(), req.target_ref, req.changeset, &resp);
+        return Ok(Json(resp).into_response());
     };
     // The client's body byte for byte, so fields this server does not know
     // reach the coordinating server unchanged.
@@ -1713,7 +1730,10 @@ async fn land(
             )
             .await?
         {
-            Coordinated::Landed(r) => Json(r).into_response(),
+            Coordinated::Landed(r) => {
+                review_requests::after_land(repo.clone(), req.target_ref, req.changeset, &r);
+                Json(r).into_response()
+            }
             Coordinated::Forwarded(relayed) => relayed.into_response(),
             Coordinated::NotLeader => coord::not_leader(),
         },
@@ -1762,6 +1782,7 @@ mod tests {
             root_tree: Hash::of_blob(b"root"),
             path_at: None,
             renamed: None,
+            created_by: None,
         };
         let n = LOG_CHUNK_ENTRIES;
         for len in [0, 1, n - 1, n, n + 1, 2 * n, 2 * n + 1, 5 * n + 17] {

@@ -881,6 +881,7 @@ fn changeset_info(d: &Data, id: ChangesetId) -> Resp<ChangesetInfo> {
         changeset: cs,
         path_at: None,
         renamed: None,
+        created_by: None,
     }))
 }
 
@@ -1241,6 +1242,7 @@ fn log_of(d: &Data, id: ChangesetId, raw: &Option<String>) -> Resp<LogResponse> 
                     .flatten()
                     .and_then(|(_, p)| RepoPath::new(p.as_str()).ok()),
                 renamed: None,
+                created_by: None,
             });
         }
     }
@@ -1356,6 +1358,7 @@ async fn last_change(
             changeset: cs,
             path_at: None,
             renamed: None,
+            created_by: None,
         },
         concurrent: vec![],
         answered_at: None,

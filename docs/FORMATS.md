@@ -37,6 +37,7 @@ skill.
 | derived `signature-v1` | — | `MetaStore.derived`, key = `Hash::of_object("signature", changeset_id ‖ key_id)`, value = postcard `Signature { key_id: String, public_key: [u8; 32], sig: [u8; 64] }` (`leep_core::signature`) |
 | derived `review-v1` | — | `MetaStore.derived`, key = `Hash::of_object("review", changeset_id ‖ reviewer name utf-8)`, value = postcard `Review { reviewer: String, verdict: Verdict, comment: String, timestamp: i64 }` (`leep_core::review`); `Verdict` is `Approve` (variant 0), `Reject` (variant 1) or `Withdrawn` (variant 2, ADR 0063; a policy reads it as no review) |
 | derived `review-source-v1` | — | `MetaStore.derived`, key as `review-v1` is, value = postcard `ReviewSource { via: String, source: String, timestamp: i64 }` (`leep_core::review`): the token that posted a review and its `source` string (ADR 0063); written before the review it describes, replaced by a later direct post |
+| derived `created-by-v1` | — | `MetaStore.derived`, key = changeset id, value = postcard `CreatedBy { principal: String, timestamp: i64 }` (`leep_core::review_request`): the token that first stored the changeset and when, by the server's clock; written by `POST /v1/changesets` with authentication only in the store write that inserts the changeset, never for one already stored, never replaced (ADR 0086) |
 | derived `rebased-origin-v1` | — | `MetaStore.derived`, key = rebased copy id, value = 32 raw bytes (id it was rebased from); written by `Repo::rebase` |
 | derived `blob-claim-v1` | — | `MetaStore.derived`, key = blob hash, value = unix seconds as 8-byte big-endian `i64` |
 | derived `blob-condemned-v1` | — | `MetaStore.derived`, key = blob hash, value = condemnation time, unix seconds as 8-byte big-endian `i64`, from the GC host's clock |
@@ -461,6 +462,21 @@ leases(scope TEXT NOT NULL,                                     -- migration 000
        epoch BIGINT NOT NULL,                                   -- +1 whenever the holder changes
        renewed_at BIGINT NOT NULL, expires_at BIGINT NOT NULL,  -- ms, the store's clock; 0 = released
        PRIMARY KEY (scope, repo_id, name, shard))
+review_requests(id BIGSERIAL PRIMARY KEY,                      -- migration 0008; SQLite: INTEGER PRIMARY KEY AUTOINCREMENT
+                repo_id BIGINT NOT NULL DEFAULT 1,              -- SQLite: INTEGER (and below)
+                changeset BYTEA NOT NULL, target_ref TEXT NOT NULL,
+                requester TEXT NOT NULL,                        -- a token name
+                message TEXT NOT NULL DEFAULT '',
+                created BIGINT NOT NULL,                        -- unix seconds, the server's clock
+                state TEXT NOT NULL DEFAULT 'open',             -- 'open', 'landed' or 'withdrawn'
+                closed BIGINT, landed_as BYTEA)                 -- set when it stops being open
+review_requests_open: INDEX ON review_requests(state, target_ref, id)
+review_requests_requester: INDEX ON review_requests(requester, id)
+review_requests_changeset: INDEX ON review_requests(changeset)
+review_request_reviewers(request_id BIGINT NOT NULL,           -- migration 0008
+                         reviewer TEXT NOT NULL,                -- a token name; no rows = any reviewer
+                         PRIMARY KEY (request_id, reviewer))
+review_request_reviewers_reviewer: INDEX ON review_request_reviewers(reviewer, request_id)
 ```
 
 `ref_log` (ADR 0018) is appended in the transaction of every ref create, move
@@ -513,6 +529,10 @@ after it (v6 never names the column), stay NULL and read through
 by it, never by the client's `Changeset::timestamp`. Backups (ADR 0026) copy
 the column with that substitution already made, so a restore, whose own
 migrations run later, keeps every row's age.
+
+Migration 0008 (`review_requests`, ADR 0086) adds the two review request
+tables and their indexes, empty. Older servers never read them, so the
+migration tolerates them. See "Review requests" below.
 
 ### Changeset rows (ADR 0053)
 
@@ -639,6 +659,42 @@ On the wire nothing a client sends or reads changed. Between servers:
   land again. Clients never see it.
 - With coordination on, `GET /v1/health` carries `Leep-Instance: <holder>`,
   which a server uses to check that its `--advertise-url` reaches itself.
+
+## Review requests and creators (new tables, derived kind and API, ADR 0086)
+
+No changeset, tree or hash changed. Added:
+
+- The `review_requests` and `review_request_reviewers` tables above. A
+  request is inserted with its reviewer rows in one transaction; ids only
+  grow. The only update is the close, `UPDATE ... SET state, closed,
+  landed_as WHERE id = $1 AND state = 'open'`, so a request is closed once
+  and never reopened. Rows are never deleted. `state` text is fixed:
+  `open`, `landed`, `withdrawn`. Backups copy both tables with their ids;
+  a Postgres restore sets the id sequence to the highest restored id.
+- `MetaStore::supports_review_requests`, `put_review_request`,
+  `get_review_request`, `list_review_requests` and `close_review_request`
+  (defaults refuse), checked by `check_review_request_contract`; and
+  `put_changeset_with_derived_if_new(cs, rows, if_new) -> bool`, which
+  writes `if_new` only in the store write that inserts the changeset
+  (default: writes no `if_new` row and returns false), checked by
+  `check_insert_once_contract`. A request needs its target ref to exist (or a land policy to cover it),
+  and a requester may have at most 100 open (`too_many_review_requests`).
+- The derived kind `created-by-v1` (table above), an attestation for verify
+  and repair (checked to decode; `repair drop` refuses it) that the
+  changeset sweep deletes with its changeset.
+- `ChangesetInfo::created_by` (`{principal, timestamp}`, omitted when
+  absent), set only by `GET /v1/changesets/{id}`.
+- `POST /v1/review-requests` (`CreateReviewRequest {changeset, target_ref =
+  "main", reviewers = [], message = ""}` → `CreateReviewRequestResponse
+  {request, existing}`), `GET /v1/review-requests` (filters `reviewer`,
+  `requester`, `changeset`, `ref`, `state` or `open`, `before`, `limit` →
+  `ReviewRequestsResponse {requests, next?}`), `GET
+  /v1/review-requests/{id}` and `POST /v1/review-requests/{id}/withdraw`
+  (→ `ReviewRequestEntry`). An entry is the request's own fields (`id`,
+  `changeset`, `target_ref`, `requester`, `reviewers`, `message`, `created`,
+  `state`, `closed?`, `landed_as?`) plus optional `created_by` and `title`,
+  all in one object. Every field a client may omit has a default, and every
+  optional answer field is omitted when absent.
 
 ## Index leases and bounded queries (additive, ADR 0058)
 
@@ -1344,6 +1400,7 @@ client treats an unknown or absent code by its HTTP status.
 | 400 | `invalid_name` | a ref name the validator refuses |
 | 400 | `ambiguous_prefix` | a short id matching several changesets (`AmbiguousPrefixResponse`) |
 | 400 | `cursor_unrepresentable` | a paged `GET /v1/files` or `/v1/diff` whose page would end at a path too long for a cursor (added with file and diff paging): repeat the request without `limit` |
+| 400 | `too_many_review_requests` | a review request from a principal that already has 100 open ones (ADR 0086) |
 | 400 | `invalid` | any other bad request (also `405`) |
 | 401 | `unauthorized` | no token, or an unknown one |
 | 401 | `token_expired` | a known token past its `expires` (ADR 0007): fetch a new one; retrying will not help |

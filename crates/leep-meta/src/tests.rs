@@ -620,6 +620,34 @@ async fn sqlite_leases() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_review_requests() {
+    let Some((s, _)) = pg_store("review_requests").await else {
+        return;
+    };
+    assert!(s.supports_review_requests());
+    leep_core::memory::check_review_request_contract(&s).await;
+    leep_core::memory::check_insert_once_contract(&s).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_review_requests() {
+    let dir = std::env::temp_dir().join(format!("leep-meta-rr-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let url = format!("sqlite://{}?mode=rwc", dir.join("meta.db").display());
+    let s = SqliteMetaStore::connect(&url).await.unwrap();
+    assert!(s.supports_review_requests());
+    leep_core::memory::check_review_request_contract(&s).await;
+    leep_core::memory::check_insert_once_contract(&s).await;
+    // A memory database too: one connection, so a transaction must not
+    // wait for a second.
+    let m = SqliteMetaStore::connect("sqlite::memory:").await.unwrap();
+    leep_core::memory::check_review_request_contract(&m).await;
+    leep_core::memory::check_insert_once_contract(&m).await;
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_contract() {
     let Some((s, url)) = pg_store("contract").await else {
         return;

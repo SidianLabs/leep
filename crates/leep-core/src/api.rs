@@ -33,6 +33,10 @@
 //! | POST | `/v1/changesets/{id}/reviews` | [`AddReviewRequest`] | [`AddReviewResponse`] (the reviewer is the token's name, or the body's `reviewer` for a `review_for` token and 403 for any other; 400 without authentication; 404 if the changeset is unknown) |
 //! | GET  | `/v1/changesets/{id}/reviews` | – | [`ReviewsResponse`] |
 //! | GET  | `/v1/changesets/{id}/review-status?ref=main` | – | [`ReviewStatusResponse`] (`ref` defaults to `main`) |
+//! | POST | `/v1/review-requests` | [`CreateReviewRequest`] | [`CreateReviewRequestResponse`] (ask for a review of `changeset` before it lands on `target_ref`; the requester is the token's name; `reviewers` must be tokens that may review, and default to the owners of the paths the changeset still needs approved; an open request of the same requester, changeset, ref and reviewers is answered instead of a second one; 400 without authentication; 404 if the changeset is unknown, or `target_ref` is missing and no land policy covers it; 400 `too_many_review_requests` when the requester already has `MAX_OPEN_REQUESTS` (100) open; ADR 0086) |
+//! | GET  | `/v1/review-requests?reviewer=n&requester=n&changeset=id&ref=r&state=s&open=bool&before=id&limit=n` | – | [`ReviewRequestsResponse`] (newest first; `reviewer` matches requests that name it and requests open to any reviewer made by someone else; `state` is `open`, `landed` or `withdrawn`, `open=true` is `state=open` and `open=false` every closed state; `limit` defaults to 50, capped at 500; `before` pages by id; ADR 0086) |
+//! | GET  | `/v1/review-requests/{id}` | – | [`ReviewRequestEntry`] (404 if unknown) |
+//! | POST | `/v1/review-requests/{id}/withdraw` | – | [`ReviewRequestEntry`] (only its requester may; 403 otherwise; a request no longer open is answered as it is) |
 //! | POST | `/v1/merge` | [`MergeRequest`] | [`MergeResponse`] |
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
 //! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`] (`create: false` refuses to create a missing `target_ref` with 404; absent creates it, as before; ADR 0036. `land_id` makes retries idempotent at any age; ADR 0057) |
@@ -79,6 +83,7 @@
 //! | 400 | `invalid_name` | a ref name [`crate::refname::validate`] refuses |
 //! | 400 | `ambiguous_prefix` | a short id matching several changesets ([`AmbiguousPrefixResponse`]) |
 //! | 400 | `cursor_unrepresentable` | a paged `GET /v1/files` or `/v1/diff` whose page ends at a path too long for a cursor: repeat the request without `limit` |
+//! | 400 | `too_many_review_requests` | a review request from a principal with [`crate::review_request::MAX_OPEN_REQUESTS`] open ones already (ADR 0086) |
 //! | 400 | `invalid` | any other bad request |
 //! | 401 | `unauthorized` | no token, or an unknown one |
 //! | 401 | `token_expired` | a known token past its `expires` (ADR 0007): fetch a new one; retrying will not help |
@@ -192,6 +197,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::review::{Review, Verdict};
+pub use crate::review_request::{CreatedBy, ReviewRequest, ReviewRequestState};
 pub use crate::store::{LandId, RefLogEntry};
 use crate::{Changeset, ChangesetId, FileChange, FileKind, Hash, RepoPath, TreeEntry};
 
@@ -283,6 +289,11 @@ pub mod error_code {
     /// long to fit a cursor ([`super::CURSOR_UNREPRESENTABLE_MARKER`]). The
     /// same request without `limit` answers the whole list.
     pub const CURSOR_UNREPRESENTABLE: &str = "cursor_unrepresentable";
+    /// 400: a review request from a principal that already has as many open
+    /// ones as the server allows
+    /// ([`crate::review_request::TOO_MANY_REQUESTS_MARKER`], ADR 0086).
+    /// Withdraw some (`leep review cancel`) or wait for them to land.
+    pub const TOO_MANY_REVIEW_REQUESTS: &str = "too_many_review_requests";
     /// 400: any other bad request.
     pub const INVALID: &str = "invalid";
     /// 401: no token, or an unknown one.
@@ -339,6 +350,7 @@ pub mod error_code {
         INVALID_NAME,
         AMBIGUOUS_PREFIX,
         CURSOR_UNREPRESENTABLE,
+        TOO_MANY_REVIEW_REQUESTS,
         INVALID,
         UNAUTHORIZED,
         TOKEN_EXPIRED,
@@ -550,6 +562,11 @@ pub struct ChangesetInfo {
     /// renaming `from`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renamed: Option<RenameEntry>,
+    /// The token that first stored the changeset (ADR 0086). Only
+    /// `GET /v1/changesets/{id}` sets it, and only for changesets created
+    /// by an authenticated client of a server that records it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<CreatedBy>,
 }
 
 /// Attest to a changeset. Both fields are text so the body is easy to build
@@ -679,6 +696,52 @@ pub struct ReviewStatusResponse {
     pub target_ref: String,
     pub approved: bool,
     pub paths: Vec<PathReview>,
+}
+
+/// `POST /v1/review-requests`: ask for a review (ADR 0086).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateReviewRequest {
+    pub changeset: ChangesetId,
+    /// The ref the changeset is meant to land on; its owners and review
+    /// status decide the default reviewers.
+    #[serde(default = "default_ref")]
+    pub target_ref: String,
+    /// Token names to ask. Empty asks the owners of the paths still pending
+    /// on `target_ref`, or any reviewer when no owner is pending.
+    #[serde(default)]
+    pub reviewers: Vec<String>,
+    #[serde(default)]
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateReviewRequestResponse {
+    pub request: ReviewRequestEntry,
+    /// True when an equal open request already existed and is the answer.
+    #[serde(default)]
+    pub existing: bool,
+}
+
+/// A review request as listed: the stored request, plus what a reviewer
+/// wants to see about its changeset.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRequestEntry {
+    #[serde(flatten)]
+    pub request: ReviewRequest,
+    /// Who created the changeset, as in [`ChangesetInfo::created_by`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<CreatedBy>,
+    /// First line of the changeset's message; absent if it is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRequestsResponse {
+    pub requests: Vec<ReviewRequestEntry>,
+    /// Pass as `before` for the next page; absent on the last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1558,6 +1621,50 @@ mod tests {
         }
     }
 
+    /// Review requests (ADR 0086): what an old client sends is enough, an
+    /// entry is the request's fields plus optional extras, and a
+    /// `ChangesetInfo` from a server without `created_by` still decodes.
+    #[test]
+    fn review_request_shapes() {
+        let id = ChangesetId(Hash::of_blob(b"c"));
+        let req: CreateReviewRequest =
+            serde_json::from_value(serde_json::json!({ "changeset": id.to_string() })).unwrap();
+        assert_eq!(req.target_ref, "main");
+        assert!(req.reviewers.is_empty() && req.message.is_empty());
+        let entry: ReviewRequestEntry = serde_json::from_value(serde_json::json!({
+            "id": 7, "changeset": id.to_string(), "target_ref": "main",
+            "requester": "ada", "reviewers": ["rhea"], "created": 3, "state": "open",
+        }))
+        .unwrap();
+        assert_eq!(entry.request.id, 7);
+        assert_eq!((&entry.created_by, &entry.title), (&None, &None));
+        let v = serde_json::to_value(&entry).unwrap();
+        assert_eq!(v["requester"], "ada");
+        assert!(v.get("request").is_none() && v.get("created_by").is_none());
+        let with = ReviewRequestEntry {
+            created_by: Some(CreatedBy {
+                principal: "ada".into(),
+                timestamp: 4,
+            }),
+            title: Some("t".into()),
+            ..entry
+        };
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(v["created_by"]["principal"], "ada");
+        assert_eq!(
+            serde_json::from_value::<ReviewRequestEntry>(v).unwrap(),
+            with
+        );
+        let page: ReviewRequestsResponse =
+            serde_json::from_value(serde_json::json!({ "requests": [] })).unwrap();
+        assert_eq!(page.next, None);
+        let r: CreateReviewRequestResponse = serde_json::from_value(serde_json::json!({
+            "request": serde_json::to_value(&with).unwrap()
+        }))
+        .unwrap();
+        assert!(!r.existing);
+    }
+
     #[test]
     fn review_shapes() {
         let req: AddReviewRequest =
@@ -1614,6 +1721,7 @@ mod tests {
             root_tree: Hash::of_blob(b"t"),
             path_at: None,
             renamed: None,
+            created_by: None,
         };
         let mut v = serde_json::json!({ "path": "src", "changeset": info });
         let r: LastChangeResponse = serde_json::from_value(v.clone()).unwrap();
@@ -1654,6 +1762,7 @@ mod tests {
             root_tree: Hash::of_blob(b"t"),
             path_at: Some(RepoPath::new("a/b.rs").unwrap()),
             renamed: None,
+            created_by: None,
         };
         let s = LogSummaryEntry::from(&info);
         assert_eq!(s, LogSummaryEntry::from(info.clone()));
