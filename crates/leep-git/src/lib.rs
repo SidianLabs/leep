@@ -65,6 +65,24 @@ pub(crate) fn open_git_with(
     gix::open_opts(git_dir, options).map_err(gerr)
 }
 
+/// History cut at a shallow boundary would import as root commits whose
+/// ids differ from the full history's, so a later unshallowed import could
+/// not reuse them. Refuse instead of forking history.
+pub(crate) fn refuse_shallow(
+    git: &gix::Repository,
+    git_dir: &std::path::Path,
+) -> leep_core::Result<()> {
+    if git.is_shallow().map_err(gerr)? {
+        return Err(Error::Invalid(format!(
+            "{} is a shallow git clone, so its history is incomplete and cannot \
+             be imported; run `git fetch --unshallow` in it (or clone without \
+             --depth) and import again",
+            git_dir.display()
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn gerr(e: impl std::fmt::Display) -> Error {
     Error::Other(format!("git: {e}"))
 }

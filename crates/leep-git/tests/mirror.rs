@@ -2493,3 +2493,29 @@ fn a_mapped_owners_github_approval_lets_a_require_review_land_through() {
     ));
     assert_eq!(leep.get_ref("main"), Some(r1));
 }
+
+#[test]
+fn a_shallow_work_repository_is_refused_with_a_clear_error() {
+    let f = fixture();
+    let full = f._dir.path().join("full");
+    std::fs::create_dir_all(&full).unwrap();
+    git(&full, &["init", "-q", "-b", "main"]);
+    for n in 0..3 {
+        write(&full, "a", &format!("{n}\n"));
+        commit(&full, &format!("c{n}"));
+    }
+    std::fs::create_dir_all(&f.work).unwrap();
+    let url = format!("file://{}", full.display());
+    git(
+        &f.work,
+        &["clone", "-q", "--bare", "--depth", "1", &url, "git"],
+    );
+
+    let leep = Local::new();
+    let err = mirror::Mirror::open(config(&f, false), &leep)
+        .err()
+        .expect("a shallow repository must be refused")
+        .to_string();
+    assert!(err.contains("shallow"), "{err}");
+    assert!(err.contains("git fetch --unshallow"), "{err}");
+}
