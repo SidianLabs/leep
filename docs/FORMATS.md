@@ -1524,10 +1524,12 @@ ref's head, `.leep/state.json` gains the optional `resolving`:
 | `from` | array of changeset ids | What the land tried to add, newest first: the first-parent chain from the landed changeset down to the generation of its merge base with the head, at most 64. |
 | `target_ref` | string | The ref the land was onto. |
 | `onto` | changeset id | The head the conflicts were against, which became the base. |
+| `message` | string, optional | The replaced changeset's message when `from` holds exactly one: the default message of the resolution commit. Absent for a stack and in files written before it existed. |
 
 The next `leep commit` whose base is still `onto` (not a merge or a
 cherry-pick) records `extra["leep.rebased_from"]` = the `from` ids joined
-with commas, the same key a cherry-pick sets to one id. A land that lands
+with commas, the same key a cherry-pick sets to one id; without `-m` it
+takes `message` as its message, when present. A land that lands
 and any checkout (`checkout`, `sync`, `switch`, `reset --hard`) remove the
 field. It is omitted when absent (`skip_serializing_if`), a state file
 without it loads unchanged (`serde(default)`), and an older CLI ignores it.

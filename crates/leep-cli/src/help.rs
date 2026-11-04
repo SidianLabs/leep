@@ -124,6 +124,7 @@ Examples:
   leep review reject 2a954d8ef7c7 -m \"breaks the parser\"
   leep review request @ -m \"new API field\"   # ask the owners of what is still pending
   leep review request @ --to rhea       # or name the reviewers
+  leep review status @ --wait           # until approved (exit 0), rejected or an hour passes (1)
   leep review inbox                     # requests waiting for you (--mine: the ones you made)";
 /// Shown under the top-level help; the full contract is docs/CLI.md.
 pub const EXIT_CODES: &str = "\

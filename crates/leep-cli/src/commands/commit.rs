@@ -16,6 +16,7 @@ use crate::error::{CliError, Result};
 use crate::fmt::{plural, short};
 use crate::sign::AuthorKey;
 use crate::snapshot;
+use crate::state::ResolvingLand;
 use crate::status::status;
 
 #[derive(Args, Debug, Default, Clone)]
@@ -80,6 +81,17 @@ pub fn agent_extra(
     m
 }
 
+/// The conflicted land this commit resolves: one is recorded, the working
+/// copy is still on the head it was rebased onto, and `plain` (no merge or
+/// pick under way) holds.
+fn resolving(ctx: &Ctx, plain: bool) -> Option<&ResolvingLand> {
+    ctx.wc
+        .state
+        .resolving
+        .as_ref()
+        .filter(|r| plain && ctx.wc.state.base == Some(r.onto))
+}
+
 pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
     // Fail before uploading anything if the key cannot be used.
     let key = args
@@ -111,6 +123,9 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
         .clone()
         .or_else(|| merge.as_ref().map(|m| m.message.clone()))
         .or_else(|| pick.as_ref().map(|p| p.message.clone()))
+        .or_else(|| {
+            resolving(ctx, merge.is_none() && pick.is_none()).and_then(|r| r.message.clone())
+        })
         .ok_or_else(|| CliError::user("a commit message is required (-m)"))?;
 
     let changes = snapshot::upload_changes(ctx, &st)?;
@@ -127,13 +142,7 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
             EXTRA_REBASED_FROM
         };
         extra.insert(key.to_string(), p.from.to_string());
-    } else if let Some(r) = ctx
-        .wc
-        .state
-        .resolving
-        .as_ref()
-        .filter(|r| ctx.wc.state.base == Some(r.onto) && merge.is_none())
-    {
+    } else if let Some(r) = resolving(ctx, merge.is_none()) {
         // The resolution of a land's conflicts: name what it replaces, so
         // reviews of identical changes can carry over (the server decides).
         extra.insert(EXTRA_REBASED_FROM.to_string(), r.rebased_from());

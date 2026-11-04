@@ -210,6 +210,101 @@ fn a_verdict_says_where_it_leaves_the_changeset() {
     );
 }
 
+/// A verdict on a changeset main already holds still counts for copies,
+/// and says so; its status says where it landed instead of "not approved".
+#[test]
+fn a_verdict_on_a_landed_changeset_says_it_landed() {
+    let leep = Leep::new();
+    let mock = Mock::start();
+    let root = mock.seed(None, &[("a.txt", "one\n", FileKind::Regular)], &[]);
+    let original = mock.seed(None, &[("a.txt", "zero\n", FileKind::Regular)], &[]);
+    let wc = init(&leep, &mock);
+    let id = root.to_string();
+    {
+        let mut d = mock.data.lock().unwrap();
+        d.report_on_refs = true;
+        d.taken_back = vec![original];
+        d.refs.insert("main".into(), root);
+    }
+    // Landed: nothing left to wait for, so exit 0 and `--wait` returns at once.
+    let status = leep.ok(wc.path(), &["review", "status", &id]);
+    assert!(
+        status.starts_with(&format!(
+            "changeset {} on main: landed on main\n",
+            &id[..12]
+        )),
+        "{status}"
+    );
+    leep.ok(wc.path(), &["review", "status", &id, "--wait=5"]);
+
+    let out = leep.ok(wc.path(), &["review", "reject", &id, "-m", "oops"]);
+    assert_eq!(
+        out,
+        format!(
+            "Rejected {} as mock\n\
+             already on main: verdicts now only affect copies (cherry-picks, rebases)\n\
+             also rejected on {} (your approval of it carried here)\n",
+            &id[..12],
+            &original.to_string()[..12]
+        )
+    );
+    let out = leep.ok(wc.path(), &["review", "withdraw", &id]);
+    assert!(out.contains("also withdrawn on"), "{out}");
+}
+
+/// `review status --wait` asks until a verdict comes: approved is exit 0,
+/// a rejection stops it at once, and running out of time is exit 1.
+#[test]
+fn review_status_waits_for_the_verdict() {
+    use leep_core::review::Verdict;
+    let leep = Leep::new();
+    let mock = Mock::start();
+    let root = mock.seed(None, &[("a.txt", "one\n", FileKind::Regular)], &[]);
+    let wc = init(&leep, &mock);
+    let id = root.to_string();
+
+    // Out of time: exit 1, after printing where it stands.
+    let out = leep.run(wc.path(), &["review", "status", &id, "--wait=1"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stdout).contains("not approved"),
+        "{}",
+        text(&out.stdout)
+    );
+    let err = text(&out.stderr);
+    assert!(
+        err.contains("waiting for approval of") && err.contains("timed out after"),
+        "{err}"
+    );
+
+    // An approval arriving while it waits ends it with exit 0.
+    let data = mock.data.clone();
+    let approver = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        data.lock().unwrap().reviews.push((root, Verdict::Approve));
+    });
+    let out = leep.run(wc.path(), &["review", "status", &id, "--wait=60"]);
+    approver.join().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains(": approved"),
+        "{}",
+        text(&out.stdout)
+    );
+
+    // A rejection is an answer too: no point waiting for the clock.
+    leep.ok(wc.path(), &["review", "reject", &id, "-m", "no"]);
+    let started = std::time::Instant::now();
+    let out = leep.run(wc.path(), &["review", "status", &id, "--wait"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    assert!(
+        text(&out.stderr).contains("stopped waiting"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
 /// Two working copies change the same line from `base`; the second land
 /// conflicts. Returns the losing working copy.
 fn conflict(leep: &Leep, mock: &Mock, base: &str) -> tempfile::TempDir {
@@ -304,6 +399,12 @@ fn the_resolution_of_a_land_names_what_it_replaces() {
         "{}",
         text(&out.stdout)
     );
+    // Two messages, so none to reuse.
+    assert!(
+        text(&out.stdout).contains("then run `leep commit -m MESSAGE`"),
+        "{}",
+        text(&out.stdout)
+    );
     let onto = head(&mock);
     let state: serde_json::Value =
         serde_json::from_slice(&std::fs::read(b.path().join(".leep/state.json")).unwrap()).unwrap();
@@ -348,6 +449,40 @@ fn the_resolution_of_a_land_names_what_it_replaces() {
     let state: serde_json::Value =
         serde_json::from_slice(&std::fs::read(b.path().join(".leep/state.json")).unwrap()).unwrap();
     assert!(state.get("resolving").is_none(), "{state}");
+}
+
+/// One changeset replaced: its resolution commit reuses its message.
+#[test]
+fn the_resolution_of_one_changeset_defaults_to_its_message() {
+    let leep = Leep::new();
+    let mock = Mock::start();
+    let b = conflict(&leep, &mock, "base\n");
+    let out = leep.run(b.path(), &["land"]);
+    assert_eq!(out.status.code(), Some(5));
+    assert!(
+        text(&out.stdout).contains("then run `leep commit` (its message by default)"),
+        "{}",
+        text(&out.stdout)
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(b.path().join(".leep/state.json")).unwrap()).unwrap();
+    assert_eq!(state["resolving"]["message"], "b");
+
+    std::fs::write(b.path().join("a.txt"), "both\n").unwrap();
+    leep.ok(b.path(), &["resolve", "a.txt"]);
+    let id: ChangesetId = leep.ok(b.path(), &["commit"]).trim().parse().unwrap();
+    let cs = mock.data.lock().unwrap().changesets[&id].clone();
+    assert_eq!(cs.message, "b");
+    assert!(cs.extra.contains_key(EXTRA_REBASED_FROM));
+    // Past the resolution, a commit needs its own message again.
+    std::fs::write(b.path().join("c.txt"), "c\n").unwrap();
+    let out = leep.run(b.path(), &["commit"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("message is required"),
+        "{}",
+        text(&out.stderr)
+    );
 }
 
 #[test]
