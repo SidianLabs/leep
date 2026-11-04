@@ -727,8 +727,9 @@ omitted when empty:
   [{reviewer, verdict}], carried, differs?, reason?}]`, the candidates named
   by `leep.rebased_from` (and the server's rows) that were compared, nearest
   first, each with the verdicts that would carry, whether they do, the
-  reviewed path not reproduced (`differs`) or another reason in words
-  (`reason`). Candidates without such verdicts are not listed.
+  reviewed path not reproduced (`differs`: the first one the check found,
+  only; others may differ too) or another reason in words (`reason`).
+  Candidates without such verdicts are not listed.
 - `ReviewRequestEntry` gains `paths` (the first 16 paths the changeset
   changes, in path order) and `changed` (how many it changes).
 

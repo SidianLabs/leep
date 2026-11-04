@@ -55,7 +55,8 @@ X's change at p when:
 Rebased and union apply only when all four sides exist with one kind that
 is not a symlink (a reviewed kind change carries only identically), each
 blob is valid UTF-8 and at most 2 MiB (`MAX_AUTO_BYTES`, the content
-rules' bound), the path is not an `OWNERS` file, X and Y have different
+rules' bound), each of the three merged texts has at most 10,000 lines
+(`MAX_CARRY_LINES`, below), the path is not an `OWNERS` file, X and Y have different
 first parents, and Y modifies the file. At most 32 paths of one candidate
 are merged (`MAX_CARRY_MERGED_PATHS`); with more, nothing carries from it.
 The rest of ADR 0085 is unchanged: every reviewed path of X must be
@@ -70,8 +71,11 @@ candidate whose approval would carry to Y.
 would not have made a merged copy, so `review-status` and lands there carry
 identical changes only, and review requests targeting it close by identical
 changes only. Taking back always considers merges, since taking back more
-than any ref would carry is the safe side; `GET .../reviews`, which names no
-ref, lists carried verdicts as the server's default policy judges them.
+than any ref would carry is the safe side. `GET .../reviews` names no ref,
+so it lists carried verdicts as the server's default land policy judges
+them: on a server whose default merges but with a strict ref, it may list a
+verdict as carried that a land on that strict ref does not count (the land
+and `review-status?ref=` are what decide).
 
 **Why this is safe.** The hint still only picks what to compare; Y.new is a
 deterministic function of three stored blobs. X.old and X.new are what the
@@ -98,13 +102,32 @@ block, `allow(...)` or early `return` moved into another function keeps the
 same `+` lines) and fails the motivating case with context (one test sits
 in the other's context lines). The tests include the moved-lines attack.
 
-**Bounds.** Each merge is the cost the server's own rebase of that file
-would pay; it runs on a blocking thread, and its outcome is cached in
-process by the three content hashes (4,096 entries), so a status request
-repeated by a client costs the merges once. A path whose file did not move
-or whose sides cannot merge is refused before any blob read. Nothing new is
-persisted. Errors reading a blob propagate as before; a blob that is
-missing, too big or not UTF-8 simply does not carry.
+**Bounds.** diffy's Myers diff costs O((N+M)·D) with no cutoff, so a byte
+bound alone is not one: 2 MiB of distinct one-character lines is about
+10^12 steps per merge, and `review-status` is a GET a read token can repeat,
+while a land check runs under the ref's land leader. So a merge is refused,
+deterministically and before any diff, when any of its three texts has more
+than 10,000 lines (`MAX_CARRY_LINES`), which bounds each of the merge's two
+diffs near (2·10^4)² steps; a security review suggested 20,000, and half
+that keeps the worst case four times lower while real source files stay far
+below it. There is no timeout: an answer that depended on timing would make
+carrying, and taking back, nondeterministic. Each merge runs once: on a
+blocking thread, under a process-wide limit of half the cores (at least
+one, the permit held by the thread itself), with concurrent asks for the
+same three contents waiting for the first instead of merging again, and the
+outcome, refusals included, is cached in process by the three content
+hashes in two generations of 2,048 entries (an entry asked for again moves
+to the newer one, so hot entries survive). The diff3 merge runs once per
+outcome: its clean result is the server's (diffy's options differ only in
+marker length, which shows only in conflicts), and its conflicted result is
+parsed for the unions. A path whose file did not move or whose sides cannot
+merge is refused before any blob read. Nothing new is persisted. Errors
+reading a blob propagate as before (a swallowed one could hide a carried
+reject) and cache nothing; a blob that is missing, too big or not UTF-8
+simply does not carry. A candidate with reviews that is no longer stored
+(collected by the changeset sweep, its review rows kept) carries nothing,
+with the reason `it is no longer stored`, instead of failing the status
+request or the land.
 
 ### 2. Saying why a verdict did not carry
 `ReviewStatusResponse` gains `origins` (`#[serde(default)]`, omitted when
@@ -112,8 +135,9 @@ empty): for each candidate compared, nearest first, `{from, reviews:
 [{reviewer, verdict}], carried, differs?, reason?}`. `reviews` are the
 candidate's verdicts by reviewers without a review of Y; candidates with
 none are not listed. `differs` names the reviewed path that Y does not
-reproduce (the first found); `reason` covers the rest in words (a merge,
-more than 1,024 paths, more than 32 merged paths, more than 16 reviewed
+reproduce: the first one the check found, only, since the check stops
+there (a list, so a later server may name more); `reason` covers the rest
+in words (a merge, no longer stored, more than 1,024 paths, more than 32 merged paths, more than 16 reviewed
 origins, or every path auto-approved in it). `PathReview` gains
 `carried_rule` (`identical`, `rebased` or `union`; omitted unless
 `carried_from` is set). `leep review status` prints, per origin,
@@ -166,7 +190,13 @@ is what to check first.
   that used a union-shaped changelog resolution to show the docs rule's
   effect now use a resolution that is neither.
 - Cost: a candidate whose reviewed files moved costs up to 32 three-way
-  merges of files up to 2 MiB, once per process per content triple.
+  merges of files up to 2 MiB and 10,000 lines, once per process per
+  content triple, at most half the cores at a time.
+- Tests for the bounds: `carry::tests::texts_over_the_line_budget_are_not_merged`,
+  `concurrent_asks_for_one_merge_compute_it_once`,
+  `the_cache_keeps_hot_entries_across_a_generation`,
+  `a_clean_merge_equals_diffys_default_merge`, and the server's
+  `a_reviewed_origin_that_is_gone_carries_nothing_and_fails_nothing`.
 - API additions only: `PathReview.carried_rule`,
   `ReviewStatusResponse.origins` (`OriginStatus`, `OriginReview`),
   `ReviewRequestEntry.paths` and `changed`, all `#[serde(default)]` and

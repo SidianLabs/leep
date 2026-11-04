@@ -229,8 +229,17 @@ comparison was rejected: identical `+` lines can sit in another function.
 Marker look-alikes in the texts cannot confuse the union parser (markers
 are longer than any run in the inputs, runs over 64 refuse, and a text
 without a final newline refuses). `OWNERS` files, symlinks, kind changes,
-non-UTF-8 and blobs over 2 MiB never merge, and a candidate needing more
-than 32 merges carries nothing. Requests close by the same check. Tests in
+non-UTF-8, blobs over 2 MiB and texts over 10,000 lines never merge, and a
+candidate needing more than 32 merges carries nothing. *Found in review:*
+the byte bound alone left diffy's uncapped Myers diff at ~10^12 steps per
+merge, reachable from a read token's `review-status` and from land checks
+under the ref's land leader, and merges had no concurrency limit; now the
+line budget refuses before any diff, deterministically, merges run once per
+content triple (single-flight, cached, refusals included) under a limit of
+half the cores, and a reviewed candidate that was collected carries nothing
+instead of answering 404 or 500 (`texts_over_the_line_budget_are_not_merged`,
+`concurrent_asks_for_one_merge_compute_it_once`,
+`a_reviewed_origin_that_is_gone_carries_nothing_and_fails_nothing`). Requests close by the same check. Tests in
 `crates/leep-server/tests/reviews.rs`:
 `an_approval_carries_to_a_resolution_equal_to_the_servers_rebase`,
 `an_approval_carries_to_a_union_of_two_appends_in_either_order`,

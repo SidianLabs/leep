@@ -1343,7 +1343,9 @@ place. Anything else needs review again, and `leep review status` names the
 original and the first path that differs. On refs with strict land
 conflicts (`--strict-land-ref`, ADR 0066) only identical paths carry. The
 check costs at most 32 three-way text merges per original (files up to
-2 MiB), each cached in process by content; nothing to configure.
+2 MiB and 10,000 lines), each computed once and cached in process by
+content, with at most half the cores merging at a time on blocking threads;
+nothing to configure.
 
 **Derived kinds that change encoding.** A release that changes how a derived
 kind is stored gives it a new name, so old and new servers never read each

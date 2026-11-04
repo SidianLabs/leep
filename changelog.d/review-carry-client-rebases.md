@@ -4,7 +4,8 @@
   when the file is exactly what the server's own rebase of the reviewed
   change would make there, or keeps both sides' lines where both only added
   lines at one place (two tests appended to one module), in either order.
-  Text files only, at most 2 MiB a side, never `OWNERS`, at most 32 merged
+  Text files only, at most 2 MiB and 10,000 lines a side, never `OWNERS`,
+  at most 32 merged
   paths per original, and only identical changes on strict land refs
   (ADR 0089). Review requests close by the same rule.
 - **Added.** `GET .../review-status` answers `origins` (the originals it

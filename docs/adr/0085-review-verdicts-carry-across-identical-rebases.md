@@ -184,7 +184,7 @@ a reviewed path whose base moved is also reproduced when the judged
 changeset's file is exactly the server's own rebase of the reviewed change
 onto its base (`rebased`), or keeps both sides' insertions where the merge
 conflicts only between pure insertions at one place (`union`); text only,
-at most 2 MiB a side, never `OWNERS`, at most 32 merged paths per
+at most 2 MiB and 10,000 lines a side, never `OWNERS`, at most 32 merged paths per
 candidate, and not on strict land refs. The "compare diffs (hunks)"
 alternative stays rejected. `PathReview` gains `carried_rule`, and
 `review-status` gains `origins`.

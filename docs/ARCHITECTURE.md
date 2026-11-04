@@ -1550,9 +1550,11 @@ when Y's file is exactly the server's own rebase of X's change onto Y's base
 (`diffy::merge` as `rebase_as` calls it), or keeps both sides' insertions
 where the merge conflicts only between pure insertions at one place
 ([ADR 0089](adr/0089-review-verdicts-carry-across-client-rebases.md),
-`leep_derive::carry`): text only, at most 2 MiB a side, never `OWNERS`, at
-most 32 merged paths per candidate, outcomes cached in process by content
-hash, and never on a strict land ref (ADR 0066). `review-status` names the
+`leep_derive::carry`): text only, at most 2 MiB and 10,000 lines a side,
+never `OWNERS`, at most 32 merged paths per candidate, each merge computed
+once (single-flight, on a blocking thread, at most half the cores at once)
+and cached in process by content hash, and never on a strict land ref
+(ADR 0066). `review-status` names the
 source in `carried_from` and how in `carried_rule`, and lists the
 candidates it compared in `origins`, with why one did not carry. It is a second
 `LandPolicy`: `Repo::with_land_policy` composes policies (all must pass), and
