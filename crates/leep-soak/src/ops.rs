@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Serialize;
-use sqlx::{AssertSqlSafe, Connection, PgConnection};
+use sqlx::{Connection, PgConnection};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
@@ -27,57 +27,10 @@ pub struct Stores {
     pub blob_dir: Option<PathBuf>,
 }
 
-/// A throwaway Postgres database inside an admin URL.
-pub struct PgDb {
-    admin_url: String,
-    pub name: String,
-    pub url: String,
-}
-
-fn replace_db(url: &str, db: &str) -> Result<String> {
-    let (base, query) = match url.split_once('?') {
-        Some((b, q)) => (b, format!("?{q}")),
-        None => (url, String::new()),
-    };
-    let root = base
-        .rsplit_once('/')
-        .ok_or_else(|| anyhow!("postgres url has no database"))?
-        .0;
-    Ok(format!("{root}/{db}{query}"))
-}
-
-impl PgDb {
-    pub async fn create(admin_url: &str, tag: &str) -> Result<PgDb> {
-        let name = format!("leep_soak_{tag}");
-        let mut c = PgConnection::connect(admin_url)
-            .await
-            .context("connecting to postgres")?;
-        sqlx::query(AssertSqlSafe(format!(
-            "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
-        )))
-        .execute(&mut c)
-        .await?;
-        sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {name}")))
-            .execute(&mut c)
-            .await?;
-        Ok(PgDb {
-            admin_url: admin_url.to_string(),
-            url: replace_db(admin_url, &name)?,
-            name,
-        })
-    }
-
-    pub async fn drop_db(&self) -> Result<()> {
-        let mut c = PgConnection::connect(&self.admin_url).await?;
-        sqlx::query(AssertSqlSafe(format!(
-            "DROP DATABASE IF EXISTS {} WITH (FORCE)",
-            self.name
-        )))
-        .execute(&mut c)
-        .await?;
-        Ok(())
-    }
-}
+/// The run's throwaway Postgres database: dropped when the guard goes out
+/// of scope unless [`keep`](PgDb::keep) was called, so a run that stops on
+/// an error before its end leaves nothing behind either.
+pub use leep_meta::pg_test::TestDb as PgDb;
 
 /// Size and health numbers read from Postgres.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -861,7 +814,7 @@ mod tests {
     #[test]
     fn database_name_is_swapped() {
         assert_eq!(
-            replace_db("postgres://u:p@h:5432/postgres?sslmode=disable", "x").unwrap(),
+            leep_meta::pg_test::replace_db("postgres://u:p@h:5432/postgres?sslmode=disable", "x"),
             "postgres://u:p@h:5432/x?sslmode=disable"
         );
     }
