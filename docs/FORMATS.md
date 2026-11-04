@@ -766,8 +766,9 @@ Nothing persisted changed.
   good?, bad, suspects: [Suspect {changeset, seq, operation, actor?, time,
   land_id?, land_changeset?, created_by?, author, title, agent_model?, paths
   = [], more_paths = false}], truncated}`). The two ref paths share the
-  `/v1/refs/{*name}` route: a ref whose own name ends in `/checks` or
-  `/culprits` is still answered as that ref.
+  `/v1/refs/{*name}` route: the suffix meaning wins whenever the ref
+  before it exists, and a ref whose own name ends in `/checks` or
+  `/culprits` is answered as itself only when it does not.
 - Error code `promotion_only` (422): a land, move or delete of a green ref.
 
 ## Index leases and bounded queries (additive, ADR 0058)

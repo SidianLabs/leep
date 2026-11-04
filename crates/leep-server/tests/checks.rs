@@ -530,16 +530,22 @@ async fn suspects_are_the_lands_between_good_and_bad() {
 }
 
 #[tokio::test]
-async fn a_ref_named_like_a_suffix_is_still_itself() {
+async fn a_ref_named_like_a_suffix_never_shadows_the_status() {
     let api = Api::new(true);
     let h = api.lands(1).await;
-    api.repo
-        .meta()
-        .cas_ref("main/checks", None, Some(h[0]))
-        .await
-        .unwrap();
-    let r: RefResponse = api.get("/v1/refs/main/checks").await.ok();
-    assert_eq!((r.name.as_str(), r.target), ("main/checks", Some(h[0])));
+    for name in ["main/checks", "solo/checks"] {
+        api.repo
+            .meta()
+            .cas_ref(name, None, Some(h[0]))
+            .await
+            .unwrap();
+    }
+    // `main` exists: its status, never the look-alike ref.
+    let r: RefChecksResponse = api.get("/v1/refs/main/checks").await.ok();
+    assert_eq!((r.name.as_str(), r.head), ("main", h[1]));
+    // No `solo`: the ref itself.
+    let r: RefResponse = api.get("/v1/refs/solo/checks").await.ok();
+    assert_eq!((r.name.as_str(), r.target), ("solo/checks", Some(h[0])));
 }
 
 #[test]

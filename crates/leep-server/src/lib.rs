@@ -1177,21 +1177,30 @@ async fn list_refs(State(repo): S) -> ApiResult<Json<RefsResponse>> {
 
 /// `GET /v1/refs/{name}`, and `.../checks` and `.../culprits` of a ref
 /// (ADR 0091): ref names may hold `/`, so they share the route. A ref whose
-/// own name ends in one of those suffixes is still answered as itself.
+/// own name ends in one of those suffixes is answered as itself only when
+/// the ref before the suffix does not exist.
 async fn get_ref(
     State(repo): S,
     Extension(config): Cfg,
     Path(name): Path<String>,
     q: checks::MaybeCulprits,
 ) -> ApiResult<Response> {
-    let target = repo.meta().get_ref(&name).await?;
-    if target.is_none() {
-        if let Some(base) = name.strip_suffix(CHECKS_SUFFIX) {
+    // The suffix wins whenever the ref it names exists, so a ref called
+    // `main/checks` cannot stand in for `main`'s check status.
+    if let Some(base) = name.strip_suffix(CHECKS_SUFFIX) {
+        if repo.meta().get_ref(base).await?.is_some() {
             return checks::for_ref(&repo, &config, base).await;
         }
-        if let Some(base) = name.strip_suffix(CULPRITS_SUFFIX) {
+    }
+    if let Some(base) = name.strip_suffix(CULPRITS_SUFFIX) {
+        if repo.meta().get_ref(base).await?.is_some() {
             return checks::culprits(&repo, base, q.0).await;
         }
+    }
+    let target = repo.meta().get_ref(&name).await?;
+    if target.is_none() && (name.ends_with(CHECKS_SUFFIX) || name.ends_with(CULPRITS_SUFFIX)) {
+        // Neither the ref nor the one it would be about.
+        return Err(Error::NotFound(format!("ref {name:?}")).into());
     }
     Ok(Json(RefResponse { name, target }).into_response())
 }
