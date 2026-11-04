@@ -556,6 +556,8 @@ mod tests {
                 !attestation_or_state
                     && k.name != HISTORY_NODE_KIND
                     && k.name != LOG_FILTER_NAME_KIND
+                    // Dropped with `git-commit-v1`, all four together.
+                    && ![GIT_BLOB_KIND, GIT_TREE_KIND, GIT_OID_KIND].contains(&k.name)
             );
         }
         assert!(check_droppable("ref_log").is_err());
