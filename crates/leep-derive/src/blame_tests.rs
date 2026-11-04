@@ -469,10 +469,10 @@ async fn a_file_recreated_between_cuts_agrees_with_a_full_walk() {
 
 /// The first blame of a file changed on most of a long history walks the
 /// stretches at once and gathers their reads: it makes fewer reads than
-/// there are changes, and with every read delayed it takes a fraction of
+/// there are changes, and with every read delayed it waits a fraction of
 /// the time one read per change, in sequence, would. Short cuts stand in
 /// for a long history's (a 32-step head is most of this one).
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn first_blame_of_a_busy_file_is_not_one_read_per_change() {
     let (r, meta) = slow_repo();
     let mut text = String::new();
@@ -494,20 +494,20 @@ async fn first_blame_of_a_busy_file_is_not_one_read_per_change() {
         min_span: 8,
         linear_jumps: true,
     });
-    // The same blame without delays, for the time the replay takes.
-    let started = std::time::Instant::now();
     let cold = Repo::new(r.blobs().clone(), meta.clone());
     let (fast, _) = cold
         .blame_walk_in(tip, &rp("f"), cuts, false)
         .await
         .unwrap();
     assert_eq!(fast, full.0);
-    let base = started.elapsed();
     let latency = Duration::from_millis(2);
     meta.latency_us
         .store(latency.as_micros() as u64, Ordering::Relaxed);
     meta.reads.store(0, Ordering::Relaxed);
-    let started = std::time::Instant::now();
+    // The runtime's clock is paused and advances only when every task waits
+    // on a delay, so `took` is the delays along the longest chain of reads:
+    // exact, whatever the machine's load.
+    let started = tokio::time::Instant::now();
     let cold = Repo::new(r.blobs().clone(), meta.clone());
     let (fast, _) = cold
         .blame_walk_in(tip, &rp("f"), cuts, false)
@@ -520,8 +520,8 @@ async fn first_blame_of_a_busy_file_is_not_one_read_per_change() {
     assert!(reads < 800, "{reads} reads for about 800 changes");
     // One read per change, in sequence, would add 1.6 s.
     assert!(
-        took.saturating_sub(base) < latency * 400,
-        "the first blame took {took:?} ({base:?} without delays) over {reads} reads"
+        took < latency * 400,
+        "the first blame waited {took:?} on {reads} reads"
     );
 }
 
