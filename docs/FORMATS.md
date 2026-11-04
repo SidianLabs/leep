@@ -388,8 +388,11 @@ schema.
   message gets `Leep-Changeset: <id>` in its final trailer paragraph. Under
   `+provenance`, `agent.*` extras become `Leep-Agent-*` trailers first. A
   changeset with no files has git's empty tree.
-- **The style is part of every native commit id**, so it is written once.
-  Changing it means new kinds (`git-commit-v2`), not rewriting the row.
+- **The style is part of every native commit id**, so it is written once,
+  through the new `MetaStore::put_derived_if_absent` (stores a row only if
+  none is there and returns the row that won; atomic on Postgres and
+  SQLite). It is undone only by `repair drop --kind git-style-v1`, which
+  drops every git id derived under it.
 - **Not the bridge's maps.** `leep-to-git-v1` and `git-to-leep-v1` keep
   their meaning: what an import or a mirror recorded (and a GC root, ADR
   0059). For a commit the export reproduces, the two agree.
