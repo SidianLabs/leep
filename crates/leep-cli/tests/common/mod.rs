@@ -445,6 +445,8 @@ async fn add_review(
     Ok(Json(AddReviewResponse {
         reviewer: "mock".into(),
         verdict: req.verdict,
+        on_refs: Default::default(),
+        taken_back: Default::default(),
     }))
 }
 
@@ -492,6 +494,7 @@ async fn review_status(
         target_ref: q.get("ref").cloned().unwrap_or_else(|| "main".into()),
         approved: rule == "owner" || paths.is_empty(),
         paths,
+        on_refs: Default::default(),
     }))
 }
 

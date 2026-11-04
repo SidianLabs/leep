@@ -17,6 +17,7 @@ use leep_core::api::{
     error_code, CreateReviewRequest, CreateReviewRequestResponse, LandResponse, ReviewRequestEntry,
     ReviewRequestsResponse,
 };
+use leep_core::review::Verdict;
 use leep_core::review_request::{
     NewReviewRequest, ReviewRequestFilter, ReviewRequestState, TOO_MANY_REQUESTS_MARKER,
 };
@@ -73,15 +74,19 @@ pub(crate) async fn create(
     if reviewers.is_empty() {
         reviewers = default_reviewers(&repo, &config, &req, &who.name, &may_review).await?;
     }
+    let rules = config.review.as_ref().map(|s| s.rules());
     let asked = repo
-        .request_review(NewReviewRequest {
-            changeset: req.changeset,
-            target_ref: req.target_ref,
-            requester: who.name.clone(),
-            reviewers,
-            message: req.message,
-            created: unix_now(),
-        })
+        .request_review(
+            NewReviewRequest {
+                changeset: req.changeset,
+                target_ref: req.target_ref,
+                requester: who.name.clone(),
+                reviewers,
+                message: req.message,
+                created: unix_now(),
+            },
+            rules,
+        )
         .await;
     let (request, existing) = match asked {
         Err(Error::Invalid(m)) if m.contains(TOO_MANY_REQUESTS_MARKER) => {
@@ -97,7 +102,7 @@ pub(crate) async fn create(
         metrics::counter!("leep_review_requests_created_total").increment(1);
     }
     Ok(Json(CreateReviewRequestResponse {
-        request: entry(&repo, request).await?,
+        request: entry(&repo, &config, request).await?,
         existing,
     })
     .into_response())
@@ -117,7 +122,9 @@ async fn default_reviewers(
     let Some(service) = config.review.as_ref() else {
         return Ok(Vec::new());
     };
-    let status = service.status(repo, req.changeset, &req.target_ref).await?;
+    let status = service
+        .status(repo, req.changeset, &req.target_ref, &[])
+        .await?;
     let owners: BTreeSet<String> = status
         .paths
         .iter()
@@ -131,10 +138,41 @@ async fn default_reviewers(
 
 async fn entry(
     repo: &Repo,
+    config: &crate::reload::RuntimeConfig,
     r: leep_core::review_request::ReviewRequest,
 ) -> ApiResult<ReviewRequestEntry> {
-    let mut v = repo.review_request_entries(vec![r]).await?;
+    let mut v = entries(repo, config, vec![r]).await?;
     Ok(v.pop().expect("one entry per request"))
+}
+
+/// `reqs` as listed: with the changeset's creator and title, and who has
+/// approved or rejected the changeset itself (ADR 0087), each read in one
+/// batch for the page.
+async fn entries(
+    repo: &Repo,
+    config: &crate::reload::RuntimeConfig,
+    reqs: Vec<leep_core::review_request::ReviewRequest>,
+) -> ApiResult<Vec<ReviewRequestEntry>> {
+    let mut out = repo.review_request_entries(reqs).await?;
+    let Some(service) = config.review.as_ref() else {
+        return Ok(out);
+    };
+    let mut ids: Vec<ChangesetId> = out.iter().map(|e| e.request.changeset).collect();
+    ids.sort();
+    ids.dedup();
+    let verdicts = repo.reviews_by(&ids, service.reviewers()).await?;
+    for e in &mut out {
+        for r in verdicts.get(&e.request.changeset).into_iter().flatten() {
+            match r.verdict {
+                Verdict::Approve => e.approved_by.push(r.reviewer.clone()),
+                Verdict::Reject => e.rejected_by.push(r.reviewer.clone()),
+                Verdict::Withdrawn => {}
+            }
+        }
+        e.approved_by.sort();
+        e.rejected_by.sort();
+    }
+    Ok(out)
 }
 
 #[derive(Deserialize)]
@@ -152,6 +190,7 @@ pub(crate) struct ListQuery {
 
 pub(crate) async fn list(
     State(repo): S,
+    Extension(config): Cfg,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<ReviewRequestsResponse>> {
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT);
@@ -184,23 +223,26 @@ pub(crate) async fn list(
         before: q.before,
         limit: limit.min(MAX_LIMIT),
     };
-    let (reqs, next) = repo.review_requests(&filter).await?;
+    let rules = config.review.as_ref().map(|s| s.rules());
+    let (reqs, next) = repo.review_requests(&filter, rules).await?;
     Ok(Json(ReviewRequestsResponse {
-        requests: repo.review_request_entries(reqs).await?,
+        requests: entries(&repo, &config, reqs).await?,
         next,
     }))
 }
 
 pub(crate) async fn get_one(
     State(repo): S,
+    Extension(config): Cfg,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ReviewRequestEntry>> {
     let r = repo.review_request(request_id(&id)?).await?;
-    Ok(Json(entry(&repo, r).await?))
+    Ok(Json(entry(&repo, &config, r).await?))
 }
 
 pub(crate) async fn withdraw(
     State(repo): S,
+    Extension(config): Cfg,
     auth::MaybePrincipal(who): auth::MaybePrincipal,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
@@ -218,7 +260,7 @@ pub(crate) async fn withdraw(
         ));
     }
     let r = repo.withdraw_review_request(id).await?;
-    Ok(Json(entry(&repo, r).await?).into_response())
+    Ok(Json(entry(&repo, &config, r).await?).into_response())
 }
 
 fn request_id(s: &str) -> ApiResult<u64> {
@@ -229,11 +271,14 @@ fn request_id(s: &str) -> ApiResult<u64> {
 /// After a land answered `resp`, close the requests it satisfied, in a task
 /// of its own: the land has happened, and nothing here may delay or fail
 /// its answer. What this misses (an error, a timeout) a listing closes
-/// later where it can see it.
+/// later where it can see it. `actor` ran the land: its own requests close
+/// when the land names their changesets (ADR 0087).
 pub(crate) fn after_land(
     repo: Repo,
+    config: &crate::reload::RuntimeConfig,
     target_ref: String,
     submitted: ChangesetId,
+    actor: Option<&str>,
     resp: &LandResponse,
 ) {
     let LandResponse::Landed { landed, .. } = resp else {
@@ -243,8 +288,16 @@ pub(crate) fn after_land(
         return;
     }
     let landed = *landed;
+    let actor = actor.map(str::to_string);
+    let rules = config.review.as_ref().map(|s| s.rules().clone());
     tokio::spawn(async move {
-        let closing = repo.close_landed_review_requests(&target_ref, submitted, landed);
+        let closing = repo.close_landed_review_requests(
+            &target_ref,
+            submitted,
+            landed,
+            actor.as_deref(),
+            rules.as_ref(),
+        );
         match tokio::time::timeout(CLOSE_TIMEOUT, closing).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {

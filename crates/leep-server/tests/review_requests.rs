@@ -518,21 +518,42 @@ async fn landing_closes_the_request() {
     let other = api
         .commit(Some("carol"), &[head], &[("b", "2\n")], "change b")
         .await;
-    for x in [other, c] {
-        let r = api
-            .post(
-                &format!("/v1/changesets/{x}/reviews"),
-                Some("bob"),
-                &AddReviewRequest {
-                    verdict: Verdict::Approve,
-                    comment: String::new(),
-                    reviewer: None,
-                    source: None,
-                },
-            )
-            .await;
-        assert_eq!(r.status, StatusCode::OK);
-    }
+    let review = |x: ChangesetId, who: &'static str, verdict: Verdict| {
+        let api = &api;
+        async move {
+            let r = api
+                .post(
+                    &format!("/v1/changesets/{x}/reviews"),
+                    Some(who),
+                    &AddReviewRequest {
+                        verdict,
+                        comment: String::new(),
+                        reviewer: None,
+                        source: None,
+                    },
+                )
+                .await;
+            r.ok::<AddReviewResponse>()
+        }
+    };
+    let entry_of = |e: &ReviewRequestsResponse| {
+        let e = &e.requests[0];
+        (e.approved_by.clone(), e.rejected_by.clone())
+    };
+    // The listing says who has answered (ADR 0087).
+    let none: (Vec<String>, Vec<String>) = Default::default();
+    assert_eq!(entry_of(&api.list("reviewer=bob").await), none);
+    review(c, "carol", Verdict::Reject).await;
+    review(c, "bob", Verdict::Approve).await;
+    assert_eq!(
+        entry_of(&api.list("reviewer=bob").await),
+        (vec!["bob".to_string()], vec!["carol".to_string()])
+    );
+    review(c, "carol", Verdict::Withdrawn).await;
+    let raw: serde_json::Value = api.get("/v1/review-requests?reviewer=bob").await.json();
+    assert_eq!(raw["requests"][0]["approved_by"][0], "bob");
+    assert!(raw["requests"][0].get("rejected_by").is_none());
+    review(other, "bob", Verdict::Approve).await;
     let land = |x: ChangesetId| LandRequest {
         changeset: x,
         target_ref: "main".into(),
@@ -564,4 +585,9 @@ async fn landing_closes_the_request() {
     assert_eq!(entry.request.landed_as, Some(landed));
     assert!(api.ids("reviewer=bob&open=true").await.is_empty());
     assert_eq!(api.ids("state=landed").await, [id]);
+    // A verdict on what already landed is kept, and says so.
+    assert_eq!(
+        review(landed, "bob", Verdict::Approve).await.on_refs,
+        ["main"]
+    );
 }

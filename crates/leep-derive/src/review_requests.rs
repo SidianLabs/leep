@@ -1,8 +1,9 @@
-//! Review requests and who created a changeset (ADR 0086).
+//! Review requests and who created a changeset (ADR 0086, 0087).
 //!
 //! Requests are rows of their own store table: the server opens them for
 //! the authenticated principal, lists them by reviewer or requester, and
-//! closes them when their changeset lands. Closing is bookkeeping a land
+//! closes them when their changeset, or its reviewed change, lands
+//! (ADR 0087). Closing is bookkeeping a land
 //! must never wait on or fail for, so the land path calls
 //! [`Repo::close_landed_review_requests`] after the ref moved and ignores
 //! its errors, and listing closes what a move the land path did not see
@@ -12,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 use leep_core::api::ReviewRequestEntry;
+use leep_core::changeset::EXTRA_REBASED_FROM;
 use leep_core::review_request::{
     check_request, CreatedBy, NewReviewRequest, ReviewRequest, ReviewRequestFilter,
     ReviewRequestState, CREATED_BY_KIND, MAX_OPEN_REQUESTS, TOO_MANY_REQUESTS_MARKER,
@@ -19,14 +21,34 @@ use leep_core::review_request::{
 use leep_core::store::unix_now;
 use leep_core::{refname, Changeset, ChangesetId, DerivedRow, Error, Result};
 
+use crate::review::ReviewRules;
 use crate::Repo;
 
 /// Open requests of one ref a land looks at; more stay open until listed.
 const LAND_CLOSE_LIMIT: usize = 500;
 
-/// First-parent steps a land walks from its new head looking for the
-/// copies it made of requested changesets.
+/// First-parent steps a land walks from its new head over the changesets
+/// it added (its copies, a client's resolving commit).
 const COPY_WALK_LIMIT: usize = 256;
+
+/// Newest ref log entries a land reads to find the head it moved from.
+const LAND_LOG_LOOKBACK: usize = 64;
+
+/// First-parent steps a listing walks from a ref's head looking for
+/// changesets that name a requested one in `leep.rebased_from`.
+const LIST_WALK_LIMIT: usize = 64;
+
+/// Carry candidates one listing's walk of a ref collects before it stops.
+const LIST_CANDIDATE_LIMIT: usize = 256;
+
+/// A changeset near a ref's head that names others it was made from.
+struct Hinted {
+    id: ChangesetId,
+    /// The server's `rebased-origin-v1` row: `id` is a copy of it.
+    origin: Option<ChangesetId>,
+    /// What [`Repo::carry_candidates`] finds from `id`'s hints.
+    candidates: Vec<ChangesetId>,
+}
 
 fn unsupported() -> Error {
     Error::Invalid(
@@ -73,8 +95,13 @@ impl Repo {
 
     /// Open a review request, or answer the open one of the same requester,
     /// changeset, ref and reviewers (true). The changeset must exist and
-    /// not be on the ref already.
-    pub async fn request_review(&self, mut req: NewReviewRequest) -> Result<(ReviewRequest, bool)> {
+    /// not be on the ref already. `rules` are the review policy's, for
+    /// closing landed requests before the cap is checked.
+    pub async fn request_review(
+        &self,
+        mut req: NewReviewRequest,
+        rules: Option<&ReviewRules>,
+    ) -> Result<(ReviewRequest, bool)> {
         if !self.meta().supports_review_requests() {
             return Err(unsupported());
         }
@@ -119,14 +146,18 @@ impl Repo {
         if let Some(r) = same.into_iter().find(|r| r.reviewers == req.reviewers) {
             return Ok((r, true));
         }
-        self.check_open_requests(&req.requester).await?;
+        self.check_open_requests(&req.requester, rules).await?;
         Ok((self.meta().put_review_request(&req).await?, false))
     }
 
     /// Refuse a requester at [`MAX_OPEN_REQUESTS`] open requests. At the
     /// cap, a listing first closes the ones that landed by a move the land
     /// path did not report, so only requests really waiting count.
-    async fn check_open_requests(&self, requester: &str) -> Result<()> {
+    async fn check_open_requests(
+        &self,
+        requester: &str,
+        rules: Option<&ReviewRules>,
+    ) -> Result<()> {
         let filter = ReviewRequestFilter {
             requester: Some(requester.to_string()),
             states: vec![ReviewRequestState::Open],
@@ -134,7 +165,7 @@ impl Repo {
             ..Default::default()
         };
         if self.meta().list_review_requests(&filter).await?.len() < MAX_OPEN_REQUESTS
-            || self.review_requests(&filter).await?.0.len() < MAX_OPEN_REQUESTS
+            || self.review_requests(&filter, rules).await?.0.len() < MAX_OPEN_REQUESTS
         {
             return Ok(());
         }
@@ -145,23 +176,31 @@ impl Repo {
     }
 
     /// The requests `filter` matches, and the `before` of the next page
-    /// when this one was full. Open ones whose changeset is now on their
-    /// ref's first-parent chain are closed as landed first (a move the land
-    /// path did not report, such as a raw ref update), and left out when
-    /// only open ones were asked for.
+    /// when this one was full. Open ones whose change is now on their ref
+    /// are closed as landed first (a move the land path did not report,
+    /// such as a raw ref update, or a close it missed), and left out when
+    /// only open ones were asked for: a changeset on the ref's first-parent
+    /// chain, or one that a changeset among the newest
+    /// [`LIST_WALK_LIMIT`] there copies (the server's row) or names and
+    /// lands the reviewed change of (ADR 0087). `rules` are the review
+    /// policy's; without them no auto rule holds, which closes less.
     pub async fn review_requests(
         &self,
         filter: &ReviewRequestFilter,
+        rules: Option<&ReviewRules>,
     ) -> Result<(Vec<ReviewRequest>, Option<u64>)> {
         if !self.meta().supports_review_requests() {
             return Err(unsupported());
         }
+        let default_rules = ReviewRules::default();
+        let rules = rules.unwrap_or(&default_rules);
         let mut reqs = self.meta().list_review_requests(filter).await?;
         let next = reqs
             .last()
             .map(|r| r.id)
             .filter(|_| filter.limit > 0 && reqs.len() >= filter.limit);
         let mut heads: HashMap<String, Option<ChangesetId>> = HashMap::new();
+        let mut walks: HashMap<String, Vec<Hinted>> = HashMap::new();
         let now = unix_now();
         for r in reqs.iter_mut() {
             if r.state != ReviewRequestState::Open {
@@ -178,14 +217,35 @@ impl Repo {
             let Some(head) = head else { continue };
             // A changeset that cannot be judged (collected, unreadable)
             // stays open: listing is no place to fail.
-            if !self
+            let mut landed_as = None;
+            if self
                 .on_first_parent_of(r.changeset, head)
                 .await
                 .unwrap_or(false)
             {
+                landed_as = Some(r.changeset);
+            } else {
+                if !walks.contains_key(&r.target_ref) {
+                    let walk = self.hinted_below(head).await;
+                    walks.insert(r.target_ref.clone(), walk);
+                }
+                // Oldest first: the changeset that first put it there.
+                for h in walks[&r.target_ref].iter().rev() {
+                    if h.origin == Some(r.changeset)
+                        || (h.candidates.contains(&r.changeset)
+                            && self
+                                .lands_reviewed_change(r.changeset, h.id, rules)
+                                .await
+                                .unwrap_or(false))
+                    {
+                        landed_as = Some(h.id);
+                        break;
+                    }
+                }
+            }
+            if landed_as.is_none() {
                 continue;
             }
-            let landed_as = Some(r.changeset);
             if self
                 .meta()
                 .close_review_request(r.id, ReviewRequestState::Landed, landed_as, now)
@@ -204,6 +264,43 @@ impl Repo {
             reqs.retain(|r| filter.states.contains(&r.state));
         }
         Ok((reqs, next))
+    }
+
+    /// The changesets among the newest [`LIST_WALK_LIMIT`] on `head`'s
+    /// first-parent chain that name others in `leep.rebased_from`, newest
+    /// first, until [`LIST_CANDIDATE_LIMIT`] candidates are collected. A
+    /// read that fails ends the walk with what it found: listing is no
+    /// place to fail.
+    async fn hinted_below(&self, head: ChangesetId) -> Vec<Hinted> {
+        let mut out = Vec::new();
+        let mut total = 0;
+        let mut cur = Some(head);
+        for _ in 0..LIST_WALK_LIMIT {
+            let Some(id) = cur else { break };
+            let Ok(cs) = self.get_changeset(id).await else {
+                break;
+            };
+            cur = cs.parents.first().copied();
+            if !cs.extra.contains_key(EXTRA_REBASED_FROM) {
+                continue;
+            }
+            let (Ok(candidates), Ok(origin)) = (
+                self.carry_candidates(id).await,
+                self.rebased_origin(id).await,
+            ) else {
+                break;
+            };
+            total += candidates.len();
+            out.push(Hinted {
+                id,
+                origin,
+                candidates,
+            });
+            if total >= LIST_CANDIDATE_LIMIT {
+                break;
+            }
+        }
+        out
     }
 
     pub async fn review_request(&self, id: u64) -> Result<ReviewRequest> {
@@ -233,20 +330,37 @@ impl Repo {
     }
 
     /// Close the open requests of `target_ref` that a land of `submitted`,
-    /// which put `landed` at the head, satisfied: the submitted changeset,
-    /// the changesets of its stack (as themselves or as the copies the land
-    /// replayed them as) and anything else now on the head's first-parent
-    /// chain. Returns how many it closed. Callers ignore its errors: the
+    /// which put `landed` at the head, satisfied (ADR 0086, 0087): the
+    /// submitted changeset, the changesets of its stack (as themselves or as
+    /// the copies the land replayed them as), anything else now on the
+    /// head's first-parent chain, and changesets that a changeset Z the land
+    /// added names in `leep.rebased_from` when either
+    ///
+    /// - Z lands their reviewed change, judged by content alone as a carried
+    ///   verdict is ([`Repo::lands_reviewed_change`]), so a forged hint
+    ///   closes nothing whose reviewed change did not land; or
+    /// - `actor`, who ran the land, made the request: a requester may
+    ///   withdraw their own request anyway, and this covers a stack entry
+    ///   whose reviewed file a lower entry also changed.
+    ///
+    /// The changesets the land added are found from the ref log entry of
+    /// the move to `landed` (the first-parent chain down to the head it
+    /// moved from); without one, only `landed` and the server copies below
+    /// it count. Returns how many it closed. Callers ignore its errors: the
     /// land has happened whatever this does.
     pub async fn close_landed_review_requests(
         &self,
         target_ref: &str,
         submitted: ChangesetId,
         landed: ChangesetId,
+        actor: Option<&str>,
+        rules: Option<&ReviewRules>,
     ) -> Result<u64> {
         if !self.meta().supports_review_requests() {
             return Ok(0);
         }
+        let default_rules = ReviewRules::default();
+        let rules = rules.unwrap_or(&default_rules);
         let open = self
             .meta()
             .list_review_requests(&ReviewRequestFilter {
@@ -259,15 +373,21 @@ impl Repo {
         if open.is_empty() {
             return Ok(0);
         }
-        let copies = if submitted == landed {
-            HashMap::new()
-        } else {
-            self.copies_below(landed).await?
-        };
+        let mut copies = HashMap::new();
+        let mut named = Vec::new();
+        for z in self.land_added(target_ref, landed).await? {
+            if let Some(origin) = self.rebased_origin(z).await? {
+                copies.entry(origin).or_insert(z);
+            }
+            let candidates = self.carry_candidates(z).await?;
+            if !candidates.is_empty() {
+                named.push((z, candidates));
+            }
+        }
         let now = unix_now();
         let mut closed = 0;
         for r in open {
-            let landed_as = if r.changeset == submitted || r.changeset == landed {
+            let mut landed_as = if r.changeset == submitted || r.changeset == landed {
                 Some(landed)
             } else if let Some(copy) = copies.get(&r.changeset) {
                 Some(*copy)
@@ -278,8 +398,28 @@ impl Repo {
             {
                 Some(r.changeset)
             } else {
-                continue;
+                None
             };
+            // Oldest first: the changeset that first put it there.
+            for (z, candidates) in named.iter().rev() {
+                if landed_as.is_some() {
+                    break;
+                }
+                if !candidates.contains(&r.changeset) {
+                    continue;
+                }
+                if actor == Some(r.requester.as_str())
+                    || self
+                        .lands_reviewed_change(r.changeset, *z, rules)
+                        .await
+                        .unwrap_or(false)
+                {
+                    landed_as = Some(*z);
+                }
+            }
+            if landed_as.is_none() {
+                continue;
+            }
             if self
                 .meta()
                 .close_review_request(r.id, ReviewRequestState::Landed, landed_as, now)
@@ -295,25 +435,51 @@ impl Repo {
         Ok(closed)
     }
 
-    /// The server-made copies on `head`'s first-parent chain, by the
-    /// changeset each copies, down to the first changeset that is not one.
-    /// Only the `rebased-origin-v1` row the server writes when it makes a
-    /// copy counts: a changeset's own `leep.rebased_from` is whatever its
-    /// client wrote, and trusting it would let one agent's land close
-    /// another's request.
-    async fn copies_below(&self, head: ChangesetId) -> Result<HashMap<ChangesetId, ChangesetId>> {
-        let mut out = HashMap::new();
-        let mut cur = Some(head);
+    /// The changesets a land that moved `target_ref` to `landed` added,
+    /// newest first: `landed`'s first-parent chain down to the head the ref
+    /// log says it moved from, at most [`COPY_WALK_LIMIT`]. Without that
+    /// entry (more than [`LAND_LOG_LOOKBACK`] moves since), `landed` and the
+    /// server copies directly below it, which a replayed land made.
+    async fn land_added(&self, target_ref: &str, landed: ChangesetId) -> Result<Vec<ChangesetId>> {
+        let log = self
+            .meta()
+            .ref_log(Some(target_ref), None, LAND_LOG_LOOKBACK)
+            .await
+            .unwrap_or_default();
+        let from = log.iter().find(|e| e.new == Some(landed)).map(|e| e.old);
+        let mut out = Vec::new();
         let mut seen = HashSet::new();
+        let mut cur = Some(landed);
         while let Some(id) = cur.filter(|_| out.len() < COPY_WALK_LIMIT) {
             if !seen.insert(id) {
                 break;
             }
-            let Some(origin) = self.rebased_origin(id).await? else {
-                break;
+            match from {
+                Some(old) if old == Some(id) => break,
+                None if id != landed && self.rebased_origin(id).await?.is_none() => break,
+                _ => {}
+            }
+            out.push(id);
+            cur = match self.get_changeset(id).await {
+                Ok(cs) => cs.parents.first().copied(),
+                Err(Error::NotFound(_)) => None,
+                Err(e) => return Err(e),
             };
-            out.insert(origin, id);
-            cur = self.get_changeset(id).await?.parents.first().copied();
+        }
+        Ok(out)
+    }
+
+    /// The refs among `names` whose first-parent chain holds `id`, in the
+    /// order given: where a verdict on `id` no longer decides a land.
+    pub async fn refs_holding(&self, id: ChangesetId, names: &[String]) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for name in names {
+            let Some(head) = self.meta().get_ref(name).await? else {
+                continue;
+            };
+            if self.on_first_parent_of(id, head).await.unwrap_or(false) {
+                out.push(name.clone());
+            }
         }
         Ok(out)
     }
@@ -358,6 +524,8 @@ impl Repo {
                     request,
                     created_by,
                     title,
+                    approved_by: Vec::new(),
+                    rejected_by: Vec::new(),
                 }
             })
             .collect())
@@ -371,7 +539,8 @@ mod tests {
     use leep_core::{FileChange, FileKind, Hash, RepoPath};
 
     use super::*;
-    use crate::tests::repo;
+    use crate::review::AutoRule;
+    use crate::tests::{commit as files_commit, repo};
 
     async fn commit(r: &Repo, parent: Option<ChangesetId>, n: u8) -> ChangesetId {
         let body = vec![n; 3];
@@ -406,6 +575,299 @@ mod tests {
             message: String::new(),
             created: 1,
         }
+    }
+
+    fn all_auto() -> ReviewRules {
+        ReviewRules::new(
+            [
+                AutoRule::CommentOnly,
+                AutoRule::WhitespaceOnly,
+                AutoRule::DocsOnly,
+            ],
+            &["**/*.md".into()],
+        )
+        .unwrap()
+    }
+
+    fn docs() -> ReviewRules {
+        ReviewRules::new([AutoRule::DocsOnly], &["**/*.md".into()]).unwrap()
+    }
+
+    /// A changeset with `files`, naming `from` in `leep.rebased_from`
+    /// (newest first, as the CLI writes a resolved stack).
+    async fn naming(
+        r: &Repo,
+        parent: ChangesetId,
+        files: &[(&str, Option<&str>)],
+        from: &[ChangesetId],
+    ) -> ChangesetId {
+        let id = files_commit(r, &[parent], files, "resolve").await;
+        let mut cs = r.get_changeset(id).await.unwrap();
+        let named: Vec<String> = from.iter().map(|c| c.to_string()).collect();
+        cs.extra.insert(EXTRA_REBASED_FROM.into(), named.join(","));
+        r.create_changeset(cs).await.unwrap()
+    }
+
+    async fn landed_by(r: &Repo, id: ChangesetId, actor: &str) -> ChangesetId {
+        match r.land_as(id, "main", Some(actor)).await.unwrap() {
+            leep_core::api::LandResponse::Landed { landed, .. } => landed,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    async fn state(r: &Repo, q: &ReviewRequest) -> (ReviewRequestState, Option<ChangesetId>) {
+        let q = r.review_request(q.id).await.unwrap();
+        (q.state, q.landed_as)
+    }
+
+    /// Main with `a.rs` and a changelog; ada's X changes both and is
+    /// requested; bo's change to the changelog lands first, so X conflicts.
+    async fn conflicted(r: &Repo, x_files: &[(&str, Option<&str>)]) -> (ChangesetId, ChangesetId) {
+        let base = files_commit(
+            r,
+            &[],
+            &[("a.rs", Some("1\n")), ("CHANGELOG.md", Some("c\n"))],
+            "base",
+        )
+        .await;
+        r.meta().cas_ref("main", None, Some(base)).await.unwrap();
+        let x = files_commit(r, &[base], x_files, "x").await;
+        let m = files_commit(r, &[base], &[("CHANGELOG.md", Some("c\nm\n"))], "m").await;
+        landed_by(r, m, "bo").await;
+        (x, m)
+    }
+
+    /// The client resolves X's changelog conflict in a commit of its own
+    /// that names X: the reviewed code is byte for byte X's, so the land
+    /// closes the request by content, whoever ran it. Without the policy's
+    /// docs rule the changelog counts as reviewed and nothing closes.
+    #[tokio::test]
+    async fn a_client_resolution_naming_the_request_closes_it() {
+        let r = repo();
+        let (x, m) = conflicted(
+            &r,
+            &[("a.rs", Some("2\n")), ("CHANGELOG.md", Some("c\nx\n"))],
+        )
+        .await;
+        let (q, _) = r
+            .request_review(ask(x, "ada", &["rhea"]), None)
+            .await
+            .unwrap();
+        let z = naming(
+            &r,
+            m,
+            &[("a.rs", Some("2\n")), ("CHANGELOG.md", Some("c\nm\nx\n"))],
+            &[x],
+        )
+        .await;
+        assert_eq!(landed_by(&r, z, "cy").await, z);
+        assert_eq!(
+            r.close_landed_review_requests("main", z, z, Some("cy"), None)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(state(&r, &q).await, (ReviewRequestState::Open, None));
+        assert_eq!(
+            r.close_landed_review_requests("main", z, z, Some("cy"), Some(&docs()))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(state(&r, &q).await, (ReviewRequestState::Landed, Some(z)));
+    }
+
+    /// One changed byte in a reviewed file: the resolution is not the
+    /// reviewed change, and only its requester's own land closes it.
+    #[tokio::test]
+    async fn a_resolution_that_changed_a_reviewed_byte_stays_open() {
+        let r = repo();
+        let (x, m) = conflicted(
+            &r,
+            &[("a.rs", Some("2\n")), ("CHANGELOG.md", Some("c\nx\n"))],
+        )
+        .await;
+        let (q, _) = r
+            .request_review(ask(x, "ada", &["rhea"]), None)
+            .await
+            .unwrap();
+        let z = naming(
+            &r,
+            m,
+            &[("a.rs", Some("2!\n")), ("CHANGELOG.md", Some("c\nm\nx\n"))],
+            &[x],
+        )
+        .await;
+        landed_by(&r, z, "cy").await;
+        assert_eq!(
+            r.close_landed_review_requests("main", z, z, Some("cy"), Some(&all_auto()))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            r.review_requests(&open_for("rhea"), Some(&all_auto()))
+                .await
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
+        assert_eq!(state(&r, &q).await, (ReviewRequestState::Open, None));
+    }
+
+    /// X changed only the changelog, which the docs rule approves: it
+    /// closes once the changelog lands, in whatever docs form, under a
+    /// changeset naming it. One that leaves the file alone does not.
+    #[tokio::test]
+    async fn an_auto_only_request_closes_when_its_docs_land_differently() {
+        let r = repo();
+        let (x, m) = conflicted(&r, &[("CHANGELOG.md", Some("c\nx\n"))]).await;
+        let (q, _) = r
+            .request_review(ask(x, "ada", &["rhea"]), None)
+            .await
+            .unwrap();
+        let elsewhere = naming(&r, m, &[("README.md", Some("r\n"))], &[x]).await;
+        landed_by(&r, elsewhere, "cy").await;
+        assert_eq!(
+            r.close_landed_review_requests("main", elsewhere, elsewhere, Some("cy"), Some(&docs()))
+                .await
+                .unwrap(),
+            0
+        );
+        let z = naming(&r, elsewhere, &[("CHANGELOG.md", Some("c\nm\nx\n"))], &[x]).await;
+        landed_by(&r, z, "cy").await;
+        // Without the docs rule the changelog is reviewed content that
+        // differs.
+        assert_eq!(
+            r.close_landed_review_requests("main", z, z, Some("cy"), None)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            r.close_landed_review_requests("main", z, z, Some("cy"), Some(&docs()))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(state(&r, &q).await, (ReviewRequestState::Landed, Some(z)));
+    }
+
+    /// A stack S1 then S2, both changing `a.rs`, resolved into one commit
+    /// naming both: S2's reviewed old content is S1's, so the content rule
+    /// refuses both.
+    async fn resolved_stack(r: &Repo) -> (ReviewRequest, ReviewRequest, ChangesetId) {
+        let (s1, m) = conflicted(
+            r,
+            &[("a.rs", Some("2\n")), ("CHANGELOG.md", Some("c\ns1\n"))],
+        )
+        .await;
+        let s2 = files_commit(r, &[s1], &[("a.rs", Some("3\n"))], "s2").await;
+        let (q1, _) = r
+            .request_review(ask(s1, "ada", &["rhea"]), None)
+            .await
+            .unwrap();
+        let (q2, _) = r
+            .request_review(ask(s2, "ada", &["rhea"]), None)
+            .await
+            .unwrap();
+        let z = naming(
+            r,
+            m,
+            &[("a.rs", Some("3\n")), ("CHANGELOG.md", Some("c\nm\ns1\n"))],
+            &[s2, s1],
+        )
+        .await;
+        (q1, q2, z)
+    }
+
+    #[tokio::test]
+    async fn the_requesters_own_land_closes_a_stack_entry_the_content_rule_refuses() {
+        let r = repo();
+        let (q1, q2, z) = resolved_stack(&r).await;
+        assert!(!r
+            .lands_reviewed_change(q2.changeset, z, &docs())
+            .await
+            .unwrap());
+        landed_by(&r, z, "ada").await;
+        assert_eq!(
+            r.close_landed_review_requests("main", z, z, Some("ada"), Some(&docs()))
+                .await
+                .unwrap(),
+            2
+        );
+        for q in [&q1, &q2] {
+            assert_eq!(state(&r, q).await, (ReviewRequestState::Landed, Some(z)));
+        }
+    }
+
+    #[tokio::test]
+    async fn another_agents_land_naming_it_does_not() {
+        let r = repo();
+        let (q1, q2, z) = resolved_stack(&r).await;
+        landed_by(&r, z, "bo").await;
+        assert_eq!(
+            r.close_landed_review_requests("main", z, z, Some("bo"), Some(&all_auto()))
+                .await
+                .unwrap(),
+            0
+        );
+        // A listing has no actor: it closes by content only.
+        assert_eq!(
+            r.review_requests(&open_for("rhea"), Some(&all_auto()))
+                .await
+                .unwrap()
+                .0
+                .len(),
+            2
+        );
+        for q in [&q1, &q2] {
+            assert_eq!(state(&r, q).await, (ReviewRequestState::Open, None));
+        }
+    }
+
+    /// A resolution put on the ref by a raw ref update, which no land path
+    /// reports: a listing closes the request by the same content rule, with
+    /// the policy's rules.
+    #[tokio::test]
+    async fn a_listing_closes_a_resolution_moved_by_a_raw_ref_update() {
+        let r = repo();
+        let (x, m) = conflicted(
+            &r,
+            &[("a.rs", Some("2\n")), ("CHANGELOG.md", Some("c\nx\n"))],
+        )
+        .await;
+        let (q, _) = r
+            .request_review(ask(x, "ada", &["rhea"]), None)
+            .await
+            .unwrap();
+        let z = naming(
+            &r,
+            m,
+            &[("a.rs", Some("2\n")), ("CHANGELOG.md", Some("c\nm\nx\n"))],
+            &[x],
+        )
+        .await;
+        // Something unrelated lands on top, so z is below the head.
+        let top = files_commit(&r, &[z], &[("b.rs", Some("b\n"))], "top").await;
+        r.meta().cas_ref("main", Some(m), Some(z)).await.unwrap();
+        r.meta().cas_ref("main", Some(z), Some(top)).await.unwrap();
+        assert_eq!(
+            r.review_requests(&open_for("rhea"), None)
+                .await
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
+        assert!(r
+            .review_requests(&open_for("rhea"), Some(&docs()))
+            .await
+            .unwrap()
+            .0
+            .is_empty());
+        assert_eq!(state(&r, &q).await, (ReviewRequestState::Landed, Some(z)));
     }
 
     fn open_for(reviewer: &str) -> ReviewRequestFilter {
@@ -456,48 +918,51 @@ mod tests {
         r.meta().cas_ref("main", None, Some(base)).await.unwrap();
         let c = commit(&r, Some(base), 2).await;
         let (a, existing) = r
-            .request_review(ask(c, "ada", &["rhea", "bo", "rhea"]))
+            .request_review(ask(c, "ada", &["rhea", "bo", "rhea"]), None)
             .await
             .unwrap();
         assert!(!existing);
         assert_eq!(a.reviewers, ["bo", "rhea"]);
         let (again, existing) = r
-            .request_review(ask(c, "ada", &["bo", "rhea"]))
+            .request_review(ask(c, "ada", &["bo", "rhea"]), None)
             .await
             .unwrap();
         assert!(existing);
         assert_eq!(again, a);
-        let (other, existing) = r.request_review(ask(c, "ada", &["cy"])).await.unwrap();
+        let (other, existing) = r
+            .request_review(ask(c, "ada", &["cy"]), None)
+            .await
+            .unwrap();
         assert!(!existing && other.id != a.id);
         assert_eq!(
-            r.review_requests(&open_for("rhea")).await.unwrap().0,
+            r.review_requests(&open_for("rhea"), None).await.unwrap().0,
             std::slice::from_ref(&a)
         );
         let entries = r.review_request_entries(vec![a.clone()]).await.unwrap();
         assert_eq!(entries[0].title.as_deref(), Some("change 2"));
         assert_eq!(entries[0].created_by, None);
         // Already on the ref, unknown, a bad ref: refused.
-        assert!(r.request_review(ask(base, "ada", &[])).await.is_err());
+        assert!(r.request_review(ask(base, "ada", &[]), None).await.is_err());
         let ghost = ChangesetId(Hash::of_blob(b"ghost"));
         assert!(matches!(
-            r.request_review(ask(ghost, "ada", &[])).await,
+            r.request_review(ask(ghost, "ada", &[]), None).await,
             Err(Error::NotFound(_))
         ));
         let mut bad = ask(c, "ada", &[]);
         bad.target_ref = "a..b".into();
-        assert!(r.request_review(bad).await.is_err());
+        assert!(r.request_review(bad, None).await.is_err());
         // A ref that does not exist: nothing could ever close it.
         let mut nowhere = ask(c, "ada", &[]);
         nowhere.target_ref = "nowhere".into();
         assert!(matches!(
-            r.request_review(nowhere).await,
+            r.request_review(nowhere, None).await,
             Err(Error::NotFound(_))
         ));
 
         let w = r.withdraw_review_request(a.id).await.unwrap();
         assert_eq!(w.state, ReviewRequestState::Withdrawn);
         assert!(r
-            .review_requests(&open_for("rhea"))
+            .review_requests(&open_for("rhea"), None)
             .await
             .unwrap()
             .0
@@ -521,31 +986,41 @@ mod tests {
         let mut first = None;
         for i in 0..MAX_OPEN_REQUESTS {
             let name = format!("r{i}");
-            let (q, existing) = r.request_review(ask(c, "ada", &[&name])).await.unwrap();
+            let (q, existing) = r
+                .request_review(ask(c, "ada", &[&name]), None)
+                .await
+                .unwrap();
             assert!(!existing);
             first.get_or_insert(q.id);
         }
         let err = r
-            .request_review(ask(c, "ada", &["one-more"]))
+            .request_review(ask(c, "ada", &["one-more"]), None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains(TOO_MANY_REQUESTS_MARKER), "{err}");
         // An existing one is still answered, and others may still ask.
-        assert!(r.request_review(ask(c, "ada", &["r0"])).await.unwrap().1);
-        r.request_review(ask(c, "bo", &["one-more"])).await.unwrap();
+        assert!(
+            r.request_review(ask(c, "ada", &["r0"]), None)
+                .await
+                .unwrap()
+                .1
+        );
+        r.request_review(ask(c, "bo", &["one-more"]), None)
+            .await
+            .unwrap();
         r.withdraw_review_request(first.unwrap()).await.unwrap();
-        r.request_review(ask(c, "ada", &["one-more"]))
+        r.request_review(ask(c, "ada", &["one-more"]), None)
             .await
             .unwrap();
         // Requests whose change reached the ref by a raw move stop counting.
         let err = r
-            .request_review(ask(c, "ada", &["two-more"]))
+            .request_review(ask(c, "ada", &["two-more"]), None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains(TOO_MANY_REQUESTS_MARKER), "{err}");
         r.meta().cas_ref("main", Some(base), Some(c)).await.unwrap();
         let d = commit(&r, Some(c), 3).await;
-        r.request_review(ask(d, "ada", &["two-more"]))
+        r.request_review(ask(d, "ada", &["two-more"]), None)
             .await
             .unwrap();
     }
@@ -559,7 +1034,10 @@ mod tests {
         let base = commit(&r, None, 1).await;
         r.meta().cas_ref("main", None, Some(base)).await.unwrap();
         let x = commit(&r, Some(base), 2).await;
-        let (qa, _) = r.request_review(ask(x, "ada", &["rhea"])).await.unwrap();
+        let (qa, _) = r
+            .request_review(ask(x, "ada", &["rhea"]), None)
+            .await
+            .unwrap();
         // Bo's changeset claims to be a copy of ada's and lands.
         let mut forged = r
             .get_changeset(commit(&r, Some(base), 3).await)
@@ -571,10 +1049,17 @@ mod tests {
             x.to_string(),
         );
         let y = r.create_changeset(forged).await.unwrap();
-        r.land(y, "main").await.unwrap();
+        r.land_as(y, "main", Some("bo")).await.unwrap();
+        // Bo's own land of it closes nothing, whatever the auto rules.
+        assert_eq!(
+            r.close_landed_review_requests("main", y, y, Some("bo"), Some(&all_auto()))
+                .await
+                .unwrap(),
+            0
+        );
         // Cy's land is replayed on top of it.
         let w = commit(&r, Some(base), 4).await;
-        let landed = match r.land(w, "main").await.unwrap() {
+        let landed = match r.land_as(w, "main", Some("cy")).await.unwrap() {
             leep_core::api::LandResponse::Landed {
                 landed, rebased, ..
             } => {
@@ -585,10 +1070,29 @@ mod tests {
         };
         assert_eq!(r.get_changeset(landed).await.unwrap().parents, [y]);
         assert_eq!(
-            r.close_landed_review_requests("main", w, landed)
+            r.close_landed_review_requests("main", w, landed, None, None)
                 .await
                 .unwrap(),
             0
+        );
+        // Ada's own land on top: the requester rule counts only what her
+        // land added, not bo's forged changeset below it.
+        let v = commit(&r, Some(landed), 5).await;
+        r.land_as(v, "main", Some("ada")).await.unwrap();
+        assert_eq!(
+            r.close_landed_review_requests("main", v, v, Some("ada"), None)
+                .await
+                .unwrap(),
+            0
+        );
+        // Nor does a listing, which walks past the forged changeset.
+        assert_eq!(
+            r.review_requests(&open_for("rhea"), Some(&all_auto()))
+                .await
+                .unwrap()
+                .0
+                .len(),
+            1
         );
         let qa = r.review_request(qa.id).await.unwrap();
         assert_eq!((qa.state, qa.landed_as), (ReviewRequestState::Open, None));
@@ -641,16 +1145,22 @@ mod tests {
         // Someone else lands first, so the stack is replayed.
         let moved = commit(&r, Some(base), 5).await;
         r.land(moved, "main").await.unwrap();
-        let (q1, _) = r.request_review(ask(s1, "ada", &["rhea"])).await.unwrap();
-        let (q2, _) = r.request_review(ask(s2, "ada", &["rhea"])).await.unwrap();
+        let (q1, _) = r
+            .request_review(ask(s1, "ada", &["rhea"]), None)
+            .await
+            .unwrap();
+        let (q2, _) = r
+            .request_review(ask(s2, "ada", &["rhea"]), None)
+            .await
+            .unwrap();
         let (q3, _) = r
-            .request_review(ask(elsewhere, "bo", &["rhea"]))
+            .request_review(ask(elsewhere, "bo", &["rhea"]), None)
             .await
             .unwrap();
         r.meta().cas_ref("dev", None, Some(base)).await.unwrap();
         let mut dev = ask(s2, "ada", &["rhea"]);
         dev.target_ref = "dev".into();
-        let (q4, _) = r.request_review(dev).await.unwrap();
+        let (q4, _) = r.request_review(dev, None).await.unwrap();
         let landed = match r.land(s2, "main").await.unwrap() {
             leep_core::api::LandResponse::Landed {
                 landed, rebased, ..
@@ -661,7 +1171,7 @@ mod tests {
             other => panic!("{other:?}"),
         };
         assert_eq!(
-            r.close_landed_review_requests("main", s2, landed)
+            r.close_landed_review_requests("main", s2, landed, None, None)
                 .await
                 .unwrap(),
             2
@@ -685,7 +1195,7 @@ mod tests {
         }
         // Closing again closes nothing.
         assert_eq!(
-            r.close_landed_review_requests("main", s2, landed)
+            r.close_landed_review_requests("main", s2, landed, None, None)
                 .await
                 .unwrap(),
             0
@@ -693,13 +1203,16 @@ mod tests {
 
         // A move the land path never reported: listing notices.
         let ff = commit(&r, Some(landed), 6).await;
-        let (q5, _) = r.request_review(ask(ff, "bo", &["rhea"])).await.unwrap();
+        let (q5, _) = r
+            .request_review(ask(ff, "bo", &["rhea"]), None)
+            .await
+            .unwrap();
         r.meta()
             .cas_ref("main", Some(landed), Some(ff))
             .await
             .unwrap();
         let open: Vec<u64> = r
-            .review_requests(&open_for("rhea"))
+            .review_requests(&open_for("rhea"), None)
             .await
             .unwrap()
             .0

@@ -871,14 +871,16 @@ async fn stacks_need_every_entry_approved_and_rebased_copies_report_via() {
     };
     assert!(rebased);
 
-    // The rebased copy has no review of its own; the listing says whose it
-    // borrows. Its status counts them because it makes exactly `s2`'s
-    // change (ADR 0085), not because the server says it is a copy.
+    // The rebased copy has no review of its own; the listing shows the one
+    // that carries to it. Its status counts it because it makes exactly
+    // `s2`'s change (ADR 0085), not because the server says it is a copy.
     let list = api.reviews(landed).await;
-    assert_eq!(list.via, Some(s2));
+    assert_eq!(list.via, None);
     assert_eq!(list.reviews.len(), 1);
     assert_eq!(list.reviews[0].reviewer, "alice");
+    assert_eq!(list.reviews[0].carried_from, Some(s2));
     assert_eq!(api.reviews(s2).await.via, None);
+    assert_eq!(api.reviews(s2).await.reviews[0].carried_from, None);
     let copy = api.status(landed).await;
     assert!(copy.approved);
     assert_eq!(copy.paths[0].rule, "owner");
@@ -1643,8 +1645,28 @@ async fn an_approval_carries_to_a_changelog_only_conflict_resolution() {
         .json();
     assert_eq!(raw["paths"][1]["carried_from"], c.x.to_string());
     assert!(raw["paths"][0].get("carried_from").is_none());
+    // `review list` shows the carried approval, saying whose it is.
+    let list = api.reviews(y).await;
+    assert_eq!(list.via, None);
+    assert_eq!(list.reviews.len(), 1);
+    assert_eq!(
+        (
+            list.reviews[0].reviewer.as_str(),
+            list.reviews[0].carried_from
+        ),
+        ("alice", Some(c.x))
+    );
+    assert!(s.on_refs.is_empty());
     assert_eq!(api.land(y, "bob").await.status, StatusCode::OK);
     assert_eq!(api.main_ref().await, Some(y));
+    // Landed: status says so, and a verdict on it is kept but answered
+    // with the refs that already hold it (ADR 0087).
+    assert_eq!(api.status(y).await.on_refs, ["main"]);
+    let r: AddReviewResponse = api.review(y, "carol", Verdict::Approve).await.json();
+    assert_eq!(r.on_refs, ["main"]);
+    assert!(r.taken_back.is_empty());
+    let r: AddReviewResponse = api.review(c.x, "carol", Verdict::Approve).await.json();
+    assert!(r.on_refs.is_empty(), "x itself never landed");
 }
 
 #[tokio::test]
@@ -1968,10 +1990,10 @@ async fn a_reject_on_a_copy_takes_back_the_approval_it_carried() {
         c.api.approve(c.x, "alice").await;
         let x2 = c.resolve(A1, Some(c.x)).await;
         assert!(c.api.status(x2).await.approved);
-        assert_eq!(
-            c.api.review(x2, "alice", later).await.status,
-            StatusCode::OK
-        );
+        let r = c.api.review(x2, "alice", later).await;
+        assert_eq!(r.status, StatusCode::OK);
+        // The answer says where else the verdict was written.
+        assert_eq!(r.json::<AddReviewResponse>().taken_back, [c.x]);
         let on_x = c.api.reviews(c.x).await.reviews;
         assert_eq!(on_x[0].verdict, later);
         assert_eq!(
@@ -1987,7 +2009,8 @@ async fn a_reject_on_a_copy_takes_back_the_approval_it_carried() {
         // A copy that did not reproduce `x` takes nothing back.
         c.api.approve(c.x, "alice").await;
         let other = c.resolve("fn a() { other() }\n", Some(c.x)).await;
-        c.api.review(other, "alice", Verdict::Reject).await;
+        let r = c.api.review(other, "alice", Verdict::Reject).await;
+        assert!(r.json::<AddReviewResponse>().taken_back.is_empty());
         assert_eq!(
             c.api.reviews(c.x).await.reviews[0].verdict,
             Verdict::Approve
@@ -2033,7 +2056,8 @@ async fn too_many_reviewed_candidates_carry_nothing_and_the_work_is_bounded() {
     // The walk reads the 64 changesets (and the one rebase row of the
     // hinted changeset); reviews are read per candidate (4 principals here)
     // until the 17th reviewed one, when nothing carries and the rest are
-    // not compared. Measured: 174 calls (100 changesets, 72 review rows).
+    // not compared. Measured: 176 calls (100 changesets, 72 review rows,
+    // and the ref list and ref read that `on_refs` makes, ADR 0087).
     let meta = used.meta_calls();
     eprintln!(
         "carry status over 64 candidates: {meta} meta calls, {} blob calls\n{used}",

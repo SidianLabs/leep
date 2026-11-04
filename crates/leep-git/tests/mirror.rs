@@ -358,6 +358,7 @@ impl Leep for Local {
                 source: row.as_ref().map(|s| s.source.clone()),
                 via: row.map(|s| s.via),
                 review,
+                carried_from: None,
             });
         }
         Ok(out)
@@ -2472,7 +2473,7 @@ fn a_mapped_owners_github_approval_lets_a_require_review_land_through() {
     }
     assert!(
         !leep
-            .on(service.status(&leep.repo, r1, "main"))
+            .on(service.status(&leep.repo, r1, "main", &[]))
             .unwrap()
             .approved
     );
@@ -2483,7 +2484,7 @@ fn a_mapped_owners_github_approval_lets_a_require_review_land_through() {
     gh.review(3, 1, "ada", "APPROVED", &sha);
     assert!(m.run_once());
     assert!(
-        leep.on(service.status(&leep.repo, r1, "main"))
+        leep.on(service.status(&leep.repo, r1, "main", &[]))
             .unwrap()
             .approved
     );

@@ -171,3 +171,10 @@ is still `400 invalid`).
 - **403 or 409 for policy refusals.** Old CLIs map 403 to `auth` and 409 to a
   retryable conflict (exit 5), and the mirror would stop counting the land as
   refused; 422 falls into "other 4xx" everywhere.
+
+*Amended by [ADR 0087](0087-review-requests-close-by-content.md):*
+`carried_paths` returns an empty set (not `None`) when every path of X is
+auto-approved there and none is reproduced; carrying and taking back skip
+it, and review requests use it to close. `GET .../reviews` lists carried
+verdicts with `carried_from`, and `via` only where none carry. A review
+post answers `taken_back` and `on_refs`.

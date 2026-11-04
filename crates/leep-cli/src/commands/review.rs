@@ -296,6 +296,7 @@ mod tests {
                 path("g.rs", "merge_parent", &[], &[], &[]),
                 path("h.rs", "future_rule", &[], &[], &[]),
             ],
+            on_refs: Default::default(),
         };
         let lines = status_lines(&resp);
         let short = short(id());
@@ -336,6 +337,7 @@ mod tests {
             target_ref: "main".into(),
             approved: true,
             paths: vec![],
+            on_refs: Default::default(),
         };
         let lines = status_lines(&resp);
         assert!(lines[0].ends_with(": approved"));
@@ -360,6 +362,7 @@ mod tests {
                     comment: "ok".into(),
                     timestamp: 0,
                 },
+                carried_from: Default::default(),
             }],
             via: Some(ChangesetId(Hash::of_blob(b"orig"))),
         };

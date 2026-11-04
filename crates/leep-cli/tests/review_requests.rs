@@ -68,6 +68,8 @@ fn entry(r: &ReviewRequest) -> ReviewRequestEntry {
             timestamp: 1,
         }),
         title: Some("a change".into()),
+        approved_by: Default::default(),
+        rejected_by: Default::default(),
     }
 }
 

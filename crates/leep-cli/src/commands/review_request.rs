@@ -208,6 +208,8 @@ mod tests {
                 timestamp: 0,
             }),
             title: Some("core: add a field".into()),
+            approved_by: Default::default(),
+            rejected_by: Default::default(),
         };
         let lines = entry_lines(&e);
         assert_eq!(
