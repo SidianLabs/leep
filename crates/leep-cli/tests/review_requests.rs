@@ -73,6 +73,8 @@ fn entry(r: &ReviewRequest) -> ReviewRequestEntry {
         title: Some("a change".into()),
         approved_by: Default::default(),
         rejected_by: Default::default(),
+        paths: Default::default(),
+        changed: 0,
     }
 }
 
@@ -148,6 +150,7 @@ async fn approved(Path(id): Path<ChangesetId>) -> Json<ReviewStatusResponse> {
         approved: true,
         paths: vec![],
         on_refs: vec![],
+        origins: vec![],
     })
 }
 
@@ -215,6 +218,7 @@ fn inbox(mine: bool, all: bool) -> InboxArgs {
         mine,
         all,
         limit: None,
+        wait: None,
     }
 }
 
@@ -390,4 +394,28 @@ fn request_wait_delegates_to_status_wait() {
     assert!(stdout.starts_with("Requested review of"), "{stdout}");
     assert!(!stdout.contains("waits for the verdict"), "{stdout}");
     assert!(stdout.contains(": approved\n"), "{stdout}");
+}
+
+/// `review inbox --wait` answers as soon as something waits (exit 0), and
+/// exits 1 when the time runs out with nothing.
+#[test]
+fn inbox_wait_returns_once_something_waits_or_times_out() {
+    let (url, _data) = start(true);
+    let started = std::time::Instant::now();
+    let out = leep(&url, &["review", "inbox", "--wait=1"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("timed out after"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.starts_with("No review requests are waiting for you."),
+        "{stdout}"
+    );
+
+    let env = Env::new(&url);
+    review_request::request(&env.remote(false), &ask(&id(3).to_string(), &["ada"], None)).unwrap();
+    let out = leep(&url, &["review", "inbox", "--wait=30"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("#1 open"));
 }

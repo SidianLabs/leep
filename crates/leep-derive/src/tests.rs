@@ -2271,15 +2271,15 @@ mod land_policy {
 }
 
 mod review {
-    use std::collections::BTreeSet;
     use std::sync::Mutex;
 
     use async_trait::async_trait;
     use leep_core::review::{Review, Verdict};
 
     use super::*;
+    use crate::carry::CarryRule;
     use crate::owners::OwnersResolver;
-    use crate::review::{AutoRule, PathRule, ReviewRules};
+    use crate::review::{AutoRule, CarryRefusal, PathRule, ReviewRules};
     use crate::{LandPolicy, PolicySet};
 
     fn rev(who: &str, v: Verdict) -> Review {
@@ -3046,7 +3046,7 @@ mod review {
         let carried = |y| {
             let r = r.clone();
             let docs = docs.clone();
-            async move { r.carried_paths(x, y, &docs).await.unwrap() }
+            async move { r.carried_paths(x, y, &docs, false).await.unwrap() }
         };
         // The docs path is auto in `x`, so `y` may change it differently,
         // and add a path of its own.
@@ -3061,7 +3061,10 @@ mod review {
             "y",
         )
         .await;
-        assert_eq!(carried(y).await, Some(BTreeSet::from([rp("a.rs")])));
+        assert_eq!(
+            carried(y).await,
+            Some(BTreeMap::from([(rp("a.rs"), CarryRule::Identical)]))
+        );
         // One byte, a missing reviewed path, a kind change: nothing.
         let byte = commit(&r, &[moved], &[("a.rs", Some("3\n"))], "byte").await;
         assert_eq!(carried(byte).await, None);
@@ -3071,11 +3074,11 @@ mod review {
         // no verdict but lost nothing reviewed (ADR 0087).
         let docs_x = commit(&r, &[base], &[("N.md", Some("x\n"))], "docs x").await;
         assert_eq!(
-            r.carried_paths(docs_x, y, &docs).await.unwrap(),
-            Some(BTreeSet::new())
+            r.carried_paths(docs_x, y, &docs, false).await.unwrap(),
+            Some(BTreeMap::new())
         );
         assert_eq!(
-            r.carried_paths(docs_x, y, &ReviewRules::default())
+            r.carried_paths(docs_x, y, &ReviewRules::default(), false)
                 .await
                 .unwrap(),
             None
@@ -3098,6 +3101,10 @@ mod review {
         let on_b = commit(&r, &[base], &[("a.rs", Some("5\n"))], "a moved").await;
         let rebased = commit(&r, &[on_b], &[("a.rs", Some("2\n"))], "rebased").await;
         assert_eq!(carried(rebased).await, None);
+        assert_eq!(
+            r.carried_paths(x, rebased, &docs, true).await.unwrap(),
+            None
+        );
         // An OWNERS file is never auto, even under a docs glob.
         let docs_owners = ReviewRules::new([AutoRule::DocsOnly], &["**".into()]).unwrap();
         let owners = commit(
@@ -3109,16 +3116,89 @@ mod review {
         .await;
         let y = commit(&r, &[base], &[("a.rs", Some("2\n"))], "y").await;
         assert_eq!(
-            r.carried_paths(owners, y, &docs_owners).await.unwrap(),
+            r.carried_paths(owners, y, &docs_owners, true)
+                .await
+                .unwrap(),
             None
         );
         // A merge is never a source, whatever it reproduces.
         let merge = commit(&r, &[x, moved], &[("a.rs", Some("2\n"))], "merge").await;
-        assert_eq!(r.carried_paths(merge, y, &docs).await.unwrap(), None);
+        assert_eq!(r.carried_paths(merge, y, &docs, true).await.unwrap(), None);
         assert_eq!(
-            r.carried_paths(x, y, &docs).await.unwrap(),
-            Some(BTreeSet::from([rp("a.rs")]))
+            r.carried_paths(x, y, &docs, false).await.unwrap(),
+            Some(BTreeMap::from([(rp("a.rs"), CarryRule::Identical)]))
         );
+    }
+
+    #[tokio::test]
+    async fn carried_paths_take_the_servers_rebase_or_a_union_of_insertions() {
+        let r = repo();
+        let rules = ReviewRules::default();
+        const A0: &str = "fn a() {}\n\nfn t0() {}\n";
+        let base = commit(
+            &r,
+            &[],
+            &[("OWNERS", Some("root\n")), ("a.rs", Some(A0))],
+            "base",
+        )
+        .await;
+        // Reviewed: a test appended at the end.
+        let x = commit(
+            &r,
+            &[base],
+            &[("a.rs", Some("fn a() {}\n\nfn t0() {}\nfn dee() {}\n"))],
+            "x",
+        )
+        .await;
+        // Landed since: an edit at the top, and another test at the end.
+        let top = commit(
+            &r,
+            &[base],
+            &[("a.rs", Some("fn a() { 1 }\n\nfn t0() {}\n"))],
+            "top",
+        )
+        .await;
+        let cy = commit(
+            &r,
+            &[base],
+            &[("a.rs", Some("fn a() {}\n\nfn t0() {}\nfn cy() {}\n"))],
+            "cy",
+        )
+        .await;
+        let at = |parent, text: &'static str| {
+            let r = r.clone();
+            async move { commit(&r, &[parent], &[("a.rs", Some(text))], "y").await }
+        };
+        let rebased = at(top, "fn a() { 1 }\n\nfn t0() {}\nfn dee() {}\n").await;
+        let carried = |y, merges| {
+            let r = r.clone();
+            let rules = rules.clone();
+            async move { r.carried_paths(x, y, &rules, merges).await.unwrap() }
+        };
+        let one = |rule| Some(BTreeMap::from([(rp("a.rs"), rule)]));
+        assert_eq!(carried(rebased, true).await, one(CarryRule::Rebased));
+        // Not on a ref whose lands never merge contents.
+        assert_eq!(carried(rebased, false).await, None);
+        // The union of both appends, in either order.
+        let cy_first = at(cy, "fn a() {}\n\nfn t0() {}\nfn cy() {}\nfn dee() {}\n").await;
+        let dee_first = at(cy, "fn a() {}\n\nfn t0() {}\nfn dee() {}\nfn cy() {}\n").await;
+        assert_eq!(carried(cy_first, true).await, one(CarryRule::Union));
+        assert_eq!(carried(dee_first, true).await, one(CarryRule::Union));
+        // One extra line, or one side's insertion dropped: nothing.
+        let extra = at(
+            cy,
+            "fn a() {}\n\nfn t0() {}\nfn cy() {}\nfn dee() {}\nfn evil() {}\n",
+        )
+        .await;
+        assert_eq!(carried(extra, true).await, None);
+        let dropped = at(cy, "fn a() {}\n\nfn t0() {}\nfn dee() {}\n").await;
+        assert_eq!(
+            r.carry_check(x, dropped, &rules, true).await.unwrap(),
+            Err(CarryRefusal::Differs(rp("a.rs")))
+        );
+        // The judged changeset's parent decides the base, whatever `x`'s is.
+        let on_x = at(x, "fn a() { 1 }\n\nfn t0() {}\nfn dee() {}\n").await;
+        assert_eq!(carried(on_x, true).await, None);
     }
 }
 

@@ -521,6 +521,7 @@ async fn review_status(
             approved_by: ok.clone(),
             rejected_by: no.clone(),
             carried_from: None,
+            carried_rule: None,
         })
         .collect();
     Ok(Json(ReviewStatusResponse {
@@ -529,6 +530,7 @@ async fn review_status(
         approved: rule == "owner" || paths.is_empty(),
         paths,
         on_refs: on_refs(&d, id),
+        origins: Vec::new(),
     }))
 }
 

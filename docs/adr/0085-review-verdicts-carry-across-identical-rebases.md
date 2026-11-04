@@ -178,3 +178,13 @@ auto-approved there and none is reproduced; carrying and taking back skip
 it, and review requests use it to close. `GET .../reviews` lists carried
 verdicts with `carried_from`, and `via` only where none carry. A review
 post answers `taken_back` and `on_refs`.
+
+*Amended by [ADR 0089](0089-review-verdicts-carry-across-client-rebases.md):*
+a reviewed path whose base moved is also reproduced when the judged
+changeset's file is exactly the server's own rebase of the reviewed change
+onto its base (`rebased`), or keeps both sides' insertions where the merge
+conflicts only between pure insertions at one place (`union`); text only,
+at most 2 MiB and 10,000 lines a side, never `OWNERS`, at most 32 merged paths per
+candidate, and not on strict land refs. The "compare diffs (hunks)"
+alternative stays rejected. `PathReview` gains `carried_rule`, and
+`review-status` gains `origins`.

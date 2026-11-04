@@ -1,6 +1,7 @@
 //! `leep commit`: upload new blobs, then create a changeset.
 
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use clap::Args;
@@ -9,7 +10,7 @@ use leep_core::changeset::{
     EXTRA_REBASED_FROM, EXTRA_REVERT_OF,
 };
 use leep_core::outln;
-use leep_core::Changeset;
+use leep_core::{Changeset, ChangesetId};
 
 use super::{print_json, Ctx};
 use crate::error::{CliError, Result};
@@ -188,8 +189,7 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
     if ctx.json {
         print_json(&leep_core::api::CreateChangesetResponse { id })?;
     } else {
-        outln!("{id}");
-        eprintln!(
+        let summary = format!(
             "committed {} ({}{})",
             short(id),
             plural(cs.changes.len(), "file"),
@@ -198,9 +198,48 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
                 None => String::new(),
             }
         );
+        let (out, err) = commit_lines(id, summary, std::io::stdout().is_terminal());
+        for line in out {
+            outln!("{line}");
+        }
+        for line in err {
+            eprintln!("{line}");
+        }
         if let Some(s) = signed_by {
             eprintln!("signed as {} (key {})", s.name, s.key_id);
         }
     }
     Ok(0)
+}
+
+/// What `leep commit` prints to stdout and to stderr. On a terminal one
+/// line says it all; piped, stdout is the full id alone, for scripts
+/// (`id=$(leep commit -m ...)`), and the summary goes to stderr.
+fn commit_lines(id: ChangesetId, summary: String, tty: bool) -> (Vec<String>, Vec<String>) {
+    if tty {
+        (vec![summary], vec![])
+    } else {
+        (vec![id.to_string()], vec![summary])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use leep_core::Hash;
+
+    use super::*;
+
+    #[test]
+    fn a_terminal_gets_one_line_and_a_pipe_the_full_id() {
+        let id = ChangesetId(Hash::of_blob(b"c"));
+        let summary = format!("committed {} (3 files)", short(id));
+        assert_eq!(
+            commit_lines(id, summary.clone(), true),
+            (vec![summary.clone()], vec![])
+        );
+        assert_eq!(
+            commit_lines(id, summary.clone(), false),
+            (vec![id.to_string()], vec![summary])
+        );
+    }
 }

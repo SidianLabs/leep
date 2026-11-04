@@ -1330,6 +1330,23 @@ them. Otherwise restore a backup taken before the upgrade.
 no longer needs (`leep review cancel N`, listed by `leep review inbox
 --mine`); requests close by themselves as their changesets land.
 
+**Carried verdicts across rebases** (ADR 0085, 0089). A land the server
+replays onto a moved head stores a copy with a new id whose
+`leep.rebased_from` names the original; the land policy judged the
+original, so its reviews count, and `leep land` says so
+(`rebased from ID; reviews of the original count`). A land that conflicts
+is resolved by the client in a new changeset naming the original; an
+approval of the original carries to it on each reviewed path that is
+identical, exactly the server's own rebase of the reviewed change onto the
+new head, or both sides' insertions kept where both only added lines at one
+place. Anything else needs review again, and `leep review status` names the
+original and the first path that differs. On refs with strict land
+conflicts (`--strict-land-ref`, ADR 0066) only identical paths carry. The
+check costs at most 32 three-way text merges per original (files up to
+2 MiB and 10,000 lines), each computed once and cached in process by
+content, with at most half the cores merging at a time on blocking threads;
+nothing to configure.
+
 **Derived kinds that change encoding.** A release that changes how a derived
 kind is stored gives it a new name, so old and new servers never read each
 other's rows; nothing to migrate. The new kind derives on first use, which on

@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand};
 use leep_core::api::{
-    AddReviewRequest, AddReviewResponse, PathReview, ReviewStatusResponse, ReviewsResponse,
+    AddReviewRequest, AddReviewResponse, OriginStatus, PathReview, ReviewStatusResponse,
+    ReviewsResponse,
 };
 use leep_core::review::Verdict;
 use leep_core::{outln, ChangesetId};
@@ -311,12 +312,82 @@ pub fn status_lines(resp: &ReviewStatusResponse) -> Vec<String> {
     if resp.paths.is_empty() {
         out.push("  (no changed paths)".into());
     }
+    for o in &resp.origins {
+        out.push(origin_line(resp.changeset, o));
+    }
     out.push(format!("diff: leep diff {}", short(resp.changeset)));
     out
 }
 
-/// The state column and the explanation for one path.
+/// What became of the verdicts on an origin the changeset names
+/// (`leep.rebased_from`): carried, or why not and how to compare.
+fn origin_line(id: ChangesetId, o: &OriginStatus) -> String {
+    let mut by: Vec<String> = Vec::new();
+    for v in [Verdict::Approve, Verdict::Reject, Verdict::Withdrawn] {
+        let names: Vec<&str> = o
+            .reviews
+            .iter()
+            .filter(|r| r.verdict == v)
+            .map(|r| r.reviewer.as_str())
+            .collect();
+        if !names.is_empty() {
+            let word = match v {
+                Verdict::Approve => "approved",
+                Verdict::Reject => "rejected",
+                Verdict::Withdrawn => "withdrawn",
+            };
+            by.push(format!("{word} by {}", names.join(", ")));
+        }
+    }
+    let mut line = format!("replaces {}", short(o.from));
+    if !by.is_empty() {
+        line.push_str(&format!(", {}", by.join(", ")));
+    }
+    if o.carried {
+        line.push_str("; carried");
+        return line;
+    }
+    let why = if !o.differs.is_empty() {
+        let paths: Vec<&str> = o.differs.iter().map(|p| p.as_str()).collect();
+        format!("{} differs", paths.join(", "))
+    } else {
+        o.reason
+            .clone()
+            .unwrap_or_else(|| "nothing it reviewed is reproduced".into())
+    };
+    line.push_str(&format!(
+        "; not carried: {why} (leep diff {}; leep diff {})",
+        short(o.from),
+        short(id)
+    ));
+    line
+}
+
+/// How a carried verdict's path reproduces the reviewed change, in words.
+fn carried_note(p: &PathReview) -> Option<String> {
+    let from = p.carried_from?;
+    let how = match p.carried_rule.as_deref() {
+        Some("identical") => " (identical)",
+        Some("rebased") => " (rebased onto the new base)",
+        Some("union") => " (both sides' insertions kept)",
+        _ => "",
+    };
+    Some(format!("; carried from {}{how}", short(from)))
+}
+
+/// The state column and the explanation for one path, saying where a
+/// carried verdict came from.
 fn path_state(p: &PathReview) -> (&'static str, String) {
+    let (state, mut why) = path_rule_state(p);
+    if matches!(p.rule.as_str(), "owner" | "rejected") {
+        if let Some(note) = carried_note(p) {
+            why.push_str(&note);
+        }
+    }
+    (state, why)
+}
+
+fn path_rule_state(p: &PathReview) -> (&'static str, String) {
     let who = |names: &[String]| names.join(", ");
     let whose = if p.owners.is_empty() {
         "any reviewer"
@@ -426,6 +497,7 @@ mod tests {
             approved_by: v(ok),
             rejected_by: v(no),
             carried_from: None,
+            carried_rule: None,
         }
     }
 
@@ -446,6 +518,7 @@ mod tests {
                 path("h.rs", "future_rule", &[], &[], &[]),
             ],
             on_refs: Default::default(),
+            origins: Default::default(),
         };
         let lines = status_lines(&resp);
         let short = short(id());
@@ -487,6 +560,7 @@ mod tests {
             approved: true,
             paths: vec![],
             on_refs: Default::default(),
+            origins: Default::default(),
         };
         let lines = status_lines(&resp);
         assert!(lines[0].ends_with(": approved"));
@@ -530,6 +604,7 @@ mod tests {
             approved: false,
             paths: vec![path("a.rs", "pending", &[], &[], &[])],
             on_refs: vec!["release".into()],
+            origins: vec![],
         };
         // Held by another ref only: still judged for main.
         assert!(status_lines(&resp)[0].ends_with(": not approved"));
@@ -593,6 +668,64 @@ mod tests {
         assert!(
             !lines.iter().any(|l| l.contains("do not count")),
             "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn status_says_how_a_verdict_carried_and_why_one_did_not() {
+        use leep_core::api::OriginReview;
+        let x = ChangesetId(Hash::of_blob(b"orig"));
+        let x2 = ChangesetId(Hash::of_blob(b"orig2"));
+        let mut a = path("a.rs", "owner", &["rhea"], &["rhea"], &[]);
+        a.carried_from = Some(x);
+        a.carried_rule = Some("rebased".into());
+        let origin = |from, carried, differs: &[&str], reason: Option<&str>| OriginStatus {
+            from,
+            reviews: vec![
+                OriginReview {
+                    reviewer: "rhea".into(),
+                    verdict: Verdict::Approve,
+                },
+                OriginReview {
+                    reviewer: "bo".into(),
+                    verdict: Verdict::Reject,
+                },
+            ],
+            carried,
+            differs: differs.iter().map(|p| RepoPath::new(*p).unwrap()).collect(),
+            reason: reason.map(String::from),
+        };
+        let resp = ReviewStatusResponse {
+            changeset: id(),
+            target_ref: "main".into(),
+            approved: false,
+            paths: vec![a, path("b.rs", "pending", &["rhea"], &[], &[])],
+            on_refs: vec![],
+            origins: vec![
+                origin(x, true, &[], None),
+                origin(x2, false, &["b.rs"], None),
+                origin(x2, false, &[], Some("it is a merge")),
+            ],
+        };
+        let (y, sx, sx2) = (short(id()), short(x), short(x2));
+        assert_eq!(
+            status_lines(&resp)[1..],
+            [
+                format!(
+                    "  ok       a.rs  approved by rhea (owner); carried from {sx} (rebased onto the new base)"
+                ),
+                "  PENDING  b.rs  needs one of: rhea".to_string(),
+                format!("replaces {sx}, approved by rhea, rejected by bo; carried"),
+                format!(
+                    "replaces {sx2}, approved by rhea, rejected by bo; not carried: b.rs differs \
+                     (leep diff {sx2}; leep diff {y})"
+                ),
+                format!(
+                    "replaces {sx2}, approved by rhea, rejected by bo; not carried: it is a merge \
+                     (leep diff {sx2}; leep diff {y})"
+                ),
+                format!("diff: leep diff {y}"),
+            ]
         );
     }
 

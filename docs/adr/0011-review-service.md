@@ -64,6 +64,11 @@ changeset that the judged one names in `leep.rebased_from` (or the server's
 rebase link names) when it makes exactly the same change to every path that
 needed a reviewer there (same old and new content and kind, old relative to
 each one's own first parent). Rejects carry too; withdrawals do not.
+*Amended by [ADR 0089](0089-review-verdicts-carry-across-client-rebases.md):*
+a path's change may also be exactly what the server's own rebase of the
+original's change onto the judged changeset's base would make (the trust a
+clean replay already has), or keep both sides' insertions where the only
+conflicts are pure insertions.
 
 **Decision per path.** For each path a changeset changes (relative to its first
 parent), and on a merge also each path where it keeps the first parent's

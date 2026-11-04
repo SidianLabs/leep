@@ -2,7 +2,10 @@
 
 Don't edit `CHANGELOG.md` in a change. Add one file here instead, named after
 your review ref without the `review/` prefix: `review/cli-review-wait` becomes
-`changelog.d/cli-review-wait.md`. Two changes then never edit the same lines,
+`changelog.d/cli-review-wait.md`. Without a review ref (a land straight onto
+the target ref), name it `<area>-<kebab-desc>.md` from the commit subject:
+`cli: wait for review verdicts` becomes `changelog.d/cli-wait-for-review-verdicts.md`
+or a shorter description. Two changes then never edit the same lines,
 so landing one never makes the other conflict
 ([ADR 0088](../docs/adr/0088-changelog-fragments.md)).
 
