@@ -86,11 +86,13 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
             clean,
         } => {
             let from = landed_stack(ctx, base, onto);
+            let message = replaced_message(ctx, &from);
             let unmerged = rebase_locally(ctx, &target_ref, onto, &conflicts, &clean)?;
             ctx.wc.state.resolving = Some(ResolvingLand {
                 from,
                 target_ref: target_ref.clone(),
                 onto,
+                message,
             });
             ctx.wc.save_state()?;
             if !ctx.json {
@@ -118,9 +120,20 @@ pub fn run(ctx: &mut Ctx, args: &LandArgs) -> Result<i32> {
                 if conflicts.len() > unmerged.len() {
                     outln!("{}", explain(&Labels::landed(&target_ref)));
                 }
+                let commit = if ctx
+                    .wc
+                    .state
+                    .resolving
+                    .as_ref()
+                    .is_some_and(|r| r.message.is_some())
+                {
+                    "`leep commit` (its message by default)"
+                } else {
+                    "`leep commit -m MESSAGE`"
+                };
                 outln!(
                     "Your working copy is now on {} with your changes applied.\n\
-                     Resolve the conflicts (`leep resolve PATH` once chosen), then run `leep commit` and `leep land`.\n\
+                     Resolve the conflicts (`leep resolve PATH` once chosen), then run {commit} and `leep land`.\n\
                      The commit records that it replaces {} (`leep.rebased_from`).",
                     short(onto),
                     resolving_names(ctx)
@@ -174,6 +187,20 @@ fn landed_stack(ctx: &Ctx, base: ChangesetId, onto: ChangesetId) -> Vec<Changese
         out.push(base);
     }
     out
+}
+
+/// The message the resolution commit defaults to: the replaced changeset's,
+/// when the land replaces just one. A stack of several has no one message
+/// to reuse. Best effort: `None` when it cannot be read.
+fn replaced_message(ctx: &Ctx, from: &[ChangesetId]) -> Option<String> {
+    match from {
+        [one] => ctx
+            .cache
+            .changeset(&ctx.client, one)
+            .ok()
+            .map(|info| info.changeset.message),
+        _ => None,
+    }
 }
 
 /// The changesets a conflicted land replaces, for the report.
@@ -348,7 +375,8 @@ fn hint_policy(e: CliError, target_ref: &str) -> CliError {
     if e.is_server(error_code::NEEDS_REVIEW, NEEDS_REVIEW_MARKER) {
         return e.map_message(|m| format!(
             "{m}\n{target_ref} needs approval from the owners of the paths a changeset changes: \
-             ask one to run `leep review approve <changeset>`; `leep review status <changeset> --ref {target_ref}` shows what is missing."
+             ask one to run `leep review approve <changeset>` (`leep review request @ --ref {target_ref}` asks them for you); \
+             `leep review status <changeset> --ref {target_ref} --wait` shows what is missing and waits for it."
         ));
     }
     if e.is_server(error_code::NOT_SIGNED, NOT_SIGNED_MARKER) {
@@ -551,5 +579,22 @@ mod tests {
         let never = || -> Result<bool> { unreachable!() };
         assert_eq!(pending(Some(&p), b, "main", never).ok(), Some(Pending::New));
         assert_eq!(pending(Some(&p), a, "dev", never).ok(), Some(Pending::New));
+    }
+
+    #[test]
+    fn a_review_refusal_says_how_to_ask_and_wait() {
+        let e =
+            CliError::user("changeset abc needs review: path a needs approval from any reviewer")
+                .with_server_code(Some(error_code::NEEDS_REVIEW.into()));
+        let msg = hint_policy(e, "main").to_string();
+        assert!(msg.contains("`leep review approve <changeset>`"), "{msg}");
+        assert!(
+            msg.contains("`leep review request @ --ref main` asks them for you"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("`leep review status <changeset> --ref main --wait`"),
+            "{msg}"
+        );
     }
 }

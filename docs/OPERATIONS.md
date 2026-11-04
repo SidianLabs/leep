@@ -1057,7 +1057,10 @@ need git credentials: they land in Leep and the mirror pushes.
 1. Start from a clean working copy on `leep-main` (`leep switch leep-main`)
    and create the review ref: `leep switch -c review/<area>-<desc>`.
 2. Commit, then `leep land`, which lands on the review ref. Within seconds
-   the mirror pushes `review/<area>-<desc>` to GitHub.
+   the mirror pushes `review/<area>-<desc>` to GitHub. Put the
+   changelog entry in `changelog.d/<area>-<desc>.md`, not in
+   `CHANGELOG.md` (ADR 0088): two review refs then never conflict over it.
+   At a release the maintainer runs `scripts/changelog-assemble.sh`.
 3. Open the pull request from that branch into `main`
    (`gh pr create --head review/<area>-<desc> --base main`). The body uses
    the sections of the `commit-and-pr` skill. CI runs on it.

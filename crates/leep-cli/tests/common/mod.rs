@@ -79,6 +79,12 @@ pub struct Data {
     /// Answer 500 to every files request, like a server going down between
     /// two of a command's calls.
     pub fail_files: bool,
+    /// Report `on_refs` in review answers: the refs whose first-parent
+    /// chain holds the changeset (ADR 0087). Off, the mock is an older
+    /// server.
+    pub report_on_refs: bool,
+    /// What a reject or withdrawal answers as `taken_back`.
+    pub taken_back: Vec<ChangesetId>,
 }
 
 pub type Shared = Arc<Mutex<Data>>;
@@ -442,12 +448,40 @@ async fn add_review(
         return Err(err(StatusCode::NOT_FOUND, "no such changeset"));
     }
     d.reviews.push((id, req.verdict));
+    let taken_back = if req.verdict == leep_core::review::Verdict::Approve {
+        vec![]
+    } else {
+        d.taken_back.clone()
+    };
     Ok(Json(AddReviewResponse {
         reviewer: "mock".into(),
         verdict: req.verdict,
-        on_refs: Default::default(),
-        taken_back: Default::default(),
+        on_refs: on_refs(&d, id),
+        taken_back,
     }))
+}
+
+fn on_refs(d: &Data, id: ChangesetId) -> Vec<String> {
+    if !d.report_on_refs {
+        return vec![];
+    }
+    d.refs
+        .iter()
+        .filter(|(_, head)| {
+            let mut cur = Some(**head);
+            while let Some(c) = cur {
+                if c == id {
+                    return true;
+                }
+                cur = d
+                    .changesets
+                    .get(&c)
+                    .and_then(|cs| cs.parents.first().copied());
+            }
+            false
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 /// A server without owners: every changed path needs one approval from
@@ -494,7 +528,7 @@ async fn review_status(
         target_ref: q.get("ref").cloned().unwrap_or_else(|| "main".into()),
         approved: rule == "owner" || paths.is_empty(),
         paths,
-        on_refs: Default::default(),
+        on_refs: on_refs(&d, id),
     }))
 }
 

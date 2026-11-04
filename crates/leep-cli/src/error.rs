@@ -10,7 +10,7 @@ pub mod exit {
     pub const OK: i32 = 0;
     /// Generic failure: bad input, a refused operation, an authentication
     /// problem. Also "no" from the predicate commands (`search` without a
-    /// match, `review status` when not approved).
+    /// match, `review status` when not approved and not on the ref).
     pub const USER: i32 = 1;
     /// The command line itself is wrong (clap).
     pub const USAGE: i32 = 2;

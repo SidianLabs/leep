@@ -132,9 +132,9 @@ names, as in `OWNERS` files.
 
 | Command | Effect |
 |---|---|
-| `leep review request REV [-m MSG]` | Ask for a review of `REV` before it lands on the target ref (`--ref` for another). With no `--to`, the server asks the owners of the paths still pending or rejected on that ref, or any reviewer when none is owned. Prints `Requested review of ID on REF from NAMES (#N)`; asking again for the same thing answers the open request (`Already requested ...`). |
+| `leep review request REV [-m MSG]` | Ask for a review of `REV` before it lands on the target ref (`--ref` for another). With no `--to`, the server asks the owners of the paths still pending or rejected on that ref, or any reviewer when none is owned. Prints `Requested review of ID on REF from NAMES (#N)` and how to follow it up (`leep review status ID --ref REF --wait`, `leep review cancel N`); asking again for the same thing answers the open request (`Already requested ...`). `--wait[=SECS]` then waits for the verdict as `leep review status --wait` does. |
 | `leep review request REV --to NAME [--to NAME]...` | Ask these reviewers instead. Each must be a token that may review, and not you; anything else is refused (exit 1). |
-| `leep review inbox` | Open requests that name you, or that any reviewer may take and someone else made, newest first: `#N STATE ID -> REF by REQUESTER (created by CREATOR), for REVIEWERS (TIME)`, then the changeset's title and the note. `--mine` lists the requests you made, `--all` adds closed ones, `-n N` caps the list (50). |
+| `leep review inbox` | Open requests that name you, or that any reviewer may take and someone else made, newest first: `#N STATE ID -> REF by REQUESTER (created by CREATOR), for REVIEWERS (TIME)`, then the changeset's title and the note. The header ends with who answered (`, approved by you, rhea`, `, rejected by bo`: verdicts on the changeset itself; carried ones are judged by `review status`). Requests you already approved or rejected are left out, with a count of them at the end (also left out of `--json`); withdrawing your verdict brings one back. `--mine` lists the requests you made, `--all` adds closed ones and the ones you answered, `-n N` caps the list (50, counted before your answered ones are left out). |
 | `leep review cancel N` | Withdraw request `N`, which you made. |
 
 The ref must exist (or be one the server protects), and you may have at most 100 open requests; one more
@@ -148,7 +148,7 @@ new one: request again, and cancel the old request. `--json` prints the
 server's answer. Against a server without review requests the commands say
 the server needs an upgrade.
 
-`leep show` prints `Created-by: NAME` when the server recorded which token
+`leep show` prints `Created-by: NAME` after `Author:` when the server recorded which token
 created the changeset, so a reviewer can tell agents apart even when they
 share an author.
 
@@ -203,9 +203,27 @@ patch, and with `--json` puts it in a `patch` field beside the changeset.
 satisfied it (`approved by rhea (any reviewer)`, `approved by alice (owner)`,
 `needs no review (auto:docs_only)`) or what it still needs
 (`needs one of: alice, bob`), and ends with `diff: leep diff ID`. `--json`
-keeps the server's rule names (`owner`, `pending`, ...). `leep review approve`
-and `reject` then read the status on the target ref and print
-`now approved for main` or the paths still waiting.
+keeps the server's rule names (`owner`, `pending`, ...). Once the ref
+holds the changeset (the server's `on_refs` names it,
+[ADR 0087](adr/0087-review-requests-close-by-content.md)), the first line
+says `landed on main` instead of `not approved` and the exit status is 0:
+nothing is left to wait for. `leep review approve` and `reject` then read
+the status on the target ref and print `now approved for main` or the
+paths still waiting. A verdict on a changeset already on a protected ref
+is stored all the same and prints `already on main: verdicts now only
+affect copies (cherry-picks, rebases)`; a reject or withdrawal that the
+server also wrote on originals whose approval carried here prints
+`also rejected on ID` (or `withdrawn`) for each. `leep review list` marks
+a review that carries from the changeset's original with
+`(carried from ID)`; such reviews count for landing.
+
+`leep review status REV --wait[=SECS]` asks again until the changeset is
+approved for the ref or the ref holds it (exit 0), a path is rejected
+(exit 1 at once, since someone has to act first) or SECS pass (exit 1,
+default 3600; `--wait=0` waits without limit). It asks after 2 seconds,
+then twice as late each time, at most a minute apart, and prints the last
+status either way; what it is waiting for goes to stderr. A land refused
+for review names both `leep review request @ --ref REF` and this.
 
 ## Landing onto a new ref
 
@@ -272,7 +290,10 @@ reStructuredText underline headings with it.
 
 When `leep land` exits 5 the working copy is on the ref's head with your
 changes applied and the conflicts marked; resolve them, `leep commit`, and
-`leep land` again. Until a land lands, `.leep/state.json` remembers the
+`leep land` again. When the land carried one changeset, `leep commit`
+without `-m` reuses its message (the report says
+`` `leep commit` (its message by default) ``); a stack of several has no one
+message, so the report asks for `-m`. Until a land lands, `.leep/state.json` remembers the
 conflicted land (`resolving`; `leep status` shows it and `leep --json status`
 carries it), and the commit made on that head records the changesets it
 replaces in `leep.rebased_from`: their ids, newest first and joined with
@@ -357,7 +378,7 @@ Decided in [ADR 0034](adr/0034-cli-exit-codes-and-json-errors.md).
 | Code | Meaning |
 |---|---|
 | 0 | Success. |
-| 1 | Generic failure: bad input, a refused operation (dirty working copy, existing tag), authentication. Also "no" from `search` (no match) and `review status` (not approved). |
+| 1 | Generic failure: bad input, a refused operation (dirty working copy, existing tag), authentication. Also "no" from `search` (no match) and `review status` (not approved, and not yet on the ref; with `--wait`, also rejected or out of time). |
 | 2 | The command line does not parse. |
 | 3 | The server or the network failed: unreachable, 5xx, a timeout, rate limited after retries. Running the command again may work. |
 | 4 | Not found: a revision, ref, branch, tag, file, stash or log entry. |

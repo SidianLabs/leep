@@ -157,6 +157,11 @@ pub struct ResolvingLand {
     /// The head the conflicts were against: the working copy's base after
     /// the local rebase.
     pub onto: ChangesetId,
+    /// The replaced changeset's message when `from` is one changeset: the
+    /// resolution commit's default message. Absent in files written before
+    /// it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 impl ResolvingLand {

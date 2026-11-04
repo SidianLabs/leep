@@ -21,6 +21,8 @@ struct Data {
     requests: Vec<ReviewRequest>,
     /// Raw query strings of every listing.
     queries: Vec<Vec<(String, String)>>,
+    /// Who has approved each request's changeset, by request id.
+    approved: std::collections::HashMap<u64, Vec<String>>,
 }
 
 type Shared = Arc<Mutex<Data>>;
@@ -41,7 +43,8 @@ fn start(with_endpoints: bool) -> (String, Shared) {
     if with_endpoints {
         app = app
             .route("/v1/review-requests", get(list).post(create))
-            .route("/v1/review-requests/{id}/withdraw", post(withdraw));
+            .route("/v1/review-requests/{id}/withdraw", post(withdraw))
+            .route("/v1/changesets/{id}/review-status", get(approved));
     }
     let app = app.with_state(data.clone());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -126,11 +129,25 @@ async fn list(
         .filter(|r| get("reviewer").is_none_or(|x| r.reviewers.contains(&x)))
         .filter(|r| get("requester").is_none_or(|x| r.requester == x))
         .filter(|r| get("open").is_none() || r.state == ReviewRequestState::Open)
-        .map(entry)
+        .map(|r| ReviewRequestEntry {
+            approved_by: d.approved.get(&r.id).cloned().unwrap_or_default(),
+            ..entry(r)
+        })
         .collect();
     Json(ReviewRequestsResponse {
         requests,
         next: None,
+    })
+}
+
+/// Every changeset is approved here.
+async fn approved(Path(id): Path<ChangesetId>) -> Json<ReviewStatusResponse> {
+    Json(ReviewStatusResponse {
+        changeset: id,
+        target_ref: "main".into(),
+        approved: true,
+        paths: vec![],
+        on_refs: vec![],
     })
 }
 
@@ -189,6 +206,7 @@ fn ask(rev: &str, to: &[&str], msg: Option<&str>) -> RequestArgs {
         to: to.iter().map(|s| s.to_string()).collect(),
         message: msg.map(Into::into),
         target_ref: None,
+        wait: None,
     }
 }
 
@@ -289,4 +307,87 @@ fn an_older_server_is_named_as_such() {
         );
         assert_eq!(e.exit_code(), 1);
     }
+}
+
+fn leep(url: &str, args: &[&str]) -> std::process::Output {
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_leep"));
+    for (k, _) in std::env::vars() {
+        if k.starts_with("LEEP_") {
+            c.env_remove(k);
+        }
+    }
+    c.current_dir(dir.path())
+        .env("LEEP_CACHE_DIR", dir.path().join("cache"))
+        .env("LEEP_TOKEN", "tok-ada")
+        .env("NO_COLOR", "1")
+        .args(["--server", url])
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// The inbox is what still waits for you: a request you approved leaves it
+/// (until you withdraw), `--all` brings it back marked, and the requester's
+/// view names who approved.
+#[test]
+fn the_inbox_hides_what_you_already_answered() {
+    let (url, data) = start(true);
+    let env = Env::new(&url);
+    let r = env.remote(false);
+    let one = id(1).to_string();
+    let two = id(2).to_string();
+    review_request::request(&r, &ask(&one, &["ada"], None)).unwrap();
+    review_request::request(&r, &ask(&two, &["ada"], None)).unwrap();
+    data.lock()
+        .unwrap()
+        .approved
+        .insert(1, vec!["ada".into(), "rhea".into()]);
+
+    let text = |o: std::process::Output| {
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap()
+    };
+    let inbox = text(leep(&url, &["review", "inbox"]));
+    assert!(inbox.starts_with("#2 open"), "{inbox}");
+    assert!(!inbox.contains("#1 "), "{inbox}");
+    assert!(
+        inbox.ends_with(
+            "(1 request you already answered not shown; `leep review inbox --all` shows them)\n"
+        ),
+        "{inbox}"
+    );
+    let json: ReviewRequestsResponse =
+        serde_json::from_str(&text(leep(&url, &["--json", "review", "inbox"]))).unwrap();
+    assert_eq!(json.requests.len(), 1);
+
+    let all = text(leep(&url, &["review", "inbox", "--all"]));
+    assert!(
+        all.contains("#1 open") && all.contains("approved by you, rhea"),
+        "{all}"
+    );
+    let mine = text(leep(&url, &["review", "inbox", "--mine"]));
+    // The requester sees the same answers; here she is a reviewer too.
+    assert!(mine.contains("approved by you, rhea"), "{mine}");
+    assert!(mine.contains("#2 open"), "{mine}");
+
+    // Everything answered: the empty inbox still says how to see them.
+    data.lock().unwrap().approved.insert(2, vec!["ada".into()]);
+    let inbox = text(leep(&url, &["review", "inbox"]));
+    assert!(
+        inbox.starts_with("No review requests are waiting for you.\n(2 requests you already"),
+        "{inbox}"
+    );
+}
+
+/// `review request --wait` asks, then waits as `review status --wait`.
+#[test]
+fn request_wait_delegates_to_status_wait() {
+    let (url, _data) = start(true);
+    let out = leep(&url, &["review", "request", &id(1).to_string(), "--wait=1"]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("Requested review of"), "{stdout}");
+    assert!(!stdout.contains("waits for the verdict"), "{stdout}");
+    assert!(stdout.contains(": approved\n"), "{stdout}");
 }

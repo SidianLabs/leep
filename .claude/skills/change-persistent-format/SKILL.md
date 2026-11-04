@@ -62,5 +62,5 @@ Migrations are forward-only and numbered; a released one is never edited
    a restore of the previous schema's snapshot to the test. A change to the
    backup directory or `manifest.json` needs a new manifest `format` unless it
    only adds a field.
-7. Update docs/FORMATS.md (schema section), the CHANGELOG and, if operators
+7. Update docs/FORMATS.md (schema section), a `changelog.d/` fragment (never `CHANGELOG.md`) and, if operators
    must do something, docs/OPERATIONS.md "Upgrading".

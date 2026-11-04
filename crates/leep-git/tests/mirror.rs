@@ -2519,4 +2519,9 @@ fn a_shallow_work_repository_is_refused_with_a_clear_error() {
         .to_string();
     assert!(err.contains("shallow"), "{err}");
     assert!(err.contains("git fetch --unshallow"), "{err}");
+    // The mirror shares the message with import, so it must not say "import".
+    assert!(
+        !err.contains("imported") && !err.contains("import again"),
+        "{err}"
+    );
 }
