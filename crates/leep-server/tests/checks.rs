@@ -352,6 +352,18 @@ async fn an_unlanded_changeset_never_promotes() {
     let api = Api::new(true);
     let h = api.lands(1).await;
     let wip = api.commit("alice", &[h[1]], "w", "wip").await;
+    // A changeset no ref holds takes no results: they would only pin it.
+    let why = api
+        .check("ci-test", wip, "test", Outcome::Pass)
+        .await
+        .refused(StatusCode::BAD_REQUEST, error_code::INVALID);
+    assert!(why.contains("no ref"), "{why}");
+    // On another ref (PR CI on a review ref) it does, and promotes nothing.
+    api.repo
+        .meta()
+        .cas_ref("review/x", None, Some(wip))
+        .await
+        .unwrap();
     api.check("ci-test", wip, "test", Outcome::Pass)
         .await
         .ok::<PostCheckResponse>();

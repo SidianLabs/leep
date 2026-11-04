@@ -267,6 +267,29 @@ pub(crate) async fn post(
             "a token may not post check results for a changeset it created",
         ));
     }
+    // CI attests what is on a ref; a result for a changeset nowhere would
+    // only pin it against GC. Policy refs first, the common case.
+    let policy_refs: Vec<String> = config
+        .checks
+        .as_ref()
+        .map(|p| p.refs.keys().cloned().collect())
+        .unwrap_or_default();
+    if repo.refs_holding(id, &policy_refs).await?.is_empty() {
+        let others: Vec<String> = repo
+            .meta()
+            .list_refs()
+            .await?
+            .into_keys()
+            .filter(|n| !is_green(n) && !policy_refs.contains(n))
+            .collect();
+        if repo.refs_holding(id, &others).await?.is_empty() {
+            return Err(Error::Invalid(format!(
+                "{id} is on no ref's first-parent chain: post results for changesets a ref \
+                 holds, such as a head CI tested"
+            ))
+            .into());
+        }
+    }
     repo.put_check(id, &check).await?;
     let mut promoted = Vec::new();
     if check.outcome == Outcome::Pass {

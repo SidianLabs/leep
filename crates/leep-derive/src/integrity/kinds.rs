@@ -205,11 +205,10 @@ static KINDS: &[KindInfo] = &[
         name: CHECK_KIND,
         class: KindClass::Attestation,
         summary: "the newest result of one check (CI) on a changeset",
-        rederive: Rederive::No("check results are not computed from history"),
-        drop: DropPolicy::Refused(
-            "check results are attestations CI posted; they are not computed from \
-             history, so a dropped row is gone for good",
-        ),
+        rederive: Rederive::No("check results are not computed from history; rerun the check"),
+        // CI reproduces a result by running the check again, so dropping
+        // them is how an operator unpins changesets they keep from GC.
+        drop: DropPolicy::Allowed { also: &[] },
     },
     KindInfo {
         name: CREATED_BY_KIND,
@@ -512,7 +511,7 @@ mod tests {
                 matches!(k.class, KindClass::Attestation | KindClass::Bookkeeping);
             assert_eq!(
                 droppable,
-                !attestation_or_state
+                (!attestation_or_state || k.name == CHECK_KIND)
                     && k.name != HISTORY_NODE_KIND
                     && k.name != LOG_FILTER_NAME_KIND
             );
