@@ -7,6 +7,11 @@ had a release; versions stay below 0.1.0 until the maintainer cuts one
 
 ## [Unreleased]
 
+### Docs: all-of-Linux path-history size is labelled v3
+- **Fixed.** `docs/PERFORMANCE.md` ("All of Linux") no longer calls the
+  16 KB per changeset v3 path-history index the largest thing Leep stores;
+  it points to the v4 measurements (ADR 0045).
+
 ### Review verdicts carry across identical rebases; policy refusals are 422
 - **Changed.** A reviewer's approve or reject of a changeset X now counts
   for a changeset Y that names X in `leep.rebased_from` (a hint, followed to
