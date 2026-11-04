@@ -521,6 +521,8 @@ async fn owners_are_read_from_the_head_not_the_change() {
     let s = api.status(c).await;
     assert!(!s.approved);
     assert_eq!(s.paths[0].owners, ["alice"]);
+    // The file that named them, from the head: not the change's own.
+    assert_eq!(s.paths[0].owners_files, ["a/OWNERS"]);
     assert!(s.paths[0].approved_by.is_empty());
 
     api.approve(c, "alice").await;
@@ -2578,6 +2580,7 @@ async fn a_strict_ref_carries_only_identical_changes() {
         Some("src/a.rs is identical-only (strict land ref)")
     );
     assert_eq!(s.paths[1].carry.as_deref(), Some("identical"));
+    assert_eq!(s.paths[1].carry_source.as_deref(), Some("strict land ref"));
 }
 
 #[tokio::test]
@@ -2641,6 +2644,8 @@ async fn an_identical_only_path_keeps_a_rebased_resolution_pending_and_says_why(
     assert!(!s.approved, "{s:?}");
     assert_eq!(rules(&s)[1], ("src/a.rs", "pending"));
     assert_eq!(s.paths[1].carry.as_deref(), Some("identical"));
+    assert_eq!(s.paths[1].carry_source.as_deref(), Some("OWNERS"));
+    assert_eq!(s.paths[1].owners_files, ["OWNERS"]);
     assert_eq!(s.origins[0].differs, [RepoPath::new("src/a.rs").unwrap()]);
     assert_eq!(
         s.origins[0].reason.as_deref(),

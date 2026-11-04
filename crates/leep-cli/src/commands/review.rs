@@ -504,6 +504,8 @@ mod tests {
             carried_from: None,
             carried_rule: None,
             carry: None,
+            owners_files: vec![],
+            carry_source: None,
         }
     }
 
