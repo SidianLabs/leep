@@ -77,6 +77,12 @@ them: on a server whose default merges but with a strict ref, it may list a
 verdict as carried that a land on that strict ref does not count (the land
 and `review-status?ref=` are what decide).
 
+*Amended by [ADR 0092](0092-identical-only-review-carry.md):* merged carries
+are not used either on a path the policy's `identical_only_globs` or the nearest `OWNERS`
+`carry identical` line in the target ref's head declare identical-only;
+the refusal names which (`P is identical-only (src/OWNERS)`), and request
+closing uses the same scope.
+
 **Why this is safe.** The hint still only picks what to compare; Y.new is a
 deterministic function of three stored blobs. X.old and X.new are what the
 reviewer saw. Y.old is the file in Y's first parent, which a land of Y puts

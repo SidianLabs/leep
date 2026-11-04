@@ -1369,6 +1369,33 @@ check costs at most 32 three-way text merges per original (files up to
 content, with at most half the cores merging at a time on blocking threads;
 nothing to configure.
 
+**Identical-only paths** (ADR 0092). Owners can keep merged carries off
+for a directory with an `OWNERS` line `carry identical` (the nearest
+`carry identical` or `carry merged` line up to `noparent` decides), and
+operators for any path with the review policy's `identical_only_globs`
+(`["**/Cargo.lock", "migrations/**"]`); a strict ref still covers every
+path, and nothing loosens another source. Both are read from the target
+ref's head. `leep review status` says `not carried: P is identical-only
+(src/OWNERS)` (or `(policy glob G)`, `(strict land ref)`), and `--json`
+gives each path's `carry`. Upgrade every server before adding the policy
+key: an older server refuses the file at startup and keeps its previous
+config on SIGHUP (`config reload failed`). Upgrade before adding `carry`
+lines to `OWNERS` files too: an older server reads them as an owner name
+nobody has, which is harmless beside real names but leaves a file with no
+other names unapprovable.
+
+Expect more re-approvals there, by design: on a strict ref or an
+identical-only path, any edit of the file that lands while a client
+resolution of it is pending moves its base, so the resolution needs a fresh
+approval. That includes edits approved by an auto rule (`comment_only`,
+`whitespace_only`, `docs_only`), which judge the editor's own change, not
+the pending one on top. How often owners re-approve is bounded by how often
+the file can be edited, the editors' request and land limits; `leep log`
+on the file shows who moved the base. Should that prove noisy, a future `noauto`
+`OWNERS` line could turn the auto rules off for a directory, so only
+owner-approved edits move it; it does not exist yet. Narrow the auto rules
+in the policy file meanwhile.
+
 **Derived kinds that change encoding.** A release that changes how a derived
 kind is stored gives it a new name, so old and new servers never read each
 other's rows; nothing to migrate. The new kind derives on first use, which on
