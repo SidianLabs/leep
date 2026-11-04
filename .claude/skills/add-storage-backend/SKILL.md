@@ -66,7 +66,11 @@ Backends implement `leep_core::BlobStore` (in `leep-store`) or
      exactly one wins;
    - if the backend needs a service, gate the tests on an env var
      (`LEEP_TEST_<NAME>_URL`), skip with a printed note when it's unset, and
-     add the service to `.github/workflows/rust.yml`.
+     add the service to `.github/workflows/rust.yml`;
+   - give each test a namespace of its own (a schema, a database, a key
+     prefix) behind a guard that removes it on `Drop`, a panicking test's
+     included, as `leep_meta::pg_test::{TestSchema, TestDb}` do for
+     Postgres: test databases are shared, and leftovers pile up per run.
 5. Fault tolerance (ADR 0021): run the contract through a quiet
    `leep_testkit::FaultyBlobStore` / `FaultyMetaStore` (it must still pass),
    and write down in `docs/ARCHITECTURE.md` §9 what the backend guarantees
