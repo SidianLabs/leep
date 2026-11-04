@@ -12,8 +12,12 @@
 //! ```json
 //! { "refs": ["main"],
 //!   "auto_approve": ["comment_only", "whitespace_only", "docs_only"],
-//!   "docs_globs": ["**/*.md", "docs/**"] }
+//!   "docs_globs": ["**/*.md", "docs/**"],
+//!   "identical_only_globs": ["**/Cargo.lock"] }
 //! ```
+//!
+//! `identical_only_globs` (ADR 0092) name paths whose verdicts carry only to
+//! identical changes, never to a rebase or union (ADR 0089).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -27,7 +31,7 @@ use leep_core::review::{Review, ReviewSource, Verdict, NEEDS_REVIEW_MARKER};
 use leep_core::{ChangesetId, Error, Result};
 use leep_derive::owners::OwnersResolver;
 use leep_derive::review::{
-    AutoRule, Carried, CarryRefusal, ChangesetReview, PathRule, ReviewRules,
+    AutoRule, Carried, CarryRefusal, CarryScope, ChangesetReview, PathRule, ReviewRules,
 };
 use leep_derive::{LandPolicy, Repo};
 use serde::Deserialize;
@@ -41,6 +45,8 @@ struct PolicyFile {
     auto_approve: Vec<String>,
     #[serde(default)]
     docs_globs: Vec<String>,
+    #[serde(default)]
+    identical_only_globs: Vec<String>,
 }
 
 /// Most candidates with reviews one judgement compares (ADR 0085).
@@ -60,6 +66,7 @@ pub struct ReviewPolicy {
     /// rules changed (`ReviewRules` is opaque).
     pub auto_approve: Vec<String>,
     pub docs_globs: Vec<String>,
+    pub identical_only_globs: Vec<String>,
 }
 
 impl ReviewPolicy {
@@ -78,16 +85,19 @@ impl ReviewPolicy {
                 )
             })?);
         }
-        let rules = ReviewRules::new(auto, &file.docs_globs).map_err(|e| {
-            e.to_string()
-                .trim_start_matches("invalid input: ")
-                .to_string()
-        })?;
+        let rules = ReviewRules::new(auto, &file.docs_globs)
+            .and_then(|r| r.with_identical_only(&file.identical_only_globs))
+            .map_err(|e| {
+                e.to_string()
+                    .trim_start_matches("invalid input: ")
+                    .to_string()
+            })?;
         Ok(ReviewPolicy {
             refs: file.refs,
             rules,
             auto_approve: file.auto_approve,
             docs_globs: file.docs_globs,
+            identical_only_globs: file.identical_only_globs,
         })
     }
 
@@ -165,13 +175,14 @@ impl ReviewService {
     pub async fn describe(&self, repo: &Repo, id: ChangesetId) -> Result<ReviewsResponse> {
         let mut own = self.entries_for(repo, id).await?;
         let mine: Vec<Review> = own.iter().map(|e| e.review.clone()).collect();
-        // A listing names no ref: judge as the server's default lands do.
+        // A listing names no ref: judge as the server's default lands do,
+        // with the policy's identical-only globs but no ref's `OWNERS`.
         let carried = self
             .carried(
                 repo,
                 id,
                 &mine,
-                repo.carry_merges(""),
+                &mut CarryScope::for_ref(repo.carry_merges(""), None),
                 &mut CarryCache::default(),
                 None,
             )
@@ -226,9 +237,9 @@ impl ReviewService {
         origins: Option<&mut Vec<OriginStatus>>,
     ) -> Result<ChangesetReview> {
         let reviews = self.reviews_for(repo, id).await?;
-        let merges = repo.carry_merges(target_ref);
+        let mut scope = CarryScope::for_ref(repo.carry_merges(target_ref), Some(&mut *owners));
         let carried = self
-            .carried(repo, id, &reviews, merges, seen, origins)
+            .carried(repo, id, &reviews, &mut scope, seen, origins)
             .await?;
         repo.review_changeset_carried(id, &self.rules, &reviews, &carried, owners)
             .await
@@ -244,8 +255,9 @@ impl ReviewService {
     ///
     /// At most [`MAX_CARRY_CHECKS`] candidates with reviews are compared.
     /// One more and nothing carries at all: stopping early could drop a
-    /// newer reject that a later candidate holds. `merges` lets a path carry
-    /// as the server's rebase or a union of insertions (ADR 0089).
+    /// newer reject that a later candidate holds. `scope` says where a path
+    /// may carry as the server's rebase or a union of insertions (ADR 0089,
+    /// 0092).
     /// `origins`, when given, gets each compared candidate with its
     /// verdicts and why it did not carry.
     async fn carried(
@@ -253,7 +265,7 @@ impl ReviewService {
         repo: &Repo,
         id: ChangesetId,
         own: &[Review],
-        merges: bool,
+        scope: &mut CarryScope<'_, '_>,
         seen: &mut CarryCache,
         mut origins: Option<&mut Vec<OriginStatus>>,
     ) -> Result<Vec<Carried>> {
@@ -290,7 +302,7 @@ impl ReviewService {
                 }
                 return Ok(Vec::new());
             }
-            let check = repo.carry_check(from, id, &self.rules, merges).await?;
+            let check = repo.carry_check(from, id, &self.rules, scope).await?;
             if let Some(o) = origins.as_deref_mut() {
                 let (carried, differs, reason) = match &check {
                     Ok(paths) if !paths.is_empty() => (true, Vec::new(), None),
@@ -300,6 +312,9 @@ impl ReviewService {
                         Some("every path of it is approved by an auto rule".to_string()),
                     ),
                     Err(CarryRefusal::Differs(p)) => (false, vec![p.clone()], None),
+                    Err(why @ CarryRefusal::IdenticalOnly { path, .. }) => {
+                        (false, vec![path.clone()], Some(why.to_string()))
+                    }
                     Err(why) => (false, Vec::new(), Some(why.to_string())),
                 };
                 o.push(OriginStatus {
@@ -360,10 +375,10 @@ impl ReviewService {
             if theirs.verdict != Verdict::Approve {
                 continue;
             }
-            // With merges whatever the ref: taking back more than any ref
-            // would carry is the safe side.
+            // With merges whatever the ref or its files declare: taking
+            // back more than any ref would carry is the safe side.
             if !repo
-                .carried_paths(from, id, &self.rules, true)
+                .carried_paths(from, id, &self.rules, &mut CarryScope::widest())
                 .await?
                 .is_some_and(|p| !p.is_empty())
             {
@@ -428,6 +443,15 @@ impl ReviewService {
                 Some(&mut origins),
             )
             .await?;
+        // The carry rule of each path, so a reviewer sees where only an
+        // identical change keeps their verdict (ADR 0092).
+        let mut carry = Vec::with_capacity(review.paths.len());
+        let merges = repo.carry_merges(target_ref);
+        for p in &review.paths {
+            let mut scope = CarryScope::for_ref(merges, Some(&mut owners));
+            let identical = scope.identical_only(&self.rules, &p.path).await?.is_some();
+            carry.push(if identical { "identical" } else { "merged" });
+        }
         Ok(ReviewStatusResponse {
             changeset: id,
             target_ref: target_ref.to_string(),
@@ -440,7 +464,8 @@ impl ReviewService {
             paths: review
                 .paths
                 .into_iter()
-                .map(|p| PathReview {
+                .zip(carry)
+                .map(|(p, carry)| PathReview {
                     path: p.path,
                     rule: p.rule.label(),
                     owners: p.owners,
@@ -448,6 +473,7 @@ impl ReviewService {
                     rejected_by: p.rejected_by,
                     carried_from: p.carried_from,
                     carried_rule: p.carried_rule.map(|r| r.name().to_string()),
+                    carry: Some(carry.to_string()),
                 })
                 .collect(),
             origins,
@@ -535,6 +561,31 @@ mod tests {
         assert_eq!(p.refs, ["main", "release/1"]);
         assert!(p.rules.enabled(AutoRule::CommentOnly));
         assert!(p.rules.is_docs("docs/a/b.png"));
+        assert_eq!(p.rules.identical_only_glob("Cargo.lock"), None);
+    }
+
+    #[test]
+    fn identical_only_globs_need_no_auto_rule_and_name_the_first_match() {
+        let p = ReviewPolicy::parse(
+            r#"{"identical_only_globs":["**/Cargo.lock","*.lock","migrations/**"]}"#,
+        )
+        .unwrap();
+        assert_eq!(p.identical_only_globs.len(), 3);
+        assert_eq!(
+            p.rules.identical_only_glob("Cargo.lock"),
+            Some("**/Cargo.lock")
+        );
+        assert_eq!(
+            p.rules.identical_only_glob("a/Cargo.lock"),
+            Some("**/Cargo.lock")
+        );
+        assert_eq!(p.rules.identical_only_glob("yarn.lock"), Some("*.lock"));
+        assert_eq!(p.rules.identical_only_glob("a/yarn.lock"), None);
+        assert_eq!(
+            p.rules.identical_only_glob("migrations/1.sql"),
+            Some("migrations/**")
+        );
+        assert_eq!(p.rules.identical_only_glob("src/lib.rs"), None);
     }
 
     #[test]
@@ -560,6 +611,7 @@ mod tests {
             err(r#"{"auto_approve":["docs_only"],"docs_globs":["["]}"#).contains("bad docs glob")
         );
         assert!(err(r#"{"auto_approve":"comment_only"}"#).contains("bad JSON"));
+        assert!(err(r#"{"identical_only_globs":["["]}"#).contains("bad identical_only glob"));
     }
 
     #[test]

@@ -17,6 +17,8 @@
 //! Verdicts on another changeset X can carry to this one (ADR 0085), but only
 //! for paths whose change is identical in both, or what the server's own
 //! rebase of X's change would make (ADR 0089): see [`Repo::carried_paths`].
+//! Paths declared identical-only carry only identical changes (ADR 0092):
+//! see [`CarryScope`].
 
 use std::collections::btree_map::Entry as BTreeEntry;
 use std::collections::hash_map::Entry;
@@ -30,7 +32,7 @@ use leep_core::{ChangesetId, Error, FileChange, FileKind, RepoPath, Result};
 
 use crate::carry::{self, CarryRule};
 use crate::comments::strip_comments;
-use crate::owners::OwnersResolver;
+use crate::owners::{CarryDirective, OwnersResolver};
 use crate::Repo;
 
 /// Largest file (per side) the content rules read; bigger files need a human.
@@ -63,6 +65,35 @@ pub enum CarryRefusal {
     Differs(RepoPath),
     /// The candidate is not stored (never was, or collected since).
     Gone,
+    /// This reviewed path's change is not identical in the judged changeset,
+    /// and only an identical change carries there (ADR 0092).
+    IdenticalOnly {
+        path: RepoPath,
+        declared_by: CarrySource,
+    },
+}
+
+/// What makes a path identical-only for carrying (ADR 0092), strictest
+/// first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CarrySource {
+    /// The target ref never merges file contents (ADR 0066, 0089).
+    StrictRef,
+    /// The review policy file's `identical_only_globs` entry that matches.
+    Policy(String),
+    /// The `OWNERS` file, read from the target ref's head, whose
+    /// `carry identical` line is the nearest `carry` line for the path.
+    Owners(String),
+}
+
+impl std::fmt::Display for CarrySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CarrySource::StrictRef => write!(f, "strict land ref"),
+            CarrySource::Policy(g) => write!(f, "policy glob {g}"),
+            CarrySource::Owners(file) => write!(f, "{file}"),
+        }
+    }
 }
 
 impl std::fmt::Display for CarryRefusal {
@@ -78,6 +109,9 @@ impl std::fmt::Display for CarryRefusal {
             ),
             CarryRefusal::Differs(p) => write!(f, "{p} differs"),
             CarryRefusal::Gone => write!(f, "it is no longer stored"),
+            CarryRefusal::IdenticalOnly { path, declared_by } => {
+                write!(f, "{path} is identical-only ({declared_by})")
+            }
         }
     }
 }
@@ -113,11 +147,27 @@ impl AutoRule {
     }
 }
 
-/// The enabled auto rules and the docs globs.
+/// The enabled auto rules, the docs globs and the identical-only globs.
 #[derive(Clone, Debug, Default)]
 pub struct ReviewRules {
     auto: BTreeSet<AutoRule>,
     docs: Option<GlobSet>,
+    /// Paths whose verdicts carry only to identical changes (ADR 0092),
+    /// with the globs as written, to name the one that matched.
+    identical_only: Option<(GlobSet, Vec<String>)>,
+}
+
+fn glob_set(globs: &[String], what: &str) -> Result<GlobSet> {
+    let mut b = GlobSetBuilder::new();
+    for g in globs {
+        let glob: Glob = GlobBuilder::new(g)
+            .literal_separator(true)
+            .build()
+            .map_err(|e| Error::Invalid(format!("bad {what} glob {g:?}: {e}")))?;
+        b.add(glob);
+    }
+    b.build()
+        .map_err(|e| Error::Invalid(format!("bad {what} globs: {e}")))
 }
 
 impl ReviewRules {
@@ -138,22 +188,36 @@ impl ReviewRules {
             ));
         }
         let docs = if docs_on {
-            let mut b = GlobSetBuilder::new();
-            for g in docs_globs {
-                let glob: Glob = GlobBuilder::new(g)
-                    .literal_separator(true)
-                    .build()
-                    .map_err(|e| Error::Invalid(format!("bad docs glob {g:?}: {e}")))?;
-                b.add(glob);
-            }
-            Some(
-                b.build()
-                    .map_err(|e| Error::Invalid(format!("bad docs globs: {e}")))?,
-            )
+            Some(glob_set(docs_globs, "docs")?)
         } else {
             None
         };
-        Ok(ReviewRules { auto, docs })
+        Ok(ReviewRules {
+            auto,
+            docs,
+            identical_only: None,
+        })
+    }
+
+    /// These rules with `globs` as the paths whose verdicts carry only to
+    /// identical changes (ADR 0092), matched as `docs_globs` are.
+    pub fn with_identical_only(mut self, globs: &[String]) -> Result<Self> {
+        self.identical_only = if globs.is_empty() {
+            None
+        } else {
+            Some((glob_set(globs, "identical_only")?, globs.to_vec()))
+        };
+        Ok(self)
+    }
+
+    /// The first `identical_only_globs` entry matching `path`, in the order
+    /// written.
+    pub fn identical_only_glob(&self, path: &str) -> Option<&str> {
+        let (set, globs) = self.identical_only.as_ref()?;
+        set.matches(path)
+            .into_iter()
+            .min()
+            .map(|i| globs[i].as_str())
     }
 
     pub fn enabled(&self, rule: AutoRule) -> bool {
@@ -258,6 +322,85 @@ pub struct Carried {
     /// Reviews of `from`, withdrawals included, by reviewers with no review
     /// of their own of the changeset being judged.
     pub reviews: Vec<Review>,
+}
+
+/// Which carries a judgement allows besides identical changes (ADR 0089,
+/// 0092): the target ref's own rule, the policy's identical-only globs and
+/// the `carry` lines of the `OWNERS` files in the target ref's head. Each
+/// can only make a path identical-only, never undo another's, so the rule
+/// is the same whichever of them a reader looks at first.
+///
+/// Carrying a verdict and closing a review request use one scope per
+/// target ref, so a request closes exactly when its verdicts would carry.
+pub struct CarryScope<'o, 'a> {
+    merges: bool,
+    declared: bool,
+    owners: Option<&'o mut OwnersResolver<'a>>,
+}
+
+impl<'o, 'a> CarryScope<'o, 'a> {
+    /// The scope of a land on a ref: `merges` from
+    /// [`Repo::carry_merges`], `owners` reading the ref's head. Without
+    /// `owners` (a listing that names no ref), `OWNERS` lines are not read.
+    pub fn for_ref(merges: bool, owners: Option<&'o mut OwnersResolver<'a>>) -> Self {
+        CarryScope {
+            merges,
+            declared: true,
+            owners,
+        }
+    }
+
+    /// Merges everywhere, whatever any ref or file declares: for taking a
+    /// verdict back, where more than any ref would carry is the safe side
+    /// (ADR 0085, 0089).
+    pub fn widest() -> Self {
+        CarryScope {
+            merges: true,
+            declared: false,
+            owners: None,
+        }
+    }
+
+    /// Why only an identical change of `path` carries, or `None` when a
+    /// rebase or union may.
+    pub async fn identical_only(
+        &mut self,
+        rules: &ReviewRules,
+        path: &RepoPath,
+    ) -> Result<Option<CarrySource>> {
+        if !self.merges {
+            return Ok(Some(CarrySource::StrictRef));
+        }
+        if !self.declared {
+            return Ok(None);
+        }
+        if let Some(g) = rules.identical_only_glob(path.as_str()) {
+            return Ok(Some(CarrySource::Policy(g.to_string())));
+        }
+        if let Some(owners) = self.owners.as_deref_mut() {
+            if let Some((CarryDirective::Identical, file)) = owners.carry_of(path).await? {
+                return Ok(Some(CarrySource::Owners(file)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The refusal for the first of `paths` that is identical-only.
+    async fn refusal(
+        &mut self,
+        rules: &ReviewRules,
+        paths: &[&RepoPath],
+    ) -> Result<Option<CarryRefusal>> {
+        for p in paths {
+            if let Some(declared_by) = self.identical_only(rules, p).await? {
+                return Ok(Some(CarryRefusal::IdenticalOnly {
+                    path: (*p).clone(),
+                    declared_by,
+                }));
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// Whether `a` is a later word than `b` from the same reviewer: by
@@ -495,8 +638,10 @@ impl Repo {
     ///   one kind throughout (no symlinks, no kind change), each at most
     ///   [`MAX_AUTO_BYTES`] and [`carry::MAX_CARRY_LINES`] lines, never
     ///   `OWNERS`, at most
-    ///   [`MAX_CARRY_MERGED_PATHS`] per candidate. `merges` is off on refs
-    ///   whose lands never merge file contents (`--strict-land-ref`).
+    ///   [`MAX_CARRY_MERGED_PATHS`] per candidate. Not where `scope` makes
+    ///   the path identical-only: on refs whose lands never merge file
+    ///   contents (`--strict-land-ref`), and on paths the policy's globs or
+    ///   an `OWNERS` `carry identical` line declare so (ADR 0092).
     ///
     /// `None` when a path of `from` that needed a reviewer is changed
     /// otherwise in `id`, or missing from it (so a reviewed path never
@@ -512,9 +657,9 @@ impl Repo {
         from: ChangesetId,
         id: ChangesetId,
         rules: &ReviewRules,
-        merges: bool,
+        scope: &mut CarryScope<'_, '_>,
     ) -> Result<Option<BTreeMap<RepoPath, CarryRule>>> {
-        Ok(self.carry_check(from, id, rules, merges).await?.ok())
+        Ok(self.carry_check(from, id, rules, scope).await?.ok())
     }
 
     /// Whether verdicts carried to a land on `target_ref` may rest on a
@@ -536,7 +681,7 @@ impl Repo {
         from: ChangesetId,
         id: ChangesetId,
         rules: &ReviewRules,
-        merges: bool,
+        scope: &mut CarryScope<'_, '_>,
     ) -> Result<std::result::Result<BTreeMap<RepoPath, CarryRule>, CarryRefusal>> {
         // A candidate with reviews may have been collected: it carries
         // nothing, and the judgement goes on without it.
@@ -573,9 +718,9 @@ impl Repo {
         );
         // Could a merge reproduce it? Both modify the file, never `OWNERS`,
         // on different bases (on the same one the merge is `from`'s file).
+        // Whether the scope allows it is asked only of these paths, below.
         let may_merge = |p: &RepoPath, c: &FileChange| {
-            merges
-                && px != py
+            px != py
                 && p.file_name() != OWNERS_FILE
                 && matches!(c, FileChange::Modify { .. })
                 && matches!(mine.changes.get(p), Some(FileChange::Modify { .. }))
@@ -594,9 +739,13 @@ impl Repo {
                 return Ok(Err(CarryRefusal::Differs(p.clone())));
             }
         }
+        if let Some(refused) = scope.refusal(rules, &merge).await? {
+            return Ok(Err(refused));
+        }
         if merge.len() > MAX_CARRY_MERGED_PATHS {
             return Ok(Err(CarryRefusal::TooManyMerges));
         }
+        let asked = merge.len();
         let old = |parent: Option<ChangesetId>, p: &RepoPath| {
             let p = p.clone();
             async move {
@@ -629,6 +778,9 @@ impl Repo {
                 return Ok(Err(CarryRefusal::Differs(p.clone())));
             }
             merge.push(p);
+        }
+        if let Some(refused) = scope.refusal(rules, &merge[asked..]).await? {
+            return Ok(Err(refused));
         }
         if merge.len() > MAX_CARRY_MERGED_PATHS {
             return Ok(Err(CarryRefusal::TooManyMerges));
@@ -725,8 +877,8 @@ impl Repo {
 
     /// Whether `id` puts the reviewed change of `from` on its ref, the
     /// content rule a review request for `from` closes by (ADR 0087):
-    /// [`Self::carried_paths`] (with `merges`) holds and reproduces at least
-    /// one path, or
+    /// [`Self::carried_paths`] (in the ref's `scope`, as carrying a verdict
+    /// there uses) holds and reproduces at least one path, or
     /// every path of `from` is one an auto rule approves there and `id`
     /// changes each of them in a form an auto rule approves in `id`. Like
     /// carrying, it is decided by content alone, so a forged hint closes
@@ -736,9 +888,9 @@ impl Repo {
         from: ChangesetId,
         id: ChangesetId,
         rules: &ReviewRules,
-        merges: bool,
+        scope: &mut CarryScope<'_, '_>,
     ) -> Result<bool> {
-        let paths = match self.carried_paths(from, id, rules, merges).await {
+        let paths = match self.carried_paths(from, id, rules, scope).await {
             Ok(Some(paths)) => paths,
             Ok(None) | Err(Error::NotFound(_)) => return Ok(false),
             Err(e) => return Err(e),

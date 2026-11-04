@@ -347,13 +347,15 @@ fn origin_line(id: ChangesetId, o: &OriginStatus) -> String {
         line.push_str("; carried");
         return line;
     }
-    let why = if !o.differs.is_empty() {
-        let paths: Vec<&str> = o.differs.iter().map(|p| p.as_str()).collect();
-        format!("{} differs", paths.join(", "))
-    } else {
-        o.reason
-            .clone()
-            .unwrap_or_else(|| "nothing it reviewed is reproduced".into())
+    // A reason beside `differs` says why the path does not carry (an
+    // identical-only path, ADR 0092), so it is the better word.
+    let why = match (&o.reason, o.differs.is_empty()) {
+        (Some(reason), _) => reason.clone(),
+        (None, false) => {
+            let paths: Vec<&str> = o.differs.iter().map(|p| p.as_str()).collect();
+            format!("{} differs", paths.join(", "))
+        }
+        (None, true) => "nothing it reviewed is reproduced".into(),
     };
     line.push_str(&format!(
         "; not carried: {why} (leep diff {}; leep diff {})",
@@ -498,6 +500,7 @@ mod tests {
             rejected_by: v(no),
             carried_from: None,
             carried_rule: None,
+            carry: None,
         }
     }
 
@@ -705,6 +708,12 @@ mod tests {
                 origin(x, true, &[], None),
                 origin(x2, false, &["b.rs"], None),
                 origin(x2, false, &[], Some("it is a merge")),
+                origin(
+                    x2,
+                    false,
+                    &["b.rs"],
+                    Some("b.rs is identical-only (src/OWNERS)"),
+                ),
             ],
         };
         let (y, sx, sx2) = (short(id()), short(x), short(x2));
@@ -723,6 +732,10 @@ mod tests {
                 format!(
                     "replaces {sx2}, approved by rhea, rejected by bo; not carried: it is a merge \
                      (leep diff {sx2}; leep diff {y})"
+                ),
+                format!(
+                    "replaces {sx2}, approved by rhea, rejected by bo; not carried: b.rs is \
+                     identical-only (src/OWNERS) (leep diff {sx2}; leep diff {y})"
                 ),
                 format!("diff: leep diff {y}"),
             ]

@@ -522,6 +522,7 @@ async fn review_status(
             rejected_by: no.clone(),
             carried_from: None,
             carried_rule: None,
+            carry: None,
         })
         .collect();
     Ok(Json(ReviewStatusResponse {

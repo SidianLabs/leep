@@ -714,6 +714,13 @@ pub struct PathReview {
     /// kept whole). ADR 0089; older servers leave it out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carried_rule: Option<String>,
+    /// How a verdict on an earlier change of this path carries to a
+    /// re-committed one on the target ref (ADR 0092): `identical` (only an
+    /// identical change carries: a strict land ref, a policy glob or an
+    /// `OWNERS` `carry identical` line) or `merged` (the server's rebase and
+    /// unions carry too). Older servers leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carry: Option<String>,
 }
 
 /// One changeset a judged changeset names as its origin
@@ -2506,7 +2513,8 @@ mod tests {
         }
 
         /// ADR 0089: how a verdict carried, why one did not, and what a
-        /// request changes. Absent fields decode empty and are not written.
+        /// request changes; ADR 0092: a path's `carry` rule. Absent fields
+        /// decode empty and are not written.
         #[test]
         fn carry_fields_added_later_decode_when_absent_and_keep_their_names() {
             check_added::<PathReview>(
@@ -2516,6 +2524,7 @@ mod tests {
                 &[
                     ("carried_from", json!(id("x"))),
                     ("carried_rule", json!("rebased")),
+                    ("carry", json!("identical")),
                 ],
                 true,
             );
