@@ -2279,7 +2279,7 @@ mod review {
     use super::*;
     use crate::carry::CarryRule;
     use crate::owners::OwnersResolver;
-    use crate::review::{AutoRule, CarryRefusal, PathRule, ReviewRules};
+    use crate::review::{AutoRule, CarryRefusal, CarryScope, PathRule, ReviewRules};
     use crate::{LandPolicy, PolicySet};
 
     fn rev(who: &str, v: Verdict) -> Review {
@@ -3046,7 +3046,11 @@ mod review {
         let carried = |y| {
             let r = r.clone();
             let docs = docs.clone();
-            async move { r.carried_paths(x, y, &docs, false).await.unwrap() }
+            async move {
+                r.carried_paths(x, y, &docs, &mut CarryScope::for_ref(false, None))
+                    .await
+                    .unwrap()
+            }
         };
         // The docs path is auto in `x`, so `y` may change it differently,
         // and add a path of its own.
@@ -3074,13 +3078,20 @@ mod review {
         // no verdict but lost nothing reviewed (ADR 0087).
         let docs_x = commit(&r, &[base], &[("N.md", Some("x\n"))], "docs x").await;
         assert_eq!(
-            r.carried_paths(docs_x, y, &docs, false).await.unwrap(),
+            r.carried_paths(docs_x, y, &docs, &mut CarryScope::for_ref(false, None))
+                .await
+                .unwrap(),
             Some(BTreeMap::new())
         );
         assert_eq!(
-            r.carried_paths(docs_x, y, &ReviewRules::default(), false)
-                .await
-                .unwrap(),
+            r.carried_paths(
+                docs_x,
+                y,
+                &ReviewRules::default(),
+                &mut CarryScope::for_ref(false, None)
+            )
+            .await
+            .unwrap(),
             None
         );
         let mut exec = BTreeMap::new();
@@ -3102,7 +3113,9 @@ mod review {
         let rebased = commit(&r, &[on_b], &[("a.rs", Some("2\n"))], "rebased").await;
         assert_eq!(carried(rebased).await, None);
         assert_eq!(
-            r.carried_paths(x, rebased, &docs, true).await.unwrap(),
+            r.carried_paths(x, rebased, &docs, &mut CarryScope::for_ref(true, None))
+                .await
+                .unwrap(),
             None
         );
         // An OWNERS file is never auto, even under a docs glob.
@@ -3116,16 +3129,28 @@ mod review {
         .await;
         let y = commit(&r, &[base], &[("a.rs", Some("2\n"))], "y").await;
         assert_eq!(
-            r.carried_paths(owners, y, &docs_owners, true)
-                .await
-                .unwrap(),
+            r.carried_paths(
+                owners,
+                y,
+                &docs_owners,
+                &mut CarryScope::for_ref(true, None)
+            )
+            .await
+            .unwrap(),
             None
         );
         // A merge is never a source, whatever it reproduces.
         let merge = commit(&r, &[x, moved], &[("a.rs", Some("2\n"))], "merge").await;
-        assert_eq!(r.carried_paths(merge, y, &docs, true).await.unwrap(), None);
         assert_eq!(
-            r.carried_paths(x, y, &docs, false).await.unwrap(),
+            r.carried_paths(merge, y, &docs, &mut CarryScope::for_ref(true, None))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            r.carried_paths(x, y, &docs, &mut CarryScope::for_ref(false, None))
+                .await
+                .unwrap(),
             Some(BTreeMap::from([(rp("a.rs"), CarryRule::Identical)]))
         );
     }
@@ -3173,7 +3198,11 @@ mod review {
         let carried = |y, merges| {
             let r = r.clone();
             let rules = rules.clone();
-            async move { r.carried_paths(x, y, &rules, merges).await.unwrap() }
+            async move {
+                r.carried_paths(x, y, &rules, &mut CarryScope::for_ref(merges, None))
+                    .await
+                    .unwrap()
+            }
         };
         let one = |rule| Some(BTreeMap::from([(rp("a.rs"), rule)]));
         assert_eq!(carried(rebased, true).await, one(CarryRule::Rebased));
@@ -3193,12 +3222,258 @@ mod review {
         assert_eq!(carried(extra, true).await, None);
         let dropped = at(cy, "fn a() {}\n\nfn t0() {}\nfn dee() {}\n").await;
         assert_eq!(
-            r.carry_check(x, dropped, &rules, true).await.unwrap(),
+            r.carry_check(x, dropped, &rules, &mut CarryScope::for_ref(true, None))
+                .await
+                .unwrap(),
             Err(CarryRefusal::Differs(rp("a.rs")))
         );
         // The judged changeset's parent decides the base, whatever `x`'s is.
         let on_x = at(x, "fn a() { 1 }\n\nfn t0() {}\nfn dee() {}\n").await;
         assert_eq!(carried(on_x, true).await, None);
+    }
+
+    /// ADR 0092: the strictest `carry` line on the owners walk decides
+    /// (`carry identical` anywhere, named by the deepest file saying it,
+    /// else the nearest `carry merged`), up to the first `noparent`.
+    #[tokio::test]
+    async fn the_strictest_carry_line_decides_and_noparent_stops_the_walk() {
+        use crate::owners::CarryDirective::{Identical, Merged};
+        let r = repo();
+        let head = commit(
+            &r,
+            &[],
+            &[
+                ("OWNERS", Some("root\ncarry identical\n")),
+                ("a/OWNERS", Some("alice\ncarry merged\n")),
+                ("a/b/OWNERS", Some("bob\n")),
+                ("a/b/c/OWNERS", Some("carry identical\n")),
+                ("n/OWNERS", Some("nora\nnoparent\n")),
+                ("m/OWNERS", Some("noparent\ncarry merged\n")),
+                ("top.rs", Some("t\n")),
+            ],
+            "head",
+        )
+        .await;
+        let mut o = OwnersResolver::new(&r, Some(head)).await.unwrap();
+        let at = |d, f: &str| Some((d, f.to_string()));
+        for (p, want) in [
+            ("top.rs", at(Identical, "OWNERS")),
+            ("d/x.rs", at(Identical, "OWNERS")),
+            ("a/x.rs", at(Identical, "OWNERS")),
+            ("a/b/x.rs", at(Identical, "OWNERS")),
+            ("a/b/c/d/x.rs", at(Identical, "a/b/c/OWNERS")),
+            ("n/x.rs", None),
+            ("m/x.rs", at(Merged, "m/OWNERS")),
+        ] {
+            assert_eq!(o.carry_of(&rp(p)).await.unwrap(), want, "{p}");
+        }
+        // Owners are unchanged by the directives.
+        assert_eq!(
+            owners(&r, Some(head), "a/b/c/x").await,
+            ["alice", "bob", "root"]
+        );
+        let mut none = OwnersResolver::new(&r, None).await.unwrap();
+        assert_eq!(none.carry_of(&rp("top.rs")).await.unwrap(), None);
+    }
+
+    /// Security (ADR 0092): a subdirectory's `carry merged` cannot undo an
+    /// ancestor's `carry identical`; the source named is the deepest file
+    /// saying `carry identical`. Only `noparent` ends the ancestor's reach.
+    #[tokio::test]
+    async fn a_subdirectory_cannot_loosen_an_ancestors_carry_identical() {
+        use crate::owners::CarryDirective::{Identical, Merged};
+        let r = repo();
+        let head = commit(
+            &r,
+            &[],
+            &[
+                ("src/OWNERS", Some("rhea\ncarry identical\n")),
+                ("src/api/OWNERS", Some("bo\ncarry merged\n")),
+                ("src/api/v1/OWNERS", Some("carry identical\n")),
+                ("src/api/v1/x/OWNERS", Some("carry merged\n")),
+                ("src/free/OWNERS", Some("cy\nnoparent\ncarry merged\n")),
+                ("lib/OWNERS", Some("carry merged\n")),
+            ],
+            "head",
+        )
+        .await;
+        let mut o = OwnersResolver::new(&r, Some(head)).await.unwrap();
+        let at = |d, f: &str| Some((d, f.to_string()));
+        for (p, want) in [
+            ("src/api/a.rs", at(Identical, "src/OWNERS")),
+            ("src/api/v1/a.rs", at(Identical, "src/api/v1/OWNERS")),
+            ("src/api/v1/x/a.rs", at(Identical, "src/api/v1/OWNERS")),
+            ("src/free/a.rs", at(Merged, "src/free/OWNERS")),
+            ("lib/a.rs", at(Merged, "lib/OWNERS")),
+        ] {
+            assert_eq!(o.carry_of(&rp(p)).await.unwrap(), want, "{p}");
+        }
+    }
+
+    /// ADR 0092: the effective rule is strict ref, then policy glob, then
+    /// `OWNERS`, and each can only make a path stricter.
+    #[tokio::test]
+    async fn identical_only_is_strict_ref_or_glob_or_owners_and_only_stricter() {
+        use crate::review::CarrySource;
+        let r = repo();
+        let head = commit(
+            &r,
+            &[],
+            &[
+                ("OWNERS", Some("root\ncarry identical\n")),
+                ("free/OWNERS", Some("noparent\ncarry merged\n")),
+            ],
+            "head",
+        )
+        .await;
+        let rules = ReviewRules::default()
+            .with_identical_only(&["**/*.lock".into()])
+            .unwrap();
+        let mut o = OwnersResolver::new(&r, Some(head)).await.unwrap();
+        // `carry merged` does not undo a policy glob or a strict ref.
+        for (merges, p, want) in [
+            (true, "a.rs", Some(CarrySource::Owners("OWNERS".into()))),
+            (true, "free/a.rs", None),
+            (
+                true,
+                "free/Cargo.lock",
+                Some(CarrySource::Policy("**/*.lock".into())),
+            ),
+            (false, "free/a.rs", Some(CarrySource::StrictRef)),
+            (false, "x.lock", Some(CarrySource::StrictRef)),
+        ] {
+            let got = CarryScope::for_ref(merges, Some(&mut o))
+                .identical_only(&rules, &rp(p))
+                .await
+                .unwrap();
+            assert_eq!(got, want, "{p}");
+        }
+        // Without a head's `OWNERS` (a listing naming no ref), globs only.
+        let mut bare = CarryScope::for_ref(true, None);
+        assert_eq!(
+            bare.identical_only(&rules, &rp("a.rs")).await.unwrap(),
+            None
+        );
+        assert!(bare
+            .identical_only(&rules, &rp("a.lock"))
+            .await
+            .unwrap()
+            .is_some());
+        // Taking back ignores all of it.
+        let mut widest = CarryScope::widest();
+        for p in ["a.rs", "a.lock"] {
+            assert_eq!(widest.identical_only(&rules, &rp(p)).await.unwrap(), None);
+        }
+    }
+
+    /// ADR 0092: under `carry identical` a rebased or union resolution of a
+    /// reviewed path carries nothing and says why, an identical one still
+    /// carries, and the same files under `carry merged` carry as ADR 0089.
+    #[tokio::test]
+    async fn an_identical_only_path_carries_identical_changes_only() {
+        use crate::review::CarrySource;
+        const A0: &str = "fn a() {}\n\nfn t0() {}\n";
+        const AX: &str = "fn a() {}\n\nfn t0() {}\nfn dee() {}\n";
+        for directive in ["carry merged", "carry identical"] {
+            let r = repo();
+            let owners_text = format!("root\n{directive}\n");
+            let base = commit(
+                &r,
+                &[],
+                &[
+                    ("OWNERS", Some(owners_text.as_str())),
+                    ("src/a.rs", Some(A0)),
+                    ("b.rs", Some("b\n")),
+                ],
+                "base",
+            )
+            .await;
+            let x = commit(&r, &[base], &[("src/a.rs", Some(AX))], "x").await;
+            let top = commit(
+                &r,
+                &[base],
+                &[("src/a.rs", Some("fn a() { 1 }\n\nfn t0() {}\n"))],
+                "top",
+            )
+            .await;
+            let cy = commit(
+                &r,
+                &[base],
+                &[("src/a.rs", Some("fn a() {}\n\nfn t0() {}\nfn cy() {}\n"))],
+                "cy",
+            )
+            .await;
+            let elsewhere = commit(&r, &[base], &[("b.rs", Some("B\n"))], "b").await;
+            let at = |parent, text: &'static str| {
+                let r = r.clone();
+                async move { commit(&r, &[parent], &[("src/a.rs", Some(text))], "y").await }
+            };
+            let rebased = at(top, "fn a() { 1 }\n\nfn t0() {}\nfn dee() {}\n").await;
+            let union = at(cy, "fn a() {}\n\nfn t0() {}\nfn cy() {}\nfn dee() {}\n").await;
+            let identical = at(elsewhere, AX).await;
+            let rules = ReviewRules::default();
+            let check = |y| {
+                let (r, rules) = (r.clone(), &rules);
+                async move {
+                    let mut o = OwnersResolver::new(&r, Some(base)).await.unwrap();
+                    let mut scope = CarryScope::for_ref(true, Some(&mut o));
+                    let carried = r.carry_check(x, y, rules, &mut scope).await.unwrap();
+                    let closes = r
+                        .lands_reviewed_change(x, y, rules, &mut scope)
+                        .await
+                        .unwrap();
+                    // Carrying and closing a request agree, always.
+                    assert_eq!(closes, carried.as_ref().is_ok_and(|p| !p.is_empty()));
+                    carried
+                }
+            };
+            let one = |rule| Ok(BTreeMap::from([(rp("src/a.rs"), rule)]));
+            assert_eq!(check(identical).await, one(CarryRule::Identical));
+            if directive == "carry merged" {
+                assert_eq!(check(rebased).await, one(CarryRule::Rebased));
+                assert_eq!(check(union).await, one(CarryRule::Union));
+                continue;
+            }
+            for y in [rebased, union] {
+                let refused = check(y).await.unwrap_err();
+                assert_eq!(
+                    refused,
+                    CarryRefusal::IdenticalOnly {
+                        path: rp("src/a.rs"),
+                        declared_by: CarrySource::Owners("OWNERS".into()),
+                    }
+                );
+                assert_eq!(refused.to_string(), "src/a.rs is identical-only (OWNERS)");
+            }
+            // Taking back still reaches through a merge.
+            assert_eq!(
+                r.carried_paths(x, rebased, &rules, &mut CarryScope::widest())
+                    .await
+                    .unwrap(),
+                Some(BTreeMap::from([(rp("src/a.rs"), CarryRule::Rebased)]))
+            );
+            // A strict ref and a policy glob name themselves.
+            assert_eq!(
+                r.carry_check(x, rebased, &rules, &mut CarryScope::for_ref(false, None))
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string(),
+                "src/a.rs is identical-only (strict land ref)"
+            );
+            let globbed = rules
+                .clone()
+                .with_identical_only(&["src/**".into()])
+                .unwrap();
+            assert_eq!(
+                r.carry_check(x, rebased, &globbed, &mut CarryScope::for_ref(true, None))
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string(),
+                "src/a.rs is identical-only (policy glob src/**)"
+            );
+        }
     }
 }
 

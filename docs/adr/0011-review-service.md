@@ -69,6 +69,11 @@ a path's change may also be exactly what the server's own rebase of the
 original's change onto the judged changeset's base would make (the trust a
 clean replay already has), or keep both sides' insertions where the only
 conflicts are pure insertions.
+*Amended by [ADR 0092](0092-identical-only-review-carry.md):* an `OWNERS`
+line `carry identical` or `carry merged` is a directive, not a name; the
+strictest on the owners walk (`carry identical` anywhere up to
+`noparent`) decides whether only identical changes carry
+verdicts there, read from the target ref's head like the names.
 
 **Decision per path.** For each path a changeset changes (relative to its first
 parent), and on a merge also each path where it keeps the first parent's

@@ -124,6 +124,10 @@ pub trait Leep {
     ) -> Result<LandOutcome>;
     /// `GET /v1/merge-base`.
     fn merge_base(&self, a: ChangesetId, b: ChangesetId) -> Result<Option<ChangesetId>>;
+    /// The store's git commit style (ADR 0090), recording `style` when none
+    /// is; an error if another is recorded. A server from before the style
+    /// existed has none to check, which is Ok.
+    fn agree_git_style(&self, style: CommitStyle) -> Result<()>;
     /// Delete ref `name` if it still holds `expected`.
     fn delete_ref(&self, name: &str, expected: ChangesetId, message: &str) -> Result<Cas>;
     /// `POST /v1/refs/{name}/rebase-onto` (ADR 0062): replay the ref's
@@ -313,6 +317,28 @@ impl Leep for Client {
 
     fn merge_base(&self, a: ChangesetId, b: ChangesetId) -> Result<Option<ChangesetId>> {
         Ok(Client::merge_base(self, &a, &b)?.base)
+    }
+
+    fn agree_git_style(&self, style: CommitStyle) -> Result<()> {
+        let want = style.encode();
+        let have = match Client::git_style(self) {
+            Ok(r) => r.style,
+            // An older server keeps no style.
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        match have {
+            Some(h) if h == want => Ok(()),
+            Some(h) => bail!(style_mismatch(&h, &want)),
+            None => match Client::set_git_style(self, &want) {
+                Ok(_) => Ok(()),
+                Err(e) if e.kind() == ErrorKind::Conflict => {
+                    let h = Client::git_style(self)?.style.unwrap_or_default();
+                    bail!(style_mismatch(&h, &want))
+                }
+                Err(e) => Err(e.into()),
+            },
+        }
     }
 
     fn delete_ref(&self, name: &str, expected: ChangesetId, message: &str) -> Result<Cas> {
@@ -802,6 +828,18 @@ fn hex(o: Option<impl std::fmt::Display>) -> Option<String> {
     o.map(|v| v.to_string())
 }
 
+/// Why a mirror's flags cannot run against a store with another style.
+pub fn style_mismatch(have: &str, want: &str) -> String {
+    format!(
+        "the server's store records git commit style {have:?} but this mirror's flags give \
+         {want:?}; a changeset would get a second commit id. Either set \
+         --provenance-trailers and --no-changeset-trailer to match the store, or, if the \
+         store's style is the mistake, drop it on the server with `leep-server repair drop \
+         --kind git-style-v1` (which drops every git id derived under it) and start the \
+         mirror again (ADR 0090)"
+    )
+}
+
 impl<'a> Mirror<'a> {
     /// Open the work directory (creating it and its bare repository), take
     /// its lock and load the map.
@@ -838,6 +876,7 @@ impl<'a> Mirror<'a> {
             gix::init_bare(&git_dir).context("creating the mirror's git repository")?
         };
         let map = Map::open(&cfg.work_dir.join("map")).context("opening the mirror map")?;
+        leep.agree_git_style(cfg.style)?;
         let ex = export::Exporter::new(repo, map, cfg.style);
         let remote = Remote::new(&git_dir, &cfg.remote, cfg.git_timeout);
         let now = status::now();

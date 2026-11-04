@@ -44,6 +44,8 @@
 //! | POST | `/v1/merge` | [`MergeRequest`] | [`MergeResponse`] |
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
 //! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`] (`create: false` refuses to create a missing `target_ref` with 404; absent creates it, as before; ADR 0036. `land_id` makes retries idempotent at any age; ADR 0057) |
+//! | GET  | `/v1/git/style` | – | [`GitStyleResponse`] (the store's git commit style, or null if none was recorded; ADR 0090) |
+//! | POST | `/v1/git/style` | [`GitStyleRequest`] | [`GitStyleResponse`] (records the style when none is; the same style again is answered as it is; another is 409, since it is chosen once; an unknown style is 400; needs a write token; ADR 0090) |
 //! | POST | `/v1/refs/{name}/rebase-onto` | [`RebaseOntoRequest`] | [`RebaseOntoResponse`] (replays the ref's first-parent stack above `expected_base` onto `onto` and moves the ref once, ordered with lands; 409 if the merge base of the head and `onto` is not `expected_base`; 400 on a `--protect-ref` ref; needs a write token; ADR 0062) |
 //!
 //! Ref names may contain `/` (e.g. `release/1.0`); `{name}` and `{rev}` match
@@ -900,6 +902,13 @@ pub struct PathReview {
     /// kept whole). ADR 0089; older servers leave it out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carried_rule: Option<String>,
+    /// How a verdict on an earlier change of this path carries to a
+    /// re-committed one on the target ref (ADR 0092): `identical` (only an
+    /// identical change carries: a strict land ref, a policy glob or an
+    /// `OWNERS` `carry identical` line) or `merged` (the server's rebase and
+    /// unions carry too). Older servers leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carry: Option<String>,
 }
 
 /// One changeset a judged changeset names as its origin
@@ -949,6 +958,12 @@ pub struct ReviewStatusResponse {
     /// why an approval of the original did not carry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub origins: Vec<OriginStatus>,
+    /// Why a land of the changeset is refused whatever its reviews say,
+    /// such as an `OWNERS` line that starts with `carry` but is no
+    /// directive (ADR 0092); `approved` is then false. Older servers leave
+    /// it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
 
 /// `POST /v1/review-requests`: ask for a review (ADR 0086).
@@ -1384,6 +1399,19 @@ pub struct ProvenanceResponse {
     /// Changesets scanned.
     pub scanned: u64,
     pub truncated: bool,
+}
+
+/// The store's git commit style (ADR 0090): `plain` or `trailer`, with
+/// `+provenance` when `Leep-Agent-*` trailers are written. It decides the
+/// commit ids of changesets made in Leep, so it is chosen once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitStyleResponse {
+    pub style: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitStyleRequest {
+    pub style: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2679,7 +2707,8 @@ mod tests {
         }
 
         /// ADR 0089: how a verdict carried, why one did not, and what a
-        /// request changes. Absent fields decode empty and are not written.
+        /// request changes; ADR 0092: a path's `carry` rule. Absent fields
+        /// decode empty and are not written.
         #[test]
         fn carry_fields_added_later_decode_when_absent_and_keep_their_names() {
             check_added::<PathReview>(
@@ -2689,6 +2718,7 @@ mod tests {
                 &[
                     ("carried_from", json!(id("x"))),
                     ("carried_rule", json!("rebased")),
+                    ("carry", json!("identical")),
                 ],
                 true,
             );
@@ -2704,6 +2734,7 @@ mod tests {
                                  "reviews": [{ "reviewer": "rhea", "verdict": "approve" }],
                                  "carried": false, "differs": ["a.txt"] }]),
                     ),
+                    ("refused", json!("src/OWNERS: \"carry identically\"")),
                 ],
                 true,
             );
@@ -2729,5 +2760,21 @@ mod tests {
                 true,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod git_style_shape {
+    use super::*;
+
+    /// `/v1/git/style` (ADR 0090): field names are part of `/v1`.
+    #[test]
+    fn git_style_json_shape() {
+        let none = serde_json::to_value(GitStyleResponse { style: None }).unwrap();
+        assert_eq!(none, serde_json::json!({"style": null}));
+        let set: GitStyleRequest = serde_json::from_str(r#"{"style":"trailer"}"#).unwrap();
+        assert_eq!(set.style, "trailer");
+        let r: GitStyleResponse = serde_json::from_str(r#"{"style":"plain+provenance"}"#).unwrap();
+        assert_eq!(r.style.as_deref(), Some("plain+provenance"));
     }
 }

@@ -1201,6 +1201,10 @@ async fn answers(w: &World) -> String {
     let r = &w.repo;
     let mut out = String::new();
     for rev in w.ids.iter().chain([&w.copy]) {
+        out.push_str(&format!(
+            "git {rev}: {}\n",
+            r.git_commit_id(*rev).await.unwrap()
+        ));
         let log = r.log(*rev, None, 100).await.unwrap();
         out.push_str(&format!(
             "log {rev}: {:?}\n",

@@ -829,6 +829,23 @@ pub trait MetaStore: Send + Sync + 'static {
 
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()>;
 
+    /// Store `value` at `(kind, key)` unless a row is there already, and
+    /// return the row there afterwards: `value` if this call stored it, the
+    /// earlier row if not. Of concurrent callers on one key exactly one
+    /// value wins, and every caller gets it back: what a value written once
+    /// needs (the git commit style, ADR 0090).
+    ///
+    /// The database backends do it atomically. This default reads then
+    /// writes, so two first writers racing through it can each see their own
+    /// value; a wrapper store forwards to the store it wraps instead.
+    async fn put_derived_if_absent(&self, kind: &str, key: &Hash, value: Bytes) -> Result<Bytes> {
+        if let Some(v) = self.get_derived(kind, key).await? {
+            return Ok(v);
+        }
+        self.put_derived(kind, key, value.clone()).await?;
+        Ok(value)
+    }
+
     /// [`put_derived`](Self::put_derived) for many rows in one round trip
     /// (ADR 0031). The result is that of putting the rows one by one in
     /// order, so a key given twice keeps its last value.

@@ -69,7 +69,8 @@ pub struct RuntimeConfig {
     /// and protected delete rules and `land` all read the same refs.
     pub land_policy: Option<Arc<dyn LandPolicy>>,
     protected_refs: Vec<String>,
-    review_rules: (Vec<String>, Vec<String>),
+    /// Auto rules, docs globs and identical-only globs, as written.
+    review_rules: (Vec<String>, Vec<String>, Vec<String>),
 }
 
 impl RuntimeConfig {
@@ -270,6 +271,9 @@ impl ReloadSources {
         if !self.protect_refs.is_empty() {
             canon.set("protect_refs", &self.protect_refs);
         }
+        if !policy.identical_only_globs.is_empty() {
+            canon.set("identical_only_globs", &policy.identical_only_globs);
+        }
         if let Some(c) = &checks {
             canon.section("checks_policy", c.refs.len());
             for (name, required) in &c.refs {
@@ -293,7 +297,11 @@ impl ReloadSources {
                     ),
                     &checks_refs,
                 ),
-                review_rules: (policy.auto_approve, policy.docs_globs),
+                review_rules: (
+                    policy.auto_approve,
+                    policy.docs_globs,
+                    policy.identical_only_globs,
+                ),
             },
             limiter: limiter_change,
         })
@@ -1060,6 +1068,13 @@ mod tests {
             r#"{ "refs": ["main"], "auto_approve": ["docs_only"], "docs_globs": ["docs/**"] }"#,
         );
         check("docs rules added", f);
+
+        let f = files();
+        f.put(
+            "policy.json",
+            r#"{ "refs": ["main"], "identical_only_globs": ["**/Cargo.lock"] }"#,
+        );
+        check("identical-only globs added", f);
 
         let mut f = files();
         f.sources.signing_keys_file = None;

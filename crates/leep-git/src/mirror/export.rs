@@ -12,8 +12,8 @@ use leep_core::{Changeset, ChangesetId, FileChange, FileKind, Hash};
 
 use super::map::{Map, Origin};
 use super::Leep;
-use crate::export::{commit_object, sort_entries};
-use crate::EXTRA_GIT_COMMIT;
+pub use leep_gitobj::CommitStyle;
+use leep_gitobj::{commit_for, sort_entries};
 
 /// Changesets kept in memory between planning and writing; beyond this a
 /// long first export fetches them again rather than holding them all.
@@ -21,15 +21,6 @@ const PLAN_CACHE: usize = 10_000;
 /// Blob ids remembered across exports, to skip downloading a blob a later
 /// changeset names again.
 const BLOB_CACHE: usize = 200_000;
-
-/// Export options that change commit bytes. They must not change between
-/// runs of one mirror, or new exports of old changesets would not match what
-/// the remote already has.
-#[derive(Clone, Copy, Debug)]
-pub struct CommitStyle {
-    pub provenance_trailers: bool,
-    pub changeset_trailer: bool,
-}
 
 pub struct Exporter {
     pub repo: gix::Repository,
@@ -153,20 +144,7 @@ impl Exporter {
             Some(t) => t,
             None => self.repo.write_object(gix::objs::Tree::empty())?.detach(),
         };
-        let mut commit = commit_object(
-            cs,
-            tree,
-            parents.clone(),
-            self.style.provenance_trailers,
-            None,
-        )?;
-        // Only a changeset whose export is the commit it came from goes
-        // without the trailer. One that names a `git.commit` it does not
-        // reproduce (the server's rebased copy of an imported changeset, as
-        // a land branch makes) is Leep's own and must say so.
-        if self.style.changeset_trailer && !reproduces(self.repo.object_hash(), cs, &commit)? {
-            commit = commit_object(cs, tree, parents, self.style.provenance_trailers, Some(id))?;
-        }
+        let commit = commit_for(cs, id, tree, parents, self.style)?;
         let oid = gix::prelude::Write::write_buf(&self.repo, gix::objs::Kind::Commit, &commit)?;
         self.map.insert(id, oid, Origin::Exported)?;
         self.commits_written += 1;
@@ -188,15 +166,6 @@ impl Exporter {
         self.blobs.insert(*hash, oid);
         Ok(oid)
     }
-}
-
-/// Is `commit` the commit `cs` was imported from?
-fn reproduces(kind: gix::hash::Kind, cs: &Changeset, commit: &[u8]) -> Result<bool> {
-    let Some(want) = cs.extra.get(EXTRA_GIT_COMMIT) else {
-        return Ok(false);
-    };
-    let oid = gix::objs::compute_hash(kind, gix::objs::Kind::Commit, commit)?;
-    Ok(want.parse::<ObjectId>().is_ok_and(|w| w == oid))
 }
 
 fn fetch(leep: &dyn Leep, id: &ChangesetId) -> Result<Changeset> {

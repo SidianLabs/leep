@@ -62,6 +62,11 @@ skill.
 | retired `history-tree-v3`, `history-node-v3` | — | written by servers from ADR 0037 to ADR 0045 (one content-addressed postcard row per node, chunk, list or patch, keyed by `Hash::of_object("history-node-v3", bytes)`); never read by current servers; removed with `repair drop --kind history-tree-v3` |
 | derived `blame-v2` | — | `MetaStore.derived`, key = `Hash::of_object("blame", changeset id ‖ path bytes)`, value = postcard `(RepoPath, Vec<BlameLine>)`: a complete blame following renames and merged branches (ADR 0065), written for the blamed changeset and its newest changer, at the starts of walks below merges and renames, and as checkpoints every 256 versions of a long replay (ADR 0078) |
 | retired `blame` | — | the same key and encoding, credited over first parents only; written by servers before ADR 0065; never read by current servers; removed with `repair drop --kind blame` |
+| derived `git-blob-v1` | — | `MetaStore.derived`, key = blob hash, value = the 20-byte sha1 git gives the blob (ADR 0090) |
+| derived `git-tree-v1` | — | `MetaStore.derived`, key = tree node hash (`TreeNode::hash()`), value = the 20-byte sha1 of the node's git tree: one entry per file (`100644`, `100755` or `120000` by `FileKind`, the blob's `git-blob-v1` id) and per directory (`40000`, its `git-tree-v1` id) whose tree is not git's empty tree, in git's order |
+| derived `git-commit-v1` | — | `MetaStore.derived`, key = changeset id, value = the 20-byte sha1 of the changeset's git commit: `leep_gitobj::commit_for` of the changeset, its root tree's `git-tree-v1` id, its parents' `git-commit-v1` ids and the store's `git-style-v1` |
+| derived `git-oid-v1` | — | `MetaStore.derived`, key = `Hash::of_object("git-oid", sha1 bytes)`, value = one kind byte (1 blob, 2 tree, 3 commit) then the 32-byte Leep hash (blob hash, tree node hash, changeset id) |
+| derived `git-style-v1` | — | `MetaStore.derived`, one row, key = `Hash::of_object("git-style", "")`, value = UTF-8 `plain` or `trailer`, optionally followed by `+provenance`; written once |
 | other derived kinds | — | owned and versioned by `leep-derive` |
 
 ## Integrity on read
@@ -135,6 +140,19 @@ the files in its directory and every ancestor up to the first `noparent`
 Owners are always read from the head of the ref being landed on. No file
 covering a path (or no names in the covering files) means no owners: any one
 approval from any principal satisfies the path.
+A line that is exactly `carry identical` or `carry merged` (ADR 0092) is a
+directive, not a name: on the same walk (`noparent`'s file included),
+`carry identical` in any file, else the nearest `carry merged`, decides
+whether verdicts carry to a
+re-committed change of a path only when it is identical; both lines in one
+file mean `carry identical`. Any other line whose first word is `carry`
+in any case (`Carry identical` included) is neither a name nor a
+directive, and a review-protected land writing one is refused (422). An
+ownerless `noparent` file such as `noparent` + `carry merged` makes its
+directory approvable by anyone, so the parent's owners approving it
+approve an unbounded delegation. Older servers read either line as an owner
+name nobody has (in a file with no other names, nobody can approve the
+directory there), so upgrade servers before writing them.
 
 **Review policy file** (`--review-policy-file`, JSON, unknown fields are
 rejected, every field optional):
@@ -142,13 +160,18 @@ rejected, every field optional):
 ```json
 { "refs": ["main"],
   "auto_approve": ["comment_only", "whitespace_only", "docs_only"],
-  "docs_globs": ["**/*.md", "docs/**"] }
+  "docs_globs": ["**/*.md", "docs/**"],
+  "identical_only_globs": ["**/Cargo.lock"] }
 ```
 `refs` are refs that require review (added to `--require-review`);
 `auto_approve` names the rules that approve a path without a human;
 `docs_globs` (required by `docs_only`, rejected without it) are `globset`
 patterns with `*` limited to one path level. The comment languages are
 selected by file extension (case-insensitive).
+`identical_only_globs` (ADR 0092, needs no auto rule) are patterns of the
+same kind naming paths whose verdicts carry only to identical changes; an
+older server refuses a file with the key (at startup, or keeps its old
+config on reload).
 
 ## Code search index (new derived kinds, no other format change)
 
@@ -370,6 +393,31 @@ addresses), keyed by `Hash::of_object("history-node-v1", bytes)`.
 successor), each keyed by `Hash::of_object` of its kind and bytes, with a
 `history-tree-v*` value of 32 bytes, the root's row hash. Current servers
 neither read nor write any of them.
+
+## Git ids (new derived kinds and API, ADR 0090)
+
+The first step of the git wire protocol. Five derived kinds (table above)
+and one endpoint; no change to `Changeset`, `TreeNode`, hashing or the SQL
+schema.
+
+- **Commit bytes** are `leep_gitobj::commit_for`, the mirror's rule (ADR
+  0049): the plain encoding (author, committer, time zones, encoding and
+  extra headers from the `git.*` extras an import wrote) when it hashes to
+  the changeset's `git.commit`; otherwise, under the `trailer` style, the
+  message gets `Leep-Changeset: <id>` in its final trailer paragraph. Under
+  `+provenance`, `agent.*` extras become `Leep-Agent-*` trailers first. A
+  changeset with no files has git's empty tree.
+- **The style is part of every native commit id**, so it is written once,
+  through the new `MetaStore::put_derived_if_absent` (stores a row only if
+  none is there and returns the row that won; atomic on Postgres and
+  SQLite). It is undone only by `repair drop --kind git-style-v1`, which
+  drops every git id derived under it.
+- **Not the bridge's maps.** `leep-to-git-v1` and `git-to-leep-v1` keep
+  their meaning: what an import or a mirror recorded (and a GC root, ADR
+  0059). For a commit the export reproduces, the two agree.
+- `GET /v1/git/style` → `{"style": null | "<style>"}`; `POST /v1/git/style`
+  with `{"style": "<style>"}` records it or answers the same one; another
+  is 409, an unknown one 400.
 
 ## Rename detection (no persisted change)
 
@@ -735,6 +783,15 @@ omitted when empty:
   changes, in path order) and `changed` (how many it changes).
 
 Nothing persisted changed.
+
+Later still (ADR 0092), optional and `#[serde(default)]`: `PathReview`
+gains `carry`, the path's effective carry rule on the asked ref,
+`identical` (a strict ref, a policy glob or an `OWNERS` `carry identical`
+line) or `merged`; older servers leave it out. `ReviewStatusResponse`
+gains `refused`, why a land is refused whatever the reviews (an `OWNERS`
+line starting with `carry` that is no directive), with `approved` false. An identical-only refusal
+fills the existing `OriginStatus.differs` and `reason`
+(`P is identical-only (src/OWNERS)`). Nothing persisted changed.
 
 ## Check results and known-good refs (new derived kind and API, ADR 0091)
 

@@ -138,6 +138,9 @@ pub struct Repo {
     /// Values of staged kinds computed but not stored yet, by kind and
     /// changeset (see `derived::derive`).
     pub(crate) staged_values: Arc<Mutex<HashMap<(&'static str, Hash), Bytes>>>,
+    /// The store's git commit style once read (ADR 0090). It is written
+    /// once, so a handle keeps it.
+    pub(crate) git_style: Arc<std::sync::OnceLock<leep_gitobj::CommitStyle>>,
     /// Changesets a derivation of a missing range works on at once (ADR
     /// 0050).
     derive_jobs: usize,
@@ -661,6 +664,7 @@ impl Repo {
             log_filter: Arc::default(),
             derive_locks: Arc::default(),
             staged_values: Arc::default(),
+            git_style: Arc::default(),
             derive_jobs: default_derive_jobs(),
             derive_calls: Arc::default(),
             index_policy: None,

@@ -39,6 +39,7 @@ use crate::derived::history_pack::{
 };
 use crate::derived::{DerivedKind, HistoryTree, LogFilterIndex, NodeRef, StoredHistoryNode};
 use crate::gc;
+use crate::git_map::{self, GIT_BLOB_KIND, GIT_OID_KIND, GIT_STYLE_KIND, GIT_TREE_KIND};
 use crate::path_history::{bad_chunk, chunk_fits, load_history_row, part_row, resolve_raw_row};
 use crate::search::index::TreeRowMemo;
 use crate::search::{BLOB_KIND as BLOB_TRIGRAMS, TREE_KIND as TREE_TRIGRAMS};
@@ -483,9 +484,21 @@ impl Verifier<'_> {
         if self.has(kinds::HISTORY_NODE) {
             self.scan_history_nodes().await?;
         }
+        if self.has(GIT_BLOB_KIND) {
+            self.scan_git_blobs().await?;
+        }
+        if self.has(GIT_TREE_KIND) {
+            self.scan_git_trees().await?;
+        }
+        if self.has(GIT_OID_KIND) {
+            self.scan_git_oids().await?;
+        }
         self.phase("attestations and bookkeeping rows");
         self.scan_attestations().await?;
         self.scan_rebased_origins().await?;
+        if self.has(GIT_STYLE_KIND) {
+            self.scan_git_style().await?;
+        }
         self.scan_gc_rows().await?;
         if self.has(BLAME_KIND) {
             self.phase("blame");
@@ -968,6 +981,113 @@ impl Verifier<'_> {
                 }
             }
             self.tick();
+        }
+        Ok(())
+    }
+
+    async fn scan_git_blobs(&mut self) -> Result<()> {
+        let kind = GIT_BLOB_KIND;
+        let meta = self.repo.meta().clone();
+        let mut scan = RowScan::new(kind, self.opts.full, self.opts.sample);
+        while let Some(page) = scan.next(&*meta).await? {
+            for (key, value) in page {
+                let data = match self.repo.blobs().get(&key).await {
+                    Ok(Some(data)) if Hash::of_blob(&data) == key => data,
+                    Ok(_) => {
+                        self.kstats(kind).skipped += 1;
+                        continue;
+                    }
+                    Err(e) if damage_of(&e).is_some() => {
+                        // A damaged blob is reported by the tree walk.
+                        self.kstats(kind).unverifiable += 1;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                self.kstats(kind).checked += 1;
+                let expected = Bytes::copy_from_slice(leep_gitobj::blob_id(&data)?.as_bytes());
+                if expected != value {
+                    self.row_mismatch(kind, &key, &value, &expected);
+                    self.shadow_meta.set(kind, &key, expected);
+                }
+            }
+            self.tick();
+        }
+        Ok(())
+    }
+
+    async fn scan_git_trees(&mut self) -> Result<()> {
+        let kind = GIT_TREE_KIND;
+        let meta = self.repo.meta().clone();
+        let mut scan = RowScan::new(kind, self.opts.full, self.opts.sample);
+        while let Some(page) = scan.next(&*meta).await? {
+            for (key, value) in page {
+                let expected = match self.shadow.expected_git_tree_id(key).await {
+                    Ok(Some(oid)) => Bytes::copy_from_slice(oid.as_bytes()),
+                    Ok(None) => {
+                        self.kstats(kind).skipped += 1;
+                        continue;
+                    }
+                    Err(e) if recoverable(&e) => {
+                        self.kstats(kind).skipped += 1;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                self.kstats(kind).checked += 1;
+                if expected != value {
+                    self.row_mismatch(kind, &key, &value, &expected);
+                    self.shadow_meta.set(kind, &key, expected);
+                }
+            }
+            self.tick();
+        }
+        Ok(())
+    }
+
+    async fn scan_git_oids(&mut self) -> Result<()> {
+        let kind = GIT_OID_KIND;
+        let meta = self.repo.meta().clone();
+        let mut scan = RowScan::new(kind, self.opts.full, self.opts.sample);
+        while let Some(page) = scan.next(&*meta).await? {
+            for (key, value) in page {
+                self.kstats(kind).checked += 1;
+                if let Some(why) = git_map::check_oid_row(&self.shadow, &key, &value).await? {
+                    self.kstats(kind).mismatched += 1;
+                    self.log.push(
+                        Problem::new(
+                            "derived",
+                            "derived_mismatch",
+                            format!("the {kind} row {key} is wrong: it {why}"),
+                        )
+                        .kind(kind)
+                        .key(&key),
+                    );
+                }
+            }
+            self.tick();
+        }
+        Ok(())
+    }
+
+    async fn scan_git_style(&mut self) -> Result<()> {
+        let kind = GIT_STYLE_KIND;
+        let key = git_map::style_key();
+        let Some(value) = self.repo.meta().get_derived(kind, &key).await? else {
+            return Ok(());
+        };
+        self.kstats(kind).checked += 1;
+        if let Some(why) = git_map::check_style_row(&value) {
+            self.kstats(kind).mismatched += 1;
+            self.log.push(
+                Problem::new(
+                    "bookkeeping",
+                    "bad_git_style",
+                    format!("the store's {kind} row {why}"),
+                )
+                .kind(kind)
+                .key(&key),
+            );
         }
         Ok(())
     }
