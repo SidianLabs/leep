@@ -2733,7 +2733,12 @@ fn a_fake_ci_loop_promotes_green_and_narrows_suspects_to_a_planted_break() {
         assert!(run_ci(id));
     }
     assert!(!run_ci(&lands[20]));
-    let st = alice.json(root, &["checks", "ref", "main"]);
+    // Exit 1 while red, JSON or not.
+    let ref_status = || -> serde_json::Value {
+        let out = alice.run(root, &["--json", "checks", "ref", "main"]);
+        serde_json::from_str(&stdout(&out)).unwrap()
+    };
+    let st = ref_status();
     assert_eq!(st["green"], serde_json::json!(lands[5]));
     assert_eq!(st["red"]["check"], "test");
     let out = alice.run(root, &["checks", "ref", "main"]);
@@ -2785,10 +2790,7 @@ fn a_fake_ci_loop_promotes_green_and_narrows_suspects_to_a_planted_break() {
     }
     let bad = bad.expect("a failing land");
     assert_eq!(bad, lands[PLANTED]);
-    assert_eq!(
-        alice.json(root, &["checks", "ref", "main"])["green"],
-        serde_json::json!(lands[PLANTED - 1])
-    );
+    assert_eq!(ref_status()["green"], serde_json::json!(lands[PLANTED - 1]));
     let c = alice.json(
         root,
         &["checks", "culprits", "main", "--bad", &bad, "--good", &good],
