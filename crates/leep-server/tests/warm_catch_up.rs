@@ -21,6 +21,7 @@ use leep_core::{
 };
 use leep_derive::derived::{self, HistoryTree};
 use leep_derive::Repo;
+use leep_meta::pg_test::TestSchema;
 use leep_meta::PostgresMetaStore;
 
 /// Counts read statements, passing everything a derivation uses through.
@@ -141,15 +142,15 @@ async fn commit(r: &Repo, parent: Option<ChangesetId>, n: usize) -> ChangesetId 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn warmer_catches_up_a_linear_gap() {
-    let Ok(url) = std::env::var("LEEP_TEST_POSTGRES_URL") else {
-        eprintln!("skipping: LEEP_TEST_POSTGRES_URL not set");
+    let Some(guard) = TestSchema::create("leep_test_warm_catch_up") else {
         return;
     };
+    let url = guard.url.clone();
     let gap: usize = std::env::var("LEEP_CATCH_UP_GAP")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4000);
-    let schema = format!("leep_test_warm_catch_up_{}", std::process::id());
+    let schema = guard.name.clone();
     let pg: Arc<dyn MetaStore> = Arc::new(
         PostgresMetaStore::connect_with_schema(&url, &schema)
             .await
