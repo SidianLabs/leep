@@ -35,7 +35,8 @@ pub struct RequestArgs {
         value_name = "SECS",
         num_args = 0..=1,
         require_equals = true,
-        default_missing_value = "3600"
+        default_missing_value = "3600",
+        value_parser = crate::cli::parse_secs
     )]
     pub wait: Option<u64>,
 }
@@ -53,13 +54,15 @@ pub struct InboxArgs {
     #[arg(short = 'n', long, value_name = "N")]
     pub limit: Option<usize>,
     /// Wait until something is listed, up to SECS (default 3600; 0 means
-    /// no limit): exit 0 with the list, or 1 when the time runs out.
+    /// no limit): exit 0 with the list, or 7 (nothing yet) when the time
+    /// runs out. `--wait SECS` works too.
     #[arg(
         long,
         value_name = "SECS",
         num_args = 0..=1,
         require_equals = true,
-        default_missing_value = "3600"
+        default_missing_value = "3600",
+        value_parser = crate::cli::parse_secs
     )]
     pub wait: Option<u64>,
 }
@@ -196,7 +199,7 @@ fn inbox_page(r: &Remote, args: &InboxArgs, me: &str) -> Result<(ReviewRequestsR
 }
 
 /// `--wait`: ask until a page lists something (exit 0) or the limit passes
-/// (exit 1, with the last, empty, page), backing off as `review status
+/// (exit 7, nothing yet, with the last, empty, page), backing off as `review status
 /// --wait` does.
 fn wait_for_inbox(
     r: &Remote,
@@ -218,7 +221,7 @@ fn wait_for_inbox(
                 "timed out after {}s waiting for review requests",
                 start.elapsed().as_secs()
             );
-            return Ok((resp, hidden, exit::USER));
+            return Ok((resp, hidden, exit::NOTHING_YET));
         }
         if !said {
             said = true;

@@ -793,6 +793,15 @@ line starting with `carry` that is no directive), with `approved` false. An iden
 fills the existing `OriginStatus.differs` and `reason`
 (`P is identical-only (src/OWNERS)`). Nothing persisted changed.
 
+Later again, optional, `#[serde(default)]` and omitted when empty:
+`PathReview` gains `owners_files`, the `OWNERS` files in the target ref's
+head whose names make up `owners` (deepest first, up to the first
+`noparent`), and `carry_source`, set when `carry` is `identical`: what
+made the path identical-only (`strict land ref`, `policy glob GLOB` or the
+`OWNERS` file with the `carry identical` line). The CLI shows both; a
+client that does not know them shows `owners` and `carry` alone. Nothing
+persisted changed.
+
 ## Check results and known-good refs (new derived kind and API, ADR 0091)
 
 - The derived kind `check-v1` (table above): one row per (changeset, check
@@ -1622,6 +1631,13 @@ before, a file written before it existed loads unchanged (`serde(default)`),
 and an older CLI ignores the key. An older CLI that rewrites the file (for
 example `leep switch` saving `target_ref`) drops it, as it would any key it
 does not know.
+
+The working copy's `.leep/config.json` may also hold `commit`, an object
+whose only key so far is `trailers`, a list of strings (`"Key: value"` or
+`"Key=value"`) that `leep commit` appends to every message before any
+`--trailer`. It is written by hand, omitted when empty, and loads as empty
+when absent; an older CLI ignores it (and drops it on a rewrite, as
+above).
 
 `leep config --global` writes a new per-user file, `config.json` under
 `$XDG_CONFIG_HOME/leep/` (else `%APPDATA%\leep\` on Windows, else

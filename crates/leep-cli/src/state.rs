@@ -27,6 +27,25 @@ pub struct Config {
     /// `--author` and `LEEP_AUTHOR`, above the user config and git.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
+    /// Defaults for `leep commit`, edited by hand.
+    #[serde(default, skip_serializing_if = "CommitConfig::is_empty")]
+    pub commit: CommitConfig,
+}
+
+/// `commit` in `.leep/config.json`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitConfig {
+    /// Trailers every `leep commit` appends to its message, before any
+    /// `--trailer`: `"Key: value"` (or `"Key=value"`), for example
+    /// `"Co-Authored-By: Claude <noreply@anthropic.com>"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trailers: Vec<String>,
+}
+
+impl CommitConfig {
+    pub fn is_empty(&self) -> bool {
+        self.trailers.is_empty()
+    }
 }
 
 // Manual so the token can never reach logs through `{:?}`.
@@ -38,6 +57,7 @@ impl std::fmt::Debug for Config {
             .field("prefixes", &self.prefixes)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .field("author", &self.author)
+            .field("commit", &self.commit)
             .finish()
     }
 }
@@ -422,6 +442,7 @@ mod tests {
                 prefixes: vec!["src".into()],
                 token: None,
                 author: None,
+                commit: Default::default(),
             },
         )
         .unwrap();
@@ -520,6 +541,7 @@ mod tests {
                 prefixes: vec![],
                 token: None,
                 author: None,
+                commit: Default::default(),
             },
         )
         .unwrap();
@@ -572,6 +594,7 @@ mod tests {
                 prefixes: vec![],
                 token: Some("s3cret".into()),
                 author: None,
+                commit: Default::default(),
             },
         )
         .unwrap();

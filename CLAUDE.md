@@ -129,6 +129,8 @@ provenance in `agent.model`; that is what the feature is for (below).
   `check_*_contract` functions.
 - Doc comments are short and say *why*. Avoid narrating comments.
 - Shared dependency versions go in the root `[workspace.dependencies]`.
+- A direct land (no review ref) names its changelog fragment
+  `<area>-<desc>.md` from the commit subject (`changelog.d/README.md`).
 - Architectural decisions get an ADR in `docs/adr/`. Update
   `docs/ARCHITECTURE.md` in the same change.
 - Commits, branches and PRs follow the `commit-and-pr` skill:

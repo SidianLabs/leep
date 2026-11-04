@@ -909,6 +909,17 @@ pub struct PathReview {
     /// unions carry too). Older servers leave it out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carry: Option<String>,
+    /// The `OWNERS` files in the target ref's head whose names make up
+    /// `owners`, deepest first (the owners are their union up to the first
+    /// `noparent`), so a refused author can see which rule matched. Empty
+    /// when no file covers the path, and from older servers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owners_files: Vec<String>,
+    /// When `carry` is `identical`, what made the path identical-only
+    /// (ADR 0092): `strict land ref`, `policy glob GLOB` or the `OWNERS`
+    /// file with the `carry identical` line. Older servers leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carry_source: Option<String>,
 }
 
 /// One changeset a judged changeset names as its origin
@@ -2756,6 +2767,23 @@ mod tests {
                     ("rejected_by", json!(["bo"])),
                     ("paths", json!(["a.txt", "b/c.rs"])),
                     ("changed", json!(3)),
+                ],
+                true,
+            );
+        }
+
+        /// Which `OWNERS` files a path's owners come from, and what made a
+        /// path identical-only: absent fields decode empty and are not
+        /// written.
+        #[test]
+        fn owners_sources_added_later_decode_when_absent_and_keep_their_names() {
+            check_added::<PathReview>(
+                "PathReview",
+                json!({ "path": "src/a.rs", "rule": "pending", "owners": ["rhea"],
+                        "approved_by": [] }),
+                &[
+                    ("owners_files", json!(["src/OWNERS", "OWNERS"])),
+                    ("carry_source", json!("src/OWNERS")),
                 ],
                 true,
             );

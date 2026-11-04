@@ -58,6 +58,7 @@ pub fn run(
             prefixes,
             token: token.filter(|_| store_token),
             author: None,
+            commit: Default::default(),
         },
     )?;
     let mut ctx = Ctx {

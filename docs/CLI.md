@@ -14,7 +14,7 @@ command's options with examples for the common ones.
 | Work | `init`, `checkout`, `status`, `diff`, `commit`, `amend`, `stash`, `restore`, `resolve`, `reset`, `sync`, `land` |
 | Branches | `branch`, `switch`, `tag`, `merge`, `rebase`, `cherry-pick`, `revert` |
 | History | `log`, `show`, `bisect`, `cat`, `blame`, `last-change`, `search`, `provenance`, `refs`, `reflog` |
-| Review | `review` (`approve`, `reject`, `withdraw`, `status`, `list`, `request`, `inbox`, `cancel`), `reviews`, `checks` (`post`, `status`, `ref`, `culprits`) |
+| Review | `review` (`approve`, `reject`, `withdraw`, `status`, `list`, `request`, `inbox`, `cancel`, `show`), `reviews`, `checks` (`post`, `status`, `ref`, `culprits`) |
 | Admin | `undo`, `keygen`, `config` |
 
 Global options, accepted by every command and listed only in `leep --help`:
@@ -123,6 +123,23 @@ names an author (then `author` is `null`); after a set or unset it is the
 level written (`repo` or `user`). A value with a line break or another
 control character is refused (exit 1); so is an empty one: use `--unset`.
 
+## Commit trailers
+
+`leep commit --trailer KEY=VALUE` (repeatable; `KEY: VALUE` works too)
+appends `KEY: VALUE` to the message, and `commit.trailers` in the working
+copy's `.leep/config.json` lists trailers every commit appends first, for
+example:
+
+```json
+{"server": "...", "commit": {"trailers": ["Co-Authored-By: Claude <noreply@anthropic.com>"]}}
+```
+
+They join the message's own trailer block when its last paragraph is one,
+else start a new paragraph after a blank line, and a trailer the message
+already has is not added again. A key is letters, digits and `-`; the value
+one non-empty line; anything else is refused (exit 1). `leep config` does
+not edit the list; edit the file.
+
 ## Review requests
 
 On a server with a tokens file, a change that needs review can ask for it
@@ -132,10 +149,18 @@ names, as in `OWNERS` files.
 
 | Command | Effect |
 |---|---|
-| `leep review request REV [-m MSG]` | Ask for a review of `REV` before it lands on the target ref (`--ref` for another). With no `--to`, the server asks the owners of the paths still pending or rejected on that ref, or any reviewer when none is owned. Prints `Requested review of ID on REF from NAMES (#N)` and how to follow it up (`leep review status ID --ref REF --wait`, `leep review cancel N`); asking again for the same thing answers the open request (`Already requested ...`). `--wait[=SECS]` then waits for the verdict as `leep review status --wait` does. |
+| `leep review request REV [-m MSG]` | Ask for a review of `REV` before it lands on the target ref (`--ref` for another). With no `--to`, the server asks the owners of the paths still pending or rejected on that ref, or any reviewer when none is owned. Prints `Requested review of ID on REF from NAMES (#N)` and how to follow it up (`leep review status ID --ref REF --wait`, `leep review cancel N`); asking again for the same thing answers the open request (`Already requested ...`). `--wait[=SECS]` (or `--wait SECS`) then waits for the verdict as `leep review status --wait` does. |
 | `leep review request REV --to NAME [--to NAME]...` | Ask these reviewers instead. Each must be a token that may review, and not you; anything else is refused (exit 1). |
-| `leep review inbox` | Open requests that name you, or that any reviewer may take and someone else made, newest first: `#N STATE ID -> REF by REQUESTER (created by CREATOR), for REVIEWERS (TIME)` (`for any reviewer, no owner pending` when no pending path had an owner to ask), then the changeset's title, its files (`files: a.rs, b.rs (+3)`, from servers with ADR 0089) and the note. The header ends with who answered (`, approved by you, rhea`, `, rejected by bo`: verdicts on the changeset itself; carried ones are judged by `review status`). Requests you already approved or rejected are left out, with a count of them at the end (also left out of `--json`); withdrawing your verdict brings one back. `--mine` lists the requests you made, `--all` adds closed ones and the ones you answered, `-n N` caps the list (50, counted before your answered ones are left out). `--wait[=SECS]` asks again, with `review status --wait`'s backoff, until something is listed (exit 0) or SECS pass (exit 1; default 3600, 0 for no limit). |
+| `leep review inbox` | Open requests that name you, or that any reviewer may take and someone else made, newest first: `#N STATE ID -> REF by REQUESTER (created by CREATOR), for REVIEWERS (TIME)` (`for any reviewer, no owner pending` when no pending path had an owner to ask), then the changeset's title, its files (`files: a.rs, b.rs (+3)`, from servers with ADR 0089) and the note. The header ends with who answered (`, approved by you, rhea`, `, rejected by bo`: verdicts on the changeset itself; carried ones are judged by `review status`). Requests you already approved or rejected are left out, with a count of them at the end (also left out of `--json`); withdrawing your verdict brings one back. `--mine` lists the requests you made, `--all` adds closed ones and the ones you answered, `-n N` caps the list (50, counted before your answered ones are left out). `--wait[=SECS]` asks again, with `review status --wait`'s backoff, until something is listed (exit 0) or SECS pass (exit 7, nothing yet; default 3600, 0 for no limit). |
 | `leep review cancel N` | Withdraw request `N`, which you made. |
+| `leep review show ID [--diff]` | One page for a reviewer: `ID` is a request (`#N`, or `N` when such a request exists) or a changeset. Prints the changeset's author (`(created by NAME)` when the server recorded the token), date and message; every request for it, as the inbox shows them; then each changed path with its review state, diff stat (`+A -R`, or `binary`), what it still needs or what satisfied it, the `OWNERS` files naming its owners (`(from src/OWNERS, OWNERS)`), where a verdict carried from, and `identical-only (SOURCE)` where only an identical change carries one (ADR 0092); then the origins as `review status` shows them and a total (`N files changed, A insertions(+), R deletions(-)`). `--diff` appends the whole diff; `--ref` judges against another ref (default: the request's ref, else the target ref). `--json` prints `{changeset, requests, status, stat: [{path, added, removed}], diff?}`, `added` and `removed` null for a binary file. |
+
+`--wait` on `review status`, `request` and `inbox` takes its value as
+`--wait=SECS` or `--wait SECS`; SECS is seconds or a number with `s`, `m`
+or `h` (`90`, `10m`, `1h`). The spaced form takes the next word only when
+it is such a duration and the command still has its revision elsewhere,
+so `leep review status --wait REV` waits an hour for `REV`, and `leep
+review status --wait 1234` treats `1234` as the revision.
 
 The ref must exist (or be one the server protects), and you may have at most 100 open requests; one more
 is refused (exit 1, `--json` `server_code: "too_many_review_requests"`)
@@ -313,6 +338,14 @@ explains the sections in one paragraph. Only the labels are the CLI's: the
 server's `merged_with_markers` text, which the MCP server passes on, still
 says `ours`, `original` and `theirs`, and the `/v1` fields keep those names.
 
+`leep commit` also warns, without refusing, about any file it commits
+that holds a whole conflict the way the CLI writes one: a line starting
+`<<<<<<< `, later a line that is exactly `=======`, later one starting
+`>>>>>>> ` (`warning: PATH:LINE: a ... conflict looks unresolved`), as a
+file marked resolved with its markers still in it would. A Markdown heading
+underlined with `=======` alone is no conflict. `--allow-markers` silences
+the warning.
+
 A conflicted file counts as resolved once no line starts with `<<<<<<< `,
 `||||||| ` or `>>>>>>> `, so a half-deleted conflict still blocks `commit`,
 `amend` and `land`, as do files written by older clients with
@@ -340,9 +373,23 @@ says so: other paths need review again. Any
 checkout, `sync`, `switch` or `reset --hard` forgets the land.
 
 A land the server replays onto a moved head gives the copy a new id and
-prints `Landed ID on REF (rebased from ORIGINAL; reviews of the original
-count)`: the copy's `leep.rebased_from` names the original, and the land
-policy judged the original, so its reviews count for the copy.
+prints `Landed ID on REF (N attempts)` and then `rebased from ORIGINAL onto
+HEAD: your changes are unchanged (a clean rebase by the server), so reviews
+of ORIGINAL count`: the copy's `leep.rebased_from` names the original, and
+the land policy judged the original, so its reviews count for the copy.
+
+`leep review status` of a changeset whose verdicts carried from an origin
+says the same under that origin's `replaces ...; carried` line:
+`  rebased from ORIGINAL onto PARENT: your changes are unchanged (a.rs
+identical, b.rs rebased, c.rs union)`, naming each carried path's rule
+(ADR 0089), so nobody has to diff the two ids to see the rebase changed
+nothing reviewed.
+
+In the conflict report, a file whose every conflict has both sides only
+adding lines at one place (an empty base section) says `markers written;
+both sides added lines here; keeping both (one side's lines first) carries
+the review`: keeping both sides whole, one side's lines first in every
+region, is the union rule of ADR 0089, unless the path is identical-only.
 
 ## Bisect
 
@@ -420,16 +467,24 @@ Decided in [ADR 0034](adr/0034-cli-exit-codes-and-json-errors.md).
 | Code | Meaning |
 |---|---|
 | 0 | Success. |
-| 1 | Generic failure: bad input, a refused operation (dirty working copy, existing tag), authentication. Also "no" from `search` (no match), `review status` (not approved, and not yet on the ref; with `--wait`, also rejected or out of time) and `checks ref` (the ref is red). |
+| 1 | Generic failure: bad input, a refused operation (dirty working copy, existing tag, a land that needs review), authentication. Also "no" from `search` (no match), `review status` (not approved, and not yet on the ref; with `--wait`, rejected) and `checks ref` (the ref is red). |
 | 2 | The command line does not parse. |
 | 3 | The server or the network failed: unreachable, 5xx, a timeout, rate limited after retries. Running the command again may work. |
 | 4 | Not found: a revision, ref, branch, tag, file, stash or log entry. |
 | 5 | Conflict: content conflicts to resolve (a land, sync, merge, cherry-pick, revert or stash apply that wrote markers; a command refused while conflicts wait), or a concurrent update that won (409, a lost compare-and-swap). |
 | 6 | Nothing to do: `commit`, `amend` or `stash push` found nothing to record. |
+| 7 | Nothing yet: a `--wait` ran out of time before what it waited for came (`review status --wait`, `review request --wait`: no verdict yet; `review inbox --wait`: no request). Not an error; `--json` prints the usual result. Waiting again may succeed. |
 | 130 | Interrupted (SIGINT; the shell reports 128 + 2). |
 | 141 | stdout was closed before the output was written (`leep log \| head -1`); the shell reports 128 + 13 for SIGPIPE. Nothing is printed on stderr. |
 
 Errors print `leep: MESSAGE` on stderr, sometimes followed by `hint: ...`.
+A land refused because it needs review is a normal step, so it prints
+guidance instead: `leep: ID needs review before it can land on REF:`, one
+line per path still waiting (`PENDING  src/a.rs  needs one of: rhea (from
+src/OWNERS)`), and the `hint:` with the commands to ask and wait, without
+the HTTP status or request id. With `--json` the error keeps the server's
+message (with its status), `server_code: "needs_review"`, `request_id` and
+the commands in `hint`.
 
 ## JSON output
 
@@ -480,7 +535,8 @@ print their normal JSON result and exit 5 rather than an error.
   result or `{"error":{...}}`, so nothing needs scraping.
 - **Branch on the exit code.** 3 means wait and retry; 4 means a name is
   wrong; 5 means resolve the conflicts (`leep status` lists them) and commit,
-  or for a lost race, retry; 6 means the work is already recorded.
+  or for a lost race, retry; 6 means the work is already recorded; 7 means
+  a `--wait` found nothing yet, so wait again.
 - **Leep never prompts** and never reads stdin, so it is safe to run with a
   closed or redirected stdin.
 - **Environment:**

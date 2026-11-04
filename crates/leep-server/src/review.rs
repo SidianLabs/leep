@@ -456,12 +456,15 @@ impl ReviewService {
         };
         // The carry rule of each path, so a reviewer sees where only an
         // identical change keeps their verdict (ADR 0092).
+        // And which OWNERS files name each path's owners, so a refused
+        // author sees the rule that matched.
         let mut carry = Vec::with_capacity(review.paths.len());
         let merges = repo.carry_merges(target_ref);
         for p in &review.paths {
             let mut scope = CarryScope::for_ref(merges, Some(&mut owners));
-            let identical = scope.identical_only(&self.rules, &p.path).await?.is_some();
-            carry.push(if identical { "identical" } else { "merged" });
+            let source = scope.identical_only(&self.rules, &p.path).await?;
+            let files = owners.owners_files_of(&p.path).await?;
+            carry.push((source, files));
         }
         Ok(ReviewStatusResponse {
             changeset: id,
@@ -472,7 +475,7 @@ impl ReviewService {
                 .paths
                 .into_iter()
                 .zip(carry)
-                .map(|(p, carry)| PathReview {
+                .map(|(p, (source, owners_files))| PathReview {
                     path: p.path,
                     rule: p.rule.label(),
                     owners: p.owners,
@@ -480,7 +483,16 @@ impl ReviewService {
                     rejected_by: p.rejected_by,
                     carried_from: p.carried_from,
                     carried_rule: p.carried_rule.map(|r| r.name().to_string()),
-                    carry: Some(carry.to_string()),
+                    carry: Some(
+                        if source.is_some() {
+                            "identical"
+                        } else {
+                            "merged"
+                        }
+                        .to_string(),
+                    ),
+                    owners_files,
+                    carry_source: source.map(|s| s.to_string()),
                 })
                 .collect(),
             origins,
