@@ -311,7 +311,7 @@ async fn a_healthy_store_verifies_clean_and_verify_writes_nothing() {
     }
     for kind in [
         "blob-trigrams-v1",
-        "tree-trigrams-v1",
+        "tree-trigrams-v2",
         "history-node-v4",
         "blame-v2",
         "signature-v1",
@@ -860,8 +860,8 @@ async fn search_rows_are_recomputed_from_blobs_and_trees() {
 
     // A directory filter that lost its bits would hide matches from search.
     let root = w.repo.root_tree(w.tip()).await.unwrap();
-    let good = row(&w, "tree-trigrams-v1", &root).await;
-    put_row(&w, "tree-trigrams-v1", &root, vec![2]).await;
+    let good = row(&w, "tree-trigrams-v2", &root).await;
+    put_row(&w, "tree-trigrams-v2", &root, vec![2]).await;
     let q = SearchQuery::new("needle");
     assert!(
         w.repo.search(w.tip(), &q).await.unwrap().matches.is_empty(),
@@ -869,12 +869,14 @@ async fn search_rows_are_recomputed_from_blobs_and_trees() {
     );
     let r = run_verify(&w, &full()).await;
     let p = only(&r, "derived_mismatch");
-    assert_eq!(p.kind.as_deref(), Some("tree-trigrams-v1"));
+    assert_eq!(p.kind.as_deref(), Some("tree-trigrams-v2"));
     assert_eq!(p.key.as_deref(), Some(root.to_hex().as_str()));
     // Asking for tree rows alone includes the blob rows they depend on.
-    let fixed = rederive_kinds(&w, &["tree-trigrams-v1"], false).await;
+    let fixed = rederive_kinds(&w, &["tree-trigrams-v2"], false).await;
     assert_eq!(fixed.changed(), 1);
-    assert_eq!(row(&w, "tree-trigrams-v1", &root).await, good);
+    // Rewritten whole, for the same filter the patch stood for.
+    let repaired = row(&w, "tree-trigrams-v2", &root).await;
+    assert!(w.repo.same_filter(&good, &repaired).await.unwrap());
     // The handle that searched before the repair still holds the damaged
     // filter in its cache, as a running server would until it restarts
     // (OPERATIONS.md, "Repair"); a fresh handle sees the repaired row.

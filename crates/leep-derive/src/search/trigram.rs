@@ -3,7 +3,7 @@
 
 use std::ops::ControlFlow;
 
-use leep_core::{Error, Result};
+use leep_core::{Error, Hash, Result};
 
 /// Files above this size are not indexed and not searched. Bounds the cost of
 /// one index row and of one blob fetch while matching.
@@ -162,6 +162,25 @@ const WORDS: usize = BLOOM_BITS / 64;
 const HASHES: u32 = 3;
 const DENSE: u8 = 1;
 const SPARSE: u8 = 2;
+const SATURATED: u8 = 3;
+/// The whole of a saturated row.
+pub const SATURATED_ROW: u8 = SATURATED;
+const PATCH: u8 = 4;
+
+/// A filter with more bits set than this (a quarter) is stored as one
+/// marker byte instead (ADR 0094). One probe passes it at least 1.6% of the
+/// time and a query's few probes far more often, so it prunes little, while
+/// it costs 64 KiB per version. A parent has every bit of its children, so
+/// a saturated child makes its parent saturated without reading anything.
+pub const SATURATED_BITS: usize = 1 << 17;
+
+/// The keyframe rule (ADR 0094): a patch of `p` bytes replaces a keyframe
+/// of `w` bytes while `p * p <= PATCH_BUDGET * w`. A patch holds every
+/// change since its keyframe, so it grows by about `d` bytes per version,
+/// and the bytes per version are least when the rule's constant is `2d`
+/// (ADR 0037). A land adds 100 to 300 new bit positions of two bytes each
+/// to each directory on its path, so `d` is about 256.
+pub const PATCH_BUDGET: usize = 512;
 
 /// Bit positions of a trigram: splitmix64 of the code, then double hashing
 /// over its two halves.
@@ -275,6 +294,262 @@ impl Bloom {
         let mut f = Bloom::default();
         f.or_encoded(b)?;
         Ok(f)
+    }
+
+    /// More than [`SATURATED_BITS`] set.
+    pub fn is_saturated(&self) -> bool {
+        self.set_bits() > SATURATED_BITS
+    }
+
+    /// The row stored for this filter without a predecessor: the saturated
+    /// marker, or the keyframe encoding ([`Bloom::encode`]).
+    pub fn encode_row(&self) -> Vec<u8> {
+        if self.is_saturated() {
+            vec![SATURATED]
+        } else {
+            self.encode()
+        }
+    }
+
+    /// This filter as a patch on `base`, the keyframe of the tree `key`:
+    /// the positions set here and clear there, then the reverse.
+    pub fn patch_on(&self, key: &Hash, base: &Bloom) -> Vec<u8> {
+        let (mut adds, mut removes) = (Vec::new(), Vec::new());
+        for (i, (&w, &b)) in self.words.iter().zip(&base.words).enumerate() {
+            let mut diff = w ^ b;
+            while diff != 0 {
+                let bit = diff.trailing_zeros();
+                diff &= diff - 1;
+                let p = i as u32 * 64 + bit;
+                if w >> bit & 1 == 1 {
+                    adds.push(p);
+                } else {
+                    removes.push(p);
+                }
+            }
+        }
+        let mut list = Vec::new();
+        put_deltas(&mut list, adds.into_iter());
+        let mut out = Vec::with_capacity(1 + 32 + 5 + list.len() + 2 * removes.len());
+        out.push(PATCH);
+        out.extend_from_slice(key.as_bytes());
+        put_varint(&mut out, list.len() as u32);
+        out.extend_from_slice(&list);
+        put_deltas(&mut out, removes.into_iter());
+        out
+    }
+
+    /// The row for this filter given the keyframe its predecessor's chain
+    /// is on, if any: the saturated marker; a patch on `base` if the
+    /// keyframe rule allows it; else `None`, meaning start a new keyframe.
+    pub fn encode_after(&self, base: Option<(&Hash, &Bloom)>) -> Option<Vec<u8>> {
+        if self.is_saturated() {
+            return Some(vec![SATURATED]);
+        }
+        let (key, bits) = base?;
+        let patch = self.patch_on(key, bits);
+        let whole = self.encoded_len();
+        (patch.len() * patch.len() <= PATCH_BUDGET * whole).then_some(patch)
+    }
+
+    /// Length of [`Bloom::encode`]'s output, without building it twice.
+    fn encoded_len(&self) -> usize {
+        let dense = 1 + WORDS * 8;
+        if self.set_bits() >= WORDS * 8 {
+            return dense;
+        }
+        let mut n = 1;
+        let mut prev = 0u32;
+        for (i, p) in self.set_positions().enumerate() {
+            n += varint_len(if i == 0 { p } else { p - prev });
+            prev = p;
+            if n >= dense {
+                return dense;
+            }
+        }
+        n
+    }
+
+    /// The filter a stored row stands for, `None` if it is saturated. A
+    /// patch needs its keyframe row.
+    pub fn of_row(row: &[u8], keyframe: Option<&[u8]>) -> Result<Option<Bloom>> {
+        match TreeRow::parse(row)? {
+            TreeRow::Saturated => Ok(None),
+            TreeRow::Keyframe(k) => Bloom::decode(k).map(Some),
+            TreeRow::Patch(p) => {
+                let k = keyframe_of(keyframe)?;
+                let mut f = Bloom::decode(k)?;
+                p.apply(&mut f)?;
+                Ok(Some(f))
+            }
+        }
+    }
+}
+
+fn varint_len(v: u32) -> usize {
+    match v {
+        0..=0x7f => 1,
+        0x80..=0x3fff => 2,
+        0x4000..=0x1f_ffff => 3,
+        0x20_0000..=0xfff_ffff => 4,
+        _ => 5,
+    }
+}
+
+/// The keyframe row a patch was given, which must be a dense or sparse
+/// filter: a patch on anything else is corrupt.
+fn keyframe_of(keyframe: Option<&[u8]>) -> Result<&[u8]> {
+    match keyframe {
+        Some(k @ [DENSE | SPARSE, ..]) => Ok(k),
+        Some(_) => Err(Error::Encoding(
+            "a tree-trigrams patch's keyframe is not a dense or sparse filter".into(),
+        )),
+        None => Err(Error::Encoding(
+            "a tree-trigrams patch was read without its keyframe".into(),
+        )),
+    }
+}
+
+/// A `tree-trigrams-v2` row by tag.
+#[derive(Clone, Copy, Debug)]
+pub enum TreeRow<'a> {
+    /// Dense or sparse: the whole filter, tag included.
+    Keyframe(&'a [u8]),
+    Saturated,
+    Patch(PatchRow<'a>),
+}
+
+/// Positions added to and removed from a keyframe, as encoded.
+#[derive(Clone, Copy, Debug)]
+pub struct PatchRow<'a> {
+    /// The tree whose `tree-trigrams-keyframe-v2` row this patches.
+    pub base: Hash,
+    adds: &'a [u8],
+    removes: &'a [u8],
+}
+
+impl<'a> TreeRow<'a> {
+    pub fn parse(b: &'a [u8]) -> Result<Self> {
+        match b {
+            [DENSE | SPARSE, ..] => Ok(TreeRow::Keyframe(b)),
+            [SATURATED] => Ok(TreeRow::Saturated),
+            [PATCH, rest @ ..] if rest.len() >= 33 => {
+                let base = Hash(rest[..32].try_into().expect("32 bytes"));
+                let mut at = 32;
+                let n = get_varint(rest, &mut at)? as usize;
+                let lists = &rest[at..];
+                if n > lists.len() {
+                    return Err(Error::Encoding("tree-trigrams patch list overruns".into()));
+                }
+                Ok(TreeRow::Patch(PatchRow {
+                    base,
+                    adds: &lists[..n],
+                    removes: &lists[n..],
+                }))
+            }
+            _ => Err(Error::Encoding("bad tree-trigrams row".into())),
+        }
+    }
+}
+
+impl PatchRow<'_> {
+    /// Apply to the keyframe's filter. Every removed position must be set
+    /// in it and every added one clear, so a patch has one encoding.
+    pub fn apply(&self, f: &mut Bloom) -> Result<()> {
+        let bad = || Error::Encoding("tree-trigrams patch does not fit its keyframe".into());
+        for p in get_deltas(self.removes, BLOOM_BITS as u32)? {
+            let (w, bit) = (p as usize / 64, p % 64);
+            if f.words[w] >> bit & 1 == 0 {
+                return Err(bad());
+            }
+            f.words[w] &= !(1 << bit);
+        }
+        for p in get_deltas(self.adds, BLOOM_BITS as u32)? {
+            let (w, bit) = (p as usize / 64, p % 64);
+            if f.words[w] >> bit & 1 == 1 {
+                return Err(bad());
+            }
+            f.words[w] |= 1 << bit;
+        }
+        Ok(())
+    }
+}
+
+/// The union of filters and trigrams below a directory, which stops
+/// collecting once it is saturated: its parent's would be too.
+pub struct Union {
+    bloom: Option<Bloom>,
+}
+
+impl Default for Union {
+    fn default() -> Self {
+        Union {
+            bloom: Some(Bloom::default()),
+        }
+    }
+}
+
+impl Union {
+    pub fn is_saturated(&self) -> bool {
+        self.bloom.is_none()
+    }
+
+    /// OR in a filter row: dense, sparse, saturated, or a patch, which is
+    /// applied to `keyframe` first.
+    pub fn or_row(&mut self, row: &[u8], keyframe: Option<&[u8]>) -> Result<()> {
+        if row == [SATURATED] {
+            self.bloom = None;
+        }
+        if let (Some(_), [PATCH, ..]) = (&self.bloom, row) {
+            match Bloom::of_row(row, keyframe)? {
+                Some(f) => self.or_words(&f),
+                None => self.bloom = None,
+            }
+            return Ok(());
+        }
+        match &mut self.bloom {
+            Some(b) => {
+                b.or_encoded(row)?;
+                if b.is_saturated() {
+                    self.bloom = None;
+                }
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn or_words(&mut self, f: &Bloom) {
+        if let Some(b) = &mut self.bloom {
+            for (w, x) in b.words.iter_mut().zip(&f.words) {
+                *w |= x;
+            }
+            if b.is_saturated() {
+                self.bloom = None;
+            }
+        }
+    }
+
+    pub fn insert_all(&mut self, codes: impl IntoIterator<Item = u32>) {
+        if let Some(b) = &mut self.bloom {
+            codes.into_iter().for_each(|t| b.insert(t));
+            if b.is_saturated() {
+                self.bloom = None;
+            }
+        }
+    }
+
+    /// The filter, `None` if saturated.
+    pub fn finish(self) -> Option<Bloom> {
+        self.bloom.filter(|b| !b.is_saturated())
+    }
+}
+
+/// The self-contained row of a filter: saturated marker for `None`.
+pub fn row_of(f: Option<&Bloom>) -> Vec<u8> {
+    match f {
+        Some(b) => b.encode_row(),
+        None => vec![SATURATED],
     }
 }
 
@@ -426,10 +701,12 @@ impl Probe {
 
     /// Reports to `absent`, once each, the index of each probed code a
     /// directory filter rules out (any of its bits is clear), stopping when
-    /// it breaks.
+    /// it breaks. A patch row needs its keyframe row; a saturated row rules
+    /// nothing out.
     pub fn tree_absent(
         &self,
         row: &[u8],
+        keyframe: Option<&[u8]>,
         mut absent: impl FnMut(usize) -> ControlFlow<()>,
     ) -> Result<()> {
         let mut out = vec![false; self.codes.len()];
@@ -454,6 +731,58 @@ impl Probe {
                 Ok(())
             }
             [SPARSE, rest @ ..] => absent_sorted(rest, &self.positions, bit_clear),
+            _ => {
+                let Some(flags) = self.tree_flags(row, keyframe)? else {
+                    return Ok(());
+                };
+                for (j, set) in flags.into_iter().enumerate() {
+                    if !set && bit_clear(j).is_break() {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether each probed position is set in a filter row, `None` for a
+    /// saturated row. A patch is applied to its keyframe's answers at the
+    /// probed positions only.
+    fn tree_flags(&self, row: &[u8], keyframe: Option<&[u8]>) -> Result<Option<Vec<bool>>> {
+        let mut flags = vec![false; self.positions.len()];
+        let patch = match TreeRow::parse(row)? {
+            TreeRow::Saturated => return Ok(None),
+            TreeRow::Keyframe(k) => {
+                self.keyframe_flags(k, &mut flags)?;
+                return Ok(Some(flags));
+            }
+            TreeRow::Patch(p) => p,
+        };
+        self.keyframe_flags(keyframe_of(keyframe)?, &mut flags)?;
+        let mut hit = vec![false; self.positions.len()];
+        find_sorted(patch.removes, &self.positions, &mut hit)?;
+        for (f, h) in flags.iter_mut().zip(&mut hit) {
+            *f &= !std::mem::take(h);
+        }
+        find_sorted(patch.adds, &self.positions, &mut hit)?;
+        for (f, h) in flags.iter_mut().zip(hit) {
+            *f |= h;
+        }
+        Ok(Some(flags))
+    }
+
+    fn keyframe_flags(&self, row: &[u8], flags: &mut [bool]) -> Result<()> {
+        match row {
+            [DENSE, rest @ ..] => {
+                if rest.len() != WORDS * 8 {
+                    return Err(Error::Encoding("bad dense filter length".into()));
+                }
+                for (f, &p) in flags.iter_mut().zip(&self.positions) {
+                    *f = rest[p as usize / 8] >> (p % 8) & 1 == 1;
+                }
+                Ok(())
+            }
+            [SPARSE, rest @ ..] => find_sorted(rest, &self.positions, flags),
             _ => Err(Error::Encoding("bad tree-trigrams row".into())),
         }
     }
@@ -475,20 +804,11 @@ impl Probe {
         }
     }
 
-    pub fn tree(&self, row: &[u8]) -> Result<Present<'_>> {
-        let mut flags = vec![false; self.positions.len()];
-        match row {
-            [DENSE, rest @ ..] => {
-                if rest.len() != WORDS * 8 {
-                    return Err(Error::Encoding("bad dense filter length".into()));
-                }
-                for (f, &p) in flags.iter_mut().zip(&self.positions) {
-                    *f = rest[p as usize / 8] >> (p % 8) & 1 == 1;
-                }
-            }
-            [SPARSE, rest @ ..] => find_sorted(rest, &self.positions, &mut flags)?,
-            _ => return Err(Error::Encoding("bad tree-trigrams row".into())),
-        }
+    /// A patch row needs its keyframe row.
+    pub fn tree(&self, row: &[u8], keyframe: Option<&[u8]>) -> Result<Present<'_>> {
+        let flags = self
+            .tree_flags(row, keyframe)?
+            .unwrap_or_else(|| vec![true; self.positions.len()]);
         Ok(Present {
             probe: self,
             flags,
@@ -634,6 +954,129 @@ mod tests {
         assert_eq!(Bloom::decode(&dense).unwrap(), f);
     }
 
+    /// Every `tree-trigrams-v2` tag, byte for byte (ADR 0094, FORMATS.md).
+    #[test]
+    fn tree_row_golden_bytes() {
+        let abc = code(b'a', b'b', b'c');
+        let mut k = Bloom::default();
+        k.insert(abc);
+        // Sparse: positions 68,568, 251,069 and 433,570 as deltas.
+        let sparse = [0x02, 0xd8, 0x97, 0x04, 0xe5, 0x91, 0x0b, 0xe5, 0x91, 0x0b];
+        assert_eq!(k.encode_row(), sparse);
+        assert_eq!(Bloom::of_row(&sparse, None).unwrap(), Some(k.clone()));
+        // Dense: the bits in place.
+        let mut dense = vec![0u8; 1 + BLOOM_BITS / 8];
+        dense[0] = DENSE;
+        for p in positions(abc) {
+            dense[1 + p / 8] |= 1 << (p % 8);
+        }
+        assert_eq!(Bloom::of_row(&dense, None).unwrap(), Some(k.clone()));
+        // Saturated: one byte, whatever the bits.
+        let mut full = Bloom::default();
+        for t in 0..80_000u32 {
+            full.insert(t * 13);
+        }
+        assert!(full.set_bits() > SATURATED_BITS);
+        assert_eq!(full.encode_row(), [0x03]);
+        assert_eq!(
+            full.encode_after(Some((&Hash([7; 32]), &k))),
+            Some(vec![0x03])
+        );
+        assert_eq!(Bloom::of_row(&[0x03], None).unwrap(), None);
+        // Patch: the keyframe's tree, the byte length of the added
+        // positions, the added positions (those of code 0), then the
+        // removed ones (those of `abc`).
+        let mut f = Bloom::default();
+        f.insert(0);
+        let mut patch = vec![0x04];
+        patch.extend([7; 32]);
+        patch.push(9);
+        patch.extend([0xaf, 0x9b, 0x17, 0xb9, 0xd0, 0x02, 0xb9, 0xd0, 0x02]);
+        patch.extend([0xd8, 0x97, 0x04, 0xe5, 0x91, 0x0b, 0xe5, 0x91, 0x0b]);
+        assert_eq!(f.patch_on(&Hash([7; 32]), &k), patch);
+        assert_eq!(
+            Bloom::of_row(&patch, Some(&sparse)).unwrap(),
+            Some(f.clone())
+        );
+        assert_eq!(
+            Bloom::of_row(&patch, Some(&dense)).unwrap(),
+            Some(f.clone())
+        );
+        // A patch on itself is the empty patch.
+        let mut empty = vec![0x04];
+        empty.extend(Hash([7; 32]).as_bytes());
+        empty.push(0);
+        assert_eq!(f.patch_on(&Hash([7; 32]), &f), empty);
+    }
+
+    #[test]
+    fn tree_rows_reject_malformed_bytes() {
+        let mut k = Bloom::default();
+        k.insert(code(b'a', b'b', b'c'));
+        let key = Hash([1; 32]);
+        let mut f = k.clone();
+        f.insert(5);
+        let patch = f.patch_on(&key, &k);
+        // A patch needs a dense or sparse keyframe.
+        assert!(Bloom::of_row(&patch, None).is_err());
+        assert!(Bloom::of_row(&patch, Some(&[0x03])).is_err());
+        assert!(Bloom::of_row(&patch, Some(&patch)).is_err());
+        // ... and one it fits: adding a set bit or removing a clear one is
+        // corrupt.
+        assert!(Bloom::of_row(&patch, Some(&f.encode())).is_err());
+        let mut other = Bloom::default();
+        other.insert(99);
+        assert!(Bloom::of_row(&k.patch_on(&key, &other), Some(&k.encode())).is_err());
+        for bad in [
+            &[][..],
+            &[0x03, 0x00],
+            &[0x04],
+            &[0x04; 33], // no list length
+            &[0x05],     // unknown tag
+        ] {
+            assert!(TreeRow::parse(bad).is_err(), "{bad:?}");
+        }
+        // A list length past the end.
+        let mut long = vec![0x04];
+        long.extend([0; 32]);
+        long.push(4);
+        long.push(1);
+        assert!(TreeRow::parse(&long).is_err());
+        // A saturated row is not a filter to OR into a keyframe encoding.
+        assert!(Bloom::decode(&[0x03]).is_err());
+    }
+
+    /// The keyframe rule: a patch replaces a keyframe of `w` bytes while it
+    /// is at most `sqrt(PATCH_BUDGET * w)` bytes.
+    #[test]
+    fn keyframe_rule() {
+        let mut k = Bloom::default();
+        for t in 0..20_000u32 {
+            k.insert(t * 31);
+        }
+        let key = Hash([2; 32]);
+        let mut f = k.clone();
+        let mut t = 1u32 << 23;
+        let mut patches = 0;
+        while let Some(row) = f.encode_after(Some((&key, &k))) {
+            assert_eq!(row[0], PATCH);
+            assert!(row.len() * row.len() <= PATCH_BUDGET * f.encode().len());
+            assert_eq!(
+                Bloom::of_row(&row, Some(&k.encode())).unwrap(),
+                Some(f.clone())
+            );
+            patches += 1;
+            for _ in 0..50 {
+                f.insert(t);
+                t += 1;
+            }
+        }
+        let p = f.patch_on(&key, &k);
+        assert!(p.len() * p.len() > PATCH_BUDGET * f.encode().len());
+        assert!(patches > 5, "{patches} patches");
+        assert_eq!(f.encode_after(None), None, "no base: a keyframe");
+    }
+
     #[test]
     fn bloom_union_is_bitwise_or() {
         let (mut a, mut b) = (Bloom::default(), Bloom::default());
@@ -673,8 +1116,8 @@ mod tests {
             .collect();
         let probe = Probe::new(asked.clone());
         let by_blob = probe.blob(&row).unwrap().unwrap();
-        let by_sparse = probe.tree(&sparse).unwrap();
-        let by_dense = probe.tree(&dense).unwrap();
+        let by_sparse = probe.tree(&sparse, None).unwrap();
+        let by_dense = probe.tree(&dense, None).unwrap();
         let sparse_bloom = Bloom::decode(&sparse).unwrap();
         let dense_bloom = Bloom::decode(&dense).unwrap();
         for &c in &asked {
@@ -689,7 +1132,7 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(probe.blob(&[INDEXED, 0x01, 0x00]).is_err());
-        assert!(probe.tree(&[DENSE]).is_err());
+        assert!(probe.tree(&[DENSE], None).is_err());
         assert!(probe.blob(&[9]).is_err());
     }
 
@@ -810,8 +1253,21 @@ mod tests {
         }
 
         fn full_tree(expr: &Expr, probe: &Probe, row: &[u8]) -> bool {
-            let present = probe.tree(row).unwrap();
+            let present = probe.tree(row, None).unwrap();
             expr.eval(&|t| present.has(t))
+        }
+
+        /// `row` (a whole filter) as a patch on a keyframe that shares about
+        /// half its probed positions, and the keyframe.
+        fn as_patch(rng: &mut Lcg, probe: &Probe, row: &[u8]) -> (Vec<u8>, Vec<u8>) {
+            let f = Bloom::decode(row).unwrap();
+            let kept = row_values(rng, &probe.positions, 50, 30, BLOOM_BITS as u32, u32::MAX);
+            let mut k = Bloom::default();
+            for p in kept {
+                k.words[p as usize / 64] |= 1 << (p % 64);
+            }
+            let key = Hash::of_blob(b"keyframe");
+            (f.patch_on(&key, &k), k.encode())
         }
 
         fn full_blob(expr: &Expr, probe: &Probe, row: &[u8]) -> Option<bool> {
@@ -832,13 +1288,30 @@ mod tests {
                 };
                 let pos = row_values(rng, &probe.positions, keep, 20, BLOOM_BITS as u32, cap);
                 for row in [sparse(SPARSE, &pos), dense(&pos)] {
+                    let want = full_tree(e, &probe, &row);
                     assert_eq!(
-                        gate.tree(&probe, &row).unwrap(),
-                        full_tree(e, &probe, &row),
+                        gate.tree(&probe, &row, None).unwrap(),
+                        want,
                         "case {case} row {r} tag {}: {e:?}",
                         row[0]
                     );
+                    let (patch, keyframe) = as_patch(rng, &probe, &row);
+                    assert_eq!(
+                        gate.tree(&probe, &patch, Some(&keyframe)).unwrap(),
+                        want,
+                        "case {case} row {r} patch: {e:?}"
+                    );
+                    assert_eq!(
+                        probe.tree(&patch, Some(&keyframe)).unwrap().has(0),
+                        probe.tree(&row, None).unwrap().has(0)
+                    );
                 }
+                // A saturated row admits whatever any filter could.
+                assert_eq!(
+                    gate.tree(&probe, &[SATURATED], None).unwrap(),
+                    e.eval(&|_| true),
+                    "case {case} saturated: {e:?}"
+                );
                 // A dense row with most bits set, like a large directory.
                 let mut row = busy.to_vec();
                 for &p in &probe.positions {
@@ -850,7 +1323,7 @@ mod tests {
                     }
                 }
                 assert_eq!(
-                    gate.tree(&probe, &row).unwrap(),
+                    gate.tree(&probe, &row, None).unwrap(),
                     full_tree(e, &probe, &row),
                     "case {case} row {r} busy: {e:?}"
                 );
@@ -873,7 +1346,7 @@ mod tests {
                 full_blob(e, &probe, &[INDEXED])
             );
             assert_eq!(
-                gate.tree(&probe, &[SPARSE]).unwrap(),
+                gate.tree(&probe, &[SPARSE], None).unwrap(),
                 full_tree(e, &probe, &[SPARSE])
             );
             assert_eq!(
@@ -948,7 +1421,7 @@ mod tests {
                     let tree = bloom.encode();
                     let blob = BlobRow::Trigrams(set).encode();
                     assert_eq!(
-                        c.admits_tree(&tree).unwrap(),
+                        c.admits_tree(&tree, None).unwrap(),
                         full_tree(&c.required, &c.probe, &tree),
                         "{w:?} in {text:?}"
                     );

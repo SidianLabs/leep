@@ -1,5 +1,5 @@
 # 0014. Server-side code search as derived data
-Status: Accepted
+Status: Accepted; amended by ADR 0094 (directory filters stored as patches on keyframes, or as a saturated marker, in `tree-trigrams-v2`)
 Date: 2026-10-15
 
 ## Context
@@ -32,6 +32,15 @@ that contains the same bytes, plus a planner and executor in `leep-derive`.
 
 Both are pure functions of their inputs, written idempotently with
 `put_derived`, and never deleted. Encodings are in FORMATS.md.
+
+*Amended by [ADR 0094](0094-patched-directory-filters.md):* a land rewrote a
+whole filter for every directory on its changed paths, about 200 KB a land
+on Leep's own history. `tree-trigrams-v2` stores a directory's filter as a
+patch on the keyframe its predecessor's row is on (a whole filter in
+`tree-trigrams-keyframe-v2`), or as one byte when more than a quarter of its
+bits are set; `tree-trigrams-v1` is retired. A `tree-trigrams-v2` row may
+also depend on its predecessor's row, so `verify` compares the filter a row
+stands for, not its bytes.
 
 ### Query planning
 A query is a literal or a regex, case-sensitive or not, matched line by line

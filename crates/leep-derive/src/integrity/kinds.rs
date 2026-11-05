@@ -16,7 +16,10 @@ use crate::derived::{
 };
 use crate::gc::{BLOB_CLAIM, BLOB_CONDEMNED, BLOB_DOOM, BLOB_RESCUE, GC_MARK};
 use crate::git_map::{GIT_BLOB_KIND, GIT_COMMIT_KIND, GIT_OID_KIND, GIT_STYLE_KIND, GIT_TREE_KIND};
-use crate::search::{BLOB_KIND as BLOB_TRIGRAMS, TREE_KIND as TREE_TRIGRAMS};
+use crate::search::{
+    BLOB_KIND as BLOB_TRIGRAMS, KEYFRAME_KIND as TREE_KEYFRAMES,
+    RETIRED_TREE_KIND as RETIRED_TREE_TRIGRAMS, TREE_KIND as TREE_TRIGRAMS,
+};
 use crate::signatures::REBASED_ORIGIN_KIND;
 
 /// Name of the blame cache kind, keyed by a hash of (changeset, path). The
@@ -184,11 +187,25 @@ static KINDS: &[KindInfo] = &[
         drop: DropPolicy::Allowed { also: &[] },
     },
     KindInfo {
+        name: TREE_KEYFRAMES,
+        class: KindClass::Content,
+        summary: "whole bloom filter of one directory that tree-trigrams-v2 patches are \
+                  written on (code search, ADR 0094)",
+        rederive: Rederive::Yes,
+        drop: DropPolicy::Refused(
+            "tree-trigrams-v2 patches are written on these keyframes; drop tree-trigrams-v2, \
+             which removes both",
+        ),
+    },
+    KindInfo {
         name: TREE_TRIGRAMS,
         class: KindClass::Content,
-        summary: "bloom filter over the trigrams below one directory (code search)",
+        summary: "bloom filter over the trigrams below one directory: whole, saturated, or a \
+                  patch on a keyframe (code search, ADR 0094)",
         rederive: Rederive::Yes,
-        drop: DropPolicy::Allowed { also: &[] },
+        drop: DropPolicy::Allowed {
+            also: &[TREE_KEYFRAMES],
+        },
     },
     KindInfo {
         name: HISTORY_NODE_KIND,
@@ -440,6 +457,14 @@ static RETIRED: &[KindInfo] = &[
         rederive: Rederive::No("retired; this version caches blame-v2 instead"),
         drop: DropPolicy::Allowed { also: &[] },
     },
+    KindInfo {
+        name: RETIRED_TREE_TRIGRAMS,
+        class: KindClass::Content,
+        summary: "whole bloom filters over the trigrams below one directory, replaced by \
+                  tree-trigrams-v2 patches on keyframes (ADR 0094)",
+        rederive: Rederive::No("retired; this version derives tree-trigrams-v2 instead"),
+        drop: DropPolicy::Allowed { also: &[] },
+    },
 ];
 
 /// Every kind, in dependency order.
@@ -473,6 +498,8 @@ pub fn dependencies(kind: &str) -> &'static [&'static str] {
     } else if kind == LogFilterIndex::NAME {
         &[Generation::NAME, Skiplist::NAME, LastMerge::NAME]
     } else if kind == TREE_TRIGRAMS {
+        &[BLOB_TRIGRAMS, TREE_KEYFRAMES]
+    } else if kind == TREE_KEYFRAMES {
         &[BLOB_TRIGRAMS]
     } else if kind == GIT_COMMIT_KIND {
         &[RootTree::NAME, GIT_TREE_KIND, GIT_BLOB_KIND]
@@ -567,6 +594,7 @@ mod tests {
                 (!attestation_or_state || k.name == CHECK_KIND)
                     && k.name != HISTORY_NODE_KIND
                     && k.name != LOG_FILTER_NAME_KIND
+                    && k.name != crate::search::KEYFRAME_KIND
                     // Dropped with `git-commit-v1`, all four together.
                     && ![GIT_BLOB_KIND, GIT_TREE_KIND, GIT_OID_KIND].contains(&k.name)
                     // The one choice that may be undone, with every id under it.

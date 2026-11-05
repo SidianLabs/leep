@@ -414,7 +414,7 @@ mod error_code_tests {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexingInfo {
     /// The index group, by its lease name (`history-tree-v4`,
-    /// `log-filter-v1`, `tree-trigrams-v1`).
+    /// `log-filter-v1`, `tree-trigrams-v2`).
     pub kind: String,
     pub behind: u64,
     pub retry_after_ms: u64,

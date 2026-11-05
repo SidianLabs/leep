@@ -1,6 +1,9 @@
-//! Deriving the two index kinds. Both are pure functions of content-addressed
-//! inputs (a blob; a tree node and the rows below it), so rows are written
-//! idempotently and shared by every revision that contains the same bytes.
+//! Deriving the index kinds. A blob's row and a keyframe are pure functions
+//! of content-addressed inputs (a blob; a tree node and the rows below it),
+//! so they are written idempotently and shared by every revision that
+//! contains the same bytes. A directory's row may instead be a patch on the
+//! keyframe its predecessor's row is on (ADR 0094): the same filter, written
+//! in fewer bytes, and also shared by content.
 
 use std::collections::{btree_map, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,16 +11,62 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
-use leep_core::{DerivedRow, Error, FileKind, Hash, Result, TreeEntry};
+use leep_core::{ChangesetId, DerivedRow, Error, FileKind, Hash, Result, TreeEntry, TreeNode};
 
-use super::trigram::{BlobRow, Bloom, Skip, MAX_INDEXED_BYTES};
+use super::trigram::{row_of, BlobRow, Bloom, Skip, TreeRow, Union, MAX_INDEXED_BYTES};
 use crate::indexing::bounded::SearchScan;
 use crate::Repo;
 
 /// Per-blob trigram set, keyed by blob hash.
 pub const BLOB_KIND: &str = "blob-trigrams-v1";
-/// Per-directory filter over every trigram below it, keyed by tree node hash.
-pub const TREE_KIND: &str = "tree-trigrams-v1";
+/// Per-directory filter over every trigram below it, keyed by tree node hash:
+/// whole, saturated, or a patch on a keyframe (ADR 0094).
+pub const TREE_KIND: &str = "tree-trigrams-v2";
+/// The keyframes patches are written on, keyed by the tree node whose whole
+/// filter they hold. A keyframe is written only with that filter's one
+/// encoding, so a row never changes once written, which is what a patch
+/// written on it relies on; a `tree-trigrams-v2` row itself may be
+/// rewritten by a concurrent derivation from another predecessor.
+pub const KEYFRAME_KIND: &str = "tree-trigrams-keyframe-v2";
+/// Directory filters before ADR 0094, always whole.
+pub const RETIRED_TREE_KIND: &str = "tree-trigrams-v1";
+
+/// First-parent steps a derivation looks back for a predecessor whose tree
+/// has a row, when the first parent's has none: the warmer skips heads
+/// when lands outrun it.
+const PRED_STEPS: usize = 8;
+
+/// Where keyframes sit in the search filter cache, apart from the row of
+/// the same tree.
+pub(crate) fn keyframe_cache_key(tree: &Hash) -> Hash {
+    Hash::of_object(KEYFRAME_KIND, tree.as_bytes())
+}
+
+/// A directory's stored filter row and, for a patch, its keyframe row.
+#[derive(Clone, Debug)]
+pub(crate) struct StoredFilter {
+    pub row: Bytes,
+    pub keyframe: Option<Bytes>,
+}
+
+impl StoredFilter {
+    fn whole(row: Bytes) -> Self {
+        StoredFilter {
+            row,
+            keyframe: None,
+        }
+    }
+}
+
+/// The tree a derivation diffs a directory's filter against: the same path
+/// in the first parent.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Pred {
+    pub tree: Hash,
+    /// The first parent, whose ancestors stand in when its tree has no
+    /// row; `None` to not look for them.
+    pub parent: Option<ChangesetId>,
+}
 
 /// Bytes a cached filter costs beyond its own: the map entry (key, `Arc`,
 /// size; about 48) plus the `Arc`'s counts and the `Bytes` handle (about 48).
@@ -78,7 +127,7 @@ struct Frame {
     hash: Hash,
     entries: btree_map::IntoIter<String, TreeEntry>,
     files: Vec<(Hash, u64)>,
-    bloom: Bloom,
+    union: Union,
 }
 
 impl Repo {
@@ -147,47 +196,199 @@ impl Repo {
             hash,
             entries: self.read_tree(hash).await?.entries.into_iter(),
             files: Vec::new(),
-            bloom: Bloom::default(),
+            union: Union::default(),
         })
     }
 
-    /// The encoded filter of the tree node `root`. Missing rows below it are
-    /// derived a level at a time ([`Repo::tree_row_unstored`]), and existing
-    /// rows stop the descent: a revision that changed one file derives one
-    /// row per directory on its path.
+    /// The filter row of the tree node `root` as stored, or as derived
+    /// (whole) if it was missing. Missing rows below it are derived a level
+    /// at a time ([`Repo::tree_row_unstored`]), and existing rows stop the
+    /// descent: a revision that changed one file derives one row per
+    /// directory on its path. Without a predecessor every row derived is
+    /// whole.
     pub(crate) async fn tree_row(&self, root: Hash, c: &Counters) -> Result<Bytes> {
-        if let Some(v) = self.meta().get_derived(TREE_KIND, &root).await? {
-            return Ok(v);
-        }
-        self.tree_row_unstored(root, c, &mut PoolSlot::none()).await
+        self.tree_row_after(root, None, c).await
     }
 
-    /// The filter of `tree` for a search: from the shared cache, else from
-    /// the store (and then cached), else computed by [`Repo::tree_row`]'s
-    /// rules. A computed row is not cached: under a bounded query it lives
-    /// only in that query's [`SearchScan`]. `pool` is the search's pool
-    /// permit, given back while it waits for another derivation of `tree`.
-    pub(crate) async fn search_tree_row(
+    /// [`Repo::tree_row`] for a tree whose predecessor is `pred`: each
+    /// directory derived is patched on the keyframe of the row of the same
+    /// path in `pred`'s tree, where the keyframe rule allows.
+    pub(crate) async fn tree_row_after(
+        &self,
+        root: Hash,
+        pred: Option<Pred>,
+        c: &Counters,
+    ) -> Result<Bytes> {
+        // The predecessor's row is read with the root's: without one, a
+        // nearer indexed ancestor stands in.
+        let rows = match pred {
+            Some(p) if p.tree != root => {
+                self.meta()
+                    .get_derived_many(TREE_KIND, &[root, p.tree])
+                    .await?
+            }
+            _ => vec![self.meta().get_derived(TREE_KIND, &root).await?],
+        };
+        if let Some(Some(v)) = rows.first() {
+            if let Ok(TreeRow::Patch(p)) = TreeRow::parse(v) {
+                // A patch whose keyframe was deleted (a `repair drop`
+                // racing a derivation) is derived again, below.
+                if self.keyframe_rows(&[p.base]).await?.contains_key(&p.base) {
+                    return Ok(v.clone());
+                }
+            } else {
+                return Ok(v.clone());
+            }
+        }
+        let pred = match (pred, rows.get(1)) {
+            (Some(p), Some(None)) => self.indexed_ancestor(root, p).await?,
+            _ => pred,
+        };
+        self.tree_row_unstored(root, pred, c, &mut PoolSlot::none())
+            .await
+    }
+
+    /// When the first parent's tree has no filter (the warmer skipped it
+    /// because lands outran it), the tree of the nearest of the next
+    /// [`PRED_STEPS`] first-parent ancestors that has one, if any.
+    async fn indexed_ancestor(&self, root: Hash, pred: Pred) -> Result<Option<Pred>> {
+        let Some(mut at) = pred.parent else {
+            return Ok(None);
+        };
+        let mut ids = Vec::with_capacity(PRED_STEPS);
+        for _ in 0..PRED_STEPS {
+            let Some(&p) = self.parents(at).await?.first() else {
+                break;
+            };
+            ids.push(p);
+            at = p;
+        }
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let trees = self.root_trees(&ids).await?;
+        let rows = self.meta().get_derived_many(TREE_KIND, &trees).await?;
+        Ok(trees
+            .into_iter()
+            .zip(rows)
+            .find(|(_, r)| r.is_some())
+            .filter(|(t, _)| *t != root)
+            .map(|(tree, _)| Pred { tree, parent: None }))
+    }
+
+    /// The predecessor of the tree of `id` for deriving its filters: its
+    /// first parent's tree. `None` for a root changeset.
+    pub(crate) async fn search_pred(&self, id: ChangesetId) -> Result<Option<Pred>> {
+        let Some(&parent) = self.parents(id).await?.first() else {
+            return Ok(None);
+        };
+        Ok(Some(Pred {
+            tree: self.root_tree(parent).await?,
+            parent: Some(parent),
+        }))
+    }
+
+    /// [`Repo::search_pred`] if this process holds the first parent and its
+    /// tree, else `None`: for a search, which must not pay reads for it.
+    pub(crate) fn search_pred_cached(&self, id: ChangesetId) -> Option<Pred> {
+        let parent = *self.cached_parents(id)?.first()?;
+        Some(Pred {
+            tree: self.cached_root(parent)?,
+            parent: None,
+        })
+    }
+
+    /// The filter of `tree` for a search that found it missing from the
+    /// cache and the store ([`Repo::search_tree_rows`]): computed by
+    /// [`Repo::tree_row`]'s rules after `pred`, whole. It is not cached:
+    /// under a bounded query it lives only in that query's [`SearchScan`].
+    /// `pool` is the search's pool permit, given back while it waits for
+    /// another derivation of `tree`.
+    pub(crate) async fn search_tree_row_missing(
         &self,
         tree: Hash,
+        pred: Option<Pred>,
         c: &Counters,
         pool: &mut PoolSlot<'_>,
-    ) -> Result<Bytes> {
-        match self.search_tree_rows(&[tree]).await?.pop().flatten() {
-            Some(row) => Ok(row),
-            None => self.tree_row_unstored(tree, c, pool).await,
-        }
+    ) -> Result<StoredFilter> {
+        self.tree_row_unstored(tree, pred, c, pool)
+            .await
+            .map(StoredFilter::whole)
     }
 
-    /// The stored filters of `trees`, in order, reading from the store only
-    /// those the shared cache does not hold, in one batch, and caching what
-    /// it returns. `None` for a row not stored.
-    pub(crate) async fn search_tree_rows(&self, trees: &[Hash]) -> Result<Vec<Option<Bytes>>> {
-        let mut rows: Vec<Option<Bytes>> = trees
+    /// The stored filters of `trees`, in order, with the keyframes their
+    /// patches need, reading from the store only what the shared cache does
+    /// not hold (a batch for the rows, and one for their keyframes if any is
+    /// missing) and caching what it returns. `None` for a row not stored.
+    pub(crate) async fn search_tree_rows(
+        &self,
+        trees: &[Hash],
+    ) -> Result<Vec<Option<StoredFilter>>> {
+        let rows = self.cached_rows(TREE_KIND, trees, |h| *h).await?;
+        let mut bases: Vec<Hash> = Vec::new();
+        for row in rows.iter().flatten() {
+            if let Ok(TreeRow::Patch(p)) = TreeRow::parse(row) {
+                if !bases.contains(&p.base) {
+                    bases.push(p.base);
+                }
+            }
+        }
+        let keyframes = self.keyframe_rows(&bases).await?;
+        rows.into_iter()
+            .zip(trees)
+            .map(|(row, tree)| {
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                let keyframe = match TreeRow::parse(&row) {
+                    Ok(TreeRow::Patch(p)) => match keyframes.get(&p.base) {
+                        Some(k) => Some(k.clone()),
+                        // Its keyframe was deleted (a `repair drop` racing
+                        // a derivation): not stored, so derived again and
+                        // overwritten.
+                        None => {
+                            tracing::debug!(%tree, base = %p.base, "patch without its keyframe");
+                            return Ok(None);
+                        }
+                    },
+                    _ => None,
+                };
+                Ok(Some(StoredFilter { row, keyframe }))
+            })
+            .collect()
+    }
+
+    /// The keyframe rows of `trees` that are stored, through the shared
+    /// cache: most patches of a busy directory share one keyframe.
+    pub(crate) async fn keyframe_rows(&self, trees: &[Hash]) -> Result<HashMap<Hash, Bytes>> {
+        let rows = self
+            .cached_rows(KEYFRAME_KIND, trees, keyframe_cache_key)
+            .await?;
+        Ok(trees
             .iter()
-            .map(|h| self.search_trees.get(h).map(|b| Bytes::clone(&b)))
+            .zip(rows)
+            .filter_map(|(h, r)| Some((*h, r?)))
+            .collect())
+    }
+
+    /// Rows of `kind` for `keys`, in order, from the shared filter cache
+    /// (under `cache_key`) or, for those it lacks, from one batched read,
+    /// whose rows are then cached.
+    async fn cached_rows(
+        &self,
+        kind: &str,
+        keys: &[Hash],
+        cache_key: impl Fn(&Hash) -> Hash,
+    ) -> Result<Vec<Option<Bytes>>> {
+        let mut rows: Vec<Option<Bytes>> = keys
+            .iter()
+            .map(|h| {
+                self.search_trees
+                    .get(&cache_key(h))
+                    .map(|b| Bytes::clone(&b))
+            })
             .collect();
-        let missing: Vec<Hash> = trees
+        let missing: Vec<Hash> = keys
             .iter()
             .zip(&rows)
             .filter(|(_, r)| r.is_none())
@@ -196,16 +397,16 @@ impl Repo {
         if missing.is_empty() {
             return Ok(rows);
         }
-        let read = self.meta().get_derived_many(TREE_KIND, &missing).await?;
+        let read = self.meta().get_derived_many(kind, &missing).await?;
         if read.len() != missing.len() {
             return Err(Error::Storage(format!(
-                "get_derived_many answered {} of {} {TREE_KIND} rows",
+                "get_derived_many answered {} of {} {kind} rows",
                 read.len(),
                 missing.len()
             )));
         }
         let mut read = read.into_iter();
-        for (h, slot) in trees.iter().zip(&mut rows) {
+        for (h, slot) in keys.iter().zip(&mut rows) {
             if slot.is_some() {
                 continue;
             }
@@ -216,7 +417,8 @@ impl Repo {
                 // buffer.
                 let owned = Bytes::copy_from_slice(row);
                 let size = owned.len() + CACHE_ENTRY_OVERHEAD;
-                self.search_trees.insert_sized(*h, Arc::new(owned), size);
+                self.search_trees
+                    .insert_sized(cache_key(h), Arc::new(owned), size);
             }
         }
         Ok(rows)
@@ -235,6 +437,12 @@ impl Repo {
     /// costs a few round trips per level instead of a few per directory.
     /// Memory follows the missing directories' entries, plus one batch.
     ///
+    /// With `pred`, each missing directory's predecessor (the directory at
+    /// the same path in `pred`'s tree) is read alongside it, its node with
+    /// the level's nodes and its row with the level's rows, and the filter
+    /// is written as a patch on the keyframe that row is on, or starts a new
+    /// keyframe (ADR 0094). The row returned is always whole.
+    ///
     /// One derivation of a root runs at a time in this process: a search
     /// arriving while the warmer (or another search) derives the same root
     /// waits for it, without its pool permit, then finds the row stored. If
@@ -244,6 +452,7 @@ impl Repo {
     async fn tree_row_unstored(
         &self,
         root: Hash,
+        pred: Option<Pred>,
         c: &Counters,
         pool: &mut PoolSlot<'_>,
     ) -> Result<Bytes> {
@@ -266,7 +475,13 @@ impl Repo {
         };
         // Finds the root's row stored if a derivation just finished it.
         let mut known = Held::new(KNOWN_BYTES);
-        let dirs = match self.missing_dirs(root, c, &mut known).await? {
+        let mut preds = Preds::default();
+        // A bounded query writes nothing, so nothing to patch.
+        let pred = pred.filter(|_| c.scan.is_none());
+        let dirs = match self
+            .missing_dirs(root, pred, c, &mut known, &mut preds)
+            .await?
+        {
             Missing::Stored(row) => return Ok(row),
             Missing::Dirs(dirs) => dirs,
         };
@@ -285,7 +500,10 @@ impl Repo {
                 }
                 let (batch, next) = rest.split_at(n);
                 let batch: Vec<&Dir> = batch.iter().map(|&i| &dirs[i]).collect();
-                if let Some(row) = self.derive_batch(root, &batch, c, &mut known).await? {
+                if let Some(row) = self
+                    .derive_batch(root, &batch, c, &mut known, &preds)
+                    .await?
+                {
                     root_row = Some(row);
                 }
                 rest = next;
@@ -295,31 +513,65 @@ impl Repo {
     }
 
     /// The directories at and below `root` without a filter, parents before
-    /// their children, or `root`'s own filter if it is stored after all
-    /// (another derivation finished it). Stored filters read on the way are
-    /// kept in `known` for the parents.
-    async fn missing_dirs(&self, root: Hash, c: &Counters, known: &mut Held) -> Result<Missing> {
+    /// their children, or `root`'s own filter (whole) if it is stored after
+    /// all (another derivation finished it). Stored filters read on the way
+    /// are kept whole in `known` for the parents; the predecessors of the
+    /// missing directories, their rows and their keyframes go in `preds`.
+    async fn missing_dirs(
+        &self,
+        root: Hash,
+        pred: Option<Pred>,
+        c: &Counters,
+        known: &mut Held,
+        preds: &mut Preds,
+    ) -> Result<Missing> {
         let mut out: Vec<Dir> = Vec::new();
         let mut seen: HashSet<Hash> = HashSet::from([root]);
         let mut level = vec![root];
         let mut lookup = vec![root];
+        if let Some(p) = pred.filter(|p| p.tree != root) {
+            preds.of.insert(root, p.tree);
+        }
         // A bounded scan's searchable files found so far, and their bytes.
         let (mut files, mut bytes) = (0u64, 0u64);
         while !level.is_empty() {
             for chunk in level.chunks(READ_KEYS) {
-                let nodes = self.read_trees(chunk).await?;
+                // The level's nodes and their predecessors' in one read.
+                let mut keys = chunk.to_vec();
+                let mut asked: HashSet<Hash> = chunk.iter().copied().collect();
+                for h in chunk {
+                    if let Some(&p) = preds.of.get(h) {
+                        if asked.insert(p) {
+                            keys.push(p);
+                        }
+                    }
+                }
+                let mut nodes = self.read_trees_shared(&keys).await?;
+                let pred_nodes: HashMap<Hash, Arc<TreeNode>> = keys[chunk.len()..]
+                    .iter()
+                    .copied()
+                    .zip(nodes.split_off(chunk.len()))
+                    .collect();
                 for (&hash, node) in chunk.iter().zip(nodes) {
+                    let before = preds.of.get(&hash).and_then(|p| pred_nodes.get(p));
                     let mut dir = Dir {
                         hash,
                         dirs: Vec::new(),
                         files: Vec::new(),
                     };
-                    for entry in node.entries.into_values() {
-                        match entry {
+                    for (name, entry) in &node.entries {
+                        match *entry {
                             TreeEntry::Dir { tree } => {
                                 dir.dirs.push(tree);
                                 if seen.insert(tree) {
                                     lookup.push(tree);
+                                    if let Some(TreeEntry::Dir { tree: was }) =
+                                        before.and_then(|n| n.entries.get(name))
+                                    {
+                                        if *was != tree {
+                                            preds.of.insert(tree, *was);
+                                        }
+                                    }
                                 }
                             }
                             TreeEntry::File {
@@ -344,12 +596,66 @@ impl Repo {
                     scan.discovered(files, bytes)?;
                 }
             }
-            let rows = self.rows_of(true, &lookup, c).await?;
+            // The rows of the next level and of their predecessors in one
+            // read.
+            let mut ask = lookup.clone();
+            let mut asked: HashSet<Hash> = lookup.iter().copied().collect();
+            for h in &lookup {
+                if let Some(&p) = preds.of.get(h) {
+                    if asked.insert(p) {
+                        ask.push(p);
+                    }
+                }
+            }
+            let rows: HashMap<Hash, Option<Bytes>> = ask
+                .iter()
+                .copied()
+                .zip(self.rows_of(true, &ask, c).await?)
+                .collect();
+            for h in &lookup {
+                if let Some(p) = preds.of.get(h) {
+                    if let Some(row) = &rows[p] {
+                        preds.rows.insert(*p, row.clone());
+                    }
+                }
+            }
+            // Keyframes of the patches read: those of the next level, to
+            // know their filters, and those of their predecessors, to patch.
+            let mut bases: Vec<Hash> = Vec::new();
+            let pred_rows = lookup
+                .iter()
+                .filter_map(|h| preds.of.get(h))
+                .filter_map(|p| preds.rows.get(p));
+            for row in lookup
+                .iter()
+                .filter_map(|h| rows[h].as_ref())
+                .chain(pred_rows)
+            {
+                if let Ok(TreeRow::Patch(p)) = TreeRow::parse(row) {
+                    if !bases.contains(&p.base) {
+                        bases.push(p.base);
+                    }
+                }
+            }
+            let keyframes = self.keyframe_rows(&bases).await?;
+            for (h, row) in &keyframes {
+                preds.keyframes.insert(*h, row.clone());
+            }
             level = Vec::new();
-            for (h, row) in lookup.drain(..).zip(rows) {
+            for h in lookup.drain(..) {
+                // A patch whose keyframe is gone counts as not stored: it
+                // is derived again and overwritten.
+                let row = match &rows[&h] {
+                    Some(row) => whole(row, &keyframes)?,
+                    None => None,
+                };
                 match row {
-                    Some(row) if h == root => return Ok(Missing::Stored(row)),
-                    Some(row) => known.insert(h, row),
+                    Some(row) => {
+                        if h == root {
+                            return Ok(Missing::Stored(row));
+                        }
+                        known.insert(h, row);
+                    }
                     None if h == root => {}
                     None => level.push(h),
                 }
@@ -359,14 +665,16 @@ impl Repo {
     }
 
     /// Derive one batch of directories of one height: their missing blob
-    /// rows, all written first, then their filters. Returns `root`'s filter
-    /// if it is in the batch.
+    /// rows, all written first, then their filters, each keyframe before
+    /// the patch on it. Returns `root`'s filter, whole, if it is in the
+    /// batch.
     async fn derive_batch(
         &self,
         root: Hash,
         batch: &[&Dir],
         c: &Counters,
         known: &mut Held,
+        preds: &Preds,
     ) -> Result<Option<Bytes>> {
         let mut distinct = HashSet::new();
         let files: Vec<(Hash, u64)> = batch
@@ -375,7 +683,7 @@ impl Repo {
             .filter(|f| distinct.insert(f.0))
             .collect();
         let mut blobs = Held::new(BATCH_BYTES);
-        let mut writes = Writes::new(self, c, BLOB_KIND);
+        let mut writes = Writes::new(self, c);
         for chunk in files.chunks(READ_KEYS) {
             let keys: Vec<Hash> = chunk.iter().map(|f| f.0).collect();
             let mut missing = Vec::new();
@@ -394,44 +702,110 @@ impl Repo {
             while let Some(r) = computed.next().await {
                 let (h, row) = r?;
                 blobs.insert(h, row.clone());
-                writes.push(h, row).await?;
+                writes.push(BLOB_KIND, h, row).await?;
             }
         }
         writes.flush().await?;
 
-        let mut writes = Writes::new(self, c, TREE_KIND);
         let mut root_row = None;
         for dir in batch {
-            let mut bloom = Bloom::default();
+            // A saturated child makes the directory saturated, so once one
+            // is found nothing more is read.
+            let mut union = Union::default();
             let mut absent = Vec::new();
             for t in &dir.dirs {
                 match known.get(t) {
-                    Some(row) => bloom.or_encoded(row)?,
+                    Some(row) => union.or_row(row, None)?,
                     None => absent.push(*t),
                 }
             }
-            for row in self.rows_present(true, &absent, c).await? {
-                bloom.or_encoded(&row)?;
-            }
-            let mut absent = Vec::new();
-            for (h, _) in &dir.files {
-                match blobs.get(h) {
-                    Some(row) => add_blob_row(&mut bloom, row)?,
-                    None => absent.push(*h),
+            if !union.is_saturated() {
+                for row in self.filters_present(&absent, c).await? {
+                    union.or_row(&row, None)?;
                 }
             }
-            for row in self.rows_present(false, &absent, c).await? {
-                add_blob_row(&mut bloom, &row)?;
+            if !union.is_saturated() {
+                let mut absent = Vec::new();
+                for (h, _) in &dir.files {
+                    match blobs.get(h) {
+                        Some(row) => add_blob_row(&mut union, row)?,
+                        None => absent.push(*h),
+                    }
+                }
+                for row in self.rows_present(false, &absent, c).await? {
+                    add_blob_row(&mut union, &row)?;
+                }
             }
-            let row = Bytes::from(bloom.encode());
-            known.insert(dir.hash, row.clone());
+            let filter = union.finish();
+            let whole_row = Bytes::from(row_of(filter.as_ref()));
+            let row = match &filter {
+                Some(f) => {
+                    let chain = preds.chain(dir.hash);
+                    let patch = match &chain {
+                        Chain::On(key, base) | Chain::Promote(key, base) => {
+                            f.encode_after(Some((key, base)))
+                        }
+                        Chain::None | Chain::Own => None,
+                    };
+                    match (chain, patch) {
+                        (Chain::None, _) => whole_row.clone(),
+                        (Chain::On(..), Some(patch)) => Bytes::from(patch),
+                        // The predecessor's whole row becomes its keyframe:
+                        // the same filter in its one encoding, so writing it
+                        // again changes nothing.
+                        (Chain::Promote(key, base), Some(patch)) => {
+                            writes
+                                .push(KEYFRAME_KIND, key, Bytes::from(base.encode()))
+                                .await?;
+                            Bytes::from(patch)
+                        }
+                        // Too far from the predecessor's keyframe: a new one.
+                        _ => {
+                            writes
+                                .push(KEYFRAME_KIND, dir.hash, whole_row.clone())
+                                .await?;
+                            Bytes::from(f.patch_on(&dir.hash, f))
+                        }
+                    }
+                }
+                None => whole_row.clone(),
+            };
+            known.insert(dir.hash, whole_row.clone());
             if dir.hash == root {
-                root_row = Some(row.clone());
+                root_row = Some(whole_row);
             }
-            writes.push(dir.hash, row).await?;
+            writes.push(TREE_KIND, dir.hash, row).await?;
         }
         writes.flush().await?;
         Ok(root_row)
+    }
+
+    /// Whole filters of stored directories, patches applied to their
+    /// keyframes. One whose keyframe was deleted since the walk read it is
+    /// recomputed from its tree.
+    async fn filters_present(&self, keys: &[Hash], c: &Counters) -> Result<Vec<Bytes>> {
+        let rows = self.rows_present(true, keys, c).await?;
+        let mut bases = Vec::new();
+        for row in &rows {
+            if let Ok(TreeRow::Patch(p)) = TreeRow::parse(row) {
+                if !bases.contains(&p.base) {
+                    bases.push(p.base);
+                }
+            }
+        }
+        let keyframes = self.keyframe_rows(&bases).await?;
+        let mut out = Vec::with_capacity(rows.len());
+        let mut memo = None;
+        for (key, row) in keys.iter().zip(&rows) {
+            out.push(match whole(row, &keyframes)? {
+                Some(w) => w,
+                None => {
+                    let memo = memo.get_or_insert_with(TreeRowMemo::new);
+                    self.recompute_tree_row(*key, memo).await?
+                }
+            });
+        }
+        Ok(out)
     }
 
     /// Rows of `keys`, filters if `tree` else blob rows, in order: from a
@@ -582,6 +956,83 @@ impl Drop for Flight<'_> {
     }
 }
 
+/// A stored row as the whole filter it stands for: a patch applied to its
+/// keyframe, the others as they are. `None` for a patch whose keyframe is
+/// not stored; a keyframe that is there but not a whole filter, or that the
+/// patch does not fit, is corrupt.
+fn whole(row: &Bytes, keyframes: &HashMap<Hash, Bytes>) -> Result<Option<Bytes>> {
+    let TreeRow::Patch(p) = TreeRow::parse(row)? else {
+        return Ok(Some(row.clone()));
+    };
+    let Some(k) = keyframes.get(&p.base) else {
+        return Ok(None);
+    };
+    let f = Bloom::of_row(row, Some(k))?;
+    Ok(Some(Bytes::from(row_of(f.as_ref()))))
+}
+
+/// What a derivation knows of the predecessors of the directories it
+/// derives (ADR 0094).
+struct Preds {
+    /// A missing directory's predecessor, where it has one that differs.
+    of: HashMap<Hash, Hash>,
+    /// The predecessors' rows, as stored.
+    rows: Held,
+    /// Keyframe rows, by tree.
+    keyframes: Held,
+}
+
+impl Default for Preds {
+    fn default() -> Self {
+        Preds {
+            of: HashMap::new(),
+            rows: Held::new(KNOWN_BYTES),
+            keyframes: Held::new(KNOWN_BYTES),
+        }
+    }
+}
+
+/// How a directory's filter is written given its predecessor's row.
+enum Chain {
+    /// Whole: no predecessor, or a saturated one, or one whose row or
+    /// keyframe was not kept.
+    None,
+    /// A patch on this keyframe if the keyframe rule allows, else a new
+    /// keyframe.
+    On(Hash, Bloom),
+    /// The predecessor's row is whole: it becomes a keyframe and the
+    /// directory a patch on it if the keyframe rule allows, else the
+    /// directory starts a new keyframe.
+    Promote(Hash, Bloom),
+    /// A new keyframe of the directory's own.
+    Own,
+}
+
+impl Preds {
+    fn chain(&self, dir: Hash) -> Chain {
+        let Some((&pred, row)) = self.of.get(&dir).and_then(|p| Some((p, self.rows.get(p)?)))
+        else {
+            return Chain::None;
+        };
+        match TreeRow::parse(row) {
+            Ok(TreeRow::Keyframe(k)) => match Bloom::decode(k) {
+                Ok(bits) => Chain::Promote(pred, bits),
+                Err(_) => Chain::Own,
+            },
+            Ok(TreeRow::Patch(p)) => {
+                match self.keyframes.get(&p.base).map(|k| Bloom::decode(k)) {
+                    Some(Ok(bits)) => Chain::On(p.base, bits),
+                    // A damaged keyframe is for verify to find; this
+                    // directory starts a new one.
+                    Some(Err(_)) => Chain::Own,
+                    None => Chain::None,
+                }
+            }
+            Ok(TreeRow::Saturated) | Err(_) => Chain::None,
+        }
+    }
+}
+
 /// A directory without a filter, as [`Repo::missing_dirs`] found it.
 struct Dir {
     hash: Hash,
@@ -645,11 +1096,9 @@ fn by_height(dirs: &[Dir]) -> Vec<Vec<usize>> {
     levels
 }
 
-fn add_blob_row(bloom: &mut Bloom, row: &[u8]) -> Result<()> {
+fn add_blob_row(union: &mut Union, row: &[u8]) -> Result<()> {
     if let BlobRow::Trigrams(set) = BlobRow::decode(row)? {
-        for t in set {
-            bloom.insert(t);
-        }
+        union.insert_all(set);
     }
     Ok(())
 }
@@ -683,35 +1132,36 @@ impl Held {
     }
 }
 
-/// Rows of one kind a batch computed and has not written: put in a bounded
-/// query's memory at once, else written [`WRITE_ROWS`] or [`BATCH_BYTES`] at
-/// a time, each write after the index lease check.
+/// Rows a batch computed and has not written: put in a bounded query's
+/// memory at once, else written in order [`WRITE_ROWS`] or [`BATCH_BYTES`]
+/// at a time, each write after the index lease check. Order matters: a
+/// write that fails part way may leave any prefix of its rows, and a
+/// keyframe goes before the patch on it.
 struct Writes<'a> {
     repo: &'a Repo,
     c: &'a Counters,
-    kind: &'static str,
     rows: Vec<DerivedRow>,
     bytes: usize,
 }
 
 impl<'a> Writes<'a> {
-    fn new(repo: &'a Repo, c: &'a Counters, kind: &'static str) -> Self {
+    fn new(repo: &'a Repo, c: &'a Counters) -> Self {
         Writes {
             repo,
             c,
-            kind,
             rows: Vec::new(),
             bytes: 0,
         }
     }
 
-    async fn push(&mut self, key: Hash, row: Bytes) -> Result<()> {
+    async fn push(&mut self, kind: &'static str, key: Hash, row: Bytes) -> Result<()> {
         if let Some(scan) = &self.c.scan {
-            scan.put(self.kind == TREE_KIND, key, row);
+            // A bounded query writes whole rows only, so no keyframes.
+            scan.put(kind == TREE_KIND, key, row);
             return Ok(());
         }
         self.bytes += row.len();
-        self.rows.push(DerivedRow::new(self.kind, key, row));
+        self.rows.push(DerivedRow::new(kind, key, row));
         if self.rows.len() >= WRITE_ROWS || self.bytes >= BATCH_BYTES {
             self.flush().await?;
         }
@@ -731,14 +1181,18 @@ impl<'a> Writes<'a> {
             ));
         }
         self.repo.meta().put_derived_many(&self.rows).await?;
-        let n = self.rows.len() as u64;
-        let counter = if self.kind == TREE_KIND {
-            &self.c.tree_rows
-        } else {
-            &self.c.blob_rows
-        };
-        counter.fetch_add(n, Ordering::Relaxed);
-        metrics::counter!("leep_derive_total", "kind" => self.kind).increment(n);
+        for kind in [BLOB_KIND, TREE_KIND, KEYFRAME_KIND] {
+            let n = self.rows.iter().filter(|r| r.kind == kind).count() as u64;
+            if n == 0 {
+                continue;
+            }
+            match kind {
+                BLOB_KIND => self.c.blob_rows.fetch_add(n, Ordering::Relaxed),
+                TREE_KIND => self.c.tree_rows.fetch_add(n, Ordering::Relaxed),
+                _ => 0,
+            };
+            metrics::counter!("leep_derive_total", "kind" => kind).increment(n);
+        }
         self.rows.clear();
         self.bytes = 0;
         Ok(())
@@ -775,12 +1229,14 @@ impl TreeRowMemo {
 }
 
 impl Repo {
-    /// The row `tree_row` stores for `root`, recomputed from the tree itself:
-    /// the filter over every searchable blob below it, taken from the blobs'
-    /// own rows and the filters recomputed for the directories below, never
-    /// from a stored directory filter, so damage in one cannot make another
-    /// look wrong. For verification and repair; like derivation it writes only
-    /// the blob rows it finds missing.
+    /// The whole row `tree_row` stores for `root` without a predecessor,
+    /// recomputed from the tree itself: the filter over every searchable
+    /// blob below it, taken from the blobs' own rows and the filters
+    /// recomputed for the directories below, never from a stored directory
+    /// filter, so damage in one cannot make another look wrong. For
+    /// verification and repair, which compare the filters rows stand for
+    /// ([`Repo::stored_filter`]), not their bytes; like derivation it writes
+    /// only the blob rows it finds missing.
     pub(crate) async fn recompute_tree_row(
         &self,
         root: Hash,
@@ -797,7 +1253,7 @@ impl Repo {
             for (_, entry) in top.entries.by_ref() {
                 match entry {
                     TreeEntry::Dir { tree } => match memo.rows.get(&tree) {
-                        Some(row) => top.bloom.or_encoded(row)?,
+                        Some(row) => top.union.or_row(row, None)?,
                         None => {
                             missing = Some(tree);
                             break;
@@ -822,20 +1278,48 @@ impl Repo {
                 .buffered(CONCURRENCY);
             while let Some(row) = rows.next().await {
                 if let BlobRow::Trigrams(set) = row? {
-                    for t in set {
-                        done.bloom.insert(t);
-                    }
+                    done.union.insert_all(set);
                 }
             }
             drop(rows);
-            let row = Bytes::from(done.bloom.encode());
+            let row = Bytes::from(row_of(done.union.finish().as_ref()));
             memo.insert(done.hash, row.clone());
             match stack.last_mut() {
-                Some(parent) => parent.bloom.or_encoded(&row)?,
+                Some(parent) => parent.union.or_row(&row, None)?,
                 None => return Ok(row),
             }
         }
     }
+}
+
+impl Repo {
+    /// Whether the stored filter row `row` stands for the same filter as
+    /// `expected`, a whole row: a patch is applied to its keyframe, read
+    /// from the store. A row that cannot be read that way does not match.
+    pub(crate) async fn same_filter(&self, row: &[u8], expected: &[u8]) -> Result<bool> {
+        let keyframe = match TreeRow::parse(row) {
+            Ok(TreeRow::Patch(p)) => self.meta().get_derived(KEYFRAME_KIND, &p.base).await?,
+            Ok(_) => None,
+            Err(_) => return Ok(false),
+        };
+        let (Ok(got), Ok(want)) = (
+            Bloom::of_row(row, keyframe.as_deref()),
+            Bloom::of_row(expected, None),
+        ) else {
+            return Ok(false);
+        };
+        Ok(got == want)
+    }
+}
+
+/// Whether a stored keyframe row is a whole (dense or sparse) filter equal
+/// to `expected`'s, a whole row that is not saturated.
+pub(crate) fn same_keyframe(row: &[u8], expected: &[u8]) -> bool {
+    matches!(TreeRow::parse(row), Ok(TreeRow::Keyframe(_)))
+        && matches!(
+            (Bloom::of_row(row, None), Bloom::of_row(expected, None)),
+            (Ok(Some(a)), Ok(Some(b))) if a == b
+        )
 }
 
 #[cfg(test)]

@@ -2166,7 +2166,19 @@ fn index_policy(
     }
     let mut groups = Vec::new();
     for k in &args.index_kinds {
-        let g = IndexGroup::parse(k.trim()).ok_or_else(|| {
+        let k = k.trim();
+        // The search group's lease name before ADR 0094, still accepted
+        // so a configuration written for it keeps its meaning.
+        let k = if k == leep_derive::search::RETIRED_TREE_KIND {
+            tracing::warn!(
+                "--index-kinds {k} is deprecated: the search group is now {}; use `search`",
+                IndexGroup::Search.lease_name()
+            );
+            "search"
+        } else {
+            k
+        };
+        let g = IndexGroup::parse(k).ok_or_else(|| {
             anyhow::anyhow!("--index-kinds: unknown index {k:?}; use history, log-filter or search")
         })?;
         if !groups.contains(&g) {

@@ -23,8 +23,11 @@ use super::walk::{plan, Unreadable};
 use crate::derived::history_pack::same_part;
 use crate::derived::wavefront::{self, Dag, Preparer, Wave, Window, OUTSIDE};
 use crate::derived::{DerivedKind, HistoryTree};
-use crate::search::index::TreeRowMemo;
-use crate::search::{BLOB_KIND as BLOB_TRIGRAMS, TREE_KIND as TREE_TRIGRAMS};
+use crate::search::index::{same_keyframe, TreeRowMemo};
+use crate::search::trigram::SATURATED_ROW;
+use crate::search::{
+    BLOB_KIND as BLOB_TRIGRAMS, KEYFRAME_KIND as TREE_KEYFRAMES, TREE_KIND as TREE_TRIGRAMS,
+};
 use crate::Repo;
 
 /// Which changesets a per-changeset rederivation covers.
@@ -220,9 +223,15 @@ pub async fn rederive(
         r.progress.info("repair: blob-trigrams-v1 rows");
         r.blob_trigrams().await?;
     }
+    // Keyframes first, so the patches on a repaired keyframe are checked
+    // against it and rewritten whole if they no longer fit.
+    if all.contains(&TREE_KEYFRAMES) {
+        r.progress.info("repair: tree-trigrams-keyframe-v2 rows");
+        r.tree_trigrams(TREE_KEYFRAMES).await?;
+    }
     if all.contains(&TREE_TRIGRAMS) {
-        r.progress.info("repair: tree-trigrams-v1 rows");
-        r.tree_trigrams().await?;
+        r.progress.info("repair: tree-trigrams-v2 rows");
+        r.tree_trigrams(TREE_TRIGRAMS).await?;
     }
     let (problems, problems_total) = r.log.into_parts();
     Ok(RederiveReport {
@@ -305,8 +314,9 @@ impl Rederive<'_> {
         Ok(())
     }
 
-    async fn tree_trigrams(&mut self) -> Result<()> {
-        let kind = TREE_TRIGRAMS;
+    /// Rows are compared by the filter they stand for (ADR 0094); one that
+    /// differs is rewritten whole.
+    async fn tree_trigrams(&mut self, kind: &'static str) -> Result<()> {
         let meta = self.real.meta().clone();
         let mut scan = RowScan::new(kind, true, 0);
         let mut memo = TreeRowMemo::new();
@@ -322,8 +332,31 @@ impl Rederive<'_> {
                     Err(e) => return Err(e),
                 };
                 self.clear_shadow();
-                if expected == value {
+                let same = if kind == TREE_KEYFRAMES {
+                    same_keyframe(&value, &expected)
+                } else {
+                    self.real.same_filter(&value, &expected).await?
+                };
+                if same {
                     self.report(kind).matched += 1;
+                } else if kind == TREE_KEYFRAMES && expected[..] == [SATURATED_ROW] {
+                    // A keyframe is always whole, and this tree's filter is
+                    // saturated: no keyframe is right. The patches on it no
+                    // longer match their trees and are rewritten whole by
+                    // the tree-trigrams-v2 pass that follows.
+                    self.report(kind).failed += 1;
+                    self.log.push(
+                        Problem::new(
+                            "derived",
+                            "rederive_failed",
+                            format!(
+                                "the {kind} row of {key} is wrong, and its tree's filter is \
+                                 saturated, which a keyframe cannot hold; it was left as it is"
+                            ),
+                        )
+                        .kind(kind)
+                        .key(&key),
+                    );
                 } else {
                     self.report(kind).overwritten += 1;
                     self.write(kind, &key, expected).await?;
