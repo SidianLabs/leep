@@ -67,6 +67,11 @@ const BUDGETS: &[Limit] = &[
     // trigram index on the way (ADR 0014): every blob read once.
     Limit::fixed("search", "meta calls", 30),
     Limit::fixed("search", "blob calls", 297),
+    // The warmer's search derivation of one land that changed one file
+    // three directories deep, its parent indexed: per directory on the path
+    // one batched row read on the way down and one write on the way up,
+    // plus the file's blob row (ADR 0014).
+    Limit::fixed("search land", "meta calls", 11),
     // One blob: the condemnation read beside the claim (ADR 0008, 0012). Then
     // 16 in one request: one pack, one flush, two metadata calls.
     Limit::fixed("upload", "meta calls", 2),
@@ -297,6 +302,50 @@ async fn search_budget() {
         ],
         &u,
     );
+}
+
+/// One land's search derivation on a warm process, after a chain of lands
+/// each derived as the warmer derives them.
+#[tokio::test]
+async fn search_land_budget() {
+    let (r, blobs, meta) = plain();
+    build(&r, &[]).await;
+    let head = r.meta().get_ref("main").await.unwrap().unwrap();
+    let mut changes = BTreeMap::new();
+    for i in 0..256 {
+        let body = Bytes::from(format!(
+            "fn handler_{i}(x: u32) -> u32 {{\n    // module {} part {}\n    x * {i} + {}\n}}\n",
+            i % 16,
+            i % 5,
+            i * 7919 % 1013
+        ));
+        let h = r.put_blob(body.clone()).await.unwrap();
+        changes.extend(one_file(
+            &format!("src/m{}/p{}/f{i}.rs", i % 8, i % 4),
+            h,
+            body.len(),
+        ));
+    }
+    let mut tip = r.create_changeset(changeset(head, changes)).await.unwrap();
+    let (warm, b) = counted(blobs, meta);
+    warm.derive_search(tip).await.unwrap();
+    let mut body = String::from("fn edited() {}\n");
+    for land in 0..7 {
+        body.push_str(&format!(
+            "let value_{land} = compute_{land}(\"item {land}\");\n"
+        ));
+        let h = warm.put_blob(Bytes::from(body.clone())).await.unwrap();
+        let cs = changeset(tip, one_file("src/m3/p1/f3.rs", h, body.len()));
+        tip = warm.create_changeset(cs).await.unwrap();
+        if land < 6 {
+            warm.derive_search(tip).await.unwrap();
+        }
+    }
+    b.start();
+    let report = warm.derive_search(tip).await.unwrap();
+    let u = b.stop();
+    assert_eq!(report.tree_rows, 4, "root, src, src/m3, src/m3/p1");
+    budget_check("search land", &[("meta calls", 0, u.meta_calls())], &u);
 }
 
 #[tokio::test]
