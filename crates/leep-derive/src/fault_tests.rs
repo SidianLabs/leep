@@ -1018,6 +1018,10 @@ async fn derivation_under_faults_leaves_no_wrong_rows() {
     }
     let truth_rows = truth_meta.rows();
     assert!(truth_rows.len() > 30, "the history derives many rows");
+    // Directory filters depend on which predecessor rows were stored when
+    // they were derived (ADR 0094), so they are checked for the filter they
+    // stand for, against a recomputation.
+    let mut memo = crate::search::index::TreeRowMemo::new();
 
     for seed in 1..=60u64 {
         let (bare, _) = without_derived(&truth).await;
@@ -1037,7 +1041,20 @@ async fn derivation_under_faults_leaves_no_wrong_rows() {
             for step in 0..DERIVE_STEPS {
                 loop {
                     let result = derive_step(&repo, &ids, *id, step).await;
+                    let readable = Repo::new(blobs.clone(), spy.clone());
                     for (key, row) in spy.rows() {
+                        if [crate::search::TREE_KIND, crate::search::KEYFRAME_KIND]
+                            .contains(&key.0.as_str())
+                        {
+                            let want = truth.recompute_tree_row(key.1, &mut memo).await.unwrap();
+                            let right = if key.0 == crate::search::KEYFRAME_KIND {
+                                crate::search::index::same_keyframe(&row, &want)
+                            } else {
+                                readable.same_filter(&row, &want).await.unwrap()
+                            };
+                            assert!(right, "seed {seed}: wrong filter {} {}", key.0, key.1);
+                            continue;
+                        }
                         assert_eq!(
                             truth_rows.get(&key),
                             Some(&row),
@@ -2761,7 +2778,7 @@ async fn search_rows_stay_closed_when_derivation_stops_anywhere() {
         assert_closed, assert_rows_recomputed, commit_files, index_some, level_tree, probed,
     };
     use std::sync::atomic::Ordering::SeqCst;
-    let (mut failed, mut lost) = (0, 0);
+    let (mut failed, mut lost, mut chained) = (0, 0, 0);
     for seed in seeds() {
         let mut rng = Rng::new(seed);
         let files = level_tree(seed, 20 + rng.below(80));
@@ -2814,9 +2831,40 @@ async fn search_rows_stay_closed_when_derivation_stops_anywhere() {
         r.derive_search(c).await.unwrap();
         assert_closed(&r, root, &what).await;
         assert_rows_recomputed(&r, root, &what).await;
+
+        // A land on top, its filters patched on keyframes (ADR 0094): a
+        // write that fails part way never leaves a patch without its
+        // keyframe.
+        let mut edit = level_tree(seed ^ 0xed17, 4 + rng.below(12));
+        edit.retain(|p, _| !files.keys().any(|f| f.starts_with(&format!("{p}/"))));
+        edit.retain(|p, _| !files.keys().any(|f| p.starts_with(&format!("{f}/"))));
+        let (r, probe) = probed();
+        commit_files(&r, &[], &files).await;
+        r.derive_search(c).await.unwrap();
+        let c2 = commit_files(&r, &[c], &edit).await;
+        let root2 = r.root_tree(c2).await.unwrap();
+        let before = probe.puts.load(SeqCst);
+        let (fresh, fresh_probe) = probed();
+        commit_files(&fresh, &[], &files).await;
+        fresh.derive_search(c).await.unwrap();
+        commit_files(&fresh, &[c], &edit).await;
+        let start = fresh_probe.puts.load(SeqCst);
+        fresh.derive_search(c2).await.unwrap();
+        let writes2 = fresh_probe.puts.load(SeqCst) - start;
+        if writes2 > 0 {
+            let k = 1 + rng.below(writes2 as usize) as u64;
+            *probe.fail.lock().unwrap() = Some((before + k, rng.below(64)));
+            assert!(r.derive_search(c2).await.is_err());
+            *probe.fail.lock().unwrap() = None;
+            assert_closed(&r, root2, &format!("{what}, land write {k} failed")).await;
+            r.derive_search(c2).await.unwrap();
+            assert_closed(&r, root2, &what).await;
+            assert_rows_recomputed(&r, root2, &what).await;
+            chained += 1;
+        }
     }
     assert!(
-        failed > 0 && lost > 0,
-        "{failed} failed writes, {lost} lost leases"
+        failed > 0 && lost > 0 && chained > 0,
+        "{failed} failed writes, {lost} lost leases, {chained} failed lands"
     );
 }

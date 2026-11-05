@@ -228,8 +228,8 @@ impl Gate {
     /// whose corrupt tail lies past the deciding values now prunes on its
     /// prefix instead of failing the search. `verify` still finds it: it
     /// recomputes every row and compares the bytes.
-    pub fn tree(&self, probe: &Probe, row: &[u8]) -> Result<bool> {
-        self.admits(|absent| probe.tree_absent(row, absent))
+    pub fn tree(&self, probe: &Probe, row: &[u8], keyframe: Option<&[u8]>) -> Result<bool> {
+        self.admits(|absent| probe.tree_absent(row, keyframe, absent))
     }
 
     /// Whether a blob row admits the expression; `None` for a row that
@@ -328,9 +328,10 @@ impl Compiled {
         })
     }
 
-    /// Whether a `tree-trigrams-v1` row admits the query; see [`Gate::tree`].
-    pub fn admits_tree(&self, row: &[u8]) -> Result<bool> {
-        self.gate.tree(&self.probe, row)
+    /// Whether a `tree-trigrams-v2` row admits the query; see [`Gate::tree`].
+    /// A patch row needs its keyframe row.
+    pub fn admits_tree(&self, row: &[u8], keyframe: Option<&[u8]>) -> Result<bool> {
+        self.gate.tree(&self.probe, row, keyframe)
     }
 
     /// Whether a `blob-trigrams-v1` row admits the query, `None` if the row

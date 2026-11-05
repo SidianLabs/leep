@@ -32,7 +32,8 @@ pub enum IndexGroup {
     History,
     /// `log-filter-v1` and `log-filter-name-v1`.
     LogFilter,
-    /// `tree-trigrams-v1` and `blob-trigrams-v1`.
+    /// `tree-trigrams-v2` with `tree-trigrams-keyframe-v2`, and
+    /// `blob-trigrams-v1`.
     Search,
 }
 
@@ -77,7 +78,10 @@ impl IndexGroup {
             k if k == LogFilterIndex::NAME || k == crate::derived::LOG_FILTER_NAME_KIND => {
                 Some(IndexGroup::LogFilter)
             }
-            k if k == crate::search::TREE_KIND || k == crate::search::BLOB_KIND => {
+            k if k == crate::search::TREE_KIND
+                || k == crate::search::KEYFRAME_KIND
+                || k == crate::search::BLOB_KIND =>
+            {
                 Some(IndexGroup::Search)
             }
             _ => None,

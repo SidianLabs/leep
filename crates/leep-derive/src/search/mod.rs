@@ -1,8 +1,10 @@
 //! Server-side code search over a revision (ADR 0014).
 //!
-//! Two derived kinds make it fast: `blob-trigrams-v1` (the trigram set of one
-//! text blob) and `tree-trigrams-v1` (a bloom filter over every trigram below
-//! a directory). A query names trigrams every matching file must contain
+//! Derived kinds make it fast: `blob-trigrams-v1` (the trigram set of one
+//! text blob) and `tree-trigrams-v2` (a bloom filter over every trigram below
+//! a directory, stored whole, as a saturated marker, or as a patch on a
+//! `tree-trigrams-keyframe-v2` row; ADR 0094). A query names trigrams every
+//! matching file must contain
 //! ([`plan`]); directories and files that lack them are skipped unread, and
 //! only the survivors are fetched and matched line by line. Both kinds are
 //! keyed by content hash, so a revision shares rows with its parent for every
@@ -25,10 +27,10 @@ use globset::{GlobBuilder, GlobMatcher};
 use leep_core::api::{SearchMatch, SearchResponse, SearchStats};
 use leep_core::{ChangesetId, Error, FileKind, Hash, RepoPath, Result, TreeEntry, TreeNode};
 
-pub use index::{BLOB_KIND, TREE_KIND};
+pub use index::{BLOB_KIND, KEYFRAME_KIND, RETIRED_TREE_KIND, TREE_KIND};
 pub use trigram::MAX_INDEXED_BYTES;
 
-use index::{Counters, PoolSlot, CONCURRENCY};
+use index::{Counters, PoolSlot, StoredFilter, CONCURRENCY};
 use plan::Compiled;
 use trigram::is_text;
 
@@ -252,8 +254,8 @@ struct Opener {
 
 impl Opener {
     /// Whether a directory filter admits the query.
-    fn admits(&self, row: &[u8]) -> Result<bool> {
-        self.compiled.admits_tree(row)
+    fn admits(&self, f: &StoredFilter) -> Result<bool> {
+        self.compiled.admits_tree(&f.row, f.keyframe.as_deref())
     }
 
     /// The children of the directory `dir` (node `node`) that the walk will
@@ -328,7 +330,7 @@ impl Opener {
                     // this), or waited for without it.
                     None => {
                         self.repo
-                            .search_tree_row(d.2, &self.counters, &mut pool)
+                            .search_tree_row_missing(d.2, None, &self.counters, &mut pool)
                             .await?
                     }
                 };
@@ -405,6 +407,9 @@ impl Opener {
 struct Walk {
     opener: Arc<Opener>,
     stats: Arc<WalkStats>,
+    /// The revision searched, whose first parent's tree is the predecessor
+    /// if the starting directory's filter must be derived.
+    id: ChangesetId,
     start: Option<(String, Hash)>,
     first_file: Option<FileRef>,
     stack: Vec<std::vec::IntoIter<Child>>,
@@ -429,7 +434,15 @@ impl Walk {
                 // The root's filter is a metadata read like `open`'s, so it
                 // takes a pool permit too; no `ahead` permit is held here.
                 let mut pool = PoolSlot::acquire(o.repo.search_pool.as_deref()).await?;
-                let row = o.repo.search_tree_row(tree, &o.counters, &mut pool).await?;
+                let row = match o.repo.search_tree_rows(&[tree]).await?.pop().flatten() {
+                    Some(row) => row,
+                    None => {
+                        let pred = o.repo.search_pred_at(self.id, &path).await?;
+                        o.repo
+                            .search_tree_row_missing(tree, pred, &o.counters, &mut pool)
+                            .await?
+                    }
+                };
                 o.admits(&row)?
             };
             if admitted {
@@ -620,6 +633,7 @@ impl Repo {
                 ahead: Arc::new(tokio::sync::Semaphore::new(OPEN_AHEAD)),
             }),
             stats: walk_stats.clone(),
+            id,
             start: None,
             first_file: None,
             stack: Vec::new(),
@@ -729,11 +743,31 @@ impl Repo {
     pub async fn derive_search(&self, id: ChangesetId) -> Result<SearchIndexReport> {
         let root = self.root_tree(id).await?;
         let counters = Counters::default();
-        self.tree_row(root, &counters).await?;
+        let pred = self.search_pred(id).await?;
+        self.tree_row_after(root, pred, &counters).await?;
         Ok(SearchIndexReport {
             blob_rows: counters.blob_rows(),
             tree_rows: counters.tree_rows(),
         })
+    }
+
+    /// The predecessor of the directory `path` of `id`'s tree for a search
+    /// that must derive its filter: the directory there in the first
+    /// parent's tree, when this process holds that tree's root.
+    async fn search_pred_at(&self, id: ChangesetId, path: &str) -> Result<Option<index::Pred>> {
+        let Some(mut pred) = self.search_pred_cached(id) else {
+            return Ok(None);
+        };
+        if path.is_empty() {
+            return Ok(Some(pred));
+        }
+        match self.entry_at(pred.tree, path).await? {
+            Some(TreeEntry::Dir { tree }) => {
+                pred.tree = tree;
+                Ok(Some(pred))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Decide one file: skip it, rule it out by its trigram set, or fetch and

@@ -10,8 +10,8 @@ use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
 use leep_core::{Changeset, ChangesetId, Error, FileChange, FileKind, Hash, RepoPath, TreeEntry};
 use regex::RegexBuilder;
 
-use super::index::{BLOB_KIND, TREE_KIND};
-use super::trigram::{BlobRow, Bloom, MAX_INDEXED_BYTES};
+use super::index::{BLOB_KIND, KEYFRAME_KIND, TREE_KIND};
+use super::trigram::{BlobRow, Bloom, TreeRow, MAX_INDEXED_BYTES};
 use super::{SearchQuery, MAX_LIMIT};
 
 use crate::Repo;
@@ -377,13 +377,7 @@ async fn directory_summary_covers_every_file_below() {
     .await;
     r.derive_search(c).await.unwrap();
     let root = r.root_tree(c).await.unwrap();
-    let row = r
-        .meta()
-        .get_derived(TREE_KIND, &root)
-        .await
-        .unwrap()
-        .unwrap();
-    let bloom = Bloom::decode(&row).unwrap();
+    let bloom = stored_filter(&r, root).await.unwrap();
     for t in super::trigram::extract(b"deepest content")
         .into_iter()
         .chain(super::trigram::extract(b"upper content"))
@@ -391,7 +385,8 @@ async fn directory_summary_covers_every_file_below() {
         assert!(bloom.contains(t));
     }
     // Small directories use the compact encoding.
-    assert_eq!(row[0], 2);
+    let row = stored(r.meta().as_ref(), TREE_KIND, &root).await.unwrap();
+    assert_eq!(row[0], 2, "a first revision's filters are whole");
     assert!(row.len() < 400, "{} bytes", row.len());
     // An empty tree has an empty summary.
     let empty = commit(
@@ -406,15 +401,7 @@ async fn directory_summary_covers_every_file_below() {
     .await;
     let root = r.root_tree(empty).await.unwrap();
     r.derive_search(empty).await.unwrap();
-    assert_eq!(
-        r.meta()
-            .get_derived(TREE_KIND, &root)
-            .await
-            .unwrap()
-            .unwrap()
-            .as_ref(),
-        [2]
-    );
+    assert_eq!(stored_filter(&r, root).await, Some(Bloom::default()));
     let res = r.search(empty, &SearchQuery::new("content")).await.unwrap();
     assert!(res.matches.is_empty() && !res.truncated);
 }
@@ -432,13 +419,7 @@ async fn symlinks_do_not_enter_the_summary() {
     let c = commit(&r, &[c], &[("f", Some(b"plain"))]).await;
     r.derive_search(c).await.unwrap();
     let root = r.root_tree(c).await.unwrap();
-    let row = r
-        .meta()
-        .get_derived(TREE_KIND, &root)
-        .await
-        .unwrap()
-        .unwrap();
-    let bloom = Bloom::decode(&row).unwrap();
+    let bloom = stored_filter(&r, root).await.unwrap();
     assert!(!bloom.contains(super::trigram::code(b'z', b'z', b'y')));
     assert!(bloom.contains(super::trigram::code(b'p', b'l', b'a')));
 }
@@ -1479,12 +1460,26 @@ pub(crate) async fn tree_shape(r: &Repo, root: Hash) -> Vec<DirShape> {
     out
 }
 
+/// The filter a directory's stored row stands for, its keyframe applied;
+/// `None` if saturated.
+pub(crate) async fn stored_filter(r: &Repo, tree: Hash) -> Option<Bloom> {
+    let row = stored(r.meta().as_ref(), TREE_KIND, &tree)
+        .await
+        .expect("a stored filter");
+    let keyframe = match TreeRow::parse(&row).unwrap() {
+        TreeRow::Patch(p) => stored(r.meta().as_ref(), KEYFRAME_KIND, &p.base).await,
+        _ => None,
+    };
+    Bloom::of_row(&row, keyframe.as_deref()).unwrap()
+}
+
 async fn stored(meta: &dyn leep_core::MetaStore, kind: &str, key: &Hash) -> Option<Bytes> {
     meta.get_derived(kind, key).await.unwrap()
 }
 
 /// Every stored filter below `root` has its whole subtree stored: its
-/// subdirectories' filters and its files' rows. Returns the stored filters.
+/// subdirectories' filters and its files' rows, and a patch its keyframe.
+/// Returns the stored filters.
 pub(crate) async fn assert_closed(r: &Repo, root: Hash, what: &str) -> usize {
     let meta = r.meta().as_ref();
     let mut n = 0;
@@ -1493,6 +1488,14 @@ pub(crate) async fn assert_closed(r: &Repo, root: Hash, what: &str) -> usize {
             continue;
         }
         n += 1;
+        let row = stored(meta, TREE_KIND, &h).await.unwrap();
+        if let TreeRow::Patch(p) = TreeRow::parse(&row).unwrap() {
+            assert!(
+                stored(meta, KEYFRAME_KIND, &p.base).await.is_some(),
+                "{what}: filter of {h} stored without its keyframe {}",
+                p.base
+            );
+        }
         for d in &dirs {
             assert!(
                 stored(meta, TREE_KIND, d).await.is_some(),
@@ -1519,7 +1522,10 @@ pub(crate) async fn assert_rows_recomputed(r: &Repo, root: Hash, what: &str) {
     for (h, _, files) in tree_shape(r, root).await {
         if let Some(row) = stored(meta, TREE_KIND, &h).await {
             let want = fresh.recompute_tree_row(h, &mut memo).await.unwrap();
-            assert_eq!(row, want, "{what}: filter of {h}");
+            assert!(
+                r.same_filter(&row, &want).await.unwrap(),
+                "{what}: filter of {h}"
+            );
         }
         for (f, size) in files {
             if let Some(row) = stored(meta, BLOB_KIND, &f).await {
@@ -1919,4 +1925,242 @@ async fn a_slow_history_group_does_not_delay_search_warming() {
     let _ = task.await;
     *probe.hold.lock().unwrap() = None;
     probe.gate.add_permits(100);
+}
+
+// ---- patched filters (ADR 0094) ----
+
+/// Count the stored `tree-trigrams-v2` rows by tag: whole, saturated,
+/// patch.
+async fn tags(r: &Repo) -> [usize; 3] {
+    let mut out = [0; 3];
+    for (_, row) in r
+        .meta()
+        .list_derived(TREE_KIND, None, usize::MAX)
+        .await
+        .unwrap()
+    {
+        match TreeRow::parse(&row).unwrap() {
+            TreeRow::Keyframe(_) => out[0] += 1,
+            TreeRow::Saturated => out[1] += 1,
+            TreeRow::Patch(_) => out[2] += 1,
+        }
+    }
+    out
+}
+
+/// Lines of text with about 6 bytes in 7 drawn from the first `letters` of
+/// 36 letters and digits: many distinct trigrams, as source code has.
+fn noisy_text(rng: &mut Rng, bytes: usize, letters: usize) -> Vec<u8> {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut out = Vec::with_capacity(bytes + 1);
+    while out.len() < bytes {
+        out.push(match rng.below(70) {
+            0 => b'\n',
+            1..=9 => b' ',
+            _ => ALPHABET[rng.below(letters)],
+        });
+    }
+    out.push(b'\n');
+    out
+}
+
+/// Over chained lands, derived as the warmer derives them (some heads
+/// skipped), every filter row is whole, saturated or a patch, and search
+/// answers exactly as a scan of the files at every head, through the
+/// filters' cache and without it. Big files saturate their directories and
+/// every directory above; small edits patch; rewrites start new keyframes.
+#[tokio::test]
+async fn patched_and_saturated_filters_answer_like_a_scan() {
+    let mut totals = [0; 3];
+    let mut searches = 0;
+    for seed in 1..=24u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let r = repo();
+        let dirs = ["", "src/", "src/deep/", "lib/x/", "docs/", "a/b/c/"];
+        let mut live: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        let mut head: Vec<ChangesetId> = Vec::new();
+        for land in 0..10 {
+            let mut files: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
+            let first = land == 0;
+            for _ in 0..if first { 30 } else { 1 + rng.below(3) } {
+                let path = format!("{}f{}.rs", rng.pick(&dirs), rng.below(6));
+                let body = match (live.get(&path), rng.below(10)) {
+                    // An edit: a line appended.
+                    (Some(old), 0..=5) => {
+                        let mut b = old.clone();
+                        b.extend(random_file(&mut rng));
+                        Some(b)
+                    }
+                    (Some(_), 6) => None,
+                    // Enough distinct trigrams to saturate a filter.
+                    (_, 7) if seed % 3 == 0 => Some(noisy_text(&mut rng, 60_000, 36)),
+                    _ => Some(random_file(&mut rng)),
+                };
+                files.insert(path, body);
+            }
+            for (p, c) in &files {
+                match c {
+                    Some(c) => live.insert(p.clone(), c.clone()),
+                    None => live.remove(p),
+                };
+            }
+            let refs: Vec<File> = files
+                .iter()
+                .map(|(p, c)| (p.as_str(), c.as_deref()))
+                .collect();
+            let id = commit(&r, &head, &refs).await;
+            head = vec![id];
+            // The warmer skips some heads when lands outrun it.
+            if rng.below(4) != 0 {
+                r.derive_search(id).await.unwrap();
+            }
+            if land % 3 != 2 {
+                continue;
+            }
+            let texts: Vec<String> = live
+                .values()
+                .filter_map(|b| String::from_utf8(b.clone()).ok())
+                .collect();
+            let cold = Repo::new(r.blobs().clone(), r.meta().clone());
+            for i in 0..8 {
+                let q = random_query(&mut rng, &texts);
+                let want = oracle(&r, id, &q).await;
+                let by = if i % 2 == 0 { &r } else { &cold };
+                let got = by.search(id, &q).await.unwrap();
+                assert_eq!(
+                    (render(&got), got.truncated),
+                    want,
+                    "seed {seed} land {land} query {q:?}"
+                );
+                searches += 1;
+            }
+        }
+        let root = r.root_tree(head[0]).await.unwrap();
+        r.derive_search(head[0]).await.unwrap();
+        assert_closed(&r, root, &format!("seed {seed}")).await;
+        assert_rows_recomputed(&r, root, &format!("seed {seed}")).await;
+        let t = tags(&r).await;
+        for (a, b) in totals.iter_mut().zip(t) {
+            *a += b;
+        }
+    }
+    assert!(searches > 500, "{searches} searches");
+    let [whole, saturated, patches] = totals;
+    assert!(
+        whole > 50 && saturated > 20 && patches > 100,
+        "every tag was exercised: {totals:?}"
+    );
+}
+
+/// A long chain of small lands into a few busy directories of a tree with
+/// as many distinct trigrams as real source has stores at least five times
+/// fewer filter bytes than whole rows (`tree-trigrams-v1`) would.
+#[tokio::test]
+async fn patches_store_five_times_fewer_filter_bytes_than_whole_rows() {
+    let mut rng = Rng(0x0094);
+    let r = repo();
+    let mut files = Files::new();
+    let mut live: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for top in 0..6 {
+        for sub in 0..6 {
+            for f in 0..12 {
+                let path = format!("t{top}/s{sub}/f{f}.rs");
+                let body = noisy_text(&mut rng, 1500, 30);
+                live.insert(path.clone(), body.clone());
+                files.insert(path, (body, FileKind::Regular));
+            }
+        }
+    }
+    let mut head = commit_files(&r, &[], &files).await;
+    r.derive_search(head).await.unwrap();
+    let rows_of = |r: &Repo, kind: &'static str| {
+        let m = r.meta().clone();
+        async move {
+            m.list_derived(kind, None, usize::MAX)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeMap<Hash, Bytes>>()
+        }
+    };
+    let (before, before_kf) = (
+        rows_of(&r, TREE_KIND).await,
+        rows_of(&r, KEYFRAME_KIND).await,
+    );
+    let root = r.root_tree(head).await.unwrap();
+    assert_eq!(
+        stored(r.meta().as_ref(), TREE_KIND, &root).await.unwrap()[0],
+        1,
+        "dense root"
+    );
+    let busy = ["t1/s2", "t1/s4", "t3/s0", "t5/s5"];
+    for _ in 0..80 {
+        let path = format!("{}/f{}.rs", rng.pick(&busy), rng.below(12));
+        let body = live.get_mut(&path).unwrap();
+        body.extend(noisy_text(&mut rng, 60, 30));
+        let one = Files::from([(path, (body.clone(), FileKind::Regular))]);
+        head = commit_files(&r, &[head], &one).await;
+        r.derive_search(head).await.unwrap();
+    }
+    let (after, after_kf) = (
+        rows_of(&r, TREE_KIND).await,
+        rows_of(&r, KEYFRAME_KIND).await,
+    );
+    let (mut v2, mut v1) = (0, 0);
+    for (h, row) in &after {
+        if before.contains_key(h) {
+            continue;
+        }
+        v2 += row.len();
+        // What `tree-trigrams-v1` stored for the same filter.
+        v1 += match stored_filter(&r, *h).await {
+            Some(f) => f.encode().len(),
+            None => 1 + super::trigram::BLOOM_BITS / 8,
+        };
+    }
+    for (h, row) in &after_kf {
+        if !before_kf.contains_key(h) {
+            v2 += row.len();
+        }
+    }
+    eprintln!(
+        "80 lands: whole rows {v1} bytes, patches and keyframes {v2} bytes ({:.1}x)",
+        v1 as f64 / v2 as f64
+    );
+    assert!(v1 >= 5 * v2, "{v1} bytes whole, {v2} patched");
+    assert_rows_recomputed(&r, r.root_tree(head).await.unwrap(), "chain").await;
+}
+
+/// A head whose first parent the warmer skipped patches on the nearest
+/// first-parent ancestor's keyframe instead of starting a new one.
+#[tokio::test]
+async fn a_skipped_parent_patches_on_the_nearest_indexed_ancestor() {
+    let r = repo();
+    let base = commit(&r, &[], &[("src/a.rs", Some(b"fn alpha() {}\n"))]).await;
+    r.derive_search(base).await.unwrap();
+    let one = commit(&r, &[base], &[("src/a.rs", Some(b"fn alpha() { beta }\n"))]).await;
+    r.derive_search(one).await.unwrap();
+    let one_root = r.root_tree(one).await.unwrap();
+    let row = stored(r.meta().as_ref(), TREE_KIND, &one_root)
+        .await
+        .unwrap();
+    match TreeRow::parse(&row).unwrap() {
+        TreeRow::Patch(p) => assert_eq!(p.base, one_root, "a new keyframe"),
+        other => panic!("{other:?}"),
+    }
+    let two = commit(&r, &[one], &[("src/b.rs", Some(b"gamma\n"))]).await;
+    let three = commit(&r, &[two], &[("src/c.rs", Some(b"delta\n"))]).await;
+    r.derive_search(three).await.unwrap();
+    let root = r.root_tree(three).await.unwrap();
+    let row = stored(r.meta().as_ref(), TREE_KIND, &root).await.unwrap();
+    match TreeRow::parse(&row).unwrap() {
+        TreeRow::Patch(p) => assert_eq!(p.base, one_root, "on the indexed ancestor"),
+        other => panic!("{other:?}"),
+    }
+    assert!(stored(r.meta().as_ref(), KEYFRAME_KIND, &root)
+        .await
+        .is_none());
+    let got = r.search(three, &SearchQuery::new("delta")).await.unwrap();
+    assert_eq!(hits(&got), [("src/c.rs".into(), 1)]);
+    assert_rows_recomputed(&r, root, "skipped").await;
 }
