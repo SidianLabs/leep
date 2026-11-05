@@ -122,8 +122,9 @@ pub struct Repo {
     /// Whether creates of client changesets leave their tree nodes out
     /// (ADR 0069).
     pub(crate) lazy_create: bool,
-    /// Encoded `tree-trigrams-v1` rows read from the store by searches
-    /// (see `Repo::search_tree_rows`).
+    /// Encoded `tree-trigrams-v2` rows, and the keyframes their patches
+    /// are on, read from the store by searches and search derivations (see
+    /// `Repo::search_tree_rows`).
     pub(crate) search_trees: Arc<SearchTreeCache>,
     /// Skiplists computed, or read while creating changesets (see
     /// `SkiplistCache`).
@@ -447,12 +448,14 @@ pub(crate) type TreeCache = SizedCache<TreeView, TREE_CACHE_BYTES>;
 /// hash names its content, so an entry is never stale.
 pub(crate) type NodeCache = SizedCache<TreeNode, NODE_CACHE_BYTES>;
 
-/// Directory filters (`tree-trigrams-v1` rows) as stored, by tree hash. A
-/// search reads the filter of every directory it opens, and the upper levels
-/// are the same for every query and for every revision that did not change
-/// them, so without this each search moves most of its index bytes from the
-/// store again. Rows are keyed by content and the kind name carries the
-/// encoding's version, so an entry is never stale for a correct row; one
+/// Directory filters (`tree-trigrams-v2` rows) as stored, by tree hash, and
+/// the keyframes their patches are on (`tree-trigrams-keyframe-v2` rows, by
+/// `keyframe_cache_key` of their tree). A search reads the filter of every
+/// directory it opens, and the upper levels are the same for every query and
+/// for every revision that did not change them, so without this each search
+/// moves most of its index bytes from the store again. A keyframe never
+/// changes, and a filter row another derivation rewrites stands for the same
+/// filter (ADR 0094), so an entry is never stale for a correct row; one
 /// damaged in the store and then repaired by another process stays cached
 /// until this process restarts (OPERATIONS.md, "Repair").
 pub(crate) type SearchTreeCache = SizedCache<Bytes, SEARCH_TREE_CACHE_BYTES>;

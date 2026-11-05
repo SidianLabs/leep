@@ -176,7 +176,7 @@ fn run_verify_workflow(stores: &Stores, work: &Path) {
         "root_tree",
         "history-tree-v4",
         "blob-trigrams-v1",
-        "tree-trigrams-v1",
+        "tree-trigrams-v2",
         "blame-v2",
     ] {
         assert!(
@@ -341,7 +341,7 @@ fn run_verify_workflow(stores: &Stores, work: &Path) {
     // one goes, the store stays clean, and queries bring the rows back.
     let dropped = json(
         stores,
-        &["repair", "drop", "--kind", "blame-v2", "tree-trigrams-v1"],
+        &["repair", "drop", "--kind", "blame-v2", "tree-trigrams-v2"],
         0,
     );
     assert!(

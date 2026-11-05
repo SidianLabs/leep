@@ -301,13 +301,13 @@ pub fn search_plan(data: &[u8]) {
     }
     let mut bloom = Bloom::default();
     codes.iter().for_each(|&t| bloom.insert(t));
-    let present = c.probe.tree(&bloom.encode()).unwrap();
+    let present = c.probe.tree(&bloom.encode(), None).unwrap();
     assert!(
         c.required.eval(&|t| present.has(t)),
         "tree filter of {pat:?}"
     );
     assert!(
-        c.admits_tree(&bloom.encode()).unwrap(),
+        c.admits_tree(&bloom.encode(), None).unwrap(),
         "early stop, tree filter of {pat:?}"
     );
 }

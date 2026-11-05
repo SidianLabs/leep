@@ -41,8 +41,10 @@ use crate::derived::{DerivedKind, HistoryTree, LogFilterIndex, NodeRef, StoredHi
 use crate::gc;
 use crate::git_map::{self, GIT_BLOB_KIND, GIT_OID_KIND, GIT_STYLE_KIND, GIT_TREE_KIND};
 use crate::path_history::{bad_chunk, chunk_fits, load_history_row, part_row, resolve_raw_row};
-use crate::search::index::TreeRowMemo;
-use crate::search::{BLOB_KIND as BLOB_TRIGRAMS, TREE_KIND as TREE_TRIGRAMS};
+use crate::search::index::{same_keyframe, TreeRowMemo};
+use crate::search::{
+    BLOB_KIND as BLOB_TRIGRAMS, KEYFRAME_KIND as TREE_KEYFRAMES, TREE_KIND as TREE_TRIGRAMS,
+};
 use crate::signatures::{storage_key as signature_storage_key, REBASED_ORIGIN_KIND};
 use crate::{reviews, Repo};
 
@@ -478,8 +480,12 @@ impl Verifier<'_> {
         if self.has(BLOB_TRIGRAMS) {
             self.scan_blob_trigrams().await?;
         }
+        // Keyframes first: a patch is checked against its keyframe.
+        if self.has(TREE_KEYFRAMES) {
+            self.scan_tree_trigrams(TREE_KEYFRAMES).await?;
+        }
         if self.has(TREE_TRIGRAMS) {
-            self.scan_tree_trigrams().await?;
+            self.scan_tree_trigrams(TREE_TRIGRAMS).await?;
         }
         if self.has(kinds::HISTORY_NODE) {
             self.scan_history_nodes().await?;
@@ -956,8 +962,10 @@ impl Verifier<'_> {
         Ok(())
     }
 
-    async fn scan_tree_trigrams(&mut self) -> Result<()> {
-        let kind = TREE_TRIGRAMS;
+    /// A filter row is checked for the filter it stands for, not its
+    /// bytes: a patch depends on the predecessor it was derived after (ADR
+    /// 0094). A keyframe must be whole.
+    async fn scan_tree_trigrams(&mut self, kind: &'static str) -> Result<()> {
         let meta = self.repo.meta().clone();
         let mut scan = RowScan::new(kind, self.opts.full, self.opts.sample);
         let mut memo = TreeRowMemo::new();
@@ -975,7 +983,12 @@ impl Verifier<'_> {
                 };
                 self.shadow_blobs.clear();
                 self.kstats(kind).checked += 1;
-                if expected != value {
+                let same = if kind == TREE_KEYFRAMES {
+                    same_keyframe(&value, &expected)
+                } else {
+                    self.repo.same_filter(&value, &expected).await?
+                };
+                if !same {
                     self.row_mismatch(kind, &key, &value, &expected);
                     self.shadow_meta.set(kind, &key, expected);
                 }

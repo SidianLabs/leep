@@ -52,7 +52,9 @@ skill.
 | derived `cs-tombstone-v1` | — | `MetaStore.derived`, key = id of a changeset the sweep deleted, value = deletion time (8-byte big-endian `i64`, the sweep host's clock), then the changeset's root tree hash (32 bytes) when it had a `root_tree` row. Written before the delete, dropped after `--tombstone-retention`; blob GC keeps the root trees of those within `--backup-fence` (ADR 0059 section 11) |
 | derived `cs-reach-v1` | — | `MetaStore.derived`, key = changeset id, value = the single byte `0x01` (a present row counts whatever it reads): a ref or ref log entry reaches the changeset, and every parent has a row. Written parents first (ADR 0059). One more row, key = 32 zero bytes, holds the `seq` of the newest ref log entry the rows cover (8-byte big-endian) |
 | derived `blob-trigrams-v1` | — | `MetaStore.derived`, key = blob hash, value = see "Code search index" below |
-| derived `tree-trigrams-v1` | — | `MetaStore.derived`, key = tree node hash (`TreeNode::hash()`), value = see "Code search index" below |
+| derived `tree-trigrams-v2` | — | `MetaStore.derived`, key = tree node hash (`TreeNode::hash()`), value = see "Code search index" below (ADR 0094) |
+| derived `tree-trigrams-keyframe-v2` | — | `MetaStore.derived`, key = tree node hash, value = the whole filter of that directory, dense or sparse as in `tree-trigrams-v2`; only ever written with that one encoding, before any patch on it (ADR 0094) |
+| retired `tree-trigrams-v1` | — | the same key, value = a whole filter, dense or sparse; written by servers before ADR 0094; never read by current servers; removed with `repair drop --kind tree-trigrams-v1` |
 | derived `history-tree-v4` | — | `MetaStore.derived`, key = changeset id, value = part 0 of the changeset's history pack (ADR 0045): the history nodes its derivation wrote, and its root node's address |
 | history pack part | `history-node-v4` | `MetaStore.derived` (kind `history-node-v4`), key = `Hash::of_object("history-node-v4", changeset id ‖ part as u32 LE)`, value = part 1 and up of a pack that did not fit in one |
 | derived `log-filter-v1` | — | `MetaStore.derived`, key = changeset id, value = see "Log filter index" below (ADR 0047) |
@@ -175,10 +177,13 @@ config on reload).
 
 ## Code search index (new derived kinds, no other format change)
 
-ADR 0014. Two kinds, both pure functions of content-addressed input and never
-deleted. Golden bytes are asserted in `leep-derive` (`blob_row_golden_bytes`,
-`bloom_positions_are_frozen`); any change to an encoding, a constant below or the
-definition of "text" is a new kind name (`-v2`).
+ADR 0014, ADR 0094. Three kinds, never deleted: `blob-trigrams-v1` and
+`tree-trigrams-keyframe-v2` are pure functions of content-addressed input, and
+a `tree-trigrams-v2` row may also depend on the row its predecessor had when it
+was derived. Golden bytes are asserted in `leep-derive` (`blob_row_golden_bytes`,
+`bloom_positions_are_frozen`, `tree_row_golden_bytes`, `keyframe_rule`); any
+change to an encoding, a constant below or the definition of "text" is a new
+kind name.
 
 A *trigram* is three consecutive bytes `b0 b1 b2`, coded `b0<<16 | b1<<8 | b2`
 (24 bits). A blob is *indexed* iff it is at most 1 048 576 bytes, contains no
@@ -193,7 +198,7 @@ entries are never indexed or searched.
   non-minimal varint, a value of 2^24 or more, and a trailing partial varint are
   invalid.
 
-**`tree-trigrams-v1`** value: a bloom filter of 2^19 bits with 3 hash functions
+**`tree-trigrams-v2`** value: a bloom filter of 2^19 bits with 3 hash functions
 over the trigram codes of all indexed blobs below the directory (recursively;
 filters of subdirectories are OR-ed in). Bit positions of a code `c`: let `z` be
 splitmix64 of `c` (`z = c + 0x9E3779B97F4A7C15; z = (z ^ z>>30) * 0xBF58476D1CE4E5B9;
@@ -204,8 +209,36 @@ z = (z ^ z>>27) * 0x94D049BB133111EB; z ^= z>>31`, wrapping 64-bit),
   (least significant first); or
 - `0x02` then the sorted set bit positions as delta varints as above (the first
   relative to zero, each below 2^19), used when it is shorter than the dense form.
-The encoder is canonical (sparse iff strictly shorter), but readers accept either
-form for any filter. An empty directory is `0x02`.
+- `0x03` alone: *saturated*, more than 2^17 bits are set. The bits are not
+  stored; a search admits every query here. Whenever more than 2^17 bits are
+  set the row is `0x03`, so every ancestor of a saturated directory is
+  saturated too;
+- `0x04` *patch*: then the 32-byte hash of a tree `K`, a varint `n`, `n` bytes
+  of added positions and, to the end of the row, removed positions, both
+  lists as delta varints as above (each below 2^19). The filter is that of
+  the `tree-trigrams-keyframe-v2` row of `K`, which must be `0x01` or `0x02`,
+  with the removed positions cleared and the added ones set. Every removed
+  position must be set in the keyframe and every added one clear. A patch on
+  its own tree with both lists empty (`n` = 0) starts a new keyframe.
+
+The dense and sparse encoder is canonical (sparse iff strictly shorter), but
+readers accept either form for any filter. An empty directory is `0x02`. A
+directory without a predecessor (the same path in its revision's first
+parent's tree, or in the nearest of the next 8 first-parent ancestors whose
+tree has a row) is stored whole or saturated. With one whose row is a patch
+on `K`, it is stored as a patch on `K` if `p² <= 512 × w`, `p` being the
+patch's length and `w` the length of the directory's own dense or sparse
+encoding. With one whose row is whole (`0x01` or `0x02`), the same rule
+decides a patch on the predecessor, whose `tree-trigrams-keyframe-v2` row,
+its filter's dense or sparse encoding, is written first. Otherwise it
+starts a new keyframe: its whole filter as its `tree-trigrams-keyframe-v2`
+row, written first, and the empty patch on itself. A saturated predecessor gives a whole
+row. Two derivations from different predecessors may store different rows
+for one tree; both stand for the same filter, which is what `verify`
+compares.
+
+**`tree-trigrams-keyframe-v2`** value: `0x01` or `0x02` as above, the
+directory's whole filter, never saturated.
 
 The rows are lazily derived. A search over `path` derives only the subtree.
 
@@ -846,7 +879,7 @@ No table, column or stored encoding changed.
 
 - **Index leases** are `leases` rows with `scope = 'index'`, `repo_id = 0`
   (index rows are shared by every repository), `name` the group's primary
-  kind (`history-tree-v4`, `log-filter-v1`, `tree-trigrams-v1`) and `shard =
+  kind (`history-tree-v4`, `log-filter-v1`, `tree-trigrams-v2`) and `shard =
   0`, taken with a 15 s TTL and taken over 6 s after the last renewal.
   `meta` is a JSON object the holder rewrites on each renewal:
   `{"rate": <changesets a second over the last minute>, "backlog": <changesets

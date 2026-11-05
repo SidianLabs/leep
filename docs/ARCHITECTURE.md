@@ -223,7 +223,8 @@ way.
 | `git-commit-v1` | per changeset: the 20-byte sha1 of its git commit under the store's commit style, from its root tree's and its parents' git ids. Imported changesets reproduce their original commit; others carry `Leep-Changeset:` under the `trailer` style, the mirror's rule (ADR 0049, 0090). Derived on demand; deleted with its changeset by the sweep | as above |
 | `git-oid-v1` | per `Hash::of_object("git-oid", sha)`: kind byte (1 blob, 2 tree, 3 commit) and the 32-byte Leep hash; written beside each forward row; a lookup checks the forward row, so one whose changeset was swept answers "unknown" (ADR 0090) | finding the Leep object a git id names |
 | `git-style-v1` | one row: the store's commit style (`plain`/`trailer`, optionally `+provenance`), written once by the first derivation or mirror start (ADR 0090) | every git commit id of a changeset made in Leep |
-| `tree-trigrams-v1` | per tree node hash: fixed-size bloom filter (2^19 bits) over every trigram below the directory, the OR of its children's filters; shared by every revision with the same subtree (ADR 0014) | code search directory pruning |
+| `tree-trigrams-v2` | per tree node hash: fixed-size bloom filter (2^19 bits) over every trigram below the directory, the OR of its children's filters, stored whole (dense or sparse), as a one-byte "saturated" marker past 2^17 bits set (admits every query; a saturated child makes its parent saturated), or as a patch (positions added and removed) on the whole filter in `tree-trigrams-keyframe-v2` of the keyframe its predecessor (the same path in the first parent's tree) is on, while `patch² <= 512 × whole`; reads cost at most two rows (ADR 0014, ADR 0094) | code search directory pruning |
+| `tree-trigrams-keyframe-v2` | per tree node hash: that directory's whole filter, the base of patches; a function of content written before any patch on it, so it never changes, which the patches rely on since a `tree-trigrams-v2` row may be rewritten by a derivation from another predecessor (ADR 0094) | as above |
 
 **Unstored trees** ([ADR 0069](adr/0069-lazy-create-trees.md)). The
 `root_tree` row is always stored with its changeset, but the nodes of the
@@ -567,7 +568,7 @@ case-insensitive, restricted by path prefix and glob, matched per line. The
 planner turns the query into trigrams every matching file must contain
 (literal trigrams, case variants, or literals extracted from the regex syntax
 tree; none means a plain scan). Execution walks the tree depth first with an
-explicit stack, skipping directories whose `tree-trigrams-v1` filter lacks a
+explicit stack, skipping directories whose `tree-trigrams-v2` filter lacks a
 required trigram and files whose `blob-trigrams-v1` set does, then fetches the
 survivors (16 at a time, order preserved) and runs the matcher on blocking
 threads. A directory's children's rows and surviving nodes are read in batches
@@ -575,10 +576,10 @@ when it is opened, and the subdirectories of the directory the walk is in are
 opened ahead of it, four at a time. Probing a row stops decoding as soon as
 the requirement is false with every value not yet read counted as present
 (the requirement has no negation, so that bound only falls). Each `Repo`
-keeps the encoded `tree-trigrams-v1` rows its searches read from the store
-(64 MiB of the derive cache budget by default), so the upper directories'
-filters, shared by every query and every revision that did not change them,
-are not read again; rows a bounded query computes are never cached, and a
+keeps the encoded `tree-trigrams-v2` rows its searches read from the store,
+and the keyframes their patches are on (64 MiB of the derive cache budget by
+default), so the upper directories' filters, shared by every query and every
+revision that did not change them, are not read again; rows a bounded query computes are never cached, and a
 row repaired by another process is seen after a restart. Output is ordered
 by path then line and is identical with or without the index, which a property
 test checks; the walk is lazy, so a search that has enough matches stops early.

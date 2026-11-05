@@ -2,7 +2,7 @@
 
 use leep_derive::derived::{SkipEntry, Skiplist};
 use leep_derive::gc;
-use leep_derive::search::trigram::{extract, BlobRow, Bloom, Probe, BLOOM_BITS};
+use leep_derive::search::trigram::{extract, BlobRow, Bloom, Probe, TreeRow, BLOOM_BITS};
 
 /// Distinct trigram codes to probe a row with: the codes in `set`, plus
 /// neighbours that are probably absent.
@@ -19,7 +19,7 @@ pub fn blob_trigrams_row(data: &[u8]) {
     // The probe reads rows lazily and must never panic on a corrupt one.
     let junk = Probe::new(vec![0, 1, 0x61_6263, 0xFF_FFFF]);
     let _ = junk.blob(data);
-    let _ = junk.tree(data);
+    let _ = junk.tree(data, None);
 
     let Ok(row) = BlobRow::decode(data) else {
         return;
@@ -45,9 +45,48 @@ pub fn blob_trigrams_row(data: &[u8]) {
 }
 
 pub fn tree_trigrams_row(data: &[u8]) {
+    // Any row parses or is rejected; a patch applies to a keyframe or is
+    // rejected, and probes as it decodes.
+    let empty = Bloom::default().encode();
+    let codes: Vec<u32> = data
+        .windows(3)
+        .take(16)
+        .map(|w| u32::from(w[0]) << 16 | u32::from(w[1]) << 8 | u32::from(w[2]))
+        .collect();
+    // A keyframe with some of the probed codes: patches on it both add and
+    // remove at probed positions.
+    let mut some = Bloom::default();
+    codes.iter().step_by(2).for_each(|&c| some.insert(c));
+    if let Ok(TreeRow::Patch(_)) = TreeRow::parse(data) {
+        for keyframe in [empty.clone(), some.encode()] {
+            if let Ok(Some(patched)) = Bloom::of_row(data, Some(&keyframe)) {
+                let probe = Probe::new(codes.clone());
+                let present = probe
+                    .tree(data, Some(&keyframe))
+                    .expect("a patch that applies must probe");
+                for &c in &codes {
+                    assert_eq!(present.has(c), patched.contains(c), "code {c:#x}");
+                }
+            }
+        }
+        return;
+    }
     let Ok(bloom) = Bloom::decode(data) else {
         return;
     };
+    // The same filter as a patch on a keyframe that has half the probed
+    // codes (adds and removes), or those and all of this filter when the
+    // input's length is even (removes only), decodes and probes the same.
+    let mut keyframe = some.clone();
+    if data.len().is_multiple_of(2) {
+        keyframe.or_encoded(data).unwrap();
+    }
+    let key = keyframe.encode();
+    let patch = bloom.patch_on(&leep_core::Hash([0; 32]), &keyframe);
+    assert_eq!(
+        Bloom::of_row(&patch, Some(&key)).unwrap().as_ref(),
+        Some(&bloom)
+    );
     // Either form is accepted, but the encoder is canonical and lossless.
     let enc = bloom.encode();
     let again = Bloom::decode(&enc).expect("re-encoded filter must decode");
@@ -55,15 +94,14 @@ pub fn tree_trigrams_row(data: &[u8]) {
     assert_eq!(again.set_bits(), bloom.set_bits());
     assert!(bloom.set_bits() <= BLOOM_BITS);
 
-    let codes: Vec<u32> = data
-        .windows(3)
-        .take(16)
-        .map(|w| u32::from(w[0]) << 16 | u32::from(w[1]) << 8 | u32::from(w[2]))
-        .collect();
     let probe = Probe::new(codes.clone());
-    let present = probe.tree(data).expect("a row that decodes must probe");
+    let present = probe
+        .tree(data, None)
+        .expect("a row that decodes must probe");
+    let patched = probe.tree(&patch, Some(&key)).unwrap();
     for c in codes {
         assert_eq!(present.has(c), bloom.contains(c), "code {c:#x}");
+        assert_eq!(patched.has(c), bloom.contains(c), "patched code {c:#x}");
     }
     let mut merged = Bloom::default();
     merged.or_encoded(data).unwrap();
@@ -103,7 +141,7 @@ pub fn trigram_codec(data: &[u8]) {
         let p = probe.blob(&row.encode()).unwrap().unwrap();
         assert!(codes.iter().take(32).all(|&c| p.has(c)));
     }
-    let p = probe.tree(&enc).unwrap();
+    let p = probe.tree(&enc, None).unwrap();
     assert!(codes.iter().take(32).all(|&c| p.has(c)));
 }
 
