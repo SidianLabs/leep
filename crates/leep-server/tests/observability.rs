@@ -298,7 +298,7 @@ fn warm_passes_count_rows_by_kind() {
     };
     // The base's three directories and three files; the next head's rows
     // were the search's.
-    assert_eq!(rows("tree-trigrams-v1"), 3.0);
+    assert_eq!(rows("tree-trigrams-v2"), 3.0);
     assert_eq!(rows("blob-trigrams-v1"), 3.0);
     assert_eq!(rows("history-tree-v4"), 2.0);
     assert_eq!(rows("log-filter-v1"), 2.0);
@@ -309,7 +309,7 @@ fn warm_passes_count_rows_by_kind() {
             &[&format!("kind=\"{kind}\"")],
         ))
     };
-    assert_eq!(derived("tree-trigrams-v1"), 3.0 + 3.0);
+    assert_eq!(derived("tree-trigrams-v2"), 3.0 + 3.0);
     assert_eq!(derived("blob-trigrams-v1"), 3.0 + 1.0);
     // A warmer of every group labels its passes `all`; the server's loops
     // label theirs with their group.
@@ -318,7 +318,7 @@ fn warm_passes_count_rows_by_kind() {
     let heads = line(
         &text,
         "leep_index_derived_total",
-        &["kind=\"tree-trigrams-v1\""],
+        &["kind=\"tree-trigrams-v2\""],
     );
     assert_eq!(value(heads), 2.0);
 }

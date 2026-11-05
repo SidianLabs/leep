@@ -227,7 +227,7 @@ impl Gate {
     /// Stopping early also skips validating the rest of the row, so a row
     /// whose corrupt tail lies past the deciding values now prunes on its
     /// prefix instead of failing the search. `verify` still finds it: it
-    /// recomputes every row and compares the bytes.
+    /// recomputes every row and compares the filters they stand for.
     pub fn tree(&self, probe: &Probe, row: &[u8], keyframe: Option<&[u8]>) -> Result<bool> {
         self.admits(|absent| probe.tree_absent(row, keyframe, absent))
     }

@@ -221,11 +221,14 @@ impl Repo {
     ) -> Result<Bytes> {
         // The predecessor's row is read with the root's: without one, a
         // nearer indexed ancestor stands in.
-        let keys = match pred {
-            Some(p) if p.tree != root => vec![root, p.tree],
-            _ => vec![root],
+        let rows = match pred {
+            Some(p) if p.tree != root => {
+                self.meta()
+                    .get_derived_many(TREE_KIND, &[root, p.tree])
+                    .await?
+            }
+            _ => vec![self.meta().get_derived(TREE_KIND, &root).await?],
         };
-        let rows = self.meta().get_derived_many(TREE_KIND, &keys).await?;
         if let Some(Some(v)) = rows.first() {
             return Ok(v.clone());
         }

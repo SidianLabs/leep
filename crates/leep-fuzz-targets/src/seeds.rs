@@ -288,6 +288,12 @@ fn rows(out: &mut Out) {
     let enc = dense.encode();
     assert_eq!(enc[0], 1, "the seed must be a dense filter");
     out.add("tree_trigrams_row", "dense", enc);
+    out.add("tree_trigrams_row", "saturated", vec![3u8]);
+    out.add(
+        "tree_trigrams_row",
+        "patch",
+        sparse.patch_on(&leep_core::Hash([1; 32]), &Bloom::default()),
+    );
 
     out.add("trigram_codec", "rust", text);
     out.add("trigram_codec", "binary", b"\xff\xfe\0abc");
