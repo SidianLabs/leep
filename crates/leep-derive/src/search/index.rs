@@ -230,7 +230,15 @@ impl Repo {
             _ => vec![self.meta().get_derived(TREE_KIND, &root).await?],
         };
         if let Some(Some(v)) = rows.first() {
-            return Ok(v.clone());
+            if let Ok(TreeRow::Patch(p)) = TreeRow::parse(v) {
+                // A patch whose keyframe was deleted (a `repair drop`
+                // racing a derivation) is derived again, below.
+                if self.keyframe_rows(&[p.base]).await?.contains_key(&p.base) {
+                    return Ok(v.clone());
+                }
+            } else {
+                return Ok(v.clone());
+            }
         }
         let pred = match (pred, rows.get(1)) {
             (Some(p), Some(None)) => self.indexed_ancestor(root, p).await?,
@@ -333,14 +341,16 @@ impl Repo {
                     return Ok(None);
                 };
                 let keyframe = match TreeRow::parse(&row) {
-                    Ok(TreeRow::Patch(p)) => {
-                        Some(keyframes.get(&p.base).cloned().ok_or_else(|| {
-                            Error::Storage(format!(
-                                "{KEYFRAME_KIND} row of {} missing for the patch of {tree}",
-                                p.base
-                            ))
-                        })?)
-                    }
+                    Ok(TreeRow::Patch(p)) => match keyframes.get(&p.base) {
+                        Some(k) => Some(k.clone()),
+                        // Its keyframe was deleted (a `repair drop` racing
+                        // a derivation): not stored, so derived again and
+                        // overwritten.
+                        None => {
+                            tracing::debug!(%tree, base = %p.base, "patch without its keyframe");
+                            return Ok(None);
+                        }
+                    },
                     _ => None,
                 };
                 Ok(Some(StoredFilter { row, keyframe }))
@@ -633,9 +643,14 @@ impl Repo {
             }
             level = Vec::new();
             for h in lookup.drain(..) {
-                match &rows[&h] {
+                // A patch whose keyframe is gone counts as not stored: it
+                // is derived again and overwritten.
+                let row = match &rows[&h] {
+                    Some(row) => whole(row, &keyframes)?,
+                    None => None,
+                };
+                match row {
                     Some(row) => {
-                        let row = whole(row, &keyframes)?;
                         if h == root {
                             return Ok(Missing::Stored(row));
                         }
@@ -700,13 +715,13 @@ impl Repo {
             let mut absent = Vec::new();
             for t in &dir.dirs {
                 match known.get(t) {
-                    Some(row) => union.or_row(row)?,
+                    Some(row) => union.or_row(row, None)?,
                     None => absent.push(*t),
                 }
             }
             if !union.is_saturated() {
                 for row in self.filters_present(&absent, c).await? {
-                    union.or_row(&row)?;
+                    union.or_row(&row, None)?;
                 }
             }
             if !union.is_saturated() {
@@ -724,24 +739,35 @@ impl Repo {
             let filter = union.finish();
             let whole_row = Bytes::from(row_of(filter.as_ref()));
             let row = match &filter {
-                Some(f) => match preds.chain(dir.hash) {
-                    Chain::None => whole_row.clone(),
-                    Chain::On(key, base) => match f.encode_after(Some((&key, &base))) {
-                        Some(patch) => Bytes::from(patch),
-                        None => {
+                Some(f) => {
+                    let chain = preds.chain(dir.hash);
+                    let patch = match &chain {
+                        Chain::On(key, base) | Chain::Promote(key, base) => {
+                            f.encode_after(Some((key, base)))
+                        }
+                        Chain::None | Chain::Own => None,
+                    };
+                    match (chain, patch) {
+                        (Chain::None, _) => whole_row.clone(),
+                        (Chain::On(..), Some(patch)) => Bytes::from(patch),
+                        // The predecessor's whole row becomes its keyframe:
+                        // the same filter in its one encoding, so writing it
+                        // again changes nothing.
+                        (Chain::Promote(key, base), Some(patch)) => {
+                            writes
+                                .push(KEYFRAME_KIND, key, Bytes::from(base.encode()))
+                                .await?;
+                            Bytes::from(patch)
+                        }
+                        // Too far from the predecessor's keyframe: a new one.
+                        _ => {
                             writes
                                 .push(KEYFRAME_KIND, dir.hash, whole_row.clone())
                                 .await?;
                             Bytes::from(f.patch_on(&dir.hash, f))
                         }
-                    },
-                    Chain::Start => {
-                        writes
-                            .push(KEYFRAME_KIND, dir.hash, whole_row.clone())
-                            .await?;
-                        Bytes::from(f.patch_on(&dir.hash, f))
                     }
-                },
+                }
                 None => whole_row.clone(),
             };
             known.insert(dir.hash, whole_row.clone());
@@ -755,7 +781,8 @@ impl Repo {
     }
 
     /// Whole filters of stored directories, patches applied to their
-    /// keyframes.
+    /// keyframes. One whose keyframe was deleted since the walk read it is
+    /// recomputed from its tree.
     async fn filters_present(&self, keys: &[Hash], c: &Counters) -> Result<Vec<Bytes>> {
         let rows = self.rows_present(true, keys, c).await?;
         let mut bases = Vec::new();
@@ -767,7 +794,18 @@ impl Repo {
             }
         }
         let keyframes = self.keyframe_rows(&bases).await?;
-        rows.iter().map(|row| whole(row, &keyframes)).collect()
+        let mut out = Vec::with_capacity(rows.len());
+        let mut memo = None;
+        for (key, row) in keys.iter().zip(&rows) {
+            out.push(match whole(row, &keyframes)? {
+                Some(w) => w,
+                None => {
+                    let memo = memo.get_or_insert_with(TreeRowMemo::new);
+                    self.recompute_tree_row(*key, memo).await?
+                }
+            });
+        }
+        Ok(out)
     }
 
     /// Rows of `keys`, filters if `tree` else blob rows, in order: from a
@@ -919,13 +957,18 @@ impl Drop for Flight<'_> {
 }
 
 /// A stored row as the whole filter it stands for: a patch applied to its
-/// keyframe, the others as they are.
-fn whole(row: &Bytes, keyframes: &HashMap<Hash, Bytes>) -> Result<Bytes> {
+/// keyframe, the others as they are. `None` for a patch whose keyframe is
+/// not stored; a keyframe that is there but not a whole filter, or that the
+/// patch does not fit, is corrupt.
+fn whole(row: &Bytes, keyframes: &HashMap<Hash, Bytes>) -> Result<Option<Bytes>> {
     let TreeRow::Patch(p) = TreeRow::parse(row)? else {
-        return Ok(row.clone());
+        return Ok(Some(row.clone()));
     };
-    let f = Bloom::of_row(row, keyframes.get(&p.base).map(|k| &k[..]))?;
-    Ok(Bytes::from(row_of(f.as_ref())))
+    let Some(k) = keyframes.get(&p.base) else {
+        return Ok(None);
+    };
+    let f = Bloom::of_row(row, Some(k))?;
+    Ok(Some(Bytes::from(row_of(f.as_ref()))))
 }
 
 /// What a derivation knows of the predecessors of the directories it
@@ -957,23 +1000,31 @@ enum Chain {
     /// A patch on this keyframe if the keyframe rule allows, else a new
     /// keyframe.
     On(Hash, Bloom),
-    /// A new keyframe: the predecessor's row is whole, not on a keyframe.
-    Start,
+    /// The predecessor's row is whole: it becomes a keyframe and the
+    /// directory a patch on it if the keyframe rule allows, else the
+    /// directory starts a new keyframe.
+    Promote(Hash, Bloom),
+    /// A new keyframe of the directory's own.
+    Own,
 }
 
 impl Preds {
     fn chain(&self, dir: Hash) -> Chain {
-        let Some(row) = self.of.get(&dir).and_then(|p| self.rows.get(p)) else {
+        let Some((&pred, row)) = self.of.get(&dir).and_then(|p| Some((p, self.rows.get(p)?)))
+        else {
             return Chain::None;
         };
         match TreeRow::parse(row) {
-            Ok(TreeRow::Keyframe(_)) => Chain::Start,
+            Ok(TreeRow::Keyframe(k)) => match Bloom::decode(k) {
+                Ok(bits) => Chain::Promote(pred, bits),
+                Err(_) => Chain::Own,
+            },
             Ok(TreeRow::Patch(p)) => {
                 match self.keyframes.get(&p.base).map(|k| Bloom::decode(k)) {
                     Some(Ok(bits)) => Chain::On(p.base, bits),
                     // A damaged keyframe is for verify to find; this
                     // directory starts a new one.
-                    Some(Err(_)) => Chain::Start,
+                    Some(Err(_)) => Chain::Own,
                     None => Chain::None,
                 }
             }
@@ -1202,7 +1253,7 @@ impl Repo {
             for (_, entry) in top.entries.by_ref() {
                 match entry {
                     TreeEntry::Dir { tree } => match memo.rows.get(&tree) {
-                        Some(row) => top.union.or_row(row)?,
+                        Some(row) => top.union.or_row(row, None)?,
                         None => {
                             missing = Some(tree);
                             break;
@@ -1234,7 +1285,7 @@ impl Repo {
             let row = Bytes::from(row_of(done.union.finish().as_ref()));
             memo.insert(done.hash, row.clone());
             match stack.last_mut() {
-                Some(parent) => parent.union.or_row(&row)?,
+                Some(parent) => parent.union.or_row(&row, None)?,
                 None => return Ok(row),
             }
         }

@@ -48,15 +48,25 @@ pub fn tree_trigrams_row(data: &[u8]) {
     // Any row parses or is rejected; a patch applies to a keyframe or is
     // rejected, and probes as it decodes.
     let empty = Bloom::default().encode();
+    let codes: Vec<u32> = data
+        .windows(3)
+        .take(16)
+        .map(|w| u32::from(w[0]) << 16 | u32::from(w[1]) << 8 | u32::from(w[2]))
+        .collect();
+    // A keyframe with some of the probed codes: patches on it both add and
+    // remove at probed positions.
+    let mut some = Bloom::default();
+    codes.iter().step_by(2).for_each(|&c| some.insert(c));
     if let Ok(TreeRow::Patch(_)) = TreeRow::parse(data) {
-        if let Ok(Some(patched)) = Bloom::of_row(data, Some(&empty)) {
-            let codes: Vec<u32> = (0..16u32).map(|i| i.wrapping_mul(0x9e37)).collect();
-            let probe = Probe::new(codes.clone());
-            let present = probe
-                .tree(data, Some(&empty))
-                .expect("a patch that applies must probe");
-            for c in codes {
-                assert_eq!(present.has(c), patched.contains(c), "code {c:#x}");
+        for keyframe in [empty.clone(), some.encode()] {
+            if let Ok(Some(patched)) = Bloom::of_row(data, Some(&keyframe)) {
+                let probe = Probe::new(codes.clone());
+                let present = probe
+                    .tree(data, Some(&keyframe))
+                    .expect("a patch that applies must probe");
+                for &c in &codes {
+                    assert_eq!(present.has(c), patched.contains(c), "code {c:#x}");
+                }
             }
         }
         return;
@@ -64,11 +74,17 @@ pub fn tree_trigrams_row(data: &[u8]) {
     let Ok(bloom) = Bloom::decode(data) else {
         return;
     };
-    // The same filter as a patch on the empty filter decodes and probes
-    // the same.
-    let patch = bloom.patch_on(&leep_core::Hash([0; 32]), &Bloom::default());
+    // The same filter as a patch on a keyframe that has half the probed
+    // codes (adds and removes), or those and all of this filter when the
+    // input's length is even (removes only), decodes and probes the same.
+    let mut keyframe = some.clone();
+    if data.len().is_multiple_of(2) {
+        keyframe.or_encoded(data).unwrap();
+    }
+    let key = keyframe.encode();
+    let patch = bloom.patch_on(&leep_core::Hash([0; 32]), &keyframe);
     assert_eq!(
-        Bloom::of_row(&patch, Some(&empty)).unwrap().as_ref(),
+        Bloom::of_row(&patch, Some(&key)).unwrap().as_ref(),
         Some(&bloom)
     );
     // Either form is accepted, but the encoder is canonical and lossless.
@@ -78,16 +94,11 @@ pub fn tree_trigrams_row(data: &[u8]) {
     assert_eq!(again.set_bits(), bloom.set_bits());
     assert!(bloom.set_bits() <= BLOOM_BITS);
 
-    let codes: Vec<u32> = data
-        .windows(3)
-        .take(16)
-        .map(|w| u32::from(w[0]) << 16 | u32::from(w[1]) << 8 | u32::from(w[2]))
-        .collect();
     let probe = Probe::new(codes.clone());
     let present = probe
         .tree(data, None)
         .expect("a row that decodes must probe");
-    let patched = probe.tree(&patch, Some(&empty)).unwrap();
+    let patched = probe.tree(&patch, Some(&key)).unwrap();
     for c in codes {
         assert_eq!(present.has(c), bloom.contains(c), "code {c:#x}");
         assert_eq!(patched.has(c), bloom.contains(c), "patched code {c:#x}");

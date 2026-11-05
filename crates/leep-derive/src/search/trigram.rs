@@ -163,6 +163,8 @@ const HASHES: u32 = 3;
 const DENSE: u8 = 1;
 const SPARSE: u8 = 2;
 const SATURATED: u8 = 3;
+/// The whole of a saturated row.
+pub const SATURATED_ROW: u8 = SATURATED;
 const PATCH: u8 = 4;
 
 /// A filter with more bits set than this (a quarter) is stored as one
@@ -492,10 +494,18 @@ impl Union {
         self.bloom.is_none()
     }
 
-    /// OR in a dense, sparse or saturated row (a patch is resolved first).
-    pub fn or_row(&mut self, row: &[u8]) -> Result<()> {
+    /// OR in a filter row: dense, sparse, saturated, or a patch, which is
+    /// applied to `keyframe` first.
+    pub fn or_row(&mut self, row: &[u8], keyframe: Option<&[u8]>) -> Result<()> {
         if row == [SATURATED] {
             self.bloom = None;
+        }
+        if let (Some(_), [PATCH, ..]) = (&self.bloom, row) {
+            match Bloom::of_row(row, keyframe)? {
+                Some(f) => self.or_words(&f),
+                None => self.bloom = None,
+            }
+            return Ok(());
         }
         match &mut self.bloom {
             Some(b) => {
@@ -506,6 +516,17 @@ impl Union {
                 Ok(())
             }
             None => Ok(()),
+        }
+    }
+
+    fn or_words(&mut self, f: &Bloom) {
+        if let Some(b) = &mut self.bloom {
+            for (w, x) in b.words.iter_mut().zip(&f.words) {
+                *w |= x;
+            }
+            if b.is_saturated() {
+                self.bloom = None;
+            }
         }
     }
 

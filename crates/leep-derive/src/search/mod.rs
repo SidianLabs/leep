@@ -753,7 +753,9 @@ impl Repo {
 
     /// The predecessor of the directory `path` of `id`'s tree for a search
     /// that must derive its filter: the directory there in the first
-    /// parent's tree, when this process holds that tree's root.
+    /// parent's tree, when this process holds that tree's root. Finding the
+    /// root costs no read; for a search under a path, the nodes on the way
+    /// down are read, from the node cache when they are there.
     async fn search_pred_at(&self, id: ChangesetId, path: &str) -> Result<Option<index::Pred>> {
         let Some(mut pred) = self.search_pred_cached(id) else {
             return Ok(None);

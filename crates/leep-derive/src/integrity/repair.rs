@@ -24,6 +24,7 @@ use crate::derived::history_pack::same_part;
 use crate::derived::wavefront::{self, Dag, Preparer, Wave, Window, OUTSIDE};
 use crate::derived::{DerivedKind, HistoryTree};
 use crate::search::index::{same_keyframe, TreeRowMemo};
+use crate::search::trigram::SATURATED_ROW;
 use crate::search::{
     BLOB_KIND as BLOB_TRIGRAMS, KEYFRAME_KIND as TREE_KEYFRAMES, TREE_KIND as TREE_TRIGRAMS,
 };
@@ -338,6 +339,24 @@ impl Rederive<'_> {
                 };
                 if same {
                     self.report(kind).matched += 1;
+                } else if kind == TREE_KEYFRAMES && expected[..] == [SATURATED_ROW] {
+                    // A keyframe is always whole, and this tree's filter is
+                    // saturated: no keyframe is right. The patches on it no
+                    // longer match their trees and are rewritten whole by
+                    // the tree-trigrams-v2 pass that follows.
+                    self.report(kind).failed += 1;
+                    self.log.push(
+                        Problem::new(
+                            "derived",
+                            "rederive_failed",
+                            format!(
+                                "the {kind} row of {key} is wrong, and its tree's filter is \
+                                 saturated, which a keyframe cannot hold; it was left as it is"
+                            ),
+                        )
+                        .kind(kind)
+                        .key(&key),
+                    );
                 } else {
                     self.report(kind).overwritten += 1;
                     self.write(kind, &key, expected).await?;

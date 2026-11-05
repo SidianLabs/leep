@@ -2131,7 +2131,8 @@ async fn patches_store_five_times_fewer_filter_bytes_than_whole_rows() {
     assert_rows_recomputed(&r, r.root_tree(head).await.unwrap(), "chain").await;
 }
 
-/// A head whose first parent the warmer skipped patches on the nearest
+/// A whole row becomes the keyframe of its successor's patch, and a head
+/// whose first parent the warmer skipped patches on the nearest indexed
 /// first-parent ancestor's keyframe instead of starting a new one.
 #[tokio::test]
 async fn a_skipped_parent_patches_on_the_nearest_indexed_ancestor() {
@@ -2140,21 +2141,32 @@ async fn a_skipped_parent_patches_on_the_nearest_indexed_ancestor() {
     r.derive_search(base).await.unwrap();
     let one = commit(&r, &[base], &[("src/a.rs", Some(b"fn alpha() { beta }\n"))]).await;
     r.derive_search(one).await.unwrap();
-    let one_root = r.root_tree(one).await.unwrap();
+    let (base_root, one_root) = (
+        r.root_tree(base).await.unwrap(),
+        r.root_tree(one).await.unwrap(),
+    );
     let row = stored(r.meta().as_ref(), TREE_KIND, &one_root)
         .await
         .unwrap();
     match TreeRow::parse(&row).unwrap() {
-        TreeRow::Patch(p) => assert_eq!(p.base, one_root, "a new keyframe"),
+        TreeRow::Patch(p) => assert_eq!(p.base, base_root, "the whole row became a keyframe"),
         other => panic!("{other:?}"),
     }
+    assert_eq!(
+        stored(r.meta().as_ref(), KEYFRAME_KIND, &base_root).await,
+        stored(r.meta().as_ref(), TREE_KIND, &base_root).await,
+        "the keyframe is the predecessor's whole row"
+    );
+    assert!(stored(r.meta().as_ref(), KEYFRAME_KIND, &one_root)
+        .await
+        .is_none());
     let two = commit(&r, &[one], &[("src/b.rs", Some(b"gamma\n"))]).await;
     let three = commit(&r, &[two], &[("src/c.rs", Some(b"delta\n"))]).await;
     r.derive_search(three).await.unwrap();
     let root = r.root_tree(three).await.unwrap();
     let row = stored(r.meta().as_ref(), TREE_KIND, &root).await.unwrap();
     match TreeRow::parse(&row).unwrap() {
-        TreeRow::Patch(p) => assert_eq!(p.base, one_root, "on the indexed ancestor"),
+        TreeRow::Patch(p) => assert_eq!(p.base, base_root, "on the ancestor's keyframe"),
         other => panic!("{other:?}"),
     }
     assert!(stored(r.meta().as_ref(), KEYFRAME_KIND, &root)
@@ -2163,4 +2175,66 @@ async fn a_skipped_parent_patches_on_the_nearest_indexed_ancestor() {
     let got = r.search(three, &SearchQuery::new("delta")).await.unwrap();
     assert_eq!(hits(&got), [("src/c.rs".into(), 1)]);
     assert_rows_recomputed(&r, root, "skipped").await;
+}
+
+/// A patch whose keyframe was deleted (a page-ordered `repair drop`
+/// racing a derivation) counts as not stored: search and `derive_search`
+/// derive it again and overwrite it, instead of failing.
+#[tokio::test]
+async fn a_patch_without_its_keyframe_is_derived_again() {
+    let mut files = Files::new();
+    for d in 0..6 {
+        for f in 0..4 {
+            let body = format!("fn d{d}_f{f}() {{ needle_{d} }}\n").into_bytes();
+            files.insert(format!("src/d{d}/f{f}.rs"), (body, FileKind::Regular));
+        }
+    }
+    for searching in [false, true] {
+        let r = repo();
+        let base = commit_files(&r, &[], &files).await;
+        r.derive_search(base).await.unwrap();
+        let mut edit = Files::new();
+        edit.insert(
+            "src/d2/f1.rs".into(),
+            (
+                b"fn changed() { needle_2 extra }\n".to_vec(),
+                FileKind::Regular,
+            ),
+        );
+        let head = commit_files(&r, &[base], &edit).await;
+        r.derive_search(head).await.unwrap();
+        let root = r.root_tree(head).await.unwrap();
+        let row = stored(r.meta().as_ref(), TREE_KIND, &root).await.unwrap();
+        let TreeRow::Patch(p) = TreeRow::parse(&row).unwrap() else {
+            panic!("a patch")
+        };
+        let gone = r
+            .meta()
+            .delete_derived_keys(&[KEYFRAME_KIND], &[p.base])
+            .await
+            .unwrap();
+        assert_eq!(gone, 1);
+        // A new process: nothing cached.
+        let fresh = Repo::new(r.blobs().clone(), r.meta().clone());
+        if searching {
+            let got = fresh
+                .search(head, &SearchQuery::new("needle_2 extra"))
+                .await
+                .unwrap();
+            assert_eq!(hits(&got), [("src/d2/f1.rs".into(), 1)]);
+        } else {
+            fresh.derive_search(head).await.unwrap();
+        }
+        // A search without the parent at hand rewrites it whole; the
+        // warmer's derivation patches it again, its keyframe written first.
+        let row = stored(r.meta().as_ref(), TREE_KIND, &root).await.unwrap();
+        if searching {
+            assert!(
+                matches!(TreeRow::parse(&row).unwrap(), TreeRow::Keyframe(_)),
+                "rewritten whole"
+            );
+        }
+        assert_closed(&r, root, "rederived").await;
+        assert_rows_recomputed(&r, root, "rederived").await;
+    }
 }
