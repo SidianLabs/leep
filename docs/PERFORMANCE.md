@@ -221,7 +221,8 @@ What the numbers say:
 
 From [research/search-cost.md](research/search-cost.md), fixes 2 and 3.
 Probing a row now stops once the requirement is false, and each `Repo`
-caches the `tree-trigrams-v1` rows its searches read from the store. Same
+caches the `tree-trigrams-v1` rows its searches read from the store (now
+`tree-trigrams-v2` and its keyframes). Same
 bench, indexed cases only, run one after another on the three commits on a
 4-vCPU host that was also running another build (load 4 to 8), so
 differences under about 15% are noise and the absolute numbers are slower
@@ -250,6 +251,62 @@ than the table above:
   then 20 001. Every search on `main` pays the first number. The rows left
   are blob rows and the changeset's root tree. On Postgres the filters
   were 36.6 of the 45 MB a swarm search read.
+
+### Directory filters as patches (ADR 0094)
+
+`tree-trigrams-v1` wrote a whole filter, up to 64 KiB, for every directory
+on a land's changed paths; `tree-trigrams-v2` writes a patch on a keyframe,
+or one byte for a saturated filter. Postgres 16 on localhost
+(`synchronous_commit=on`, `shared_buffers=1GB`), release builds of
+`4c6d794` (v1) and of this change (v2), filesystem blobs, server defaults
+(`--indexing local`, search warming on). Leep's own history imported
+(`leep-git import --rev 4c6d794`: 221 commits, 738 files, 10.6 MB at the
+head), then one land a second through the CLI (`leep commit` + `leep land`
+on `main`, each appending one line to each named file), so the warmer
+derived every head. A fresh database per version; sizes after the derived
+table stopped changing, `pg_database_size` after a `CHECKPOINT`, and the
+logical bytes of `derived` rows by kind.
+
+| Batch | DB growth per land, v1 | v2 | Filter bytes per land, v1 | v2 (rows + keyframes) |
+|---|---|---|---|---|
+| 40 × `README.md` (depth 1) | 75,162 | 7,373 | 65,569 | 33 + 0 |
+| 40 × `docs/ARCHITECTURE.md` (2) | 148,480 | 16,589 | 131,138 | 301 + 1,639 |
+| 40 × `docs/adr/0014-code-search.md` (3) | 201,728 | 10,035 | 184,158 | 1,042 + 1,320 |
+| 40 × `crates/leep-cli/src/main.rs` (4) | 248,627 | 10,445 | 234,243 | 1,779 + 4,201 |
+| 40 × `crates/leep-derive/src/search/trigram.rs` (5) | 318,464 | 19,456 | 292,897 | 2,820 + 4,035 |
+| **the 200 single-file lands** | **198,492** | **12,780** | **181,601** | **1,195 + 2,239** |
+| **200 three-file lands** (`README.md`, `crates/leep-server/src/main.rs`, `crates/leep-derive/src/search/trigram.rs`) | **458,957** | **44,278** | **411,628** | **12,720 + 579** |
+
+- Rows per land are unchanged (one per directory on the changed paths). At
+  the end v2 held 4 dense, 97 sparse, 401 saturated and 1,600 patch rows
+  (1.7 KB on average), and about a dozen keyframes.
+- The root and `crates/` are saturated: more than a quarter of their bits
+  are set, so they cost one byte a version. The rows that were 30 to 53 KB
+  sparse in v1 are now patches.
+- What a v2 land still adds is mostly the new blob's `blob-trigrams-v1` row
+  (4.7 KB a single-file land here, 21 KB for three files), the
+  non-search kinds (about 1.5 KB) and Postgres's page and index overhead.
+- Search, on the final head, 20 literal queries (rare and common tokens,
+  one found nowhere), same matches and pruning in both versions except the
+  absent token (v1 pruned at the root, v2, whose root is saturated, at its
+  eight children):
+
+| | v1 | v2 |
+|---|---|---|
+| warm, 10 rounds: p50 / p99 | 18.2 / 43.4 ms | 18.9 / 41.1 ms |
+| server restarted before each query: p50 / p99 | 40.1 / 94.0 ms | 41.8 / 77.2 ms |
+| bytes Postgres sent per search, restarted server (mean / max) | 2.50 / 3.62 MB | 2.53 / 3.57 MB |
+
+  Bytes were counted by a proxy between the server and Postgres. A warm
+  search reads nothing from Postgres in either version. A cold one reads
+  about as much: most of it is blob rows, and a revision's filters are no
+  smaller to read, only to keep; a patch costs one more batched read for
+  its keyframe when that is not cached.
+- In the derivation tests, a land three directories deep still makes 11
+  metadata calls (`search land` in the operation budgets), and a synthetic
+  chain of 80 small lands into four directories under a dense root stores
+  24x fewer filter bytes than whole rows
+  (`patches_store_five_times_fewer_filter_bytes_than_whole_rows`).
 
 ## Verify
 

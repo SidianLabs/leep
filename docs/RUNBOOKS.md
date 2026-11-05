@@ -2367,7 +2367,8 @@ Postgres cannot write, backups fail (see [LeepBackupStale](#leepbackupstale)).
    "Upgrading") halves it, then `VACUUM FULL changesets` returns the space (each
    needs free room of about half the table while it runs).
 4. Last resort for metadata: `leep-server repair drop --kind blob-trigrams-v1
-   tree-trigrams-v1` removes the search index rows; they rebuild on demand and the
+   tree-trigrams-v2 tree-trigrams-v1` removes the search index rows (and
+   the filters an older version left); they rebuild on demand and the
    first searches are slow (`derive-search main` warms them). Take a backup first.
 - Do not delete blob files, `-wal` files of SQLite or Postgres WAL by hand, and do not
   lower `--grace` to hurry GC while agents upload. Do not use `--unsafe-no-fence`.

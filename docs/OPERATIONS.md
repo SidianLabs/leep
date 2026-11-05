@@ -167,11 +167,11 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_warm_blame_shed_total` | counter | | Blame warmer passes skipped because every `blame` read permit was taken (ADR 0083, ADR 0074). The lands wait for a later pass. Steadily rising with `leep_read_class_shed_total{class="blame"}`: the class is too small for the blame load. |
 | `leep_blame_tracked_paths` | gauge | | Files whose blames the blame warmer keeps current: those blamed in the last 30 minutes, at most `--warm-blame-paths`. |
 | `leep_warm_delay_seconds` | histogram | `group` = `history`, `log-filter`, `search` | Time from a ref move until the warmer stored that head's indexes of one group, at **1-second resolution**: the ref log records whole seconds, so every sample is an integer and 0 means the same second. Recorded only for moves the ref-log tail found, not for refs a full listing turned up. How far the indexes trail the refs; 0 or 1 when the warmer keeps up, so read it as a count of slow warms rather than a latency below a second. |
-| `leep_index_lease_held` | gauge | `kind` | 1 while this server holds the index lease of the group named by its primary kind (`history-tree-v4`, `log-filter-v1`, `tree-trigrams-v1`), `--indexing lease` only (ADR 0058). |
+| `leep_index_lease_held` | gauge | `kind` | 1 while this server holds the index lease of the group named by its primary kind (`history-tree-v4`, `log-filter-v1`, `tree-trigrams-v2`), `--indexing lease` only (ADR 0058). |
 | `leep_index_lease_acquired_total` | counter | `kind` | Index leases this server took (a new epoch). |
 | `leep_index_lease_lost_total` | counter | `kind`; `reason` = `taken`, `store` | Index leases lost: another server took it after renewals stopped (`taken`), or renewals failed until the view ran out (`store`). |
 | `leep_index_derived_total` | counter | `kind` | Changesets (heads, for search) the lease holder's passes indexed. |
-| `leep_index_rows_total` | counter | `kind` = `history-tree-v4`, `log-filter-v1`, `blob-trigrams-v1`, `tree-trigrams-v1` | Rows the background warmer derived, in any indexing mode, by the kind of row: a changeset's row for history and log filters, and both search kinds for a search warm. `leep_derive_total{kind}` less this is what queries derived inline. A warm that waited for a search deriving the same tree counts nothing. |
+| `leep_index_rows_total` | counter | `kind` = `history-tree-v4`, `log-filter-v1`, `blob-trigrams-v1`, `tree-trigrams-v2` | Rows the background warmer derived, in any indexing mode, by the kind of row: a changeset's row for history and log filters, and both search kinds for a search warm. `leep_derive_total{kind}` less this is what queries derived inline. A warm that waited for a search deriving the same tree counts nothing. |
 | `leep_index_backlog_changesets` | gauge | `kind`, `lane` = `tip` | Changesets the holder's last pass found missing. |
 | `leep_index_lag_seconds` | gauge | `kind` | Age, by the ref log's whole seconds, of the oldest ref move a pass started on and had not indexed; 0 once a pass completes. |
 | `leep_query_unindexed_scanned_total` | counter | `route` = `log`, `log_filter`, `last_change`, `blame`, `search` | Changesets (files, for search) a bounded query examined without index rows. |
@@ -1558,6 +1558,28 @@ leep-server repair drop --kind history-tree-v2              # rows left from bef
 leep-server repair drop --kind history-tree-v1              # rows left from before ADR 0027, if any
 ```
 
+**From `tree-trigrams-v1` to `tree-trigrams-v2`** (ADR 0094). The search
+index's directory filters moved to patches on keyframes. Nothing needs
+warming ahead of traffic: a new server's warmer derives v2 rows for each
+head it sees (the first one whole, later ones as patches), and a search of
+a head without them derives them as after an import (`leep-server
+derive-search main` does it ahead of time). During a rolling upgrade old
+and new servers hold different index leases (`tree-trigrams-v1` and
+`tree-trigrams-v2`), so each version derives its own rows; with
+`--indexing lease`, give each version an indexer until the old servers are
+gone. Then delete the old rows, which on a busy store are most of
+`derived`:
+
+```sh
+leep-server repair drop --kind tree-trigrams-v1 --dry-run   # count the old rows
+leep-server repair drop --kind tree-trigrams-v1             # delete them once no old server runs
+```
+
+`upgrade-index --drop-retired --old-servers-stopped` drops them with the
+other retired kinds. As with any large drop, autovacuum makes the space
+reusable and `VACUUM FULL derived` (or `pg_repack`) returns it to the
+operating system.
+
 **From `history-tree-v3` to `history-tree-v4` on a large store** (ADR 0045).
 `upgrade-index` runs these steps; they are kept here to say what each costs.
 The v4 index is about a sixth of v3's size: on all of Linux, where v3 holds
@@ -1779,9 +1801,10 @@ allocators (musl, macOS, Windows) are unaffected.
   times `budget / 420 MiB`. More helps derivation of very wide histories
   and filtered logs over long ranges: `history-tree-v4` derivation re-reads
   hot directory nodes, and `log-filter-v1` merge walks reuse fingerprints.
-  Search keeps the `tree-trigrams-v1` rows it reads from the store (64 MiB
-  by default, about 1,000 dense filters), so repeated searches stop moving
-  the upper directories' filters out of the metadata store each time.
+  Search keeps the `tree-trigrams-v2` rows it reads from the store, and the
+  `tree-trigrams-keyframe-v2` rows their patches are on (64 MiB by default,
+  about 1,000 dense filters), so repeated searches stop moving the upper
+  directories' filters out of the metadata store each time.
   Less suits small containers. A small budget changes no answer, only how
   often rows are read again. RSS also holds the blob cache, request
   buffers and the derivation working set.
@@ -1942,7 +1965,7 @@ Use index leases instead (ADR 0058):
 | `off` | nothing | bounded while a lease lives |
 
 - **Leases** are rows of the `leases` table in scope `index`, one per group
-  (`history-tree-v4`, `log-filter-v1`, `tree-trigrams-v1`). Candidates take a
+  (`history-tree-v4`, `log-filter-v1`, `tree-trigrams-v2`). Candidates take a
   free lease on their 3 s renewal tick, never a live one, and release on
   shutdown; a killed holder's lease is taken 6 s after its last renewal.
   They need Postgres or SQLite (SQLite: one process, which holds every
@@ -2598,8 +2621,11 @@ their compressed bytes may differ between zstd versions, and `verify` and
 `repair` compare them uncompressed). `root_tree` and `history-tree-v4` also
 rewrite the tree nodes and history pack parts they derive, which is what
 restores a missing or damaged one. The search kinds (`blob-trigrams-v1`,
-`tree-trigrams-v1`) are rewritten for the rows that exist; use
-`derive-search REV` to build rows that do not.
+`tree-trigrams-keyframe-v2`, `tree-trigrams-v2`) are rewritten for the rows
+that exist; use `derive-search REV` to build rows that do not. A directory
+filter is compared by the filter it stands for, not its bytes (a patch is
+applied to its keyframe first, ADR 0094), and one that differs is rewritten
+whole.
 
 A running server keeps decoded skiplists and search directory filters in
 memory once read. A correct row never changes, so the copies never go
@@ -2627,27 +2653,32 @@ long history the first query derives the whole history. Warm them with
 `repair rederive` instead of waiting for a user. Dropping `history-tree-v4` also
 drops `history-node-v4`, because only it refers to those rows. `drop` also
 accepts the retired `history-tree-v1`, `history-tree-v2` and `history-tree-v3`
-(with `history-node-v1`, `history-node-v2` and `history-node-v3`) and the
-retired blame cache `blame`, which current servers no longer use; see
-[Upgrading](#upgrading).
+(with `history-node-v1`, `history-node-v2` and `history-node-v3`), the
+retired blame cache `blame` and the retired directory filters
+`tree-trigrams-v1`, which current servers no longer use; see
+[Upgrading](#upgrading). Dropping `tree-trigrams-v2` also drops
+`tree-trigrams-keyframe-v2`, whose rows only its patches read.
 
 Kinds that cannot be rederived (and so are refused by `drop` with an
 explanation and exit status 2): `signature-v1`, `review-v1` and `review-source-v1` (clients wrote
 them), `rebased-origin-v1` (written by rebase; `land`'s retry detection depends
 on it), `blob-claim-v1`, `blob-condemned-v1`, `blob-rescue-v1`, `blob-doom-v1`, `gc-mark-v1` (the GC
-fence, ADR 0012), `history-node-v4` (or `-v3`, `-v2`, `-v1`) on its own, and the ref log. The full table
+fence, ADR 0012), `history-node-v4` (or `-v3`, `-v2`, `-v1`) and
+`tree-trigrams-keyframe-v2` on their own, and the ref log. The full table
 with reasons is in ADR 0025. `blame-v2` can be dropped but not rederived: its rows
 are keyed by a hash of (changeset, path) and cannot be listed.
 
 **Restart servers after a repair of the search kinds.** A running server
-keeps the `tree-trigrams-v1` rows its searches read in memory (see
+keeps the `tree-trigrams-v2` and `tree-trigrams-keyframe-v2` rows its
+searches read in memory (see
 [Connection pool and caches](#connection-pool-and-caches)). `repair rederive`
-overwrites a damaged row in place and `repair drop --kind tree-trigrams-v1`
+overwrites a damaged row in place and `repair drop --kind tree-trigrams-v2`
 deletes them, but both run in their own process, so a server that cached a
-damaged row before the repair keeps using it until it restarts. Rows are keyed
-by content, so a correct row is never stale; only a damaged one outlives the
-repair this way. After repairing or dropping `tree-trigrams-v1`, restart each
-`leep-server` (a rolling restart is enough).
+damaged row before the repair keeps using it until it restarts. A correct row
+is never stale (a `tree-trigrams-v2` row rewritten by another derivation
+stands for the same filter); only a damaged one outlives the repair this way.
+After repairing or dropping `tree-trigrams-v2`, restart each `leep-server` (a
+rolling restart is enough).
 
 Everything `repair` changes is derived data. If a repair makes things worse
 (it cannot, short of a bug), `repair drop` of the same kind returns the store
@@ -3126,9 +3157,9 @@ interval is measured from the end of one run to the start of the next.
 
 ## Code search index
 
-`GET /v1/search/{rev}` (`leep search`, the `leep_search` MCP tool) uses two
-derived kinds, `blob-trigrams-v1` and `tree-trigrams-v1` (ADR 0014). They are
-built on demand: the first search of a tree that was never indexed derives all
+`GET /v1/search/{rev}` (`leep search`, the `leep_search` MCP tool) uses the
+derived kinds `blob-trigrams-v1` and `tree-trigrams-v2`, with
+`tree-trigrams-keyframe-v2` (ADR 0014, ADR 0094). They are built on demand: the first search of a tree that was never indexed derives all
 of it before it can prune anything, which takes about a second per 20 000 files
 (35 MiB) on in-memory stores and longer against real stores. After an import,
 or before an agent swarm starts, warm a revision:
@@ -3145,5 +3176,10 @@ required trigram (`.*`, a pattern shorter than three bytes) derives nothing and
 scans. Rows are never deleted and take about 30% of the size of the indexed text
 for source code (up to about 100% for random text) plus at most 64 KiB per
 directory; they live in the `derived` table, so size the metadata store for them.
+A head the warmer derives after its first parent writes, for each directory on
+the changed paths, a patch on the keyframe its predecessor's row is on: a few
+hundred bytes to a few KB, and a new keyframe (up to 64 KiB) every few dozen
+lands of that directory. A filter with more than a quarter of its bits set is
+stored as one byte and prunes nothing (ADR 0094).
 Searches are bounded by the 1000-match cap and a 256 MiB scan budget per request
 and by `--request-timeout`.
