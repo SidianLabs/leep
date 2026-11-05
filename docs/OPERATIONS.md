@@ -1567,7 +1567,8 @@ derive-search main` does it ahead of time). During a rolling upgrade old
 and new servers hold different index leases (`tree-trigrams-v1` and
 `tree-trigrams-v2`), so each version derives its own rows; with
 `--indexing lease`, give each version an indexer until the old servers are
-gone. Then delete the old rows, which on a busy store are most of
+gone. `--index-kinds tree-trigrams-v1` on a new server still means
+the search group, with a deprecation warning; write `search` instead. Then delete the old rows, which on a busy store are most of
 `derived`:
 
 ```sh

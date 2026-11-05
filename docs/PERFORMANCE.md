@@ -269,17 +269,18 @@ logical bytes of `derived` rows by kind.
 
 | Batch | DB growth per land, v1 | v2 | Filter bytes per land, v1 | v2 (rows + keyframes) |
 |---|---|---|---|---|
-| 40 × `README.md` (depth 1) | 75,162 | 7,373 | 65,569 | 33 + 0 |
-| 40 × `docs/ARCHITECTURE.md` (2) | 148,480 | 16,589 | 131,138 | 301 + 1,639 |
-| 40 × `docs/adr/0014-code-search.md` (3) | 201,728 | 10,035 | 184,158 | 1,042 + 1,320 |
-| 40 × `crates/leep-cli/src/main.rs` (4) | 248,627 | 10,445 | 234,243 | 1,779 + 4,201 |
-| 40 × `crates/leep-derive/src/search/trigram.rs` (5) | 318,464 | 19,456 | 292,897 | 2,820 + 4,035 |
-| **the 200 single-file lands** | **198,492** | **12,780** | **181,601** | **1,195 + 2,239** |
-| **200 three-file lands** (`README.md`, `crates/leep-server/src/main.rs`, `crates/leep-derive/src/search/trigram.rs`) | **458,957** | **44,278** | **411,628** | **12,720 + 579** |
+| 40 × `README.md` (depth 1) | 75,162 | 6,963 | 65,569 | 33 + 0 |
+| 40 × `docs/ARCHITECTURE.md` (2) | 148,480 | 18,637 | 131,138 | 314 + 1,639 |
+| 40 × `docs/adr/0014-code-search.md` (3) | 201,728 | 9,626 | 184,158 | 1,086 + 1,320 |
+| 40 × `crates/leep-cli/src/main.rs` (4) | 248,627 | 10,854 | 234,243 | 1,920 + 4,200 |
+| 40 × `crates/leep-derive/src/search/trigram.rs` (5) | 318,464 | 18,432 | 292,897 | 3,002 + 4,034 |
+| **the 200 single-file lands** | **198,492** | **12,902** | **181,601** | **1,271 + 2,239** |
+| **200 three-file lands** (`README.md`, `crates/leep-server/src/main.rs`, `crates/leep-derive/src/search/trigram.rs`) | **458,957** | **44,319** | **411,628** | **12,956 + 579** |
 
 - Rows per land are unchanged (one per directory on the changed paths). At
   the end v2 held 4 dense, 97 sparse, 401 saturated and 1,600 patch rows
-  (1.7 KB on average), and about a dozen keyframes.
+  (1.7 KB on average), and 10 keyframes (563 KB), most of them whole rows
+  from the import's head promoted when a land first patched on them.
 - The root and `crates/` are saturated: more than a quarter of their bits
   are set, so they cost one byte a version. The rows that were 30 to 53 KB
   sparse in v1 are now patches.
@@ -293,15 +294,20 @@ logical bytes of `derived` rows by kind.
 
 | | v1 | v2 |
 |---|---|---|
-| warm, 10 rounds: p50 / p99 | 18.2 / 43.4 ms | 18.9 / 41.1 ms |
-| server restarted before each query: p50 / p99 | 40.1 / 94.0 ms | 41.8 / 77.2 ms |
-| bytes Postgres sent per search, restarted server (mean / max) | 2.50 / 3.62 MB | 2.53 / 3.57 MB |
+| warm, 10 rounds: p50 / p99 | 18.2 / 43.4 ms | 21.0 / 45.5 ms |
+| server restarted before each query: p50 / p99 | 40.1 / 94.0 ms | 46.6 / 76.5 ms |
+| bytes Postgres sent per search, restarted server (mean / max) | 2.50 / 3.62 MB | 2.46 / 3.57 MB |
 
-  Bytes were counted by a proxy between the server and Postgres. A warm
+  Latency differences are within the noise of the shared 4-core host
+  (v1 and v2 ran at different times). Bytes were counted by a proxy
+  between the server and Postgres. A warm
   search reads nothing from Postgres in either version. A cold one reads
   about as much: most of it is blob rows, and a revision's filters are no
   smaller to read, only to keep; a patch costs one more batched read for
   its keyframe when that is not cached.
+- Only heads the warmer derives after their first parent are patched. A
+  fleet that searches heads before they are warmed, on servers that do not
+  hold the parent's tree, derives their rows whole, as v1 did.
 - In the derivation tests, a land three directories deep still makes 11
   metadata calls (`search land` in the operation budgets), and a synthetic
   chain of 80 small lands into four directories under a dense root stores

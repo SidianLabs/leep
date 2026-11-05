@@ -228,9 +228,11 @@ parent's tree, or in the nearest of the next 8 first-parent ancestors whose
 tree has a row) is stored whole or saturated. With one whose row is a patch
 on `K`, it is stored as a patch on `K` if `p² <= 512 × w`, `p` being the
 patch's length and `w` the length of the directory's own dense or sparse
-encoding; otherwise, or if the predecessor's row is whole, it starts a new
-keyframe: its whole filter as its `tree-trigrams-keyframe-v2` row, written
-first, and the empty patch on itself. A saturated predecessor gives a whole
+encoding. With one whose row is whole (`0x01` or `0x02`), the same rule
+decides a patch on the predecessor, whose `tree-trigrams-keyframe-v2` row,
+its filter's dense or sparse encoding, is written first. Otherwise it
+starts a new keyframe: its whole filter as its `tree-trigrams-keyframe-v2`
+row, written first, and the empty patch on itself. A saturated predecessor gives a whole
 row. Two derivations from different predecessors may store different rows
 for one tree; both stand for the same filter, which is what `verify`
 compares.

@@ -73,8 +73,10 @@ directory whose filter is not saturated:
 - predecessor's row a patch on keyframe `K`: write a patch on `K` when
   `patch² <= 512 × whole` in bytes, `whole` being the directory's own whole
   encoding; otherwise start a new keyframe;
-- predecessor's row whole (derived without a predecessor): start a new
-  keyframe;
+- predecessor's row whole (derived without a predecessor): that row
+  becomes the predecessor's keyframe (the same filter in its one encoding,
+  so writing it is idempotent) and the directory a patch on it, under the
+  same rule; otherwise start a new keyframe;
 - no predecessor, or a saturated one: write the whole filter.
 
 Starting a keyframe writes the directory's whole filter as its
@@ -87,10 +89,21 @@ new positions of about two bytes each to each directory on its path, so
 `d` is about 256 and the constant is `2d = 512`: a patch may grow to about
 5.8 KB on a dense 64 KiB filter before a new keyframe.
 
-A first revision, a search on a path, and a bounded query (ADR 0058) derive
-without a predecessor and write whole rows, as v1 did. A search that must
-derive a head's filters uses the first parent's tree when this process
-already holds it, which costs no read.
+A first revision and a bounded query (ADR 0058) derive without a
+predecessor and write whole rows, as v1 did. A search that must derive a
+head's filters uses the first parent's tree when this process already holds
+its root, which costs no read (for a search under a path, the nodes on the
+way down that tree are read, usually from the node cache); otherwise it
+writes whole rows too, so a fleet that searches heads before the warmer
+reaches them, on servers that do not hold the parent, stores v1-sized rows
+for those heads.
+
+**Dangling patches.** A page-ordered `repair drop --kind tree-trigrams-v2`
+racing a derivation can delete a fresh keyframe and leave the patch on it.
+Search and derivation treat a patch whose keyframe is not stored as a row
+not stored: it is derived again and overwritten. Only a keyframe that is
+there but not whole, or that the patch does not fit, is an error, for
+`verify` to report.
 
 **Reading.** A search reads a directory's row as before and, for a patch,
 its keyframe through the same filter cache (`--derive-cache-bytes`): the keyframes
@@ -122,25 +135,26 @@ patches"):
 
 | Lands | Database growth per land, v1 → v2 | Filter bytes per land (v2: rows and keyframes) |
 |---|---|---|
-| 40 × `README.md` (depth 1) | 75.2 KB → 7.4 KB | 65,569 → 33 |
-| 40 × `docs/ARCHITECTURE.md` (2) | 148.5 KB → 16.6 KB | 131,138 → 1,940 |
-| 40 × `docs/adr/0014-code-search.md` (3) | 201.7 KB → 10.0 KB | 184,158 → 2,362 |
-| 40 × `crates/leep-cli/src/main.rs` (4) | 248.6 KB → 10.4 KB | 234,243 → 5,980 |
-| 40 × `crates/leep-derive/src/search/trigram.rs` (5) | 318.5 KB → 19.5 KB | 292,897 → 6,855 |
-| **200 single-file lands, depths 1 to 5** | **198.5 KB → 12.8 KB** (15.5x) | **181,601 → 3,434** (53x) |
-| **200 three-file lands** | **459.0 KB → 44.3 KB** (10.4x) | **411,628 → 13,299** (31x) |
+| 40 × `README.md` (depth 1) | 75.2 KB → 7.0 KB | 65,569 → 33 |
+| 40 × `docs/ARCHITECTURE.md` (2) | 148.5 KB → 18.6 KB | 131,138 → 1,953 |
+| 40 × `docs/adr/0014-code-search.md` (3) | 201.7 KB → 9.6 KB | 184,158 → 2,406 |
+| 40 × `crates/leep-cli/src/main.rs` (4) | 248.6 KB → 10.9 KB | 234,243 → 6,120 |
+| 40 × `crates/leep-derive/src/search/trigram.rs` (5) | 318.5 KB → 18.4 KB | 292,897 → 7,036 |
+| **200 single-file lands, depths 1 to 5** | **198.5 KB → 12.9 KB** (15.4x) | **181,601 → 3,510** (52x) |
+| **200 three-file lands** | **459.0 KB → 44.3 KB** (10.4x) | **411,628 → 13,535** (30x) |
 
-  The root and `crates/` are saturated (one byte a version), about a dozen
-  keyframes (564 KB) were written over 400 lands, the first version of each
-  busy directory after the import among them, and the 1,600 patches average
+  The root and `crates/` are saturated (one byte a version), 10 keyframes
+  (563 KB) were written over 400 lands, most of them the whole rows the
+  import's head left, promoted when a land first patched on them, and the 1,600 patches average
   1.7 KB. What is left per land is mostly the new blob's `blob-trigrams-v1`
   row (2 to 21 KB), the other kinds (1.5 KB) and Postgres's own overhead.
 - Searches on the final head answered the same 20 queries with the same
   matches and the same pruning, apart from a token found nowhere: v1 ruled
   out the whole tree at the root, v2 at its eight children. Warm (cached)
-  latency was p50 18.2 → 18.9 ms, p99 43.4 → 41.1 ms; on a just restarted
-  server, p50 40.1 → 41.8 ms, p99 94.0 → 77.2 ms, and Postgres sent 2.50 MB
-  → 2.53 MB per search, most of it the blob rows of the files the filters
+  latency was p50 18.2 → 21.0 ms, p99 43.4 → 45.5 ms; on a just restarted
+  server, p50 40.1 → 46.6 ms, p99 94.0 → 76.5 ms (differences within the
+  noise of a shared 4-core host), and Postgres sent 2.50 MB → 2.46 MB per
+  search, most of it the blob rows of the files the filters
   could not rule out. A cold search reads about the same: the filters of one
   revision are no smaller to read, only to keep.
 

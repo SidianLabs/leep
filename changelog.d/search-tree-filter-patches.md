@@ -5,7 +5,7 @@
   than a quarter of its bits are set, instead of a whole filter of up to
   64 KiB for every directory on every land's changed paths (ADR 0094). On
   Leep's own history a warmed single-file land grows the database by
-  12.8 KB instead of 198 KB, and a three-file land by 44 KB instead of
+  12.9 KB instead of 198 KB, and a three-file land by 44 KB instead of
   459 KB. Answers are unchanged. The search index lease and
   `leep_index_rows_total` now name `tree-trigrams-v2`.
 - **Changed.** `verify` and `repair` compare directory filters by the
