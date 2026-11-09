@@ -46,8 +46,10 @@ impl Server {
     pub fn new(cfg: Config) -> Self {
         // A tool call never sleeps: a read the server refused for being busy
         // goes back to the agent with when to ask again (ADR 0060).
-        let client =
-            Client::with_token(&cfg.server, cfg.token.as_deref()).with_refusal_retries(false);
+        // Every request is a heartbeat of the agent's session (ADR 0095).
+        let client = Client::with_token(&cfg.server, cfg.token.as_deref())
+            .with_refusal_retries(false)
+            .with_session(cfg.agent_session.as_deref());
         Server {
             client,
             cfg,
