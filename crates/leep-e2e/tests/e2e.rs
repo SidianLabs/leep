@@ -2843,8 +2843,23 @@ fn a_fake_ci_loop_promotes_green_and_narrows_suspects_to_a_planted_break() {
 fn two_agents_sessions_are_visible_with_leep_who() {
     let _g = serial();
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    let server = Server::start(&Stores::sqlite(&root.join("data")), root);
+    let stores = Stores::sqlite(&tmp.path().join("data"));
+    run_two_agents_sessions(&stores, tmp.path());
+}
+
+#[test]
+fn two_agents_sessions_are_visible_with_leep_who_postgres() {
+    let _g = serial();
+    let Some(db) = PgDb::create("leep_e2e") else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let stores = Stores::with_meta(&tmp.path().join("data"), db.url.clone());
+    run_two_agents_sessions(&stores, tmp.path());
+}
+
+fn run_two_agents_sessions(stores: &Stores, root: &Path) {
+    let server = Server::start(stores, root);
     let client = Client::new(&server.url, &root.join("cache"));
     let seed = root.join("seed");
     client.ok(root, &["init", seed.to_str().unwrap()]);
@@ -2940,7 +2955,7 @@ fn two_agents_sessions_are_visible_with_leep_who() {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    assert_eq!(live, [a_key.clone()]);
+    assert_eq!(live, std::slice::from_ref(&a_key));
     let all = client.json(&a, &["who", "--all", "src/auth"]);
     let b_state = all["sessions"]
         .as_array()
