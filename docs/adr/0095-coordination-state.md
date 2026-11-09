@@ -106,7 +106,9 @@ session_beats(session_id BIGINT PRIMARY KEY, at BIGINT NOT NULL)   -- UNLOGGED o
   changeset changed it). At most 64 scope paths and 64 claims; at most 256
   touched paths, past which the deepest are folded into their directories
   (`bound_paths`), which still overlap everything below them, so a large
-  change stays visible without growing the table. "Who is working on or
+  change stays visible without growing the table. The one loss: when more
+  than 256 top-level names remain, only the first 256 in path order are
+  kept. "Who is working on or
   near X" matches a session path equal to X, a directory above X, or
   (for a directory) a path below X: one range scan on `(repo_id, path)`
   between `X/` and `X0` plus one probe per ancestor. Paths compare
@@ -147,8 +149,15 @@ in one statement on Postgres, and at most once a minute per session. The
 narrow `session_beats` table takes them, so a beat never rewrites the wide
 row; on Postgres it is `UNLOGGED`: a crash empties it, which only makes
 sessions look as old as their creation until they are heard from again.
-At most 100,000 sessions' beats are held per server; past that new keys are
-not held (counted), and their sessions only look idle sooner.
+At most 100,000 sessions' beats are held per server, and at most 2,000
+(twice the active limit) of one principal, so one token sending made-up keys
+cannot push out everyone else's beats; past either cap new keys are not held
+(`leep_session_beats_dropped_total{reason = "full" | "principal"}`), and
+their sessions only look idle sooner. Because a crash empties the Postgres
+beats table, the sweep first gives every active session that has no beat one
+at the sweep's time: a lost beat never expires a live session. Beats of
+sessions ended a day ago are deleted with their paths, so the expiry scan of
+the beats index meets only live and recently ended sessions.
 
 ### 5. Inference and lands
 - **From changesets.** After `POST /v1/changesets` stores a changeset that
@@ -161,7 +170,17 @@ not held (counted), and their sessions only look idle sooner.
   appear in `leep who` with no change. The create waits for this update
   for at most 250 ms, so the session holds the changeset before its
   creator can land it; past that the update is dropped (its transaction
-  rolls back) and counted. The answer is the same either way.
+  rolls back) and counted. The answer is the same either way. What the
+  update needs is taken from the changeset in one pass before the store
+  owns it (no copy of the changeset): past 1,024 changed paths they are
+  folded into their parent directories as they are read, and the rest of
+  the folding runs on a blocking thread inside the 250 ms, so a changeset of
+  100,000 paths costs the create no more than the bound (a test checks it).
+  A path with a control character is cut to its last clean directory, or
+  dropped, before it is stored: paths are agent-written text too.
+- **Any ref.** A land onto any ref (a `review/*` ref included) ends the
+  session whose head it landed; the agent's next commit under the same key
+  revives it, fresh.
 - **On land.** After a land answers `landed`, in a task of its own with a
   10-second timeout (as ADR 0086 closes requests), the server ends as
   `landed` the session of the submitted changeset's creator (else the land's
@@ -204,6 +223,15 @@ instructions. They never appear in tool descriptions or server-written
 hints. `agent.prompt` is never copied into a session. There are no read
 ACLs yet: any read token of the server lists every session, as it can read
 every changeset. Per-team visibility needs M7 identity and is not offered.
+Without a tokens file every client is the principal `anonymous`: all of them
+share its 1,000-session cap and its 2,000 held beats, and any client can end
+any session. Run a tokens file where agents should not interfere.
+
+Paths, session keys and task keys are agent-written as well. The MCP tools
+print only what the server vouches for outside the fence (id, principal,
+state and counts) and put keys, task keys and paths in the fenced rows; the
+CLI prints paths, task keys and models quoted and escaped, so no newline or
+escape sequence reaches a terminal or a tool result as text of its own.
 
 ### 8. Clients
 - CLI: `leep session start|update|end|show` and `leep who [PATH]`. The key
@@ -231,11 +259,25 @@ about 20 touched paths per session:
   `agent.session`, after the answer.
 - Listing: one range scan plus one probe per ancestor, then one read of the
   page's paths.
-- Sweep: once a minute per server, a scan of active sessions joined to
-  their beats, and bounded deletes.
+- Sweep: once a minute per server, bounded steps: a backfill of missing
+  beats (an anti-join over active sessions, empty unless a crash emptied
+  the table), a range scan of the beats index below the expiry cutoff, and
+  bounded deletes.
+- Declared paths are at most 256 bytes, so a session row and its at most
+  384 paths stay under about 100 KB in a listing, and a 500-entry page
+  under about 50 MB in the worst case.
 - Size: about 2 million `session_paths` rows; a few hundred MB with indexes.
 At 1,000 agents each of these is under 10 operations a second. None of it
-is on the land path. Backups (ADR 0026) leave the three tables out, as they
+is on the land path's statements, with one caveat on SQLite: it has a single
+writer, so each session upsert is a write transaction serialised with lands
+and other writes. It can delay a land, never change its answer. The sweep
+reads before each of its writes, so an idle sweep takes no write lock, and
+beats are written at most 500 per transaction.
+
+The per-principal cap is checked by a count inside the upsert's
+transaction, which does not lock other sessions: concurrent first upserts
+of one principal can overshoot it by the number in flight. It bounds a
+runaway token, not an exact quota. Backups (ADR 0026) leave the three tables out, as they
 do leases, and a restore clears them: they describe the live agents of the
 old store, not its history.
 
@@ -261,6 +303,11 @@ pack, review and inbox MCP tools, notes, content snapshots (a session head as
 a GC root), symbols, native review and issues. `visibility = 'private'`,
 `issue_id` and Git-push inference (`origin = 'git'`) come with the features
 that need them, as optional fields.
+
+Follow-up: the fuzz target's `JSON_TYPES` list (`leep-fuzz-targets`) does not
+include the session types, as it does not include the review request types:
+its order is part of the input format, so appending re-indexes the seed
+corpora. Adding both families, with a corpus rebuild, is a separate change.
 
 ## Alternatives considered
 - **Sessions in `MetaStore`.** Every backend and wrapper would grow
