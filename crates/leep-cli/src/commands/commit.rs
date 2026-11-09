@@ -59,10 +59,18 @@ fn author(ctx: &Ctx, args: &CommitArgs) -> Result<String> {
     snapshot::author(ctx, args.author.as_deref())
 }
 
-fn extra(args: &CommitArgs) -> BTreeMap<String, String> {
+/// The `agent.*` keys of the commit. Without `--agent-session` (or
+/// `LEEP_AGENT_SESSION`), the session `leep session start` made here, so
+/// the server joins the changeset to it (ADR 0095).
+fn extra(ctx: &Ctx, args: &CommitArgs) -> BTreeMap<String, String> {
+    let session = args
+        .agent_session
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| ctx.wc.state.session.clone());
     agent_extra(
         &args.agent_model,
-        &args.agent_session,
+        &session,
         &args.agent_prompt,
         &args.agent_tests,
     )
@@ -149,7 +157,7 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
 
     let mut parents: Vec<_> = ctx.wc.state.base.into_iter().collect();
     parents.extend(merge.as_ref().map(|m| m.other));
-    let mut extra = extra(args);
+    let mut extra = extra(ctx, args);
     if let Some(p) = &pick {
         // Same provenance a clean run records (the server's rebase for a
         // cherry-pick, the inverse changeset for a revert).

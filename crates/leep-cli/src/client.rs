@@ -70,6 +70,9 @@ pub struct Client {
     /// Whether a GET refused with `Leep-Refused` is retried here, sleeping
     /// between tries, or reported at once.
     refusal_retries: bool,
+    /// The agent session sent as `Leep-Session` on every request (ADR
+    /// 0095), so the server hears from the session; shared by clones.
+    session: Arc<Mutex<Option<String>>>,
 }
 
 /// How long index-backed queries keep retrying an indexing 503, unless
@@ -384,7 +387,30 @@ impl Client {
             stale_ok: false,
             index_retry: None,
             refusal_retries: true,
+            session: Arc::default(),
         }
+    }
+
+    /// Send `Leep-Session: KEY` on every request from now on, in this
+    /// client and its clones (`None` stops): each request is then a
+    /// heartbeat of the caller's session of that key (ADR 0095). A key a
+    /// header cannot carry is not sent.
+    pub fn set_session(&self, key: Option<&str>) {
+        let key = key
+            .map(str::trim)
+            .filter(|k| !k.is_empty() && HeaderValue::from_str(k).is_ok());
+        *self.session.lock().unwrap() = key.map(str::to_string);
+    }
+
+    /// [`Client::set_session`] as a builder.
+    pub fn with_session(self, key: Option<&str>) -> Self {
+        self.set_session(key);
+        self
+    }
+
+    /// The key sent as `Leep-Session`, if any.
+    pub fn session(&self) -> Option<String> {
+        self.session.lock().unwrap().clone()
     }
 
     /// Report a GET the server refused before doing any work (`503` with
@@ -466,7 +492,11 @@ impl Client {
     }
 
     fn named(&self, req: RequestBuilder) -> RequestBuilder {
-        req.header(REQUEST_ID_HEADER, self.request_id())
+        let req = req.header(REQUEST_ID_HEADER, self.request_id());
+        match self.session() {
+            Some(k) => req.header(SESSION_HEADER, k),
+            None => req,
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -782,6 +812,26 @@ impl Client {
                 .post(self.url(&format!("/v1/review-requests/{id}/withdraw")))
                 .json(&serde_json::json!({})),
         )
+    }
+
+    /// `POST /v1/sessions` (ADR 0095).
+    pub fn declare_session(&self, req: &DeclareSessionRequest) -> Result<DeclareSessionResponse> {
+        self.json(self.http.post(self.url("/v1/sessions")).json(req))
+    }
+
+    /// `GET /v1/sessions` with `query` as its filters.
+    pub fn sessions(&self, query: &[(&str, String)]) -> Result<SessionsResponse> {
+        self.json(self.http.get(self.url("/v1/sessions")).query(query))
+    }
+
+    /// `GET /v1/sessions/{id}`.
+    pub fn session_entry(&self, id: u64) -> Result<SessionEntry> {
+        self.json(self.http.get(self.url(&format!("/v1/sessions/{id}"))))
+    }
+
+    /// `DELETE /v1/sessions/{id}`: end it as abandoned.
+    pub fn end_session(&self, id: u64) -> Result<SessionEntry> {
+        self.json(self.http.delete(self.url(&format!("/v1/sessions/{id}"))))
     }
 
     pub fn whoami(&self) -> Result<WhoAmIResponse> {
