@@ -18,6 +18,8 @@ use crate::store::{
 };
 use crate::{BlobStore, Changeset, ChangesetId, Hash, MetaStore, Result};
 
+pub use crate::coord_memory::{check_coord_contract, MemoryCoordStore};
+
 /// Unix seconds now, for blob modification times.
 fn now_secs() -> i64 {
     unix_now()
@@ -116,6 +118,8 @@ pub struct MemoryMetaStore {
     leases: Mutex<BTreeMap<LeaseKey, LeaseRow>>,
     lease_clock: LeaseClock,
     review_requests: Mutex<BTreeMap<u64, ReviewRequest>>,
+    /// Sessions (ADR 0095), handed out by `coord_store`.
+    coord: Arc<MemoryCoordStore>,
 }
 
 /// The clock land leases are judged by, in milliseconds. The system clock
@@ -367,6 +371,10 @@ impl MetaStore for MemoryMetaStore {
             }
             _ => Ok(false),
         }
+    }
+
+    fn coord_store(&self) -> Option<Arc<dyn crate::coord::CoordStore>> {
+        Some(self.coord.clone())
     }
 
     fn supports_review_requests(&self) -> bool {
