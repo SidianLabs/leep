@@ -566,6 +566,11 @@ async fn verify(store: &dyn MetaStore, stage: &Stage, d: &Data, version: u64) {
         assert!(after[0].seq > prev.seq, "{ctx}: seq continues");
     }
     check_meta_store_contract(store).await;
+    // Sessions (migration 0009) start empty and keep their contract.
+    let coord = store
+        .coord_store()
+        .expect("a current schema keeps sessions");
+    leep_core::memory::check_coord_contract(&*coord).await;
     let timing = leep_core::LeaseTiming {
         ttl: std::time::Duration::from_secs(2),
         stale_after: std::time::Duration::from_secs(2),
@@ -599,6 +604,15 @@ fn full_schema() -> BTreeSet<String> {
         "review_requests_changeset",
         "review_request_reviewers",
         "review_request_reviewers_reviewer",
+        "sessions",
+        "sessions_key",
+        "sessions_state",
+        "sessions_task",
+        "sessions_ended",
+        "session_paths",
+        "session_paths_path",
+        "session_beats",
+        "session_beats_at",
     ]
     .map(String::from)
     .into()
@@ -996,7 +1010,8 @@ async fn upgrade_from_v4_adds_land_ids() {
                 "land_ids",
                 "leases",
                 "changeset_stored_at",
-                "review_requests"
+                "review_requests",
+                "sessions"
             ],
             "{kind}"
         );
@@ -1053,7 +1068,7 @@ async fn upgrade_from_v6_adds_stored_at() {
         assert_eq!(plan.from, v6 as u64, "{kind}");
         assert_eq!(
             plan.pending.iter().map(|m| m.name).collect::<Vec<_>>(),
-            ["changeset_stored_at", "review_requests"],
+            ["changeset_stored_at", "review_requests", "sessions"],
             "{kind}"
         );
         assert!(
@@ -1134,7 +1149,7 @@ async fn upgrade_from_v7_adds_review_requests() {
         assert_eq!(plan.from, 7, "{kind}");
         assert_eq!(
             plan.pending.iter().map(|m| m.name).collect::<Vec<_>>(),
-            ["review_requests"],
+            ["review_requests", "sessions"],
             "{kind}"
         );
         db.migrate(db.compiled(), false).await.unwrap();
@@ -1185,6 +1200,97 @@ async fn upgrade_from_v7_adds_review_requests() {
         );
         assert_eq!(db.objects().await, full_schema(), "{kind}");
         drop(s);
+        db.cleanup().await;
+    }
+}
+
+/// A database at v8 upgrades to sessions (ADR 0095) beside a v8 server that
+/// keeps running: everything it wrote reads back, it keeps working on the
+/// new schema (it never names the tables), and the new tables start empty
+/// and take sessions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upgrade_from_v8_adds_sessions() {
+    use leep_core::coord::{SessionFilter, SessionOrigin, SessionUpdate};
+    use leep_core::review_request::{NewReviewRequest, ReviewRequestFilter};
+    for db in dbs("fromv8").await {
+        let kind = db.kind();
+        let d = data();
+        let old = db
+            .open(&db.compiled()[..8], SchemaMode::Migrate)
+            .await
+            .unwrap();
+        assert!(old.coord_store().is_none(), "{kind}");
+        load(&db, &STAGES[1], &d).await;
+        // A review request written by the v8 server survives the upgrade.
+        let req = old
+            .put_review_request(&NewReviewRequest {
+                changeset: d.changesets[0].id(),
+                target_ref: "main".into(),
+                requester: "ada".into(),
+                reviewers: vec!["rhea".into()],
+                message: "before the upgrade".into(),
+                created: 1_700_000_400,
+            })
+            .await
+            .unwrap();
+        let plan = db.report(db.compiled()).await;
+        assert_eq!(plan.from, 8, "{kind}");
+        assert_eq!(
+            plan.pending.iter().map(|m| m.name).collect::<Vec<_>>(),
+            ["sessions"],
+            "{kind}"
+        );
+        db.migrate(db.compiled(), false).await.unwrap();
+        let s = db
+            .open(db.compiled(), SchemaMode::RequireCurrent)
+            .await
+            .unwrap();
+        verify(&*s, &STAGES[1], &d, LATEST as u64).await;
+        let mine = ReviewRequestFilter {
+            requester: Some("ada".into()),
+            limit: 10,
+            ..Default::default()
+        };
+        assert_eq!(
+            s.list_review_requests(&mine).await.unwrap(),
+            [req],
+            "{kind}"
+        );
+        let coord = s.coord_store().expect("sessions after 0009");
+        let every = SessionFilter {
+            limit: 10,
+            ..Default::default()
+        };
+        assert!(
+            coord.list_sessions(&every).await.unwrap().is_empty(),
+            "{kind}"
+        );
+        // The v8 server still stores and moves refs on the new schema.
+        let late = old.put_changeset(&crate::tests::cs(818181)).await.unwrap();
+        let head = old.get_ref("feature/x").await.unwrap();
+        assert!(
+            old.cas_ref("feature/x", head, Some(late)).await.unwrap(),
+            "{kind}"
+        );
+        drop(old);
+        let mut u = SessionUpdate::new("ada", "s-1", SessionOrigin::Inferred, 1_700_000_500);
+        u.head = Some(late);
+        u.touch = vec!["src/a.rs".into()];
+        let (made, created) = coord.upsert_session(&u).await.unwrap();
+        assert!(created, "{kind}");
+        assert_eq!(
+            coord
+                .list_sessions(&SessionFilter {
+                    path: Some("src".into()),
+                    ..every
+                })
+                .await
+                .unwrap(),
+            [made],
+            "{kind}"
+        );
+        assert_eq!(db.objects().await, full_schema(), "{kind}");
+        drop((s, coord));
         db.cleanup().await;
     }
 }

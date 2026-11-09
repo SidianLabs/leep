@@ -210,7 +210,7 @@ impl Server {
         let mut extra = BTreeMap::new();
         for (k, arg, default) in [
             (EXTRA_AGENT_MODEL, None, &self.cfg.agent_model),
-            (EXTRA_AGENT_SESSION, None, &self.cfg.agent_session),
+            (EXTRA_AGENT_SESSION, None, &self.agent_session()),
             (
                 EXTRA_AGENT_PROMPT,
                 a.prompt.as_ref(),

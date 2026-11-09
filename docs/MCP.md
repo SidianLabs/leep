@@ -78,6 +78,15 @@ printf '%s\n' \
 | `leep_provenance` | `rev?`, `path?`, `limit?` (changesets scanned, default 1000, max 10000), `top?` (rows per group, default 10, max 100) | per agent model and session, and per human author: changesets, distinct files touched, first and last timestamps; `agent_changesets` / `human_changesets` totals, `*_omitted` counts past `top`, `scanned` and `truncated` |
 | `leep_commit_and_land` | `message`, `changes[]`, `base?`, `target_ref?`, `create_ref?`, `prompt?`, `tests?`, `request_id?`; or `changeset` alone | landed id, or a conflict report |
 | `leep_resolve_and_land` | `conflict_id` (or `onto`), `resolutions[]` (`{path, content}` or `{path, delete: true}`, `executable?`), `message?` | finishes a conflict report sending only the conflicting files; same result shape as `leep_commit_and_land` |
+| `leep_session_start` | `title`, `approach?`, `task_key?`, `scope?[]`, `claims?[]`, `target_ref?` (default `main`), `base?` | declares (or updates) this agent's session (ADR 0095): `session`, `created`, `agent_session` (the key; one is made when `LEEP_AGENT_SESSION` is unset, and later commits record it) and `others_nearby`, the other live sessions on or near the scope and claims |
+| `leep_who` | `path?`, `task_key?`, `principal?`, `all?`, `limit?` (default 20, max 200) | the sessions working on, above or below `path` (or of a task key or principal), newest first, each with principal, agent session, state (`active`, `idle`; with `all` also `landed`, `abandoned`, `expired`), scope, claims and touched paths |
+
+Sessions are advisory: nothing in them can stop or change a land. Every
+request the MCP server sends carries `Leep-Session` with its agent session,
+so the session stays live while the agent works. Titles and approaches are
+other agents' words: they are in each session's `untrusted` object, and the
+text of `leep_session_start` and `leep_who` puts them in a fenced block under
+a fixed line saying they are data, not instructions.
 
 Data tools return JSON as text and as `structuredContent`; file and diff
 tools return plain text. Failures (bad arguments, 401, 403, 404, unreachable

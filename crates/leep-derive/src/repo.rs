@@ -192,6 +192,10 @@ pub struct Repo {
     /// Files blamed lately, whose blames the blame warmer keeps current
     /// (ADR 0083); shared by clones.
     pub(crate) blame_tracker: Arc<crate::blame_warm::BlameTracker>,
+    /// Sessions (ADR 0095); `None` keeps none. Advisory: no land reads it.
+    pub(crate) coord: Option<Arc<dyn leep_core::coord::CoordStore>>,
+    /// Heartbeats held until the next flush, shared by clones.
+    pub(crate) beats: Arc<crate::sessions::BeatBuffer>,
 }
 
 /// Whether a derivation may go on writing rows: the index lease it derives
@@ -641,6 +645,7 @@ pub const MAX_DEFAULT_DERIVE_JOBS: usize = 8;
 
 impl Repo {
     pub fn new(blobs: Arc<dyn BlobStore>, meta: Arc<dyn MetaStore>) -> Self {
+        let coord = meta.coord_store();
         Repo {
             blobs,
             meta,
@@ -685,6 +690,8 @@ impl Repo {
             blame_flights: Arc::default(),
             blame_checkpoint_every: crate::blame::CHECKPOINT_EVERY,
             blame_tracker: Arc::default(),
+            coord,
+            beats: Arc::default(),
         }
     }
 

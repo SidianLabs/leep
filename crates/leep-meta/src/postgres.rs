@@ -76,6 +76,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/postgres/0008_review_requests.sql"),
         satisfied_by: &[],
     },
+    Migration {
+        version: 9,
+        name: "sessions",
+        sql: include_str!("../migrations/postgres/0009_sessions.sql"),
+        satisfied_by: &[],
+    },
 ];
 
 /// Every table a bulk load fills, for [`PostgresMetaStore::analyze`].
@@ -136,6 +142,8 @@ pub struct PostgresMetaStore {
     pub(crate) has_stored_at: bool,
     /// Whether the schema has the review request tables (ADR 0086).
     pub(crate) has_review_requests: bool,
+    /// Sessions (ADR 0095), when the schema has their tables.
+    pub(crate) coord: Option<std::sync::Arc<dyn leep_core::coord::CoordStore>>,
     /// Whether the schema has `store_features` (ADR 0055).
     pub(crate) has_features: bool,
     /// Tops the pools up to their warm floor (ADR 0084); `None` without
@@ -827,6 +835,13 @@ impl PostgresMetaStore {
     }
 
     fn with_pool(pool: PgPool, lease_pool: PgPool, migrations: &[Migration]) -> Self {
+        let coord = migrations
+            .iter()
+            .any(|m| m.version >= crate::coord::SESSIONS_SCHEMA_VERSION)
+            .then(|| {
+                std::sync::Arc::new(crate::coord::PgCoordStore { pool: pool.clone() })
+                    as std::sync::Arc<dyn leep_core::coord::CoordStore>
+            });
         Self {
             pool,
             land_pool: None,
@@ -845,6 +860,7 @@ impl PostgresMetaStore {
             has_review_requests: migrations
                 .iter()
                 .any(|m| m.version >= crate::review_requests::REVIEW_REQUESTS_SCHEMA_VERSION),
+            coord,
             keeper: None,
         }
     }
@@ -1260,6 +1276,10 @@ impl MetaStore for PostgresMetaStore {
             .map_err(|e| log_insert_error(name, e))?;
         tx.commit().await.map_err(storage)?;
         Ok(true)
+    }
+
+    fn coord_store(&self) -> Option<std::sync::Arc<dyn leep_core::coord::CoordStore>> {
+        self.coord.clone()
     }
 
     fn supports_review_requests(&self) -> bool {

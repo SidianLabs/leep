@@ -446,6 +446,12 @@ struct Args {
     /// for comparison.
     #[arg(long, env = "LEEP_LAND_FAST_PATH", value_enum, default_value_t = Switch::On)]
     land_fast_path: Switch,
+    /// Keep sessions (ADR 0095): who is working on what before it lands,
+    /// declared through `/v1/sessions` and inferred from changesets that
+    /// carry `agent.session`. Advisory: no land answer depends on them.
+    /// `off` keeps none and answers `/v1/sessions` with 404.
+    #[arg(long, env = "LEEP_SESSIONS", value_enum, default_value_t = Switch::On)]
+    sessions: Switch,
     /// Leave a create's tree nodes out of the blob store and derive them
     /// when read (ADR 0069): a create then writes no tree node, and a land
     /// stores the tree of a changeset the ref moves to as it is. The answers
@@ -1918,6 +1924,14 @@ async fn run() -> anyhow::Result<()> {
         .with_land_conflicts(land_conflicts(&args))
         .with_lazy_create_trees(args.lazy_create_trees == Switch::On)
         .with_blame_tracking(args.warm_blame_paths);
+    if args.sessions == Switch::Off {
+        repo = repo.with_coord(None);
+    }
+    match repo.coord() {
+        Some(_) => tracing::info!("keeping sessions (ADR 0095)"),
+        None => tracing::info!("keeping no sessions: /v1/sessions answers 404"),
+    }
+    leep_server::sessions::spawn_session_tasks(repo.clone());
     let read_limits = leep_server::read_limits::ReadLimits::new(&read_concurrency);
     leep_server::reload::warn_missing_refs(repo.meta().as_ref(), &config.current()).await;
     leep_server::checks::catch_up(&repo, &config.current()).await;

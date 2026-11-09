@@ -14,6 +14,9 @@ use leep_core::{Error, MetaStore, Result};
 
 mod codec;
 pub mod compact;
+pub mod coord;
+#[cfg(test)]
+mod coord_tests;
 mod drop;
 pub mod features;
 mod leases;

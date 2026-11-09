@@ -9,8 +9,8 @@ use crate::cache::Cache;
 use crate::client::Client;
 use crate::commands::{
     amend, bisect, branch, checkout, checks, commit, config, diff, history, init, keygen, land,
-    merge, pick, rebase, reflog, reset, resolve, restore, review, search, stash, status, Ctx,
-    Remote,
+    merge, pick, rebase, reflog, reset, resolve, restore, review, search, session, stash, status,
+    Ctx, Remote,
 };
 use crate::error::{CliError, ErrorKind, Result};
 use crate::help;
@@ -143,6 +143,12 @@ pub enum Command {
     /// the suspects for a failure.
     #[command(subcommand, after_help = help::CHECKS)]
     Checks(checks::ChecksCmd),
+    /// Say what you are working on, so other agents see it before it lands.
+    #[command(subcommand, after_help = help::SESSION)]
+    Session(session::SessionCmd),
+    /// Show who is working on or near a path, before anything lands.
+    #[command(after_help = help::WHO)]
+    Who(session::WhoArgs),
 }
 
 /// The command line definition with the help text of [`help`].
@@ -327,6 +333,34 @@ pub fn run(cli: Cli) -> Result<i32> {
             .ok_or_else(|| CliError::user("no server configured; use --server or LEEP_SERVER"))
     };
 
+    // Sessions work in a working copy or, with LEEP_AGENT_SESSION, outside
+    // one; `start` keeps the key it makes in the working copy.
+    if let Command::Session(_) | Command::Who(_) = &cli.command {
+        let mut wc = wc.ok();
+        let token = resolve_token(
+            cli.token.as_deref(),
+            env_token().as_deref(),
+            wc.as_ref().and_then(|w| w.config.token.as_deref()),
+        );
+        let client = Client::with_token(&server_for(wc.as_ref())?, token.as_deref())
+            .with_session(session::session_key(None, wc.as_ref()).as_deref());
+        let target_ref = wc
+            .as_ref()
+            .map_or_else(|| "main".to_string(), |w| w.config.target_ref.clone());
+        let remote = Remote {
+            client: &client,
+            cache: &cache,
+            base: wc.as_ref().and_then(|w| w.state.base),
+            target_ref: &target_ref,
+            json: cli.json,
+        };
+        return match &cli.command {
+            Command::Session(c) => session::run(&remote, c, wc.as_mut()),
+            Command::Who(a) => session::who(&remote, a),
+            _ => unreachable!("matched above"),
+        };
+    }
+
     // Server-only commands work outside a working copy when a server is
     // given. Reviews and undo write to the server but touch no local state.
     let read_only = matches!(
@@ -347,7 +381,8 @@ pub fn run(cli: Cli) -> Result<i32> {
     );
     if read_only && wc.is_err() {
         let token = resolve_token(cli.token.as_deref(), env_token().as_deref(), None);
-        let client = Client::with_token(&server_for(None)?, token.as_deref());
+        let client = Client::with_token(&server_for(None)?, token.as_deref())
+            .with_session(session::session_key(None, None).as_deref());
         let remote = Remote {
             client: &client,
             cache: &cache,
@@ -364,7 +399,9 @@ pub fn run(cli: Cli) -> Result<i32> {
         env_token().as_deref(),
         wc.config.token.as_deref(),
     );
-    let client = Client::with_token(&server_for(Some(&wc))?, token.as_deref());
+    // Every request is a heartbeat of the agent's session (ADR 0095).
+    let client = Client::with_token(&server_for(Some(&wc))?, token.as_deref())
+        .with_session(session::session_key(None, Some(&wc)).as_deref());
     let mut ctx = Ctx {
         wc,
         client,

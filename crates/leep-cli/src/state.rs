@@ -164,6 +164,11 @@ pub struct State {
     /// Cleared by a later land that lands and by any checkout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolving: Option<ResolvingLand>,
+    /// The agent session `leep session start` made here (ADR 0095): what
+    /// `leep commit` records as `agent.session` and every request sends as
+    /// `Leep-Session` when `LEEP_AGENT_SESSION` is not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 /// See [`State::resolving`]. The commit made on `onto` records `from` as

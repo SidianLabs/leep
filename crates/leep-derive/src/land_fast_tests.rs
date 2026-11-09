@@ -242,7 +242,7 @@ async fn a_restricted_merge_matches_the_full_merge() {
 }
 
 /// The files of `id`'s tree, in model form.
-async fn files_of(r: &Repo, id: ChangesetId) -> Files {
+pub(crate) async fn files_of(r: &Repo, id: ChangesetId) -> Files {
     let mut out = Files::new();
     for f in r.list_files(id, "").await.unwrap() {
         let text = r.blobs().get(&f.content).await.unwrap().unwrap();
