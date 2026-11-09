@@ -574,3 +574,103 @@ async fn too_many_sessions_has_its_own_code() {
         .await;
     assert_eq!(r.status, StatusCode::OK);
 }
+
+/// A coordination store that never answers.
+struct Hanging;
+
+#[async_trait::async_trait]
+impl leep_core::coord::CoordStore for Hanging {
+    async fn upsert_session(
+        &self,
+        _: &leep_core::coord::SessionUpdate,
+    ) -> leep_core::Result<(leep_core::coord::Session, bool)> {
+        std::future::pending().await
+    }
+    async fn get_session(&self, _: u64) -> leep_core::Result<Option<leep_core::coord::Session>> {
+        std::future::pending().await
+    }
+    async fn list_sessions(
+        &self,
+        _: &leep_core::coord::SessionFilter,
+    ) -> leep_core::Result<Vec<leep_core::coord::Session>> {
+        std::future::pending().await
+    }
+    async fn end_session(
+        &self,
+        _: u64,
+        _: &leep_core::coord::SessionEnd,
+    ) -> leep_core::Result<bool> {
+        std::future::pending().await
+    }
+    async fn beat_sessions(&self, _: &[leep_core::coord::Beat]) -> leep_core::Result<u64> {
+        std::future::pending().await
+    }
+    async fn sweep_sessions(
+        &self,
+        _: i64,
+        _: usize,
+    ) -> leep_core::Result<leep_core::coord::SweepReport> {
+        std::future::pending().await
+    }
+    async fn count_sessions(
+        &self,
+        _: leep_core::coord::SessionState,
+        _: usize,
+    ) -> leep_core::Result<u64> {
+        std::future::pending().await
+    }
+}
+
+/// A coordination store that hangs costs a create at most its 250 ms
+/// bound, and changes neither the land's answer nor the ref log (ADR
+/// 0095): the same commits and lands on a server without sessions answer
+/// the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hanging_coordination_store_changes_no_answer() {
+    let fresh = || {
+        Repo::new(
+            Arc::new(MemoryBlobStore::new()),
+            Arc::new(MemoryMetaStore::new()),
+        )
+    };
+    let hung = Api::over(fresh().with_coord(Some(Arc::new(Hanging))), true);
+    let none = Api::over(fresh().with_coord(None), true);
+    let mut answers = Vec::new();
+    let mut logs = Vec::new();
+    for api in [&hung, &none] {
+        let started = std::time::Instant::now();
+        let first = api.commit("alice", "a-1", &[], &["src/a.rs"]).await;
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(300), "create took {took:?}");
+        let second = api.commit("bob", "b-1", &[], &["web/b.ts"]).await;
+        let t = token("alice");
+        let mut got = Vec::new();
+        for cs in [first, second] {
+            let body = serde_json::to_vec(&LandRequest {
+                changeset: cs,
+                target_ref: "main".into(),
+                create: Some(true),
+                land_id: None,
+            })
+            .unwrap();
+            let r = api
+                .call(Method::POST, "/v1/land", Some(&t), Some("a-1"), body)
+                .await;
+            got.push((r.status, String::from_utf8(r.body).unwrap()));
+        }
+        answers.push(got);
+        let log: RefLogResponse = api
+            .call(Method::GET, "/v1/reflog", Some(VIEWER), None, vec![])
+            .await
+            .ok();
+        logs.push(
+            log.entries
+                .into_iter()
+                .map(|e| (e.name, e.old, e.new, e.actor, e.operation))
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(answers[0], answers[1]);
+    assert_eq!(logs[0], logs[1]);
+    assert_eq!(logs[0].len(), 2);
+}
