@@ -435,31 +435,22 @@ impl CoordStore for PgCoordStore {
         .await
         .map_err(storage)?
         .rows_affected();
-        let mut tx = self.pool("session_sweep").begin().await.map_err(storage)?;
-        let ids: Vec<i64> = sqlx::query_scalar(
-            "SELECT id FROM sessions WHERE ended IS NOT NULL AND ended < $1 LIMIT $2",
+        // One statement: the delete re-checks `ended` on each row it
+        // locks, so a session revived since the scan is kept.
+        let sessions_deleted: i64 = sqlx::query_scalar(
+            "WITH gone AS (DELETE FROM sessions WHERE id IN \
+               (SELECT id FROM sessions WHERE ended IS NOT NULL AND ended < $1 LIMIT $2) \
+               AND ended IS NOT NULL AND ended < $1 RETURNING id), \
+             p AS (DELETE FROM session_paths WHERE session_id IN (SELECT id FROM gone)), \
+             b AS (DELETE FROM session_beats WHERE session_id IN (SELECT id FROM gone)) \
+             SELECT COUNT(*) FROM gone",
         )
         .bind(now - SESSION_RETENTION_SECS)
         .bind(limit)
-        .fetch_all(&mut *tx)
+        .fetch_one(self.pool("session_sweep"))
         .await
         .map_err(storage)?;
-        for table in ["session_paths", "session_beats"] {
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "DELETE FROM {table} WHERE session_id = ANY($1)"
-            )))
-            .bind(&ids)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
-        }
-        let sessions_deleted = sqlx::query("DELETE FROM sessions WHERE id = ANY($1)")
-            .bind(&ids)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?
-            .rows_affected();
-        tx.commit().await.map_err(storage)?;
+        let sessions_deleted = sessions_deleted as u64;
         Ok(SweepReport {
             expired,
             paths_deleted,
@@ -771,21 +762,44 @@ impl CoordStore for SqliteCoordStore {
         .await
         .map_err(storage)?
         .rows_affected();
-        let mut tx = self
-            .pool("session_sweep")
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(storage)?;
+        // Read first, outside a write transaction: SQLite has one writer,
+        // and a sweep with nothing to delete should not take its lock.
         let ids: Vec<i64> = sqlx::query_scalar(
             "SELECT id FROM sessions WHERE ended IS NOT NULL AND ended < ? LIMIT ?",
         )
         .bind(now - SESSION_RETENTION_SECS)
         .bind(limit)
-        .fetch_all(&mut *tx)
+        .fetch_all(self.pool("session_sweep"))
         .await
         .map_err(storage)?;
         let mut sessions_deleted = 0;
+        if ids.is_empty() {
+            return Ok(SweepReport {
+                expired,
+                paths_deleted,
+                sessions_deleted,
+            });
+        }
+        let mut tx = self
+            .pool("session_sweep")
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(storage)?;
         for id in ids {
+            // Still ended that long ago: an upsert since may have revived it.
+            let gone = sqlx::query(
+                "DELETE FROM sessions WHERE id = ? AND ended IS NOT NULL AND ended < ?",
+            )
+            .bind(id)
+            .bind(now - SESSION_RETENTION_SECS)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?
+            .rows_affected();
+            if gone == 0 {
+                continue;
+            }
+            sessions_deleted += gone;
             for table in ["session_paths", "session_beats"] {
                 sqlx::query(sqlx::AssertSqlSafe(format!(
                     "DELETE FROM {table} WHERE session_id = ?"
@@ -795,12 +809,6 @@ impl CoordStore for SqliteCoordStore {
                 .await
                 .map_err(storage)?;
             }
-            sessions_deleted += sqlx::query("DELETE FROM sessions WHERE id = ?")
-                .bind(id)
-                .execute(&mut *tx)
-                .await
-                .map_err(storage)?
-                .rows_affected();
         }
         tx.commit().await.map_err(storage)?;
         Ok(SweepReport {
