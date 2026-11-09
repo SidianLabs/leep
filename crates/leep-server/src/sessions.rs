@@ -30,6 +30,10 @@ use crate::{auth, parse_json, ApiResult, S};
 /// How long a hook may take before it is given up (and counted).
 const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a changeset create waits for its session update. Dropping the
+/// update past it rolls its transaction back.
+const CREATE_HOOK_BOUND: Duration = Duration::from_millis(250);
+
 /// Hooks in flight at once; past it a hook is skipped and counted, so a
 /// slow coordination store cannot pile up tasks behind changeset creates.
 const MAX_HOOKS_IN_FLIGHT: usize = 256;
@@ -200,10 +204,13 @@ where
 }
 
 /// After `POST /v1/changesets` stored `cs` as `id`: infer the creator's
-/// session from it (design D.2).
-pub(crate) fn after_create(
+/// session from it (design D.2). Awaited, for at most [`CREATE_HOOK_BOUND`],
+/// so the session holds the changeset before its creator can land it: the
+/// land's own hook then finds it. The answer is the same either way; a slow
+/// or failing store only costs the session this update.
+pub(crate) async fn after_create(
     repo: &Repo,
-    cs: Changeset,
+    cs: &Changeset,
     id: ChangesetId,
     who: &Option<auth::Principal>,
 ) {
@@ -214,11 +221,20 @@ pub(crate) fn after_create(
     {
         return;
     }
-    let repo = repo.clone();
     let principal = principal(who);
-    spawn_hook("created", async move {
-        repo.note_created(&cs, id, &principal).await
-    });
+    match tokio::time::timeout(CREATE_HOOK_BOUND, repo.note_created(cs, id, &principal)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            metrics::counter!("leep_session_hook_errors_total", "hook" => "created", "reason" => "error")
+                .increment(1);
+            tracing::warn!(error = %e, "inferring a session failed");
+        }
+        Err(_) => {
+            metrics::counter!("leep_session_hook_errors_total", "hook" => "created", "reason" => "timeout")
+                .increment(1);
+            tracing::warn!("inferring a session timed out");
+        }
+    }
 }
 
 /// After a land of `submitted` answered `resp`: end the session whose head

@@ -938,7 +938,7 @@ async fn create_changeset(
         .create_changeset_by(cs, who.as_ref().map(|p| p.name.as_str()))
         .await?;
     if let Some(cs) = kept {
-        sessions::after_create(&repo, cs, id, &who);
+        sessions::after_create(&repo, &cs, id, &who).await;
     }
     Ok(Json(CreateChangesetResponse { id }))
 }
