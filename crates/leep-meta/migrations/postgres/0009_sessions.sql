@@ -2,8 +2,9 @@
 -- per (repository, principal, agent session): what an agent run is doing
 -- and where. `origin` is 'declared' or 'inferred'; `state` is 'active',
 -- 'landed', 'abandoned' or 'expired'. Nothing here may change a land's
--- answer: dropping these tables loses no history. Old servers never read
--- them, so they tolerate them (ADR 0023).
+-- answer: dropping these tables loses no history. v8 servers already
+-- running never read them and keep working beside the migration; a v8
+-- server refuses to start on the migrated database (ADR 0023).
 CREATE TABLE sessions (
     id BIGSERIAL PRIMARY KEY,
     repo_id BIGINT NOT NULL DEFAULT 1,

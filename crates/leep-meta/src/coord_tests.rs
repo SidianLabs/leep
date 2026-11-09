@@ -96,3 +96,49 @@ async fn path_ranges(c: &dyn CoordStore) {
         ["a/b"]
     );
 }
+
+/// Beats lost (Postgres empties the UNLOGGED table after a crash) never
+/// expire live sessions: the sweep first gives each active session
+/// without a beat one at `now`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lost_beats_do_not_expire_live_sessions() {
+    let s = SqliteMetaStore::connect("sqlite::memory:").await.unwrap();
+    let c = s.coord_store().unwrap();
+    let id = lose_beats_setup(&*c).await;
+    sqlx::query("DELETE FROM session_beats")
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    lose_beats_check(&*c, id).await;
+    if let Some((s, _schema)) = crate::tests::pg_store("coordbeats").await {
+        let c = s.coord_store().unwrap();
+        let id = lose_beats_setup(&*c).await;
+        sqlx::query("DELETE FROM session_beats")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        lose_beats_check(&*c, id).await;
+    }
+}
+
+const T0: i64 = 1_700_000_000;
+
+async fn lose_beats_setup(c: &dyn CoordStore) -> u64 {
+    let u = SessionUpdate::new("ada", "k", SessionOrigin::Declared, T0);
+    c.upsert_session(&u).await.unwrap().0.id
+}
+
+async fn lose_beats_check(c: &dyn CoordStore, id: u64) {
+    use leep_core::coord::{SessionState, EXPIRE_AFTER_SECS};
+    let later = T0 + EXPIRE_AFTER_SECS + 5;
+    let r = c.sweep_sessions(later, 100).await.unwrap();
+    assert_eq!(r.expired, 0, "{r:?}");
+    let s = c.get_session(id).await.unwrap().unwrap();
+    assert_eq!((s.state, s.last_seen), (SessionState::Active, later));
+    // Without new beats it expires a day after that.
+    let r = c
+        .sweep_sessions(later + EXPIRE_AFTER_SECS + 1, 100)
+        .await
+        .unwrap();
+    assert_eq!(r.expired, 1);
+}
