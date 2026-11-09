@@ -16,9 +16,9 @@ use leep_core::api::{
 };
 use leep_core::changeset::{EXTRA_AGENT_MODEL, EXTRA_AGENT_SESSION};
 use leep_core::coord::{
-    bound_paths, check_key, normalize_path, Beat, CoordStore, Session, SessionEnd, SessionFilter,
-    SessionOrigin, SessionState, SessionUpdate, SweepReport, EXPIRE_AFTER_SECS, IDLE_AFTER_SECS,
-    MAX_KEY_BYTES, MAX_TITLE_BYTES, MAX_TOUCHED_PATHS, TOO_MANY_SESSIONS_MARKER,
+    bound_paths, check_key, check_principal, normalize_path, Beat, CoordStore, Session, SessionEnd,
+    SessionFilter, SessionOrigin, SessionState, SessionUpdate, SweepReport, EXPIRE_AFTER_SECS,
+    IDLE_AFTER_SECS, MAX_KEY_BYTES, MAX_TITLE_BYTES, MAX_TOUCHED_PATHS, TOO_MANY_SESSIONS_MARKER,
 };
 use leep_core::store::unix_now;
 use leep_core::{Changeset, ChangesetId, Error, Result};
@@ -345,7 +345,7 @@ impl Repo {
         let Some(key) = cs.extra.get(EXTRA_AGENT_SESSION) else {
             return Ok(false);
         };
-        if check_key("agent session", key).is_err() || check_key("principal", principal).is_err() {
+        if check_key("agent session", key).is_err() || check_principal(principal).is_err() {
             return Ok(false);
         }
         let mut u = SessionUpdate::new(principal, key, SessionOrigin::Inferred, unix_now());

@@ -279,7 +279,7 @@ impl SessionUpdate {
 
     /// Check the free-form parts before anything is stored.
     pub fn check(&self) -> Result<()> {
-        check_key("principal", &self.principal)?;
+        check_principal(&self.principal)?;
         check_key("agent session", &self.agent_session)?;
         if let Some(m) = &self.agent_model {
             check_line("agent model", m, MAX_KEY_BYTES)?;
@@ -329,6 +329,15 @@ pub fn check_key(what: &str, k: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// A principal: a token's name as the tokens file spells it, 1 to
+/// [`MAX_KEY_BYTES`] bytes without control characters.
+pub fn check_principal(p: &str) -> Result<()> {
+    if p.is_empty() {
+        return Err(Error::Invalid("a session needs a principal".into()));
+    }
+    check_line("principal", p, MAX_KEY_BYTES)
 }
 
 fn check_line(what: &str, s: &str, max: usize) -> Result<()> {

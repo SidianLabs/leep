@@ -918,8 +918,9 @@ Added:
   or `created` when it has none (a Postgres crash empties the `UNLOGGED`
   table). The sweep sets `state = 'expired'` 24 hours after the last beat,
   deletes the paths 24 hours after `ended` and the session (with its paths
-  and beat) 30 days after. Limits: keys (`agent_session`, `task_key`,
-  principal) 1 to 128 bytes of printable ASCII without spaces; `title` one
+  and beat) 30 days after. Limits: keys (`agent_session`, `task_key`) 1
+  to 128 bytes of printable ASCII without spaces; `principal` 1 to 128
+  bytes without control characters; `title` one
   line of at most 200 bytes; `approach` at most 2048 bytes without control
   characters other than newline and tab; at most 64 scope paths and 64
   claims, each a repository path of at most 1024 bytes; at most 256 touched

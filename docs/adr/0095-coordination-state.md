@@ -97,9 +97,10 @@ session_beats(session_id BIGINT PRIMARY KEY, at BIGINT NOT NULL)   -- UNLOGGED o
   `task_key` (an exact key, such as an issue id), `target_ref`, `base`,
   `head` (the newest changeset the session created), `agent_model`,
   `origin` (`declared` or `inferred`), `state`, `created`, `last_seen`
-  (from the beats table), `ended`, `landed_as`. Keys (the agent session,
-  task key, principal) are 1 to 128 bytes of printable ASCII without
-  spaces, so they fit a header and carry no prose.
+  (from the beats table), `ended`, `landed_as`. Keys (the agent session and
+  task key) are 1 to 128 bytes of printable ASCII without spaces, so they
+  fit a header and carry no prose; a principal is 1 to 128 bytes without
+  control characters.
 - **Paths are prefixes, not globs.** `kind` is `scope` (declared: will work
   here), `claim` (declared: means to own this) or `touched` (inferred: a
   changeset changed it). At most 64 scope paths and 64 claims; at most 256
