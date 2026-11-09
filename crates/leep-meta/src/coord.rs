@@ -466,6 +466,18 @@ impl CoordStore for PgCoordStore {
             sessions_deleted,
         })
     }
+
+    async fn count_sessions(&self, state: SessionState, cap: usize) -> Result<u64> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM sessions WHERE repo_id = 1 AND state = $1 LIMIT $2) t",
+        )
+        .bind(state.as_str())
+        .bind(to_i64(cap as u64))
+        .fetch_one(self.pool("session_count"))
+        .await
+        .map_err(storage)?;
+        Ok(n as u64)
+    }
 }
 
 // --- SQLite -------------------------------------------------------------------
@@ -796,5 +808,17 @@ impl CoordStore for SqliteCoordStore {
             paths_deleted,
             sessions_deleted,
         })
+    }
+
+    async fn count_sessions(&self, state: SessionState, cap: usize) -> Result<u64> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM sessions WHERE repo_id = 1 AND state = ? LIMIT ?)",
+        )
+        .bind(state.as_str())
+        .bind(to_i64(cap as u64))
+        .fetch_one(self.pool("session_count"))
+        .await
+        .map_err(storage)?;
+        Ok(n as u64)
     }
 }

@@ -167,6 +167,16 @@ impl CoordStore for MemoryCoordStore {
         }
         Ok(r)
     }
+
+    async fn count_sessions(&self, state: SessionState, cap: usize) -> Result<u64> {
+        let rows = self.rows.lock().unwrap();
+        Ok(rows
+            .sessions
+            .values()
+            .filter(|s| s.state == state)
+            .take(cap)
+            .count() as u64)
+    }
 }
 
 /// Assert the [`CoordStore`] contract. Run it on an empty store: the sweep
@@ -399,6 +409,24 @@ pub async fn check_coord_contract(store: &dyn CoordStore) {
         ..all.clone()
     };
     assert_eq!(list(active.clone()).await, [c.id, a.id]);
+    assert_eq!(
+        store
+            .count_sessions(SessionState::Active, 100)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        store.count_sessions(SessionState::Active, 1).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .count_sessions(SessionState::Landed, 100)
+            .await
+            .unwrap(),
+        1
+    );
     let landed = SessionFilter {
         states: vec![SessionState::Landed, SessionState::Expired],
         ..all.clone()

@@ -53,6 +53,8 @@ pub(crate) fn code_of(e: &Error) -> &'static str {
                 error_code::LAND_ID_REUSED
             } else if m.contains(INVALID_NAME_MARKER) {
                 error_code::INVALID_NAME
+            } else if m.contains(leep_core::coord::TOO_MANY_SESSIONS_MARKER) {
+                error_code::TOO_MANY_SESSIONS
             } else {
                 error_code::INVALID
             }

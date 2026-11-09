@@ -49,6 +49,9 @@ impl CoordStore for Dropped {
     async fn sweep_sessions(&self, _: i64, _: usize) -> Result<SweepReport> {
         Err(gone())
     }
+    async fn count_sessions(&self, _: leep_core::coord::SessionState, _: usize) -> Result<u64> {
+        Err(gone())
+    }
 }
 
 fn repo() -> Repo {

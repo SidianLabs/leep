@@ -476,16 +476,11 @@ impl Repo {
 
     /// Active sessions, for the `leep_sessions_active` gauge: at most
     /// `cap`, so the count costs a bounded read.
-    pub async fn count_active_sessions(&self, cap: usize) -> Result<usize> {
+    pub async fn count_active_sessions(&self, cap: usize) -> Result<u64> {
         let Some(coord) = self.coord.as_ref() else {
             return Ok(0);
         };
-        let f = SessionFilter {
-            states: vec![SessionState::Active],
-            limit: cap,
-            ..Default::default()
-        };
-        Ok(coord.list_sessions(&f).await?.len())
+        coord.count_sessions(SessionState::Active, cap).await
     }
 }
 

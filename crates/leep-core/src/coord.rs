@@ -681,6 +681,10 @@ pub trait CoordStore: Send + Sync {
     /// ended [`PATHS_RETENTION_SECS`] ago, and up to `limit` sessions ended
     /// [`SESSION_RETENTION_SECS`] ago. Each part commits on its own.
     async fn sweep_sessions(&self, now: i64, limit: usize) -> Result<SweepReport>;
+
+    /// How many sessions are in stored `state`, counting at most `cap`, so
+    /// the answer costs a bounded index scan.
+    async fn count_sessions(&self, state: SessionState, cap: usize) -> Result<u64>;
 }
 
 #[cfg(test)]
