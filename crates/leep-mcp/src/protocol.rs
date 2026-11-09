@@ -40,6 +40,8 @@ pub struct Server {
     pub(crate) pending_lands: Mutex<HashMap<(ChangesetId, String), LandId>>,
     /// Conflict reports `leep_resolve_and_land` can still finish.
     pub(crate) conflicts: Mutex<tools::Conflicts>,
+    /// The token's name, once asked (`leep_who` marks your own session).
+    pub(crate) principal: std::sync::OnceLock<String>,
 }
 
 impl Server {
@@ -56,6 +58,7 @@ impl Server {
             requests: Mutex::default(),
             pending_lands: Mutex::default(),
             conflicts: Mutex::default(),
+            principal: std::sync::OnceLock::new(),
         }
     }
 
