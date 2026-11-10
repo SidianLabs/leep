@@ -97,7 +97,13 @@ async fn create(r: &Repo, parents: &[ChangesetId], edits: &Edits, agent: usize) 
         .await
         .unwrap();
     // What the server does after storing it; its failures never surface.
-    let _ = r.note_created(&cs, id, AGENTS[agent].0).await;
+    let _ = r
+        .note_created(
+            crate::sessions::SessionSeed::of(&cs).unwrap(),
+            id,
+            AGENTS[agent].0,
+        )
+        .await;
     id
 }
 

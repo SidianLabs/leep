@@ -20,8 +20,8 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use leep_core::api::{error_code, DeclareSessionRequest, LandResponse, SESSION_HEADER};
 use leep_core::coord::SessionState;
-use leep_core::{Changeset, ChangesetId, Error};
-use leep_derive::sessions::{SessionQuery, ANONYMOUS};
+use leep_core::{ChangesetId, Error};
+use leep_derive::sessions::{SessionQuery, SessionSeed, ANONYMOUS};
 use leep_derive::Repo;
 use serde::Deserialize;
 
@@ -203,26 +203,19 @@ where
     });
 }
 
-/// After `POST /v1/changesets` stored `cs` as `id`: infer the creator's
+/// After `POST /v1/changesets` stored the changeset of `seed` as `id`: infer the creator's
 /// session from it (design D.2). Awaited, for at most [`CREATE_HOOK_BOUND`],
 /// so the session holds the changeset before its creator can land it: the
 /// land's own hook then finds it. The answer is the same either way; a slow
 /// or failing store only costs the session this update.
 pub(crate) async fn after_create(
     repo: &Repo,
-    cs: &Changeset,
+    seed: SessionSeed,
     id: ChangesetId,
     who: &Option<auth::Principal>,
 ) {
-    if repo.coord().is_none()
-        || !cs
-            .extra
-            .contains_key(leep_core::changeset::EXTRA_AGENT_SESSION)
-    {
-        return;
-    }
     let principal = principal(who);
-    match tokio::time::timeout(CREATE_HOOK_BOUND, repo.note_created(cs, id, &principal)).await {
+    match tokio::time::timeout(CREATE_HOOK_BOUND, repo.note_created(seed, id, &principal)).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
             metrics::counter!("leep_session_hook_errors_total", "hook" => "created", "reason" => "error")

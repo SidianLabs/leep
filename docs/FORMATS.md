@@ -923,8 +923,9 @@ Added:
   bytes without control characters; `title` one
   line of at most 200 bytes; `approach` at most 2048 bytes without control
   characters other than newline and tab; at most 64 scope paths and 64
-  claims, each a repository path of at most 1024 bytes; at most 256 touched
-  paths, the deepest folded into their directories; at most 1000 active
+  claims, each a repository path of at most 256 bytes; at most 256 touched
+  paths, the deepest folded into their directories, and none with a
+  control character; at most 1000 active
   sessions per principal. Backups (ADR 0026) leave the tables out, and a
   restore clears them, as for `leases`.
 - `leep_core::coord::CoordStore` (`upsert_session`, `get_session`,

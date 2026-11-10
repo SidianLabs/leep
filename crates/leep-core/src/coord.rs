@@ -35,8 +35,9 @@ pub const MAX_SCOPE_PATHS: usize = 64;
 /// them, so a large change stays visible without growing the table.
 pub const MAX_TOUCHED_PATHS: usize = 256;
 /// Longest path kept, in bytes; a longer touched path is kept as the
-/// nearest ancestor that fits (index entries have a size limit).
-pub const MAX_PATH_BYTES: usize = 1024;
+/// nearest ancestor that fits. Small, so a listing's size stays bounded:
+/// at most 384 paths of this length per session.
+pub const MAX_PATH_BYTES: usize = 256;
 /// Most sessions one principal may have active at once. One more is
 /// refused with [`TOO_MANY_SESSIONS_MARKER`] (an inferred one is skipped),
 /// so a runaway token cannot fill the table.
@@ -414,16 +415,34 @@ fn parent(p: &str) -> Option<&str> {
     p.rsplit_once('/').map(|(d, _)| d)
 }
 
+/// `p`, or its nearest ancestor, made only of whole components without
+/// control characters and at most [`MAX_PATH_BYTES`] long; `None` when no
+/// such prefix exists. Paths of changesets are stored as their clients
+/// wrote them, so a touched path is cleaned before anyone reads it.
+pub fn clean_path(p: &str) -> Option<&str> {
+    let mut p = match p.find(char::is_control) {
+        None => p,
+        // Cut inside a component: keep the whole components before it.
+        Some(i) => &p[..p[..i].rfind('/')?],
+    };
+    while p.len() > MAX_PATH_BYTES {
+        p = parent(p)?;
+    }
+    (!p.is_empty()).then_some(p)
+}
+
 fn depth(p: &str) -> usize {
     p.bytes().filter(|&b| b == b'/').count()
 }
 
-/// At most `max` paths covering every path given: paths under another
-/// given path are dropped, paths longer than [`MAX_PATH_BYTES`] become the
-/// nearest ancestor that fits, and while too many remain the deepest are
+/// At most `max` paths covering the paths given: paths under another
+/// given path are dropped, paths with a control character or longer than
+/// [`MAX_PATH_BYTES`] become their nearest clean ancestor that fits (or are
+/// dropped when they have none), and while too many remain the deepest are
 /// replaced by their directories. A directory overlaps everything below
-/// it, so the result never misses an overlap the input had; it may report
-/// more.
+/// it, so the result misses no overlap the input had (it may report more),
+/// with one exception: when more than `max` top-level names remain, only
+/// the first `max` in path order are kept, and the others are lost.
 pub fn bound_paths<I, S>(paths: I, max: usize) -> Vec<String>
 where
     I: IntoIterator<Item = S>,
@@ -431,14 +450,7 @@ where
 {
     let mut set: BTreeSet<String> = BTreeSet::new();
     for p in paths {
-        let mut p = p.as_ref();
-        while p.len() > MAX_PATH_BYTES {
-            match parent(p) {
-                Some(d) => p = d,
-                None => break,
-            }
-        }
-        if !p.is_empty() && p.len() <= MAX_PATH_BYTES {
+        if let Some(p) = clean_path(p.as_ref()) {
             set.insert(p.to_string());
         }
     }
@@ -646,6 +658,9 @@ pub struct SweepReport {
     pub expired: u64,
     /// Path rows of long-ended sessions deleted.
     pub paths_deleted: u64,
+    /// Beat rows of sessions ended a day ago deleted, so the expiry scan of
+    /// the beats index only meets recent ones.
+    pub beats_deleted: u64,
     /// Long-ended sessions deleted.
     pub sessions_deleted: u64,
 }
@@ -654,7 +669,10 @@ impl SweepReport {
     /// Whether the sweep hit its limit somewhere and may have more to do.
     pub fn full(&self, limit: usize) -> bool {
         let l = limit as u64;
-        self.expired >= l || self.paths_deleted >= l || self.sessions_deleted >= l
+        self.expired >= l
+            || self.paths_deleted >= l
+            || self.beats_deleted >= l
+            || self.sessions_deleted >= l
     }
 }
 
@@ -757,6 +775,14 @@ mod tests {
         }
         let long = format!("a/{}", "x".repeat(MAX_PATH_BYTES + 5));
         assert_eq!(bound_paths([long], 4), ["a"]);
+        // Control characters never reach a stored path.
+        assert_eq!(clean_path("src/ok.rs"), Some("src/ok.rs"));
+        assert_eq!(clean_path("src/a\nIGNORE ALL/b.rs"), Some("src"));
+        assert_eq!(clean_path("x\u{1b}[31mred/b"), None);
+        assert_eq!(
+            bound_paths(["src/a\u{1b}[2J.rs", "docs/\nhi", "\rtop"], 8),
+            ["docs", "src"]
+        );
     }
 
     fn update(at: i64) -> SessionUpdate {

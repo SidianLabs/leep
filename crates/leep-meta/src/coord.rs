@@ -26,6 +26,9 @@ use crate::{storage, to_id};
 /// The schema version that added the tables.
 pub(crate) const SESSIONS_SCHEMA_VERSION: i64 = 9;
 
+/// Beats written per SQLite transaction.
+const BEATS_PER_TRANSACTION: usize = 500;
+
 const COLUMNS: &str = "s.id, s.principal, s.agent_session, s.agent_model, s.title, s.approach, \
      s.task_key, s.target_ref, s.base, s.head, s.origin, s.state, s.created, s.ended, \
      s.landed_as, b.at AS beat";
@@ -390,12 +393,14 @@ impl CoordStore for PgCoordStore {
             ks.push(k);
             ats.push(at);
         }
+        // Rows in id order, so two servers' batches lock them in one order
+        // and never deadlock.
         let n = sqlx::query(
             "INSERT INTO session_beats (session_id, at) \
              SELECT s.id, b.at FROM sessions s \
              JOIN UNNEST($1::text[], $2::text[], $3::bigint[]) AS b(principal, agent_session, at) \
              ON s.principal = b.principal AND s.agent_session = b.agent_session \
-             WHERE s.repo_id = 1 AND s.state = 'active' \
+             WHERE s.repo_id = 1 AND s.state = 'active' ORDER BY s.id \
              ON CONFLICT (session_id) DO UPDATE SET at = GREATEST(session_beats.at, excluded.at)",
         )
         .bind(ps)
@@ -410,11 +415,26 @@ impl CoordStore for PgCoordStore {
 
     async fn sweep_sessions(&self, now: i64, limit: usize) -> Result<SweepReport> {
         let limit = to_i64(limit as u64);
+        // `session_beats` is UNLOGGED: after a crash it is empty. An active
+        // session without a beat counts as heard from now, so a crash
+        // never expires every live session at once.
+        sqlx::query(
+            "INSERT INTO session_beats (session_id, at) \
+             SELECT s.id, $1 FROM sessions s WHERE s.repo_id = 1 AND s.state = 'active' \
+             AND NOT EXISTS (SELECT 1 FROM session_beats b WHERE b.session_id = s.id) \
+             ORDER BY s.id LIMIT $2 ON CONFLICT (session_id) DO NOTHING",
+        )
+        .bind(now)
+        .bind(limit)
+        .execute(self.pool("session_sweep"))
+        .await
+        .map_err(storage)?;
+        // Expiry reads the beats index: old beats are only those of live
+        // sessions and of sessions that ended within a day.
         let expired = sqlx::query(
             "UPDATE sessions SET state = 'expired', ended = $1 WHERE state = 'active' AND id IN \
-             (SELECT s.id FROM sessions s LEFT JOIN session_beats b ON b.session_id = s.id \
-              WHERE s.repo_id = 1 AND s.state = 'active' AND COALESCE(b.at, s.created) < $2 \
-              LIMIT $3)",
+             (SELECT b.session_id FROM session_beats b JOIN sessions s ON s.id = b.session_id \
+              WHERE b.at < $2 AND s.state = 'active' AND s.repo_id = 1 LIMIT $3)",
         )
         .bind(now)
         .bind(now - EXPIRE_AFTER_SECS)
@@ -427,6 +447,17 @@ impl CoordStore for PgCoordStore {
             "DELETE FROM session_paths WHERE (session_id, kind, path) IN \
              (SELECT p.session_id, p.kind, p.path FROM session_paths p \
               JOIN sessions s ON s.id = p.session_id \
+              WHERE s.ended IS NOT NULL AND s.ended < $1 LIMIT $2)",
+        )
+        .bind(now - PATHS_RETENTION_SECS)
+        .bind(limit)
+        .execute(self.pool("session_sweep"))
+        .await
+        .map_err(storage)?
+        .rows_affected();
+        let beats_deleted = sqlx::query(
+            "DELETE FROM session_beats WHERE session_id IN \
+             (SELECT b.session_id FROM session_beats b JOIN sessions s ON s.id = b.session_id \
               WHERE s.ended IS NOT NULL AND s.ended < $1 LIMIT $2)",
         )
         .bind(now - PATHS_RETENTION_SECS)
@@ -450,11 +481,11 @@ impl CoordStore for PgCoordStore {
         .fetch_one(self.pool("session_sweep"))
         .await
         .map_err(storage)?;
-        let sessions_deleted = sessions_deleted as u64;
         Ok(SweepReport {
             expired,
             paths_deleted,
-            sessions_deleted,
+            beats_deleted,
+            sessions_deleted: sessions_deleted as u64,
         })
     }
 
@@ -708,62 +739,130 @@ impl CoordStore for SqliteCoordStore {
     }
 
     async fn beat_sessions(&self, beats: &[Beat]) -> Result<u64> {
-        if beats.is_empty() {
-            return Ok(0);
-        }
-        let mut tx = self
-            .pool("session_beat")
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(storage)?;
         let mut n = 0;
-        for (p, k, at) in newest(beats) {
-            n += sqlx::query(
-                "INSERT INTO session_beats (session_id, at) \
-                 SELECT id, ? FROM sessions WHERE repo_id = 1 AND principal = ? \
-                 AND agent_session = ? AND state = 'active' \
-                 ON CONFLICT (session_id) DO UPDATE SET at = MAX(at, excluded.at)",
-            )
-            .bind(at)
-            .bind(p)
-            .bind(k)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?
-            .rows_affected();
+        // SQLite has one writer, which lands need too: hold it for at most
+        // this many beats at a time.
+        for chunk in newest(beats).chunks(BEATS_PER_TRANSACTION) {
+            let mut tx = self
+                .pool("session_beat")
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(storage)?;
+            for (p, k, at) in chunk {
+                n += sqlx::query(
+                    "INSERT INTO session_beats (session_id, at) \
+                     SELECT id, ? FROM sessions WHERE repo_id = 1 AND principal = ? \
+                     AND agent_session = ? AND state = 'active' \
+                     ON CONFLICT (session_id) DO UPDATE SET at = MAX(at, excluded.at)",
+                )
+                .bind(at)
+                .bind(p)
+                .bind(k)
+                .execute(&mut *tx)
+                .await
+                .map_err(storage)?
+                .rows_affected();
+            }
+            tx.commit().await.map_err(storage)?;
         }
-        tx.commit().await.map_err(storage)?;
         Ok(n)
     }
 
     async fn sweep_sessions(&self, now: i64, limit: usize) -> Result<SweepReport> {
         let limit = to_i64(limit as u64);
-        let expired = sqlx::query(
-            "UPDATE sessions SET state = 'expired', ended = ? WHERE state = 'active' AND id IN \
-             (SELECT s.id FROM sessions s LEFT JOIN session_beats b ON b.session_id = s.id \
-              WHERE s.repo_id = 1 AND s.state = 'active' AND COALESCE(b.at, s.created) < ? \
-              LIMIT ?)",
+        let mut r = SweepReport::default();
+        // Each write is guarded by a read, so an idle sweep never takes
+        // SQLite's single write lock away from lands.
+        let any = |sql: &'static str, at: i64| async move {
+            let found: Option<i64> = sqlx::query_scalar(sql)
+                .bind(at)
+                .fetch_optional(self.pool("session_sweep"))
+                .await
+                .map_err(storage)?;
+            Ok::<bool, leep_core::Error>(found.is_some())
+        };
+        if any(
+            "SELECT s.id FROM sessions s WHERE s.repo_id = 1 AND s.state = 'active' \
+             AND NOT EXISTS (SELECT 1 FROM session_beats b WHERE b.session_id = s.id) \
+             AND ? IS NOT NULL LIMIT 1",
+            now,
         )
-        .bind(now)
-        .bind(now - EXPIRE_AFTER_SECS)
-        .bind(limit)
-        .execute(self.pool("session_sweep"))
-        .await
-        .map_err(storage)?
-        .rows_affected();
-        let paths_deleted = sqlx::query(
-            "DELETE FROM session_paths WHERE rowid IN \
-             (SELECT p.rowid FROM session_paths p JOIN sessions s ON s.id = p.session_id \
-              WHERE s.ended IS NOT NULL AND s.ended < ? LIMIT ?)",
+        .await?
+        {
+            // A beat for every active session that lacks one, so a lost
+            // beat never expires a live session.
+            sqlx::query(
+                "INSERT INTO session_beats (session_id, at) \
+                 SELECT s.id, ? FROM sessions s WHERE s.repo_id = 1 AND s.state = 'active' \
+                 AND NOT EXISTS (SELECT 1 FROM session_beats b WHERE b.session_id = s.id) \
+                 LIMIT ? ON CONFLICT (session_id) DO NOTHING",
+            )
+            .bind(now)
+            .bind(limit)
+            .execute(self.pool("session_sweep"))
+            .await
+            .map_err(storage)?;
+        }
+        if any(
+            "SELECT b.session_id FROM session_beats b JOIN sessions s ON s.id = b.session_id \
+             WHERE b.at < ? AND s.state = 'active' LIMIT 1",
+            now - EXPIRE_AFTER_SECS,
         )
-        .bind(now - PATHS_RETENTION_SECS)
-        .bind(limit)
-        .execute(self.pool("session_sweep"))
-        .await
-        .map_err(storage)?
-        .rows_affected();
-        // Read first, outside a write transaction: SQLite has one writer,
-        // and a sweep with nothing to delete should not take its lock.
+        .await?
+        {
+            r.expired = sqlx::query(
+                "UPDATE sessions SET state = 'expired', ended = ? WHERE state = 'active' AND id IN \
+                 (SELECT b.session_id FROM session_beats b JOIN sessions s \
+                  ON s.id = b.session_id WHERE b.at < ? AND s.state = 'active' \
+                  AND s.repo_id = 1 LIMIT ?)",
+            )
+            .bind(now)
+            .bind(now - EXPIRE_AFTER_SECS)
+            .bind(limit)
+            .execute(self.pool("session_sweep"))
+            .await
+            .map_err(storage)?
+            .rows_affected();
+        }
+        if any(
+            "SELECT p.session_id FROM session_paths p JOIN sessions s ON s.id = p.session_id \
+             WHERE s.ended IS NOT NULL AND s.ended < ? LIMIT 1",
+            now - PATHS_RETENTION_SECS,
+        )
+        .await?
+        {
+            r.paths_deleted = sqlx::query(
+                "DELETE FROM session_paths WHERE rowid IN \
+                 (SELECT p.rowid FROM session_paths p JOIN sessions s ON s.id = p.session_id \
+                  WHERE s.ended IS NOT NULL AND s.ended < ? LIMIT ?)",
+            )
+            .bind(now - PATHS_RETENTION_SECS)
+            .bind(limit)
+            .execute(self.pool("session_sweep"))
+            .await
+            .map_err(storage)?
+            .rows_affected();
+        }
+        if any(
+            "SELECT b.session_id FROM session_beats b JOIN sessions s ON s.id = b.session_id \
+             WHERE s.ended IS NOT NULL AND s.ended < ? LIMIT 1",
+            now - PATHS_RETENTION_SECS,
+        )
+        .await?
+        {
+            r.beats_deleted = sqlx::query(
+                "DELETE FROM session_beats WHERE session_id IN \
+                 (SELECT b.session_id FROM session_beats b JOIN sessions s \
+                  ON s.id = b.session_id WHERE s.ended IS NOT NULL AND s.ended < ? LIMIT ?)",
+            )
+            .bind(now - PATHS_RETENTION_SECS)
+            .bind(limit)
+            .execute(self.pool("session_sweep"))
+            .await
+            .map_err(storage)?
+            .rows_affected();
+        }
+        // Read first, outside a write transaction.
         let ids: Vec<i64> = sqlx::query_scalar(
             "SELECT id FROM sessions WHERE ended IS NOT NULL AND ended < ? LIMIT ?",
         )
@@ -772,13 +871,8 @@ impl CoordStore for SqliteCoordStore {
         .fetch_all(self.pool("session_sweep"))
         .await
         .map_err(storage)?;
-        let mut sessions_deleted = 0;
         if ids.is_empty() {
-            return Ok(SweepReport {
-                expired,
-                paths_deleted,
-                sessions_deleted,
-            });
+            return Ok(r);
         }
         let mut tx = self
             .pool("session_sweep")
@@ -799,7 +893,7 @@ impl CoordStore for SqliteCoordStore {
             if gone == 0 {
                 continue;
             }
-            sessions_deleted += gone;
+            r.sessions_deleted += gone;
             for table in ["session_paths", "session_beats"] {
                 sqlx::query(sqlx::AssertSqlSafe(format!(
                     "DELETE FROM {table} WHERE session_id = ?"
@@ -811,11 +905,7 @@ impl CoordStore for SqliteCoordStore {
             }
         }
         tx.commit().await.map_err(storage)?;
-        Ok(SweepReport {
-            expired,
-            paths_deleted,
-            sessions_deleted,
-        })
+        Ok(r)
     }
 
     async fn count_sessions(&self, state: SessionState, cap: usize) -> Result<u64> {

@@ -930,15 +930,16 @@ async fn create_changeset(
     body: Bytes,
 ) -> ApiResult<Json<CreateChangesetResponse>> {
     let cs: Changeset = parse_json(&body)?;
-    let kept = cs
-        .extra
-        .contains_key(leep_core::changeset::EXTRA_AGENT_SESSION)
-        .then(|| cs.clone());
+    // What the session update needs, taken in one pass before the store
+    // owns the changeset (ADR 0095); nothing when sessions are off.
+    let seed = repo
+        .coord()
+        .and_then(|_| leep_derive::sessions::SessionSeed::of(&cs));
     let id = repo
         .create_changeset_by(cs, who.as_ref().map(|p| p.name.as_str()))
         .await?;
-    if let Some(cs) = kept {
-        sessions::after_create(&repo, &cs, id, &who).await;
+    if let Some(seed) = seed {
+        sessions::after_create(&repo, seed, id, &who).await;
     }
     Ok(Json(CreateChangesetResponse { id }))
 }

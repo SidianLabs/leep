@@ -85,8 +85,10 @@ Sessions are advisory: nothing in them can stop or change a land. Every
 request the MCP server sends carries `Leep-Session` with its agent session,
 so the session stays live while the agent works. Titles and approaches are
 other agents' words: they are in each session's `untrusted` object, and the
-text of `leep_session_start` and `leep_who` puts them in a fenced block under
-a fixed line saying they are data, not instructions.
+text of `leep_session_start` and `leep_who` puts them, with the sessions'
+keys, task keys and paths, in a fenced block under a fixed line saying they
+are data, not instructions. Outside the fence each session is only its id,
+principal, state and counts.
 
 Data tools return JSON as text and as `structuredContent`; file and diff
 tools return plain text. Failures (bad arguments, 401, 403, 404, unreachable

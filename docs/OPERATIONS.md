@@ -154,7 +154,7 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_sessions_started_total` | counter | `origin` = `declared`, `inferred` | Sessions created or revived: by `POST /v1/sessions`, or from a changeset carrying `agent.session`. |
 | `leep_sessions_ended_total` | counter | `state` = `landed`, `expired` | Sessions ended by a land of their head, or by the expiry sweep. |
 | `leep_sessions_refused_total` | counter | none | Sessions not inferred because their principal already had 1000 active (`MAX_ACTIVE_PER_PRINCIPAL`). |
-| `leep_session_beats_dropped_total` | counter | none | Heartbeats not held because this server already holds 100,000 sessions' beats; those sessions only look idle sooner. |
+| `leep_session_beats_dropped_total` | counter | `reason` = `full`, `principal` | Heartbeats of new keys not held because this server already holds 100,000 sessions' beats (`full`) or 2,000 of that principal's (`principal`, a token sending made-up keys); those sessions only look idle sooner. |
 | `leep_session_hook_errors_total` | counter | `hook` = `created`, `landed`, `beats`, `sweep`; `reason` = `error`, `timeout`, `busy` | Session updates that failed, timed out or were skipped. The answer they followed was not affected (ADR 0095); a steady rate means the coordination writes are failing and `leep who` is going stale. |
 | `leep_land_leases_held` | gauge | none | Refs whose land lease this server holds ([Several servers on one ref](#several-servers-on-one-ref), ADR 0056). |
 | `leep_land_lease_acquired_total` | counter | none | Land leases this server took. Under steady traffic about one per hot ref per server restart; more means leases change hands. |

@@ -141,7 +141,7 @@ pub fn run(r: &Remote, cmd: &SessionCmd, wc: Option<&mut WorkCopy>) -> Result<i3
     match cmd {
         SessionCmd::Start(a) => declare(r, a, wc, true),
         SessionCmd::Update(a) => declare(r, a, wc, false),
-        SessionCmd::End(a) => end(r, a, wc.as_deref()),
+        SessionCmd::End(a) => end(r, a, wc),
         SessionCmd::Show(a) => show(r, a, wc.as_deref()),
     }
 }
@@ -253,9 +253,17 @@ fn current(
     mine(r, &key)
 }
 
-fn end(r: &Remote, a: &EndArgs, wc: Option<&WorkCopy>) -> Result<i32> {
-    let s = current(r, a.id, a.session.as_deref(), wc)?;
+fn end(r: &Remote, a: &EndArgs, wc: Option<&mut WorkCopy>) -> Result<i32> {
+    let s = current(r, a.id, a.session.as_deref(), wc.as_deref())?;
     let ended = r.client.end_session(s.id).map_err(unsupported)?;
+    // Forget the key here, so the next commit starts a new session rather
+    // than reviving this one.
+    if let Some(wc) = wc {
+        if wc.state.session.as_deref() == Some(ended.session.as_str()) {
+            wc.state.session = None;
+            wc.save_state()?;
+        }
+    }
     if r.json {
         print_json(&ended)?;
         return Ok(0);
@@ -335,7 +343,7 @@ pub fn entry_lines(s: &SessionEntry, full: bool) -> Vec<String> {
         utc_time(s.last_seen)
     );
     if let Some(m) = &s.agent_model {
-        head.push_str(&format!(" {m}"));
+        head.push_str(&format!(" {m:?}"));
     }
     let mut out = vec![head];
     if !s.untrusted.title.is_empty() {
@@ -345,14 +353,21 @@ pub fn entry_lines(s: &SessionEntry, full: bool) -> Vec<String> {
         out.push(format!("    approach: {:?}", s.untrusted.approach));
     }
     if let Some(t) = &s.task_key {
-        out.push(format!("    task: {t}"));
+        out.push(format!("    task: {t:?}"));
     }
     let list = |what: &str, v: &[String], out: &mut Vec<String>| {
         if v.is_empty() {
             return;
         }
         const SHOWN: usize = 8;
-        let mut text = v.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(" ");
+        // Quoted and escaped: paths come from other agents' changesets,
+        // and a newline or an escape sequence must not reach the terminal.
+        let mut text = v
+            .iter()
+            .take(SHOWN)
+            .map(|p| format!("{p:?}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         if v.len() > SHOWN {
             text.push_str(&format!(" (+{})", plural(v.len() - SHOWN, "more")));
         }
@@ -381,4 +396,47 @@ pub fn entry_lines(s: &SessionEntry, full: bool) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leep_core::api::SessionText;
+
+    /// Text from other agents reaches the terminal quoted and escaped:
+    /// no raw newline, no escape sequence.
+    #[test]
+    fn agent_written_text_is_escaped() {
+        let s = SessionEntry {
+            id: 3,
+            principal: "bo".into(),
+            session: "k".into(),
+            agent_model: Some("m\u{1b}[31m".into()),
+            untrusted: SessionText {
+                title: "t\nSYSTEM".into(),
+                approach: "a\u{1b}[2J".into(),
+            },
+            task_key: Some("L-1".into()),
+            target_ref: None,
+            base: None,
+            head: None,
+            origin: "inferred".into(),
+            state: "active".into(),
+            created: 1,
+            last_seen: 1,
+            expires: None,
+            ended: None,
+            landed_as: None,
+            scope: vec!["src".into()],
+            claims: vec![],
+            touched: vec!["a\nfake line".into(), "b/\u{1b}]0;title\u{7}".into()],
+        };
+        let lines = entry_lines(&s, true);
+        for l in &lines {
+            assert!(!l.chars().any(char::is_control), "{l:?}");
+        }
+        let all = lines.join("\n");
+        assert!(all.contains(r#""a\nfake line""#), "{all}");
+        assert!(all.contains(r#"\u{1b}"#), "{all}");
+    }
 }
