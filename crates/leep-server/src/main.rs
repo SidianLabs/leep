@@ -452,6 +452,12 @@ struct Args {
     /// `off` keeps none and answers `/v1/sessions` with 404.
     #[arg(long, env = "LEEP_SESSIONS", value_enum, default_value_t = Switch::On)]
     sessions: Switch,
+    /// Put overlap notices and duplicate flags in answers (ADR 0096): at
+    /// most three per answer, for the caller's session. `off` leaves them
+    /// out (overlaps are still listed when asked for), for comparing land
+    /// conflicts per 1,000 lands with and without them.
+    #[arg(long, env = "LEEP_NOTICES", value_enum, default_value_t = Switch::On)]
+    notices: Switch,
     /// Leave a create's tree nodes out of the blob store and derive them
     /// when read (ADR 0069): a create then writes no tree node, and a land
     /// stores the tree of a changeset the ref moves to as it is. The answers
@@ -1926,6 +1932,13 @@ async fn run() -> anyhow::Result<()> {
         .with_blame_tracking(args.warm_blame_paths);
     if args.sessions == Switch::Off {
         repo = repo.with_coord(None);
+    }
+    repo = repo.with_notices(args.notices == Switch::On);
+    if repo.coord().is_some() {
+        tracing::info!(
+            notices = args.notices == Switch::On,
+            "overlap notices in answers (ADR 0096)"
+        );
     }
     match repo.coord() {
         Some(_) => tracing::info!("keeping sessions (ADR 0095)"),

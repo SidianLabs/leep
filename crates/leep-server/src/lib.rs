@@ -332,6 +332,8 @@ pub fn router_with_read_classes(
             "/v1/sessions/{id}",
             get(sessions::get_one).delete(sessions::end),
         )
+        .route("/v1/sessions/{id}/overlaps", get(sessions::overlaps))
+        .route("/v1/notices", get(sessions::notices))
         .route("/v1/refs", get(list_refs))
         .route("/v1/refs/{*name}", get(get_ref).post(post_ref))
         .route("/v1/reflog", get(ref_log_all))
@@ -927,6 +929,7 @@ async fn missing_blobs(State(repo): S, body: Bytes) -> ApiResult<Json<MissingBlo
 async fn create_changeset(
     State(repo): S,
     auth::MaybePrincipal(who): auth::MaybePrincipal,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<CreateChangesetResponse>> {
     let cs: Changeset = parse_json(&body)?;
@@ -938,13 +941,11 @@ async fn create_changeset(
     let id = repo
         .create_changeset_by(cs, who.as_ref().map(|p| p.name.as_str()))
         .await?;
-    if let Some(seed) = seed {
-        sessions::after_create(&repo, seed, id, &who).await;
-    }
-    Ok(Json(CreateChangesetResponse {
-        id,
-        notices: vec![],
-    }))
+    let notices = match seed {
+        Some(seed) => sessions::after_create(&repo, seed, id, &who, &headers).await,
+        None => Vec::new(),
+    };
+    Ok(Json(CreateChangesetResponse { id, notices }))
 }
 
 /// `{id}` of a read endpoint that also takes a revision (ADR 0082): a full
@@ -1833,7 +1834,10 @@ async fn land(
             actor,
             &resp,
         );
-        return Ok(Json(resp).into_response());
+        return Ok(
+            Json(sessions::land_answer(&repo, req.changeset, actor, &headers, resp).await)
+                .into_response(),
+        );
     };
     // The client's body byte for byte, so fields this server does not know
     // reach the coordinating server unchanged.
@@ -1862,7 +1866,8 @@ async fn land(
                     actor,
                     &r,
                 );
-                Json(r).into_response()
+                Json(sessions::land_answer(&repo, req.changeset, actor, &headers, r).await)
+                    .into_response()
             }
             Coordinated::Forwarded(relayed) => relayed.into_response(),
             Coordinated::NotLeader => coord::not_leader(),
