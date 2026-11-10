@@ -156,8 +156,11 @@ impl NoticeState {
         let seen = all.entry(session).or_default();
         seen.retain(|s| now - s.at < SEEN_TTL_SECS);
         let mut out = Vec::new();
-        for f in found {
-            if out.len() >= max {
+        // Only the best-ranked overlaps are ever considered, and an
+        // unexpired entry is never dropped: a session with more overlaps
+        // than its memory holds hears the first ones once, not in a loop.
+        for f in found.into_iter().take(MAX_SEEN_PER_SESSION) {
+            if out.len() >= max || seen.len() >= MAX_SEEN_PER_SESSION {
                 break;
             }
             if seen.iter().any(|s| s.key == f.key) {
@@ -171,10 +174,6 @@ impl NoticeState {
                 followed: false,
             });
             out.push(f);
-        }
-        if seen.len() > MAX_SEEN_PER_SESSION {
-            let extra = seen.len() - MAX_SEEN_PER_SESSION;
-            seen.drain(..extra);
         }
         out
     }
@@ -778,6 +777,26 @@ mod tests {
         assert_eq!(keys(st.pick(2, all(), 3, 1002)).len(), 3, "per session");
         // Said again once the memory expires.
         assert_eq!(keys(st.pick(1, all(), 3, 1001 + SEEN_TTL_SECS)).len(), 3);
+    }
+
+    /// More overlaps than a session's memory holds: each is said once,
+    /// never again while unexpired, however many answers follow.
+    #[test]
+    fn a_full_memory_never_repeats_a_notice() {
+        let st = NoticeState::default();
+        let all = || {
+            (0..70)
+                .map(|i| found(NoticeLevel::SameFile, &format!("s{i}")))
+                .collect::<Vec<_>>()
+        };
+        let mut said = std::collections::BTreeMap::new();
+        for t in 0..60 {
+            for f in st.pick(1, all(), 3, 1000 + t) {
+                *said.entry(f.key).or_insert(0) += 1;
+            }
+        }
+        assert!(said.values().all(|n| *n == 1), "{said:?}");
+        assert!(said.contains_key("s0") && said.len() <= MAX_SEEN_PER_SESSION);
     }
 
     #[test]
