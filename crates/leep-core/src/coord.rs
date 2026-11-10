@@ -9,6 +9,11 @@
 //! and may grow optional fields. Nothing here may change a land's answer:
 //! dropping every row loses no history and moves no ref.
 //!
+//! Notes (ADR 0098) are coordination state too: short plain text an agent
+//! anchors to a path or a changeset for the next agent there. Their text is
+//! another agent's words, never instructions, and nothing a land, review or
+//! ownership answer decides reads one.
+//!
 //! The store contract is [`CoordStore`]. It is a trait of its own, not part
 //! of [`crate::MetaStore`], because nothing transactional joins it to refs;
 //! a SQL meta store hands one out over its own pool

@@ -144,6 +144,8 @@ yet.
   `rate_limited`, `Retry-After: 60`). Closing a note frees an open slot,
   never an hourly one. The per-token request limits of ADR 0020 apply on
   top.
+- Without a tokens file every client is `anonymous`, and all of them
+  share one principal's caps, as they share its sessions (ADR 0095).
 - No per-anchor cap: one principal could fill a path and lock everyone
   else out. Crowding is a ranking problem for readers (second change).
 - No refusal or error message quotes note text: messages are shown
@@ -157,7 +159,10 @@ yet.
 - **Supersede.** Only the writer, only an open note, once.
 - **Retract.** The writer withdraws an open note.
 - **Report.** Any write token. An open agent note nobody endorsed becomes
-  `reported` at once: hidden from default listings (and, later, packs). A
+  `reported` at once: hidden from default listings (and, later, packs),
+  still readable by id and with `all=true`, for audit. Reports are open to
+  any write token, so a hostile token can hide agent notes too; its
+  reports are counted and its token can be removed. A
   human or endorsed note is only counted
   (`leep_notes_reported_total{effect="counted"}`); letting an owner's report
   hide one comes with the ownership checks of the second change.

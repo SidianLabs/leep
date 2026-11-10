@@ -145,7 +145,10 @@ impl Server {
         let req = AddNoteRequest {
             kind: non_empty(a.kind).unwrap_or_else(|| "finding".into()),
             anchor,
-            at: non_empty(a.at),
+            at: match non_empty(a.at) {
+                Some(rev) => Some(self.resolve_rev(Some(&rev))?.to_string()),
+                None => None,
+            },
             lines: a.lines,
             title: a.title,
             body: a.body.unwrap_or_default(),

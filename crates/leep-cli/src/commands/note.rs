@@ -51,8 +51,8 @@ pub struct AddArgs {
     /// Lines of the file the note is about, `START:END` (from 1).
     #[arg(long, value_name = "START:END", value_parser = parse_lines)]
     pub lines: Option<[u32; 2]>,
-    /// The revision the path is read at (default: your session's target
-    /// ref, else the server's default ref).
+    /// The revision the path is read at: an id, short id or ref (default:
+    /// your session's target ref, else the server's default ref).
     #[arg(long, value_name = "REV")]
     pub at: Option<String>,
     /// A note of yours this one replaces.
@@ -172,7 +172,7 @@ fn add(r: &Remote, a: &AddArgs) -> Result<i32> {
     let req = AddNoteRequest {
         kind: a.kind.clone(),
         anchor,
-        at: a.at.clone(),
+        at: a.at.as_deref().map(|rev| changeset(r, rev)).transpose()?,
         lines: a.lines,
         title: a.title.clone(),
         body: a.body.clone().unwrap_or_default(),

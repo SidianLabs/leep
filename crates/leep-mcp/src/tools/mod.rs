@@ -819,7 +819,7 @@ pub fn definitions() -> Vec<Value> {
                     "title": { "type": "string", "description": "One line, at most 200 bytes." },
                     "body": { "type": "string", "description": "Plain text, at most 4096 bytes." },
                     "lines": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 2, "maxItems": 2, "description": "Lines [start, end] of the file the note is about." },
-                    "at": { "type": "string", "description": "Revision the path is read at (default: your session's target ref, else `main`)." },
+                    "at": { "type": "string", "description": "Revision the path is read at: an id, unique prefix or ref name (default: your session's target ref, else `main`)." },
                     "supersedes": { "type": "integer", "minimum": 1, "description": "A note of yours this one replaces." }
                 },
                 "required": ["title"],
