@@ -594,11 +594,14 @@ notes(id BIGSERIAL PRIMARY KEY,                                -- migration 0010
       trust TEXT NOT NULL DEFAULT 'agent',                      -- 'agent' or 'human', fixed at write
       endorsed_by TEXT, endorsed_at BIGINT,
       state TEXT NOT NULL DEFAULT 'open',                       -- 'open', 'superseded', 'retracted' or 'reported'
-      superseded_by BIGINT, created BIGINT NOT NULL,            -- unix seconds, the server's clock
+      superseded_by BIGINT,
+      reported_by TEXT, reported_at BIGINT,                     -- who hid it by a report, and when
+      created BIGINT NOT NULL,                                  -- unix seconds, the server's clock
       expires BIGINT)                                           -- when the sweep deletes it; NULL once endorsed
 notes_anchor: INDEX ON notes(repo_id, anchor_type, anchor, id)
 notes_principal: INDEX ON notes(repo_id, principal, created)
 notes_expires: INDEX ON notes(expires)
+notes_reported: INDEX ON notes(reported_by, reported_at) WHERE reported_by IS NOT NULL
 ```
 
 `ref_log` (ADR 0018) is appended in the transaction of every ref create, move
@@ -1100,8 +1103,9 @@ read by a land. Added:
   id; a restore into Postgres moves the id sequence past them.
 - `CoordStore::add_note`, `get_note`, `list_notes(NoteFilter {path,
   changeset, principal, states, before, limit})`, `notes_at(anchors,
-  cap)`, `change_note(id, NoteChange {Retract{by} | Report | Revoke |
-  Endorse{by}}, at)`, `revoke_notes(principal, at)` and
+  cap)`, `change_note(id, NoteChange {Retract{by} | Report{by, max_per_hour} |
+  Revoke | Endorse{by}}, at)`, `revoke_notes(principal, at)`,
+  `unreport_notes(id?, reporter?)` and
   `sweep_notes(now, limit) -> NoteSweep {expired, closed}`, checked by
   `check_notes_contract` (part of `check_coord_contract`). A store whose
   schema predates 0010 answers `NotFound`.
@@ -1113,7 +1117,8 @@ read by a land. Added:
   `NoteEntry`), `POST /v1/notes/{id}/report` (→ `ReportNoteResponse
   {note, hidden}`). An entry is `{id, kind, trust, endorsed_by?, state,
   principal, anchor_type, at?, lines?, session?, created, expires?,
-  superseded_by?, bytes, untrusted: {title, body?, anchor, agent_model?}}`:
+  superseded_by?, reported_by?, bytes, untrusted: {title, body?, anchor,
+  agent_model?}}`:
   text an agent wrote is only under `untrusted`; `kind`, `trust` and
   `state` are strings a client shows as they are when it does not know
   them (`state` may be `expired`: open, past `expires`, not yet swept).
@@ -1121,7 +1126,8 @@ read by a land. Added:
   field is omitted when absent. A server without notes answers the routes
   404.
 - Error code `too_many_notes` (400). Past the hourly limit the answer is
-  429 `rate_limited` with `Retry-After`. Superseding another principal's
+  429 `rate_limited` with `Retry-After`, as it is for a report from a
+  principal that hid 30 notes in the last hour. Superseding another principal's
   note is 403, one no longer open 409.
 - Tokens file: an optional `"kind": "agent" | "human"` per token (absent
   is `agent`). The file refuses unknown fields, so a server older than

@@ -665,6 +665,9 @@ impl leep_core::coord::CoordStore for Hanging {
     ) -> leep_core::Result<leep_core::coord::NoteSweep> {
         std::future::pending().await
     }
+    async fn unreport_notes(&self, _: Option<u64>, _: Option<&str>) -> leep_core::Result<u64> {
+        std::future::pending().await
+    }
 }
 
 /// A coordination store that hangs changes neither the land's answer nor

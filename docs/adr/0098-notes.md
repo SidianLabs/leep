@@ -40,7 +40,8 @@ notes(id BIGSERIAL PRIMARY KEY, repo_id BIGINT NOT NULL DEFAULT 1,
       trust TEXT NOT NULL DEFAULT 'agent',        -- agent|human, fixed at write
       endorsed_by TEXT, endorsed_at BIGINT,
       state TEXT NOT NULL DEFAULT 'open',         -- open|superseded|retracted|reported
-      superseded_by BIGINT, created BIGINT NOT NULL, expires BIGINT)
+      superseded_by BIGINT, reported_by TEXT, reported_at BIGINT,
+      created BIGINT NOT NULL, expires BIGINT)
   INDEX notes_anchor (repo_id, anchor_type, anchor, id)
   INDEX notes_principal (repo_id, principal, created)
   INDEX notes_expires (expires)
@@ -161,13 +162,24 @@ yet.
 - **Supersede.** Only the writer, only an open note, once.
 - **Retract.** The writer withdraws an open note.
 - **Report.** Any write token. An open agent note nobody endorsed becomes
-  `reported` at once: hidden from default listings (and, later, packs),
-  still readable by id and with `all=true`, for audit. Reports are open to
-  any write token, so a hostile token can hide agent notes too; its
-  reports are counted and its token can be removed. A
-  human or endorsed note is only counted
-  (`leep_notes_reported_total{effect="counted"}`); letting an owner's report
-  hide one comes with the ownership checks of the second change.
+  `reported` at once, recording `reported_by` (the reporter's token name)
+  and `reported_at`: hidden from default listings (and, later, packs),
+  still readable by id and with `all=true`, for audit. A human or endorsed
+  note is only counted (`leep_notes_reported_total{effect="counted"}`);
+  letting an owner's report hide one comes with the ownership checks of
+  the second change. Reports are writes with a cap of their own: a
+  principal that hid 30 notes in the last hour gets 429 for its next
+  report, counted in the same transaction as the hide. Every report is
+  logged at INFO with the note id, the reporter and its effect (never the
+  note's text); the metrics carry no principal label, so their
+  cardinality stays bounded. A hostile reporter is thus found in the log
+  or by `reported_by`, undone with `leep-server notes unreport
+  --reporter P` (or `--id N` for one note; the note is open again with an
+  agent note's life from its creation), and its token removed.
+- **Closing never lengthens a life.** Superseding, retracting, reporting
+  or revoking sets `expires` to 30 days on, or keeps it when the note's
+  life ends sooner: a report of an expired note not yet swept keeps it
+  due.
 - **Revoke.** There is no admin role, so mass revoke is an operator
   command: `leep-server notes revoke --principal P` retracts every open
   note of one token in one statement.
@@ -240,7 +252,8 @@ restores with no notes.
 - Notes join backups: a restore brings back endorsed knowledge, and a
   hostile note too, until it is retracted, reported or expires.
 - Metrics: `leep_notes_added_total{trust,kind}`,
-  `leep_notes_refused_total{reason}`, `leep_notes_reported_total{effect}`,
+  `leep_notes_refused_total{reason}` (with `report_rate`),
+  `leep_notes_reported_total{effect}`,
   `leep_notes_swept_total{reason}`.
 
 ## Not in this change

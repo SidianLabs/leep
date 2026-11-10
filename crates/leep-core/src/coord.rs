@@ -861,6 +861,15 @@ pub const HUMAN_NOTE_TTL_SECS: i64 = 365 * 24 * 60 * 60;
 pub const CLOSED_NOTE_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 /// Highest line number a note may anchor to.
 pub const MAX_NOTE_LINE: u32 = 10_000_000;
+/// Most notes one principal may hide by reporting them in an hour. One
+/// more report (of any note) is refused with [`REPORTS_PER_HOUR_MARKER`]
+/// (429): a report hides an agent's note at once, so reports are writes
+/// with a limit of their own.
+pub const MAX_REPORTS_PER_HOUR: usize = 30;
+/// Stable text in the refusal of a principal past its hourly report limit;
+/// the server answers it 429.
+pub const REPORTS_PER_HOUR_MARKER: &str =
+    "notes hidden by reports in the last hour, the most one principal may hide";
 /// Stable text in the 400 for a principal at its open note limit.
 pub const TOO_MANY_NOTES_MARKER: &str = "open notes, the most one principal may have";
 /// Stable text in the refusal of a principal past its hourly note limit;
@@ -980,6 +989,9 @@ pub struct Note {
     pub endorsed_at: Option<i64>,
     pub state: NoteState,
     pub superseded_by: Option<u64>,
+    /// Who reported it, when the report hid it, and when.
+    pub reported_by: Option<String>,
+    pub reported_at: Option<i64>,
     /// Unix seconds by the server.
     pub created: i64,
     /// When the sweep deletes it: the end of its life while open, 30 days
@@ -1112,6 +1124,20 @@ pub fn too_many_notes(principal: &str, max: usize) -> Error {
     ))
 }
 
+/// The refusal for a principal past its hourly report limit.
+pub fn reports_per_hour(principal: &str, max: usize) -> Error {
+    Error::Invalid(format!(
+        "{principal} has {max} {REPORTS_PER_HOUR_MARKER} ({max}); try again later"
+    ))
+}
+
+/// When a note closed at `at` is deleted: 30 days on, or sooner if its
+/// life ended sooner. Closing never lengthens a note's life.
+pub fn closed_expiry(expires: Option<i64>, at: i64) -> Option<i64> {
+    let x = at + CLOSED_NOTE_RETENTION_SECS;
+    Some(expires.map_or(x, |e| e.min(x)))
+}
+
 /// The refusal for a principal past its hourly note limit.
 pub fn notes_per_hour(principal: &str, max: usize) -> Error {
     Error::Invalid(format!(
@@ -1141,9 +1167,11 @@ pub fn check_supersede(old: u64, found: Option<(&str, NoteState)>, principal: &s
 pub enum NoteChange {
     /// Its principal withdraws it: `retracted` when `by` wrote it.
     Retract { by: String },
-    /// Someone reports it: an agent-tier note that nobody endorsed becomes
-    /// `reported` (hidden); any other is left as it is.
-    Report,
+    /// `by` reports it: an agent-tier note that nobody endorsed becomes
+    /// `reported` (hidden), recording `by` and the time; any other is left
+    /// as it is. Refused with [`reports_per_hour`] when `by` already hid
+    /// `max_per_hour` notes in the last hour.
+    Report { by: String, max_per_hour: usize },
     /// An operator withdraws it, whoever wrote it: `retracted`.
     Revoke,
     /// An owner vouches for it: sets `endorsed_by` and `endorsed_at`, and
@@ -1304,6 +1332,12 @@ pub trait CoordStore: Send + Sync {
     /// Revoke every open note of `principal` at `at`, as one statement (an
     /// operator's mass revoke). Answers how many.
     async fn revoke_notes(&self, principal: &str, at: i64) -> Result<u64>;
+
+    /// An operator's undo of reports: open again the reported note `id`, or
+    /// every note `reporter` hid, clearing `reported_by` and `reported_at`
+    /// and giving back an agent note's life (`created` plus
+    /// [`AGENT_NOTE_TTL_SECS`]). One statement; answers how many.
+    async fn unreport_notes(&self, id: Option<u64>, reporter: Option<&str>) -> Result<u64>;
 
     /// One bounded step of the note sweep at `now`: delete up to `limit`
     /// open notes past their `expires`, and up to `limit` closed ones past

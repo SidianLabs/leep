@@ -617,6 +617,7 @@ fn full_schema() -> BTreeSet<String> {
         "notes_anchor",
         "notes_principal",
         "notes_expires",
+        "notes_reported",
     ]
     .map(String::from)
     .into()

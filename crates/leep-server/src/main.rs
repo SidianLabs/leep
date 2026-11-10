@@ -528,6 +528,19 @@ enum NotesCmd {
         #[arg(long)]
         principal: String,
     },
+    /// Undo reports: open again one reported note (`--id`), or every note
+    /// one principal hid by reporting it (`--reporter`, a token found
+    /// reporting to silence others). Prints how many.
+    Unreport {
+        #[arg(
+            long,
+            required_unless_present = "reporter",
+            conflicts_with = "reporter"
+        )]
+        id: Option<u64>,
+        #[arg(long)]
+        reporter: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1351,6 +1364,21 @@ async fn run_revoke_notes(meta: &str, principal: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `notes unreport --id N | --reporter P` (ADR 0098): one statement.
+async fn run_unreport_notes(
+    meta: &str,
+    id: Option<u64>,
+    reporter: Option<&str>,
+) -> anyhow::Result<()> {
+    let meta = open_meta(meta).await.context("opening meta store")?;
+    let coord = meta
+        .coord_store()
+        .context("this metadata store keeps no notes (its schema is older than migration 10)")?;
+    let n = coord.unreport_notes(id, reporter).await?;
+    outln!("opened {n} reported notes again");
+    Ok(())
+}
+
 async fn run_derive_search(meta: &str, blobs: &str, rev: &str) -> anyhow::Result<()> {
     let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
     let meta = open_meta(meta).await.context("opening meta store")?;
@@ -1862,6 +1890,9 @@ async fn run() -> anyhow::Result<()> {
         Some(Cmd::Notes {
             cmd: NotesCmd::Revoke { principal },
         }) => return run_revoke_notes(&args.meta, &principal).await,
+        Some(Cmd::Notes {
+            cmd: NotesCmd::Unreport { id, reporter },
+        }) => return run_unreport_notes(&args.meta, id, reporter.as_deref()).await,
         Some(Cmd::Verify(v)) => {
             std::process::exit(repair::run_verify(&args.meta, &args.blobs, v).await)
         }
@@ -2573,6 +2604,8 @@ mod tests {
             &["migrate", "--status"],
             &["derive-search", "main"],
             &["notes", "revoke", "--principal", "p"],
+            &["notes", "unreport", "--reporter", "p"],
+            &["notes", "unreport", "--id", "3"],
             &[
                 "gen-token",
                 "--name",

@@ -226,6 +226,7 @@ mod tests {
             created: 1,
             expires: None,
             superseded_by: None,
+            reported_by: None,
             bytes: 1,
             untrusted: NoteText {
                 title: title.into(),

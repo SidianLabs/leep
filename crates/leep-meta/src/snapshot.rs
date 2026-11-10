@@ -152,13 +152,15 @@ struct NoteRow {
     endorsed_at: Option<i64>,
     state: String,
     superseded_by: Option<i64>,
+    reported_by: Option<String>,
+    reported_at: Option<i64>,
     created: i64,
     expires: Option<i64>,
 }
 
 const NOTE_COLUMNS: &str = "id, repo_id, kind, anchor_type, anchor, at_changeset, at_blob, \
      line_start, line_end, title, body, principal, agent_model, session_id, trust, endorsed_by, \
-     endorsed_at, state, superseded_by, created, expires";
+     endorsed_at, state, superseded_by, reported_by, reported_at, created, expires";
 
 /// Read a `notes` row of either backend, columns in [`NOTE_COLUMNS`] order.
 macro_rules! note_row {
@@ -184,8 +186,10 @@ macro_rules! note_row {
             endorsed_at: r.try_get(16).map_err(storage)?,
             state: r.try_get(17).map_err(storage)?,
             superseded_by: r.try_get(18).map_err(storage)?,
-            created: r.try_get(19).map_err(storage)?,
-            expires: r.try_get(20).map_err(storage)?,
+            reported_by: r.try_get(19).map_err(storage)?,
+            reported_at: r.try_get(20).map_err(storage)?,
+            created: r.try_get(21).map_err(storage)?,
+            expires: r.try_get(22).map_err(storage)?,
         }
     }};
 }
@@ -214,6 +218,8 @@ macro_rules! insert_notes {
                 .push_bind(r.endorsed_at)
                 .push_bind(r.state.clone())
                 .push_bind(r.superseded_by)
+                .push_bind(r.reported_by.clone())
+                .push_bind(r.reported_at)
                 .push_bind(r.created)
                 .push_bind(r.expires);
         });

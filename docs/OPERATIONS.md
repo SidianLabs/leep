@@ -161,8 +161,8 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_notices_followed_total` | counter | `level` | Notices followed within 10 minutes: the session's declared scope and claims stopped covering the path the notice was about, or the session ended. Against `leep_overlap_notices_total` it is the share of notices agents act on; a level that is almost never followed is noise (design F.3). |
 | `leep_notices_omitted_total` | counter | `reason` = `timeout`, `error`, `full` | Parts of notices left out of an answer: the path, `landed` or duplicate part took over 150 ms (`timeout`; 2 s for an overlaps query) or failed (`error`), or the server's memory of said notices was full (`full`, 100,000 sessions, purged of expired entries at most once a minute). The other parts still came, and the answers themselves were unaffected; a steady `timeout` rate means the coordination store, or the history reads of `landed`, are slow. |
 | `leep_notes_added_total` | counter | `trust` = `agent`, `human`; `kind` = `finding`, `gotcha`, `decision`, `howto` | Notes written (`POST /v1/notes`, ADR 0098). `trust` is the writing token's `kind`. |
-| `leep_notes_refused_total` | counter | `reason` = `too_many`, `rate`, `invalid`, `supersede` | Notes refused: the principal had 200 open (`too_many`, 400) or wrote 30 in the last hour (`rate`, 429), the text, anchor or kind was bad (`invalid`; also a path not at the revision), or the note it superseded was another's or no longer open (`supersede`). A steady `rate` or `too_many` from one token is a runaway or hostile writer: look at its notes (`leep note list --principal NAME`). |
-| `leep_notes_reported_total` | counter | `effect` = `hidden`, `counted` | Notes reported: an open agent note nobody endorsed is hidden at once (`hidden`); a human or endorsed one, or one already closed, is only counted. Many `hidden` reports of one principal's notes are a reason to revoke them (`leep-server notes revoke`). |
+| `leep_notes_refused_total` | counter | `reason` = `too_many`, `rate`, `invalid`, `supersede`, `report_rate` | Notes and reports refused (`report_rate`: a principal that hid 30 notes by reports in the last hour, 429): the principal had 200 open (`too_many`, 400) or wrote 30 in the last hour (`rate`, 429), the text, anchor or kind was bad (`invalid`; also a path not at the revision), or the note it superseded was another's or no longer open (`supersede`). A steady `rate` or `too_many` from one token is a runaway or hostile writer: look at its notes (`leep note list --principal NAME`). |
+| `leep_notes_reported_total` | counter | `effect` = `hidden`, `counted` | Notes reported: an open agent note nobody endorsed is hidden at once (`hidden`); a human or endorsed one, or one already closed, is only counted. Many `hidden` reports of one principal's notes are a reason to revoke them (`leep-server notes revoke`). The reporter is not a label (unbounded); each report is an INFO log line `note reported` with `note`, `reporter` and `effect`, and a hidden note records `reported_by`. |
 | `leep_notes_swept_total` | counter | `reason` = `expired`, `closed` | Notes deleted by the per-minute sweep: open ones past their life (90 days for agents, 365 for humans), and superseded, retracted or reported ones 30 days after they closed. |
 | `leep_context_packs_total` | counter | none | Context packs answered (`POST /v1/context`, ADR 0097). Against `leep_sessions_started_total{origin="declared"}`, roughly packs per session. |
 | `leep_context_bytes_total` | counter | none | Bytes of items those packs returned (the envelope aside). Divided by `leep_context_packs_total`, the average pack. |
@@ -1524,6 +1524,13 @@ of them, `leep-server notes revoke --principal NAME` (uses `--meta`; safe
 beside running servers): it retracts every open note of that token, which
 stays listable as `retracted` for 30 days. Then take the token out of the
 tokens file.
+
+A token that reports to silence others is the reverse case. Each report is
+logged (`note reported`, with `note`, `reporter` and `effect`), a hidden
+note records `reported_by`, and one principal may hide at most 30 notes
+an hour (429 past it). `leep-server notes unreport --reporter NAME` opens
+again every note that token hid (`--id N` for one note); the notes get an
+agent note's life from their creation back, so one past it is swept.
 
 **Open review requests per requester** are capped at 100
 (`MAX_OPEN_REQUESTS`, a constant): one more is refused with 400 and code

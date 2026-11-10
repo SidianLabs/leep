@@ -15,8 +15,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use leep_core::api::{error_code, AddNoteRequest, NoteEntry, NotesResponse, ReportNoteResponse};
-use leep_core::coord::{NoteState, NOTES_PER_HOUR_MARKER};
+use leep_core::api::{error_code, AddNoteRequest, NoteEntry, NotesResponse};
+use leep_core::coord::{NoteState, NOTES_PER_HOUR_MARKER, REPORTS_PER_HOUR_MARKER};
 use leep_core::Error;
 use leep_derive::notes::NoteQuery;
 use serde::Deserialize;
@@ -52,15 +52,7 @@ pub(crate) async fn add(
         .await
     {
         Ok(e) => Ok((StatusCode::OK, Json(e)).into_response()),
-        Err(Error::Invalid(m)) if m.contains(NOTES_PER_HOUR_MARKER) => {
-            let mut resp =
-                auth::reject(StatusCode::TOO_MANY_REQUESTS, error_code::RATE_LIMITED, &m);
-            // The window slides: a minute on, the oldest note in it may
-            // have left.
-            resp.headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
-            Ok(resp)
-        }
+        Err(Error::Invalid(m)) if m.contains(NOTES_PER_HOUR_MARKER) => Ok(rate_limited(&m)),
         Err(Error::Policy(m)) => Ok(auth::reject(
             StatusCode::FORBIDDEN,
             error_code::FORBIDDEN,
@@ -154,10 +146,25 @@ pub(crate) async fn retract(
     Ok(Json(repo.retract_note(id, &me).await?).into_response())
 }
 
-/// `POST /v1/notes/{id}/report`.
+/// `POST /v1/notes/{id}/report`. Past the reporter's hourly cap the
+/// answer is 429 with `Retry-After`.
 pub(crate) async fn report(
     State(repo): S,
+    auth::MaybePrincipal(who): auth::MaybePrincipal,
     Path(id): Path<String>,
-) -> ApiResult<Json<ReportNoteResponse>> {
-    Ok(Json(repo.report_note(note_id(&id)?).await?))
+) -> ApiResult<Response> {
+    match repo.report_note(note_id(&id)?, &principal(&who)).await {
+        Ok(r) => Ok(Json(r).into_response()),
+        Err(Error::Invalid(m)) if m.contains(REPORTS_PER_HOUR_MARKER) => Ok(rate_limited(&m)),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// A 429 for an hourly cap: the window slides, so a minute on the oldest
+/// write in it may have left.
+fn rate_limited(m: &str) -> Response {
+    let mut resp = auth::reject(StatusCode::TOO_MANY_REQUESTS, error_code::RATE_LIMITED, m);
+    resp.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+    resp
 }

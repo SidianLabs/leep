@@ -615,3 +615,91 @@ async fn open_servers_and_servers_without_notes() {
     let r = off.call(Method::GET, "/v1/notes", None, None, vec![]).await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
 }
+
+/// Reports are attributed and capped: the note records who hid it, and a
+/// reporter that hid 30 notes in an hour gets 429 for the next report,
+/// which hides nothing. The operator's undo opens them again.
+#[tokio::test]
+async fn reports_are_attributed_capped_and_undone() {
+    use leep_core::coord::MAX_REPORTS_PER_HOUR;
+    let api = Api::new(true).await;
+    let coord = api.repo.coord().unwrap().clone();
+    let mut ids = Vec::new();
+    for i in 0..=MAX_REPORTS_PER_HOUR {
+        let n = coord
+            .add_note(&NewNote {
+                kind: NoteKind::Finding,
+                anchor_type: AnchorType::Path,
+                anchor: "docs/a.md".into(),
+                at_changeset: None,
+                at_blob: None,
+                lines: None,
+                title: format!("n{i}"),
+                body: String::new(),
+                principal: "alice".into(),
+                agent_model: None,
+                session_id: None,
+                trust: NoteTrust::Agent,
+                supersedes: None,
+                created: leep_core::store::unix_now() - i as i64,
+                expires: None,
+                max_open: 1000,
+                max_per_hour: 1000,
+            })
+            .await
+            .unwrap();
+        ids.push(n.id);
+    }
+    let report = |id: u64| {
+        let uri = format!("/v1/notes/{id}/report");
+        let api = &api;
+        async move {
+            api.call(
+                Method::POST,
+                &uri,
+                Some(&token("bob")),
+                None,
+                b"{}".to_vec(),
+            )
+            .await
+        }
+    };
+    for id in &ids[..MAX_REPORTS_PER_HOUR] {
+        let r: ReportNoteResponse = report(*id).await.ok();
+        assert!(r.hidden);
+        assert_eq!(r.note.reported_by.as_deref(), Some("bob"));
+    }
+    let r = report(ids[MAX_REPORTS_PER_HOUR]).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.text());
+    assert_eq!(r.code().as_deref(), Some(error_code::RATE_LIMITED));
+    assert_eq!(r.retry_after.as_deref(), Some("60"));
+    let last: NoteEntry = api
+        .call(
+            Method::GET,
+            &format!("/v1/notes/{}", ids[MAX_REPORTS_PER_HOUR]),
+            Some(VIEWER),
+            None,
+            vec![],
+        )
+        .await
+        .ok();
+    assert_eq!(last.state, "open");
+    // Another reporter is not held back.
+    let r: ReportNoteResponse = api
+        .call(
+            Method::POST,
+            &format!("/v1/notes/{}/report", ids[MAX_REPORTS_PER_HOUR]),
+            Some(&token("hugo")),
+            None,
+            b"{}".to_vec(),
+        )
+        .await
+        .ok();
+    assert!(r.hidden);
+    // The operator's undo of one reporter.
+    assert_eq!(
+        api.repo.unreport_notes(None, Some("bob")).await.unwrap(),
+        MAX_REPORTS_PER_HOUR as u64
+    );
+    assert_eq!(api.list("").await.notes.len(), MAX_REPORTS_PER_HOUR);
+}

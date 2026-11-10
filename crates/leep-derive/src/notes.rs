@@ -15,7 +15,8 @@ use leep_core::coord::{
     check_anchor, check_key, normalize_path, AnchorType, CoordStore, NewNote, Note, NoteChange,
     NoteFilter, NoteKind, NoteState, NoteSweep, NoteTrust, SessionFilter, SessionState,
     AGENT_NOTE_TTL_SECS, HUMAN_NOTE_TTL_SECS, MAX_NOTES_PER_HOUR, MAX_OPEN_NOTES_PER_PRINCIPAL,
-    MAX_PATH_BYTES, NOTES_PER_HOUR_MARKER, TOO_MANY_NOTES_MARKER,
+    MAX_PATH_BYTES, MAX_REPORTS_PER_HOUR, NOTES_PER_HOUR_MARKER, REPORTS_PER_HOUR_MARKER,
+    TOO_MANY_NOTES_MARKER,
 };
 use leep_core::store::unix_now;
 use leep_core::{Error, Result, TreeEntry};
@@ -66,6 +67,7 @@ pub fn note_entry(n: Note, now: i64) -> NoteEntry {
         created: n.created,
         expires: n.expires,
         superseded_by: n.superseded_by,
+        reported_by: n.reported_by,
         bytes: (n.title.len() + n.body.len()) as u64,
         untrusted: NoteText {
             title: n.title,
@@ -306,20 +308,44 @@ impl Repo {
         self.note(id).await
     }
 
-    /// Report note `id`: an open agent note nobody endorsed is hidden at
-    /// once (`reported`); any other report is only counted.
-    pub async fn report_note(&self, id: u64) -> Result<ReportNoteResponse> {
+    /// `reporter` reports note `id`: an open agent note nobody endorsed is
+    /// hidden at once (`reported`, with the reporter and time recorded);
+    /// any other report is only counted. A reporter that hid
+    /// [`MAX_REPORTS_PER_HOUR`] notes in the last hour is refused. Every
+    /// report is logged with its reporter (never the note's text), so an
+    /// operator can find and undo one token's reports
+    /// (`leep-server notes unreport`).
+    pub async fn report_note(&self, id: u64, reporter: &str) -> Result<ReportNoteResponse> {
         let coord = self.notes_on()?;
         self.note(id).await?;
-        let hidden = coord
-            .change_note(id, &NoteChange::Report, unix_now())
-            .await?;
+        let change = NoteChange::Report {
+            by: reporter.to_string(),
+            max_per_hour: MAX_REPORTS_PER_HOUR,
+        };
+        let hidden = match coord.change_note(id, &change, unix_now()).await {
+            Ok(h) => h,
+            Err(e) => {
+                if matches!(&e, Error::Invalid(m) if m.contains(REPORTS_PER_HOUR_MARKER)) {
+                    metrics::counter!("leep_notes_refused_total", "reason" => "report_rate")
+                        .increment(1);
+                    tracing::warn!(note = id, reporter, "note report refused: hourly cap");
+                }
+                return Err(e);
+            }
+        };
         let effect = if hidden { "hidden" } else { "counted" };
+        tracing::info!(note = id, reporter, effect, "note reported");
         metrics::counter!("leep_notes_reported_total", "effect" => effect).increment(1);
         Ok(ReportNoteResponse {
             note: self.note(id).await?,
             hidden,
         })
+    }
+
+    /// An operator's undo of reports: open again note `id`, or every note
+    /// `reporter` hid. Answers how many.
+    pub async fn unreport_notes(&self, id: Option<u64>, reporter: Option<&str>) -> Result<u64> {
+        self.notes_on()?.unreport_notes(id, reporter).await
     }
 
     /// An operator's mass revoke: retract every open note of `principal`.
@@ -596,12 +622,16 @@ mod tests {
             r.retract_note(a.id, "bo").await,
             Err(Error::Policy(_))
         ));
-        let rep = r.report_note(h.id).await.unwrap();
+        let rep = r.report_note(h.id, "bo").await.unwrap();
         assert!(!rep.hidden && rep.note.state == "open");
-        let rep = r.report_note(a.id).await.unwrap();
+        let rep = r.report_note(a.id, "bo").await.unwrap();
         assert!(rep.hidden && rep.note.state == "reported");
-        assert!(r.report_note(a.id).await.is_ok_and(|r| !r.hidden));
-        assert!(matches!(r.report_note(999).await, Err(Error::NotFound(_))));
+        assert_eq!(rep.note.reported_by.as_deref(), Some("bo"));
+        assert!(r.report_note(a.id, "bo").await.is_ok_and(|r| !r.hidden));
+        assert!(matches!(
+            r.report_note(999, "bo").await,
+            Err(Error::NotFound(_))
+        ));
         let open = r.notes(&NoteQuery::default()).await.unwrap();
         assert_eq!(open.notes.len(), 1);
         let all = NoteQuery {

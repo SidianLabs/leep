@@ -490,6 +490,9 @@ impl CoordStore for Slow {
     async fn sweep_notes(&self, now: i64, limit: usize) -> Result<leep_core::coord::NoteSweep> {
         self.0.sweep_notes(now, limit).await
     }
+    async fn unreport_notes(&self, id: Option<u64>, r: Option<&str>) -> Result<u64> {
+        self.0.unreport_notes(id, r).await
+    }
 }
 
 /// A slow store costs an answer its notices, never more than the bound.

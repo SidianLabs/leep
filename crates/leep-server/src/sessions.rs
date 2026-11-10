@@ -469,6 +469,7 @@ mod tests {
         notes_at(&[String], usize) -> Vec<Note>;
         change_note(u64, &NoteChange, i64) -> bool;
         revoke_notes(&str, i64) -> u64;
+        unreport_notes(Option<u64>, Option<&str>) -> u64;
         sweep_notes(i64, usize) -> NoteSweep;
     }
 

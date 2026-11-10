@@ -19,12 +19,12 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use leep_core::coord::{
-    ancestors, apply_update, check_end, check_supersede, no_notes, notes_per_hour, too_many_notes,
-    AnchorType, Beat, CoordStore, NearQuery, NearRow, NewNote, Note, NoteChange, NoteFilter,
-    NoteKind, NoteState, NoteSweep, NoteTrust, PathKind, Session, SessionEnd, SessionFilter,
-    SessionOrigin, SessionState, SessionUpdate, SweepReport, CLOSED_NOTE_RETENTION_SECS,
-    EXPIRE_AFTER_SECS, NOTE_RATE_WINDOW_SECS, PATHS_RETENTION_SECS, SESSION_RETENTION_SECS,
-    TOO_MANY_SESSIONS_MARKER,
+    ancestors, apply_update, check_end, check_supersede, no_notes, notes_per_hour,
+    reports_per_hour, too_many_notes, AnchorType, Beat, CoordStore, NearQuery, NearRow, NewNote,
+    Note, NoteChange, NoteFilter, NoteKind, NoteState, NoteSweep, NoteTrust, PathKind, Session,
+    SessionEnd, SessionFilter, SessionOrigin, SessionState, SessionUpdate, SweepReport,
+    AGENT_NOTE_TTL_SECS, CLOSED_NOTE_RETENTION_SECS, EXPIRE_AFTER_SECS, NOTE_RATE_WINDOW_SECS,
+    PATHS_RETENTION_SECS, SESSION_RETENTION_SECS, TOO_MANY_SESSIONS_MARKER,
 };
 use leep_core::{ChangesetId, Error, Result};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Sqlite, SqlitePool};
@@ -43,7 +43,7 @@ const NOTES_LOCK: i32 = 0x4c4e_4f54;
 
 const NOTE_COLUMNS: &str = "id, kind, anchor_type, anchor, at_changeset, at_blob, line_start, \
      line_end, title, body, principal, agent_model, session_id, trust, endorsed_by, endorsed_at, \
-     state, superseded_by, created, expires";
+     state, superseded_by, reported_by, reported_at, created, expires";
 
 /// Beats written per SQLite transaction.
 const BEATS_PER_TRANSACTION: usize = 500;
@@ -174,6 +174,8 @@ macro_rules! note_row {
                     endorsed_at: self.try_get("endorsed_at").map_err(storage)?,
                     state: NoteState::parse(&text("state")?).map_err(storage)?,
                     superseded_by: opt_id("superseded_by")?,
+                    reported_by: self.try_get("reported_by").map_err(storage)?,
+                    reported_at: self.try_get("reported_at").map_err(storage)?,
                     created: self.try_get("created").map_err(storage)?,
                     expires: self.try_get("expires").map_err(storage)?,
                 })
@@ -204,6 +206,8 @@ fn stored(n: &NewNote, id: u64) -> Note {
         endorsed_at: None,
         state: NoteState::Open,
         superseded_by: None,
+        reported_by: None,
+        reported_at: None,
         created: n.created,
         expires: n.expires,
     }
@@ -277,13 +281,24 @@ macro_rules! change_note {
             }
             other => {
                 let state = match other {
-                    NoteChange::Report => NoteState::Reported,
+                    NoteChange::Report { .. } => NoteState::Reported,
                     _ => NoteState::Retracted,
                 };
+                // Closing never lengthens a note's life.
+                let x = at + CLOSED_NOTE_RETENTION_SECS;
                 q.push("state = ")
                     .push_bind(state.as_str())
-                    .push(", expires = ")
-                    .push_bind(at + CLOSED_NOTE_RETENTION_SECS);
+                    .push(", expires = CASE WHEN expires IS NOT NULL AND expires < ")
+                    .push_bind(x)
+                    .push(" THEN expires ELSE ")
+                    .push_bind(x)
+                    .push(" END");
+                if let NoteChange::Report { by, .. } = other {
+                    q.push(", reported_by = ")
+                        .push_bind(by.clone())
+                        .push(", reported_at = ")
+                        .push_bind(at);
+                }
             }
         }
         q.push(" WHERE id = ")
@@ -293,7 +308,7 @@ macro_rules! change_note {
             NoteChange::Retract { by } => {
                 q.push(" AND principal = ").push_bind(by.clone());
             }
-            NoteChange::Report => {
+            NoteChange::Report { .. } => {
                 q.push(" AND trust = 'agent' AND endorsed_by IS NULL");
             }
             NoteChange::Revoke => {}
@@ -873,7 +888,8 @@ impl CoordStore for PgCoordStore {
             .map_err(storage)?;
         if let Some(old) = n.supersedes {
             let done = sqlx::query(
-                "UPDATE notes SET state = 'superseded', superseded_by = $1, expires = $2 \
+                "UPDATE notes SET state = 'superseded', superseded_by = $1, \
+                 expires = CASE WHEN expires IS NOT NULL AND expires < $2 THEN expires ELSE $2 END \
                  WHERE id = $3 AND repo_id = 1 AND state = 'open' AND principal = $4",
             )
             .bind(id)
@@ -942,12 +958,43 @@ impl CoordStore for PgCoordStore {
         if !self.notes {
             return Err(no_notes());
         }
+        let NoteChange::Report { by, max_per_hour } = change else {
+            let n = change_note!(Postgres, id, change, at)
+                .build()
+                .execute(self.pool("note_change"))
+                .await
+                .map_err(storage)?
+                .rows_affected();
+            return Ok(n == 1);
+        };
+        // A report counts the reporter's hidden notes in the same
+        // transaction as it hides one, so the cap holds.
+        let mut tx = self.pool("note_change").begin().await.map_err(storage)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
+            .bind(NOTES_LOCK)
+            .bind(by)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+        let hid: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM notes WHERE reported_by = $1 AND reported_at > $2 LIMIT $3) t",
+        )
+        .bind(by)
+        .bind(at - NOTE_RATE_WINDOW_SECS)
+        .bind(to_i64(*max_per_hour as u64))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(storage)?;
+        if hid as usize >= *max_per_hour {
+            return Err(reports_per_hour(by, *max_per_hour));
+        }
         let n = change_note!(Postgres, id, change, at)
             .build()
-            .execute(self.pool("note_change"))
+            .execute(&mut *tx)
             .await
             .map_err(storage)?
             .rows_affected();
+        tx.commit().await.map_err(storage)?;
         Ok(n == 1)
     }
 
@@ -956,12 +1003,31 @@ impl CoordStore for PgCoordStore {
             return Err(no_notes());
         }
         Ok(sqlx::query(
-            "UPDATE notes SET state = 'retracted', expires = $1 \
+            "UPDATE notes SET state = 'retracted', \
+             expires = CASE WHEN expires IS NOT NULL AND expires < $1 THEN expires ELSE $1 END \
              WHERE repo_id = 1 AND principal = $2 AND state = 'open'",
         )
         .bind(at + CLOSED_NOTE_RETENTION_SECS)
         .bind(principal)
         .execute(self.pool("note_revoke"))
+        .await
+        .map_err(storage)?
+        .rows_affected())
+    }
+
+    async fn unreport_notes(&self, id: Option<u64>, reporter: Option<&str>) -> Result<u64> {
+        if !self.notes {
+            return Err(no_notes());
+        }
+        Ok(sqlx::query(
+            "UPDATE notes SET state = 'open', reported_by = NULL, reported_at = NULL, \
+             expires = created + $1 WHERE repo_id = 1 AND state = 'reported' \
+             AND (id = $2 OR reported_by = $3)",
+        )
+        .bind(AGENT_NOTE_TTL_SECS)
+        .bind(id.map(to_i64))
+        .bind(reporter)
+        .execute(self.pool("note_unreport"))
         .await
         .map_err(storage)?
         .rows_affected())
@@ -1527,8 +1593,9 @@ impl CoordStore for SqliteCoordStore {
             .map_err(storage)?;
         if let Some(old) = n.supersedes {
             let done = sqlx::query(
-                "UPDATE notes SET state = 'superseded', superseded_by = ?, expires = ? \
-                 WHERE id = ? AND repo_id = 1 AND state = 'open' AND principal = ?",
+                "UPDATE notes SET state = 'superseded', superseded_by = ?1, \
+                 expires = CASE WHEN expires IS NOT NULL AND expires < ?2 THEN expires ELSE ?2 END \
+                 WHERE id = ?3 AND repo_id = 1 AND state = 'open' AND principal = ?4",
             )
             .bind(id)
             .bind(n.created + CLOSED_NOTE_RETENTION_SECS)
@@ -1596,12 +1663,41 @@ impl CoordStore for SqliteCoordStore {
         if !self.notes {
             return Err(no_notes());
         }
+        let NoteChange::Report { by, max_per_hour } = change else {
+            let n = change_note!(Sqlite, id, change, at)
+                .build()
+                .execute(self.pool("note_change"))
+                .await
+                .map_err(storage)?
+                .rows_affected();
+            return Ok(n == 1);
+        };
+        // A report counts the reporter's hidden notes in the same
+        // transaction as it hides one, so the cap holds.
+        let mut tx = self
+            .pool("note_change")
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(storage)?;
+        let hid: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM notes WHERE reported_by = ? AND reported_at > ? LIMIT ?)",
+        )
+        .bind(by)
+        .bind(at - NOTE_RATE_WINDOW_SECS)
+        .bind(to_i64(*max_per_hour as u64))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(storage)?;
+        if hid as usize >= *max_per_hour {
+            return Err(reports_per_hour(by, *max_per_hour));
+        }
         let n = change_note!(Sqlite, id, change, at)
             .build()
-            .execute(self.pool("note_change"))
+            .execute(&mut *tx)
             .await
             .map_err(storage)?
             .rows_affected();
+        tx.commit().await.map_err(storage)?;
         Ok(n == 1)
     }
 
@@ -1610,12 +1706,31 @@ impl CoordStore for SqliteCoordStore {
             return Err(no_notes());
         }
         Ok(sqlx::query(
-            "UPDATE notes SET state = 'retracted', expires = ? \
-             WHERE repo_id = 1 AND principal = ? AND state = 'open'",
+            "UPDATE notes SET state = 'retracted', \
+             expires = CASE WHEN expires IS NOT NULL AND expires < ?1 THEN expires ELSE ?1 END \
+             WHERE repo_id = 1 AND principal = ?2 AND state = 'open'",
         )
         .bind(at + CLOSED_NOTE_RETENTION_SECS)
         .bind(principal)
         .execute(self.pool("note_revoke"))
+        .await
+        .map_err(storage)?
+        .rows_affected())
+    }
+
+    async fn unreport_notes(&self, id: Option<u64>, reporter: Option<&str>) -> Result<u64> {
+        if !self.notes {
+            return Err(no_notes());
+        }
+        Ok(sqlx::query(
+            "UPDATE notes SET state = 'open', reported_by = NULL, reported_at = NULL, \
+             expires = created + ?1 WHERE repo_id = 1 AND state = 'reported' \
+             AND (id = ?2 OR reported_by = ?3)",
+        )
+        .bind(AGENT_NOTE_TTL_SECS)
+        .bind(id.map(to_i64))
+        .bind(reporter)
+        .execute(self.pool("note_unreport"))
         .await
         .map_err(storage)?
         .rows_affected())

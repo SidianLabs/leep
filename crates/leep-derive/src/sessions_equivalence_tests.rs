@@ -84,6 +84,9 @@ impl CoordStore for Dropped {
     async fn sweep_notes(&self, _: i64, _: usize) -> Result<leep_core::coord::NoteSweep> {
         Err(gone())
     }
+    async fn unreport_notes(&self, _: Option<u64>, _: Option<&str>) -> Result<u64> {
+        Err(gone())
+    }
 }
 
 /// Notices the populated repository said during the runs.
@@ -250,7 +253,7 @@ async fn notes_chatter(r: &Repo, rng: &mut Rng, agent: usize) {
         .await;
     match rng.below(4) {
         0 => {
-            let _ = r.report_note(n.id).await;
+            let _ = r.report_note(n.id, "rex").await;
         }
         1 => {
             let _ = r.retract_note(n.id, who).await;

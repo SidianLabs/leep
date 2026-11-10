@@ -1366,6 +1366,9 @@ pub struct NoteEntry {
     pub expires: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<u64>,
+    /// The principal whose report hid it, if one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_by: Option<String>,
     /// Bytes of the title and body.
     #[serde(default)]
     pub bytes: u64,
@@ -2385,6 +2388,7 @@ mod tests {
             created: 1,
             expires: Some(2),
             superseded_by: None,
+            reported_by: None,
             bytes: 1,
             untrusted: NoteText {
                 title: "t".into(),
