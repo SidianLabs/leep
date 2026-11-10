@@ -2,6 +2,9 @@
 
 use std::ffi::OsString;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
+
+use leep_core::api::Notice;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
@@ -309,7 +312,19 @@ fn env_token() -> Option<String> {
     std::env::var("LEEP_TOKEN").ok()
 }
 
+/// Run `cli`, then show on stderr the overlap notices its answers carried
+/// (ADR 0096), escaped: they name other agents' work.
 pub fn run(cli: Cli) -> Result<i32> {
+    let sink: Arc<Mutex<Vec<Notice>>> = Arc::default();
+    let out = run_with(cli, &sink);
+    let notices = std::mem::take(&mut *sink.lock().unwrap());
+    for line in session::notice_lines(&notices) {
+        eprintln!("{line}");
+    }
+    out
+}
+
+fn run_with(cli: Cli, sink: &Arc<Mutex<Vec<Notice>>>) -> Result<i32> {
     if let Command::Keygen(args) = &cli.command {
         return keygen::run(args);
     }
@@ -343,7 +358,8 @@ pub fn run(cli: Cli) -> Result<i32> {
             wc.as_ref().and_then(|w| w.config.token.as_deref()),
         );
         let client = Client::with_token(&server_for(wc.as_ref())?, token.as_deref())
-            .with_session(session::session_key(None, wc.as_ref()).as_deref());
+            .with_session(session::session_key(None, wc.as_ref()).as_deref())
+            .with_notice_sink(sink.clone());
         let target_ref = wc
             .as_ref()
             .map_or_else(|| "main".to_string(), |w| w.config.target_ref.clone());
@@ -356,7 +372,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         };
         return match &cli.command {
             Command::Session(c) => session::run(&remote, c, wc.as_mut()),
-            Command::Who(a) => session::who(&remote, a),
+            Command::Who(a) => session::who(&remote, a, wc.as_ref()),
             _ => unreachable!("matched above"),
         };
     }
@@ -382,7 +398,8 @@ pub fn run(cli: Cli) -> Result<i32> {
     if read_only && wc.is_err() {
         let token = resolve_token(cli.token.as_deref(), env_token().as_deref(), None);
         let client = Client::with_token(&server_for(None)?, token.as_deref())
-            .with_session(session::session_key(None, None).as_deref());
+            .with_session(session::session_key(None, None).as_deref())
+            .with_notice_sink(sink.clone());
         let remote = Remote {
             client: &client,
             cache: &cache,
@@ -401,7 +418,8 @@ pub fn run(cli: Cli) -> Result<i32> {
     );
     // Every request is a heartbeat of the agent's session (ADR 0095).
     let client = Client::with_token(&server_for(Some(&wc))?, token.as_deref())
-        .with_session(session::session_key(None, Some(&wc)).as_deref());
+        .with_session(session::session_key(None, Some(&wc)).as_deref())
+        .with_notice_sink(sink.clone());
     let mut ctx = Ctx {
         wc,
         client,

@@ -439,6 +439,9 @@ pub struct HttpForward {
     pub request_id: Option<HeaderValue>,
     /// Where on the holder: `v1/land`, or a ref's `rebase-onto`.
     pub path: String,
+    /// `Leep-Session` and `Leep-Notices`, so the holder answers the land's
+    /// notices for the caller's session (ADR 0096).
+    pub session: Vec<(axum::http::HeaderName, HeaderValue)>,
 }
 
 impl HttpForward {
@@ -449,6 +452,17 @@ impl HttpForward {
             authorization: headers.get(header::AUTHORIZATION).cloned(),
             request_id: headers.get(leep_core::api::REQUEST_ID_HEADER).cloned(),
             path: "v1/land".into(),
+            session: [
+                leep_core::api::SESSION_HEADER,
+                leep_core::api::NOTICES_HEADER,
+            ]
+            .into_iter()
+            .filter_map(|h| {
+                headers
+                    .get(h)
+                    .map(|v| (axum::http::HeaderName::from_static(h), v.clone()))
+            })
+            .collect(),
         }
     }
 
@@ -491,6 +505,9 @@ impl LandForward<Relayed> for HttpForward {
         }
         if let Some(id) = &self.request_id {
             req = req.header(leep_core::api::REQUEST_ID_HEADER, id.clone());
+        }
+        for (name, value) in &self.session {
+            req = req.header(name.clone(), value.clone());
         }
         let resp = match req.send().await {
             Ok(r) => r,

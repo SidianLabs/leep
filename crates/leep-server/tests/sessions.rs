@@ -619,6 +619,12 @@ impl leep_core::coord::CoordStore for Hanging {
     ) -> leep_core::Result<u64> {
         std::future::pending().await
     }
+    async fn near_paths(
+        &self,
+        _: &leep_core::coord::NearQuery,
+    ) -> leep_core::Result<Vec<leep_core::coord::NearRow>> {
+        std::future::pending().await
+    }
 }
 
 /// A coordination store that hangs costs a create at most its 250 ms

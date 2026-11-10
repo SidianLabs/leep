@@ -211,7 +211,10 @@ pub fn run(ctx: &mut Ctx, args: &CommitArgs) -> Result<i32> {
     ctx.wc.save_state()?;
 
     if ctx.json {
-        print_json(&leep_core::api::CreateChangesetResponse { id })?;
+        print_json(&leep_core::api::CreateChangesetResponse {
+            id,
+            notices: vec![],
+        })?;
     } else {
         let summary = format!(
             "committed {} ({}{})",

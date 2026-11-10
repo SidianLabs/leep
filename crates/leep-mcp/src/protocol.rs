@@ -42,6 +42,8 @@ pub struct Server {
     pub(crate) conflicts: Mutex<tools::Conflicts>,
     /// The token's name, once asked (`leep_who` marks your own session).
     pub(crate) principal: std::sync::OnceLock<String>,
+    /// When notices were last asked for (ADR 0096).
+    pub(crate) notice_poll: Mutex<Option<std::time::Instant>>,
 }
 
 impl Server {
@@ -59,6 +61,7 @@ impl Server {
             pending_lands: Mutex::default(),
             conflicts: Mutex::default(),
             principal: std::sync::OnceLock::new(),
+            notice_poll: Mutex::default(),
         }
     }
 
@@ -142,7 +145,8 @@ impl Server {
             Some(Ok(o)) => o,
             Some(Err(e)) => ToolOutput::error(e.0),
         };
-        Ok(out.into_json())
+        // Notices of other agents' work ride on every tool result.
+        Ok(self.with_notices(name, out).into_json())
     }
 }
 

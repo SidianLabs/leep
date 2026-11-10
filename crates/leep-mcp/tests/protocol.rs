@@ -61,6 +61,7 @@ fn tools_list_schemas_are_sane() {
         "leep_provenance",
         "leep_session_start",
         "leep_who",
+        "leep_overlaps",
     ] {
         assert!(names.contains(&expected), "missing {expected}");
     }

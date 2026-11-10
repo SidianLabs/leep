@@ -442,7 +442,10 @@ async fn create(
         }
     }
     let id = d.insert(cs);
-    Ok(Json(CreateChangesetResponse { id }))
+    Ok(Json(CreateChangesetResponse {
+        id,
+        notices: vec![],
+    }))
 }
 
 /// Records the verdict as reviewer `mock`.

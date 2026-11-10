@@ -156,6 +156,10 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_sessions_refused_total` | counter | none | Sessions not inferred because their principal already had 1000 active (`MAX_ACTIVE_PER_PRINCIPAL`). |
 | `leep_session_beats_dropped_total` | counter | `reason` = `full`, `principal` | Heartbeats of new keys not held because this server already holds 100,000 sessions' beats (`full`) or 2,000 of that principal's (`principal`, a token sending made-up keys); those sessions only look idle sooner. |
 | `leep_session_hook_errors_total` | counter | `hook` = `created`, `landed`, `beats`, `sweep`; `reason` = `error`, `timeout`, `busy` | Session updates that failed, timed out or were skipped. The answer they followed was not affected (ADR 0095); a steady rate means the coordination writes are failing and `leep who` is going stale. |
+| `leep_overlap_notices_total` | counter | `level` = `near`, `same_file`, `claimed`, `possible_duplicate`, `landed` | Notices put in answers (ADR 0096), each counted once when said. |
+| `leep_duplicate_sessions_flagged_total` | counter | `by` = `task_key`, `similar` | `possible_duplicate` notices said: the same task key, or a declared title and approach at least 60% alike. |
+| `leep_notices_followed_total` | counter | `level` | Notices followed within 10 minutes: the session's declared scope and claims stopped covering the path the notice was about, or the session ended. Against `leep_overlap_notices_total` it is the share of notices agents act on; a level that is almost never followed is noise (design F.3). |
+| `leep_notices_omitted_total` | counter | `reason` = `timeout`, `error`, `full` | Parts of notices left out of an answer: the path, `landed` or duplicate part took over 150 ms (`timeout`; 2 s for an overlaps query) or failed (`error`), or the server's memory of said notices was full (`full`, 100,000 sessions, purged of expired entries at most once a minute). The other parts still came, and the answers themselves were unaffected; a steady `timeout` rate means the coordination store, or the history reads of `landed`, are slow. |
 | `leep_land_leases_held` | gauge | none | Refs whose land lease this server holds ([Several servers on one ref](#several-servers-on-one-ref), ADR 0056). |
 | `leep_land_lease_acquired_total` | counter | none | Land leases this server took. Under steady traffic about one per hot ref per server restart; more means leases change hands. |
 | `leep_land_lease_lost_total` | counter | `reason` = `taken`, `idle` | Leases this server stopped holding: another server took it after this one failed to renew it for the TTL (`taken`), or it released it after 30 s without a land (`idle`). |
@@ -1441,6 +1445,18 @@ active until the next commit of the same agent session or the 24-hour
 expiry. `--sessions off` (`LEEP_SESSIONS=off`) keeps none and answers
 `/v1/sessions` with 404. Backups leave the tables out, as they do leases:
 a restore starts with no sessions.
+
+**Overlap notices (ADR 0096)** need no migration: they read the session
+tables of migration 9 and the refs. `--notices off` (`LEEP_NOTICES=off`)
+leaves them out of every answer and changes nothing else;
+`GET /v1/sessions/{id}/overlaps` still answers. To see whether they help,
+compare land conflicts per 1,000 lands,
+`1000 * rate(leep_land_total{outcome="conflicts"}) / rate(leep_land_total)`,
+over comparable periods with `--notices on` and `off`, beside the share of
+notices followed (`leep_notices_followed_total` over
+`leep_overlap_notices_total`, by level). Each server remembers the notices
+it has said for 30 minutes, so behind a load balancer an agent may hear one
+notice once per server.
 
 There is no down migration, and a v8 server refuses to start on a v9
 database. To go back to v8 without restoring a backup, stop every server and

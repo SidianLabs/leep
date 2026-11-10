@@ -36,6 +36,7 @@ mod land_fast;
 mod land_stage;
 pub mod lazy_tree;
 mod merge;
+pub mod notices;
 pub mod owners;
 pub mod pack_order;
 mod path_history;
@@ -85,6 +86,8 @@ mod land_pipeline_tests;
 mod land_stack_tests;
 #[cfg(test)]
 mod lazy_tree_tests;
+#[cfg(test)]
+mod notices_tests;
 #[cfg(test)]
 mod page_tests;
 #[cfg(test)]

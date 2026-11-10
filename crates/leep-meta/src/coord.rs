@@ -14,9 +14,9 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use leep_core::coord::{
-    ancestors, apply_update, check_end, Beat, CoordStore, PathKind, Session, SessionEnd,
-    SessionFilter, SessionOrigin, SessionState, SessionUpdate, SweepReport, EXPIRE_AFTER_SECS,
-    PATHS_RETENTION_SECS, SESSION_RETENTION_SECS, TOO_MANY_SESSIONS_MARKER,
+    ancestors, apply_update, check_end, Beat, CoordStore, NearQuery, NearRow, PathKind, Session,
+    SessionEnd, SessionFilter, SessionOrigin, SessionState, SessionUpdate, SweepReport,
+    EXPIRE_AFTER_SECS, PATHS_RETENTION_SECS, SESSION_RETENTION_SECS, TOO_MANY_SESSIONS_MARKER,
 };
 use leep_core::{ChangesetId, Error, Result};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Sqlite, SqlitePool};
@@ -55,6 +55,8 @@ fn too_many(principal: &str, max: usize) -> Error {
 
 trait SessionRow {
     fn session(&self) -> Result<Session>;
+    /// The `path_kind` and `path_text` columns of a `near_paths` row.
+    fn path_row(&self) -> Result<(String, String)>;
 }
 
 macro_rules! session_row {
@@ -94,6 +96,13 @@ macro_rules! session_row {
                     claims: Vec::new(),
                     touched: Vec::new(),
                 })
+            }
+
+            fn path_row(&self) -> Result<(String, String)> {
+                Ok((
+                    self.try_get("path_kind").map_err(storage)?,
+                    self.try_get("path_text").map_err(storage)?,
+                ))
             }
         }
     };
@@ -345,6 +354,9 @@ impl CoordStore for PgCoordStore {
         if let Some(k) = &f.agent_session {
             q.push(" AND s.agent_session = ").push_bind(k.clone());
         }
+        if let Some(o) = f.origin {
+            q.push(" AND s.origin = ").push_bind(o.as_str());
+        }
         if !f.states.is_empty() {
             let states: Vec<&str> = f.states.iter().map(|s| s.as_str()).collect();
             q.push(" AND s.state = ANY(").push_bind(states).push(")");
@@ -360,6 +372,9 @@ impl CoordStore for PgCoordStore {
             .iter()
             .map(SessionRow::session)
             .collect::<Result<Vec<_>>>()?;
+        if f.skip_paths {
+            return Ok(sessions);
+        }
         pg_paths(&mut conn, sessions).await
     }
 
@@ -500,6 +515,75 @@ impl CoordStore for PgCoordStore {
         .map_err(storage)?;
         Ok(n as u64)
     }
+
+    async fn near_paths(&self, q: &NearQuery) -> Result<Vec<NearRow>> {
+        if q.limit == 0 || q.paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (exact, ranges) = q.probes();
+        let order_exact = exact.clone();
+        let (lo, hi): (Vec<String>, Vec<String>) = ranges.into_iter().unzip();
+        // One statement: the exact probes, then each range under its own
+        // LIMIT, so one crowded directory cannot crowd out the rest.
+        // One statement: each exact path and each range under its own
+        // LIMIT (claims first on an exact path), so one crowded path cannot
+        // crowd out the rest; claims and exact rows first overall.
+        let sql = format!(
+            "SELECT {COLUMNS}, x.kind AS path_kind, x.path AS path_text FROM ( \
+               SELECT z.session_id, z.kind, z.path \
+                 FROM unnest($1::text[]) AS e(path) \
+                 CROSS JOIN LATERAL ( \
+                   SELECT p.session_id, p.kind, p.path FROM session_paths p \
+                     JOIN sessions t ON t.id = p.session_id AND t.state = 'active' \
+                     WHERE p.repo_id = 1 AND p.path = e.path AND p.session_id <> $4 \
+                     ORDER BY (p.kind = 'claim') DESC, p.session_id LIMIT $5) z \
+               UNION \
+               SELECT y.session_id, y.kind, y.path \
+                 FROM unnest($2::text[], $3::text[]) AS r(lo, hi) \
+                 CROSS JOIN LATERAL ( \
+                   SELECT q.session_id, q.kind, q.path FROM session_paths q \
+                     JOIN sessions t ON t.id = q.session_id AND t.state = 'active' \
+                     WHERE q.repo_id = 1 AND q.path > r.lo COLLATE \"C\" \
+                       AND q.path < r.hi COLLATE \"C\" AND q.session_id <> $4 \
+                     ORDER BY q.path LIMIT $5) y \
+             ) x JOIN sessions s ON s.id = x.session_id \
+             LEFT JOIN session_beats b ON b.session_id = s.id \
+             WHERE s.repo_id = 1 AND s.state = 'active' AND s.id <> $4 \
+             ORDER BY (x.kind = 'claim') DESC, (x.path = ANY($1)) DESC, \
+               x.path COLLATE \"C\", s.id LIMIT $6"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(exact)
+            .bind(lo)
+            .bind(hi)
+            .bind(q.exclude.map_or(-1, to_i64))
+            .bind(to_i64(q.per_range as u64))
+            .bind(to_i64(q.limit as u64))
+            .fetch_all(self.pool("session_near"))
+            .await
+            .map_err(storage)?;
+        let mut out = near_rows(&rows)?;
+        NearQuery::order(&order_exact, &mut out);
+        Ok(out)
+    }
+}
+
+/// `near_paths` rows, each once.
+fn near_rows<R: SessionRow>(rows: &[R]) -> Result<Vec<NearRow>> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for r in rows {
+        let session = r.session()?;
+        let (kind, path) = r.path_row()?;
+        if seen.insert((session.id, kind.clone(), path.clone())) {
+            out.push(NearRow {
+                session,
+                kind: PathKind::parse(&kind).map_err(storage)?,
+                path,
+            });
+        }
+    }
+    Ok(out)
 }
 
 // --- SQLite -------------------------------------------------------------------
@@ -696,6 +780,9 @@ impl CoordStore for SqliteCoordStore {
         if let Some(k) = &f.agent_session {
             q.push(" AND s.agent_session = ").push_bind(k.clone());
         }
+        if let Some(o) = f.origin {
+            q.push(" AND s.origin = ").push_bind(o.as_str());
+        }
         if !f.states.is_empty() {
             q.push(" AND s.state IN (");
             let mut sep = q.separated(", ");
@@ -715,6 +802,9 @@ impl CoordStore for SqliteCoordStore {
             .iter()
             .map(SessionRow::session)
             .collect::<Result<Vec<_>>>()?;
+        if f.skip_paths {
+            return Ok(sessions);
+        }
         sqlite_paths(&mut conn, sessions).await
     }
 
@@ -918,5 +1008,45 @@ impl CoordStore for SqliteCoordStore {
         .await
         .map_err(storage)?;
         Ok(n as u64)
+    }
+    async fn near_paths(&self, q: &NearQuery) -> Result<Vec<NearRow>> {
+        if q.limit == 0 || q.paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (exact, ranges) = q.probes();
+        let head = format!(
+            "SELECT {COLUMNS}, p.kind AS path_kind, p.path AS path_text FROM session_paths p \
+             JOIN sessions s ON s.id = p.session_id \
+             LEFT JOIN session_beats b ON b.session_id = s.id \
+             WHERE p.repo_id = 1 AND s.state = 'active' AND s.id <> "
+        );
+        let exclude = q.exclude.map_or(-1, to_i64);
+        let mut conn = self.pool("session_near").acquire().await.map_err(storage)?;
+        let mut rows = Vec::new();
+        // SQLite is local: one short statement per probe costs little.
+        for p in &exact {
+            let mut b = QueryBuilder::<Sqlite>::new(head.clone());
+            b.push_bind(exclude)
+                .push(" AND p.path = ")
+                .push_bind(p.clone())
+                .push(" ORDER BY (p.kind = 'claim') DESC, s.id LIMIT ")
+                .push_bind(to_i64(q.per_range as u64));
+            rows.extend(b.build().fetch_all(&mut *conn).await.map_err(storage)?);
+        }
+        for (lo, hi) in ranges {
+            let mut b = QueryBuilder::<Sqlite>::new(head.clone());
+            b.push_bind(exclude)
+                .push(" AND p.path > ")
+                .push_bind(lo)
+                .push(" AND p.path < ")
+                .push_bind(hi)
+                .push(" ORDER BY p.path LIMIT ")
+                .push_bind(to_i64(q.per_range as u64));
+            rows.extend(b.build().fetch_all(&mut *conn).await.map_err(storage)?);
+        }
+        let mut out = near_rows(&rows)?;
+        NearQuery::order(&exact, &mut out);
+        out.truncate(q.limit);
+        Ok(out)
     }
 }

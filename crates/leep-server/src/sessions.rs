@@ -7,20 +7,30 @@
 //! advisory: the hooks run after the answer they ride on is decided, in
 //! tasks of their own with a timeout, and their failures are counted and
 //! logged, never returned. The repository logic is in `leep_derive`
-//! (`sessions.rs`).
+//! (`sessions.rs`, `notices.rs`).
+//!
+//! Overlap notices (ADR 0096) ride on the answers to session declarations
+//! and listings, changeset creates, lands and `GET /v1/notices`, for the
+//! caller's session named by `Leep-Session`; `Leep-Notices` picks the
+//! lowest level wanted, or `off`. They are computed after the answer is
+//! decided and within a bound, past which they are left out.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use leep_core::api::{error_code, DeclareSessionRequest, LandResponse, SESSION_HEADER};
+use leep_core::api::{
+    error_code, DeclareSessionRequest, LandAnswer, LandResponse, Notice, NoticesResponse,
+    OverlapsResponse, NOTICES_HEADER, SESSION_HEADER,
+};
 use leep_core::coord::SessionState;
 use leep_core::{ChangesetId, Error};
+use leep_derive::notices::{ask_from_header, NoticeAsk};
 use leep_derive::sessions::{SessionQuery, SessionSeed, ANONYMOUS};
 use leep_derive::Repo;
 use serde::Deserialize;
@@ -51,13 +61,69 @@ fn principal(who: &Option<auth::Principal>) -> String {
         .map_or_else(|| ANONYMOUS.to_string(), |p| p.name.clone())
 }
 
+/// The notices a request asks for (`Leep-Notices`, ADR 0096).
+fn ask(headers: &HeaderMap) -> Option<NoticeAsk> {
+    ask_from_header(headers.get(NOTICES_HEADER).and_then(|v| v.to_str().ok()))
+}
+
+/// The caller's agent session key (`Leep-Session`), if any.
+fn session_key(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(SESSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_string)
+}
+
+/// The notices for the caller's session named by `Leep-Session`.
+async fn caller_notices(
+    repo: &Repo,
+    who: &Option<auth::Principal>,
+    headers: &HeaderMap,
+) -> Vec<Notice> {
+    match (session_key(headers), ask(headers)) {
+        (Some(key), Some(ask)) if repo.notices_on() => {
+            repo.notices_for(&principal(who), &key, &ask).await
+        }
+        _ => Vec::new(),
+    }
+}
+
 pub(crate) async fn declare(
     State(repo): S,
     auth::MaybePrincipal(who): auth::MaybePrincipal,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<leep_core::api::DeclareSessionResponse>> {
     let req: DeclareSessionRequest = parse_json(&body)?;
-    Ok(Json(repo.declare_session(&principal(&who), req).await?))
+    let ask = ask(&headers);
+    Ok(Json(
+        repo.declare_session_with(&principal(&who), req, ask.as_ref())
+            .await?,
+    ))
+}
+
+/// `GET /v1/notices`: the caller's notices now, each said once.
+pub(crate) async fn notices(
+    State(repo): S,
+    auth::MaybePrincipal(who): auth::MaybePrincipal,
+    headers: HeaderMap,
+) -> ApiResult<Json<NoticesResponse>> {
+    if repo.coord().is_none() {
+        return Err(Error::NotFound("sessions: this server keeps none".into()).into());
+    }
+    Ok(Json(NoticesResponse {
+        notices: caller_notices(&repo, &who, &headers).await,
+    }))
+}
+
+/// `GET /v1/sessions/{id}/overlaps`: everything overlapping it now.
+pub(crate) async fn overlaps(
+    State(repo): S,
+    Path(id): Path<String>,
+) -> ApiResult<Json<OverlapsResponse>> {
+    Ok(Json(repo.session_overlaps(session_id(&id)?).await?))
 }
 
 #[derive(Deserialize)]
@@ -92,6 +158,7 @@ fn number<T: std::str::FromStr>(name: &str, v: Option<&str>) -> ApiResult<Option
 pub(crate) async fn list(
     State(repo): S,
     auth::MaybePrincipal(who): auth::MaybePrincipal,
+    headers: HeaderMap,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<leep_core::api::SessionsResponse>> {
     let mine = flag("mine", q.mine.as_deref())?;
@@ -118,7 +185,9 @@ pub(crate) async fn list(
         before: number("before", q.before.as_deref())?,
         limit,
     };
-    Ok(Json(repo.sessions(&query).await?))
+    let mut resp = repo.sessions(&query).await?;
+    resp.notices = caller_notices(&repo, &who, &headers).await;
+    Ok(Json(resp))
 }
 
 fn session_id(id: &str) -> ApiResult<u64> {
@@ -207,27 +276,86 @@ where
 /// session from it (design D.2). Awaited, for at most [`CREATE_HOOK_BOUND`],
 /// so the session holds the changeset before its creator can land it: the
 /// land's own hook then finds it. The answer is the same either way; a slow
-/// or failing store only costs the session this update.
+/// or failing store only costs the session this update. Answers the
+/// session's notices (ADR 0096), within their own bound, with the
+/// changeset's paths probed first.
 pub(crate) async fn after_create(
     repo: &Repo,
     seed: SessionSeed,
     id: ChangesetId,
     who: &Option<auth::Principal>,
-) {
+    headers: &HeaderMap,
+) -> Vec<Notice> {
     let principal = principal(who);
-    match tokio::time::timeout(CREATE_HOOK_BOUND, repo.note_created(seed, id, &principal)).await {
-        Ok(Ok(_)) => {}
+    let focus = seed.touch.clone();
+    let noted = tokio::time::timeout(
+        CREATE_HOOK_BOUND,
+        repo.note_created_session(seed, id, &principal),
+    )
+    .await;
+    let session = match noted {
+        Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             metrics::counter!("leep_session_hook_errors_total", "hook" => "created", "reason" => "error")
                 .increment(1);
             tracing::warn!(error = %e, "inferring a session failed");
+            None
         }
         Err(_) => {
             metrics::counter!("leep_session_hook_errors_total", "hook" => "created", "reason" => "timeout")
                 .increment(1);
             tracing::warn!("inferring a session timed out");
+            None
         }
+    };
+    match (session, ask(headers)) {
+        (Some(s), Some(ask)) => {
+            let ask = NoticeAsk { focus, ..ask };
+            repo.notices_for_session(&s, &ask).await
+        }
+        _ => Vec::new(),
     }
+}
+
+/// A land's answer with the notices of the land's session beside it (ADR
+/// 0096): the caller's `Leep-Session`, else the submitted changeset's
+/// `agent.session`. Computed after the answer is decided and within the
+/// notice bound; the answer itself is never touched.
+pub(crate) async fn land_answer(
+    repo: &Repo,
+    submitted: ChangesetId,
+    actor: Option<&str>,
+    headers: &HeaderMap,
+    answer: LandResponse,
+) -> LandAnswer {
+    let Some(ask) = ask(headers).filter(|_| repo.notices_on()) else {
+        return LandAnswer {
+            answer,
+            notices: Vec::new(),
+        };
+    };
+    let principal = actor.unwrap_or(ANONYMOUS).to_string();
+    let work = async {
+        let key = match session_key(headers) {
+            Some(k) => Some(k),
+            None => repo.get_changeset(submitted).await.ok().and_then(|cs| {
+                cs.extra
+                    .get(leep_core::changeset::EXTRA_AGENT_SESSION)
+                    .cloned()
+            }),
+        };
+        match key {
+            Some(k) => repo.notices_for(&principal, &k, &ask).await,
+            None => Vec::new(),
+        }
+    };
+    let notices = tokio::time::timeout(leep_derive::notices::NOTICE_BOUND, work)
+        .await
+        .unwrap_or_else(|_| {
+            metrics::counter!("leep_notices_omitted_total", "reason" => "timeout").increment(1);
+            Vec::new()
+        });
+    LandAnswer { answer, notices }
 }
 
 /// After a land of `submitted` answered `resp`: end the session whose head

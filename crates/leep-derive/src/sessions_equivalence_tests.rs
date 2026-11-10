@@ -2,8 +2,10 @@
 //! a land's answer. The same random land sequence runs on three
 //! repositories, one with no coordination store (its tables dropped), one
 //! whose sessions are declared, inferred, beaten, ended and swept at every
-//! step, and one whose coordination store fails every call. Every land
-//! answer, the refs and the ref log must be the same on all three.
+//! step, with overlap notices and duplicate flags computed on every create,
+//! declaration and land (ADR 0096), and one whose coordination store fails
+//! every call. Every land answer, the refs and the ref log must be the same
+//! on all three.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -52,7 +54,16 @@ impl CoordStore for Dropped {
     async fn count_sessions(&self, _: leep_core::coord::SessionState, _: usize) -> Result<u64> {
         Err(gone())
     }
+    async fn near_paths(
+        &self,
+        _: &leep_core::coord::NearQuery,
+    ) -> Result<Vec<leep_core::coord::NearRow>> {
+        Err(gone())
+    }
 }
+
+/// Notices the populated repository said during the runs.
+static NOTICED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn repo() -> Repo {
     Repo::new(
@@ -96,14 +107,18 @@ async fn create(r: &Repo, parents: &[ChangesetId], edits: &Edits, agent: usize) 
         .create_changeset_by(cs.clone(), Some(AGENTS[agent].0))
         .await
         .unwrap();
-    // What the server does after storing it; its failures never surface.
-    let _ = r
-        .note_created(
-            crate::sessions::SessionSeed::of(&cs).unwrap(),
-            id,
-            AGENTS[agent].0,
-        )
-        .await;
+    // What the server does after storing it, notices included (ADR 0096);
+    // its failures never surface.
+    let seed = crate::sessions::SessionSeed::of(&cs).unwrap();
+    let ask = crate::notices::NoticeAsk {
+        focus: seed.touch.clone(),
+        min: leep_core::coord::NoticeLevel::Near,
+        duplicates: false,
+    };
+    if let Ok(Some(s)) = r.note_created_session(seed, id, AGENTS[agent].0).await {
+        let n = r.notices_for_session(&s, &ask).await;
+        NOTICED.fetch_add(n.len(), std::sync::atomic::Ordering::Relaxed);
+    }
     id
 }
 
@@ -116,6 +131,7 @@ async fn chatter(r: &Repo, rng: &mut Rng, agent: usize) {
         let req = DeclareSessionRequest {
             session: format!("s-{agent}"),
             title: Some(format!("work in {dir}")),
+            target_ref: Some("main".into()),
             task_key: Some(format!("T-{}", rng.below(3))),
             scope: Some(vec![dir.into()]),
             claims: Some(if rng.below(2) == 0 {
@@ -125,8 +141,15 @@ async fn chatter(r: &Repo, rng: &mut Rng, agent: usize) {
             }),
             ..Default::default()
         };
-        let _ = r.declare_session(who, req).await;
+        if let Ok(d) = r.declare_session(who, req).await {
+            let _ = r.session_overlaps(d.session.id).await;
+        }
     }
+    let near = crate::notices::NoticeAsk {
+        min: leep_core::coord::NoticeLevel::Near,
+        ..Default::default()
+    };
+    let _ = r.notices_for(who, &format!("s-{agent}"), &near).await;
     r.heartbeat(who, &format!("s-{agent}"));
     let _ = r.flush_beats().await;
     let _ = r
@@ -224,6 +247,16 @@ async fn run(seed: u64) -> [usize; 3] {
         let mut answers = Vec::new();
         for r in repos {
             let resp = r.land_as(id, "main", Some(AGENTS[agent].0)).await;
+            // The land's notices, as the server computes them after the
+            // answer (ADR 0096); they never feed back into it.
+            let n = r
+                .notices_for(
+                    AGENTS[agent].0,
+                    &format!("s-{agent}"),
+                    &crate::notices::NoticeAsk::default(),
+                )
+                .await;
+            NOTICED.fetch_add(n.len(), std::sync::atomic::Ordering::Relaxed);
             if let Ok(LandResponse::Landed { landed, .. }) = &resp {
                 // What the server does after a land answered.
                 let _ = r.note_landed(id, *landed, Some(AGENTS[agent].0)).await;
@@ -290,6 +323,10 @@ async fn coordination_state_never_changes_a_land_answer() {
             *s += n;
         }
     }
+    assert!(
+        NOTICED.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "notices were computed and said during the runs"
+    );
     // The sequences cover clean lands, rebases and conflicts.
     assert!(
         seen.iter().all(|&n| n > 0),

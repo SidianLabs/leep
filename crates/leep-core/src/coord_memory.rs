@@ -1,15 +1,15 @@
 //! The in-memory [`CoordStore`] and the contract every backend must pass
 //! (re-exported from [`crate::memory`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 
 use crate::coord::{
-    apply_update, check_end, Beat, CoordStore, Session, SessionEnd, SessionFilter, SessionOrigin,
-    SessionState, SessionUpdate, SweepReport, EXPIRE_AFTER_SECS, MAX_TOUCHED_PATHS,
-    PATHS_RETENTION_SECS, SESSION_RETENTION_SECS, TOO_MANY_SESSIONS_MARKER,
+    apply_update, check_end, Beat, CoordStore, NearQuery, NearRow, PathKind, Session, SessionEnd,
+    SessionFilter, SessionOrigin, SessionState, SessionUpdate, SweepReport, EXPIRE_AFTER_SECS,
+    MAX_TOUCHED_PATHS, PATHS_RETENTION_SECS, SESSION_RETENTION_SECS, TOO_MANY_SESSIONS_MARKER,
 };
 use crate::{ChangesetId, Error, Hash, Result};
 
@@ -88,6 +88,14 @@ impl CoordStore for MemoryCoordStore {
             .filter(|s| f.matches(s))
             .take(f.limit)
             .cloned()
+            .map(|mut s| {
+                if f.skip_paths {
+                    s.scope.clear();
+                    s.claims.clear();
+                    s.touched.clear();
+                }
+                s
+            })
             .collect())
     }
 
@@ -176,6 +184,55 @@ impl CoordStore for MemoryCoordStore {
             .filter(|s| s.state == state)
             .take(cap)
             .count() as u64)
+    }
+
+    async fn near_paths(&self, q: &NearQuery) -> Result<Vec<NearRow>> {
+        if q.limit == 0 {
+            return Ok(Vec::new());
+        }
+        let (exact, ranges) = q.probes();
+        let rows = self.rows.lock().unwrap();
+        let mut all: Vec<(&str, u64, PathKind)> = Vec::new();
+        for s in rows.sessions.values() {
+            if s.state != SessionState::Active || q.exclude == Some(s.id) {
+                continue;
+            }
+            for (kind, path) in s.paths() {
+                all.push((path, s.id, kind));
+            }
+        }
+        all.sort();
+        let mut picked: BTreeSet<(&str, u64, PathKind)> = BTreeSet::new();
+        for e in &exact {
+            let mut on: Vec<_> = all.iter().filter(|(p, _, _)| *p == e.as_str()).collect();
+            on.sort_by_key(|(_, id, k)| (*k != PathKind::Claim, *id));
+            picked.extend(on.into_iter().take(q.per_range).copied());
+        }
+        for (lo, hi) in &ranges {
+            picked.extend(
+                all.iter()
+                    .filter(|(p, _, _)| *p > lo.as_str() && *p < hi.as_str())
+                    .take(q.per_range)
+                    .copied(),
+            );
+        }
+        let mut out: Vec<NearRow> = picked
+            .into_iter()
+            .map(|(path, id, kind)| {
+                let mut session = rows.sessions[&id].clone();
+                session.scope.clear();
+                session.claims.clear();
+                session.touched.clear();
+                NearRow {
+                    session,
+                    kind,
+                    path: path.to_string(),
+                }
+            })
+            .collect();
+        NearQuery::order(&exact, &mut out);
+        out.truncate(q.limit);
+        Ok(out)
     }
 }
 
@@ -311,6 +368,16 @@ pub async fn check_coord_contract(store: &dyn CoordStore) {
         ..all.clone()
     };
     assert_eq!(list(by).await, [b.id]);
+    let declared = SessionFilter {
+        origin: Some(SessionOrigin::Declared),
+        ..all.clone()
+    };
+    assert_eq!(list(declared).await, [c.id, a.id]);
+    let inferred = SessionFilter {
+        origin: Some(SessionOrigin::Inferred),
+        ..all.clone()
+    };
+    assert_eq!(list(inferred).await, [b.id]);
     let key = SessionFilter {
         agent_session: Some("s-1".into()),
         principal: Some("ada".into()),
@@ -518,6 +585,183 @@ pub async fn check_coord_contract(store: &dyn CoordStore) {
     assert!(deleted >= 5, "{deleted}");
     assert!(list(all).await.is_empty());
     assert_eq!(store.get_session(a.id).await.unwrap(), None);
+
+    check_near_contract(store, end_of_days).await;
+}
+
+/// [`CoordStore::near_paths`] (ADR 0096): the rows of other active
+/// sessions on, above, below and (with siblings) beside the paths asked
+/// about, with their sessions, bounded per range and in all.
+async fn check_near_contract(store: &dyn CoordStore, t0: i64) {
+    let declare = |p: &str, k: &str| SessionUpdate::new(p, k, SessionOrigin::Declared, t0);
+    let mut me = declare("me", "near-0");
+    me.title = Some("mine".into());
+    me.touch = vec!["nr/a/x.rs".into()];
+    let (me, _) = store.upsert_session(&me).await.unwrap();
+    let mut same = declare("p1", "near-1");
+    same.title = Some("same file".into());
+    same.touch = vec!["nr/a/x.rs".into(), "elsewhere/q".into()];
+    let (same, _) = store.upsert_session(&same).await.unwrap();
+    let mut above = declare("p2", "near-2");
+    above.claims = Some(vec!["nr/a".into()]);
+    let (above, _) = store.upsert_session(&above).await.unwrap();
+    let mut beside = declare("p3", "near-3");
+    beside.scope = Some(vec!["nr/a/y.rs".into(), "nr/ab".into()]);
+    let (beside, _) = store.upsert_session(&beside).await.unwrap();
+    let mut ended = declare("p4", "near-4");
+    ended.touch = vec!["nr/a/x.rs".into()];
+    let (ended, _) = store.upsert_session(&ended).await.unwrap();
+    let end = SessionEnd {
+        state: SessionState::Abandoned,
+        at: t0,
+        landed_as: None,
+        principal: None,
+        if_head: None,
+    };
+    assert!(store.end_session(ended.id, &end).await.unwrap());
+
+    let q = NearQuery {
+        paths: vec!["nr/a/x.rs".into()],
+        siblings: false,
+        exclude: Some(me.id),
+        per_range: 10,
+        limit: 100,
+    };
+    let rows = |v: Vec<NearRow>| {
+        let mut v: Vec<(u64, PathKind, String)> = v
+            .into_iter()
+            .map(|r| {
+                assert!(r.session.scope.is_empty() && r.session.touched.is_empty());
+                assert_eq!(r.session.state, SessionState::Active);
+                (r.session.id, r.kind, r.path)
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let got = rows(store.near_paths(&q).await.unwrap());
+    assert_eq!(
+        got,
+        [
+            (same.id, PathKind::Touched, "nr/a/x.rs".to_string()),
+            (above.id, PathKind::Claim, "nr/a".to_string()),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>(),
+        "the ended session and the excluded one are left out"
+    );
+    let found = store.near_paths(&q).await.unwrap();
+    let s = found.iter().find(|r| r.session.id == same.id).unwrap();
+    assert_eq!(
+        (s.session.title.as_str(), s.session.principal.as_str()),
+        ("same file", "p1")
+    );
+    // Siblings: the same directory, never a name that only starts alike.
+    let sib = NearQuery {
+        siblings: true,
+        ..q.clone()
+    };
+    let got = rows(store.near_paths(&sib).await.unwrap());
+    assert!(got.contains(&(beside.id, PathKind::Scope, "nr/a/y.rs".into())));
+    assert!(!got.iter().any(|r| r.2 == "nr/ab"), "{got:?}");
+    assert_eq!(got.len(), 3, "{got:?}");
+    // Below a directory asked about.
+    let dir = NearQuery {
+        paths: vec!["nr".into()],
+        ..q.clone()
+    };
+    assert_eq!(store.near_paths(&dir).await.unwrap().len(), 4);
+    // Bounds: per range and in all.
+    let mut crowd = Vec::new();
+    for n in 0..12 {
+        let mut u = declare("crowd", &format!("c-{n}"));
+        u.touch = vec![format!("hot/f{n}.rs")];
+        crowd.push(store.upsert_session(&u).await.unwrap().0);
+    }
+    let hot = NearQuery {
+        paths: vec!["hot".into()],
+        per_range: 5,
+        ..q.clone()
+    };
+    assert_eq!(store.near_paths(&hot).await.unwrap().len(), 5);
+    let capped = NearQuery {
+        paths: vec!["hot".into(), "nr/a/x.rs".into()],
+        per_range: 50,
+        limit: 7,
+        ..q.clone()
+    };
+    assert_eq!(store.near_paths(&capped).await.unwrap().len(), 7);
+    assert!(store
+        .near_paths(&NearQuery {
+            limit: 0,
+            ..q.clone()
+        })
+        .await
+        .unwrap()
+        .is_empty());
+    // Paths without overlap find nothing.
+    let none = NearQuery {
+        paths: vec!["zz/top".into()],
+        siblings: true,
+        ..q.clone()
+    };
+    assert!(store.near_paths(&none).await.unwrap().is_empty());
+    // Skipping paths in a listing.
+    let bare = store
+        .list_sessions(&SessionFilter {
+            principal: Some("p1".into()),
+            skip_paths: true,
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(bare.len(), 1);
+    assert!(bare[0].touched.is_empty() && bare[0].title == "same file");
+    // Claims and exact matches first: a crowd scoped to a directory above
+    // never crowds out a claim on the very file, and each exact path is
+    // bounded on its own.
+    for n in 0..12 {
+        let mut u = declare("wide", &format!("w-{n}"));
+        u.scope = Some(vec!["cl".into()]);
+        crowd.push(store.upsert_session(&u).await.unwrap().0);
+    }
+    let mut claim = declare("owner", "cl-claim");
+    claim.claims = Some(vec!["cl/a/x.rs".into()]);
+    let (claim, _) = store.upsert_session(&claim).await.unwrap();
+    crowd.push(claim.clone());
+    let narrow = NearQuery {
+        paths: vec!["cl/a/x.rs".into()],
+        per_range: 4,
+        limit: 3,
+        ..q.clone()
+    };
+    let got = rows(store.near_paths(&narrow).await.unwrap());
+    assert!(
+        got.contains(&(claim.id, PathKind::Claim, "cl/a/x.rs".into())),
+        "{got:?}"
+    );
+    assert_eq!(got.len(), 3, "{got:?}");
+    let per_path = NearQuery {
+        limit: 100,
+        ..narrow.clone()
+    };
+    let got = rows(store.near_paths(&per_path).await.unwrap());
+    assert_eq!(got.iter().filter(|r| r.2 == "cl").count(), 4, "{got:?}");
+    for s in [me, same, above, beside].into_iter().chain(crowd) {
+        assert!(store.end_session(s.id, &end).await.unwrap());
+    }
+    // Leave the store as the rest of the contract does: empty, so callers
+    // that check a fresh store after it (the migration tests) see none.
+    let gone = t0 + SESSION_RETENTION_SECS + PATHS_RETENTION_SECS + 1;
+    while store.sweep_sessions(gone, 1000).await.unwrap() != SweepReport::default() {}
+    let every = SessionFilter {
+        limit: 100,
+        ..Default::default()
+    };
+    assert!(store.list_sessions(&every).await.unwrap().is_empty());
 }
 
 #[cfg(test)]

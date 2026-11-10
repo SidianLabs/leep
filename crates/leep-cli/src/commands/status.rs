@@ -114,6 +114,11 @@ pub fn renames(ctx: &Ctx, st: &Status) -> Vec<RenameEntry> {
 
 pub fn run(ctx: &Ctx) -> Result<i32> {
     ctx.refuse_interrupted()?;
+    // The session's notices (ADR 0096), shown on stderr after the command;
+    // best effort, like `relation`: status works offline.
+    if ctx.client.session().is_some() {
+        let _ = ctx.client.notices_now();
+    }
     let st = status(&ctx.wc)?;
     let rel = ctx.wc.state.base.and_then(|b| relation(ctx, b));
     let stashes = ctx.wc.state.stashes.len();

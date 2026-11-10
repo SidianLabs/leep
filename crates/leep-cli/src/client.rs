@@ -73,7 +73,20 @@ pub struct Client {
     /// The agent session sent as `Leep-Session` on every request (ADR
     /// 0095), so the server hears from the session; shared by clones.
     session: Arc<Mutex<Option<String>>>,
+    /// Overlap notices answers carried (ADR 0096), gathered until the
+    /// command or tool call shows them; shared by clones.
+    notices: Arc<Mutex<Vec<Notice>>>,
+    /// Sent as `Leep-Notices` when set: the lowest level wanted, or `off`.
+    notice_level: Option<String>,
 }
+
+/// The environment variable a client sends as `Leep-Notices` (ADR 0096):
+/// the lowest notice level wanted (`near`, `same_file`, ...) or `off`.
+pub const NOTICE_LEVEL_ENV: &str = "LEEP_NOTICE_LEVEL";
+
+/// How long asking for notices alone may take: they are advisory, so a
+/// slow server costs them, not the command.
+pub const NOTICE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long index-backed queries keep retrying an indexing 503, unless
 /// `LEEP_INDEX_WAIT` (seconds) says otherwise.
@@ -388,6 +401,11 @@ impl Client {
             index_retry: None,
             refusal_retries: true,
             session: Arc::default(),
+            notices: Arc::default(),
+            notice_level: std::env::var(NOTICE_LEVEL_ENV)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty() && HeaderValue::from_str(v).is_ok()),
         }
     }
 
@@ -492,11 +510,36 @@ impl Client {
     }
 
     fn named(&self, req: RequestBuilder) -> RequestBuilder {
-        let req = req.header(REQUEST_ID_HEADER, self.request_id());
-        match self.session() {
-            Some(k) => req.header(SESSION_HEADER, k),
+        let mut req = req.header(REQUEST_ID_HEADER, self.request_id());
+        if let Some(k) = self.session() {
+            req = req.header(SESSION_HEADER, k);
+        }
+        match &self.notice_level {
+            Some(l) => req.header(NOTICES_HEADER, l),
             None => req,
         }
+    }
+
+    /// Keep `notices` until [`Client::take_notices`].
+    fn gather(&self, notices: Vec<Notice>) {
+        if !notices.is_empty() {
+            self.notices.lock().unwrap().extend(notices);
+        }
+    }
+
+    /// The notices answers carried since the last call (ADR 0096), each
+    /// once, in the order they came.
+    pub fn take_notices(&self) -> Vec<Notice> {
+        let mut all = std::mem::take(&mut *self.notices.lock().unwrap());
+        let mut seen = std::collections::BTreeSet::new();
+        all.retain(|n| seen.insert(serde_json::to_string(n).unwrap_or_default()));
+        all
+    }
+
+    /// Gather notices into `sink`, shared with other clients of one command.
+    pub fn with_notice_sink(mut self, sink: Arc<Mutex<Vec<Notice>>>) -> Self {
+        self.notices = sink;
+        self
     }
 
     fn url(&self, path: &str) -> String {
@@ -661,6 +704,7 @@ impl Client {
     pub fn create_changeset(&self, cs: &Changeset) -> Result<ChangesetId> {
         let r: CreateChangesetResponse =
             self.json(self.http.post(self.url("/v1/changesets")).json(cs))?;
+        self.gather(r.notices);
         Ok(r.id)
     }
 
@@ -816,12 +860,38 @@ impl Client {
 
     /// `POST /v1/sessions` (ADR 0095).
     pub fn declare_session(&self, req: &DeclareSessionRequest) -> Result<DeclareSessionResponse> {
-        self.json(self.http.post(self.url("/v1/sessions")).json(req))
+        let r: DeclareSessionResponse =
+            self.json(self.http.post(self.url("/v1/sessions")).json(req))?;
+        self.gather(r.notices.clone());
+        Ok(r)
     }
 
     /// `GET /v1/sessions` with `query` as its filters.
     pub fn sessions(&self, query: &[(&str, String)]) -> Result<SessionsResponse> {
-        self.json(self.http.get(self.url("/v1/sessions")).query(query))
+        let r: SessionsResponse =
+            self.json(self.http.get(self.url("/v1/sessions")).query(query))?;
+        self.gather(r.notices.clone());
+        Ok(r)
+    }
+
+    /// `GET /v1/notices`: the notices for this client's session now
+    /// (ADR 0096), also gathered for [`Client::take_notices`].
+    pub fn notices_now(&self) -> Result<NoticesResponse> {
+        let req = self
+            .http
+            .get(self.url("/v1/notices"))
+            .timeout(NOTICE_TIMEOUT);
+        let r: NoticesResponse = self.json(req)?;
+        self.gather(r.notices.clone());
+        Ok(r)
+    }
+
+    /// `GET /v1/sessions/{id}/overlaps`.
+    pub fn session_overlaps(&self, id: u64) -> Result<OverlapsResponse> {
+        self.json(
+            self.http
+                .get(self.url(&format!("/v1/sessions/{id}/overlaps"))),
+        )
     }
 
     /// `GET /v1/sessions/{id}`.
@@ -1292,7 +1362,9 @@ impl Client {
     }
 
     pub fn land(&self, req: &LandRequest) -> Result<LandResponse> {
-        self.json(self.http.post(self.url("/v1/land")).json(req))
+        let r: LandAnswer = self.json(self.http.post(self.url("/v1/land")).json(req))?;
+        self.gather(r.notices);
+        Ok(r.answer)
     }
 
     /// [`land`](Self::land), sent again with the same land id after a
@@ -1562,6 +1634,30 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// Asking for notices, which are advisory, gives up after a few
+    /// seconds on a server that does not answer, instead of holding the
+    /// command (or the MCP tool call) for the request timeout.
+    #[test]
+    fn notices_give_up_soon() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for conn in listener.incoming() {
+                held.push(conn);
+            }
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let c = Client::new(&url).with_session(Some("k"));
+            let _ = tx.send(c.notices_now().is_err());
+        });
+        let failed = rx
+            .recv_timeout(NOTICE_TIMEOUT * 3)
+            .expect("notices_now waited past its timeout");
+        assert!(failed);
+    }
 
     /// Answers each connection with the next canned response (the last one
     /// repeats) and counts the requests it saw.
