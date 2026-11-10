@@ -170,7 +170,7 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_context_packs_total` | counter | none | Context packs answered (`POST /v1/context`, ADR 0097). Against `leep_sessions_started_total{origin="declared"}`, roughly packs per session. |
 | `leep_context_bytes_total` | counter | none | Bytes of items those packs returned (the envelope aside). Divided by `leep_context_packs_total`, the average pack. |
 | `leep_context_items_cut_total` | counter | `section` = `files`, `owners`, `history`, `in_flight`, `ref_health`, `duplicates`, `notes`, `suspects` | Items left out to keep packs within their budget. A section cut on most packs at the default budget is a sign its quota is too small. |
-| `leep_context_sections_omitted_total` | counter | `section` = `search`, `co_change`, `owners`, `history`, `in_flight`, `ref_health`, `duplicates`, `notes`; `reason` = `timeout`, `error`, `off` | Parts of packs left out: over their 1 s bound (or the 2 s of the call), failed, or `off` without sessions. The rest of the pack still came. A steady `timeout` on `search` or `co_change` means the indexes lag or the search class is busy; on `in_flight` or `duplicates`, a slow coordination store. |
+| `leep_context_sections_omitted_total` | counter | `section` = `search`, `co_change`, `owners`, `history`, `in_flight`, `ref_health`, `duplicates`, `notes`; `reason` = `timeout`, `error`, `off`, `bound` | Parts of packs left out: over their 1 s bound (or the 2 s of the call), failed, or `off` without sessions; for `notes`, `bound` (notes past the 32 checked, or the 256-row probe cap) and `timeout` may also mark a section that came in part. The rest of the pack still came. A steady `timeout` on `search` or `co_change` means the indexes lag or the search class is busy; on `in_flight` or `duplicates`, a slow coordination store. |
 | `leep_land_leases_held` | gauge | none | Refs whose land lease this server holds ([Several servers on one ref](#several-servers-on-one-ref), ADR 0056). |
 | `leep_land_lease_acquired_total` | counter | none | Land leases this server took. Under steady traffic about one per hot ref per server restart; more means leases change hands. |
 | `leep_land_lease_lost_total` | counter | `reason` = `taken`, `idle` | Leases this server stopped holding: another server took it after this one failed to renew it for the TTL (`taken`), or it released it after 30 s without a land (`idle`). |
@@ -1536,6 +1536,14 @@ note records `reported_by`, and one principal may hide at most 30 notes
 an hour (429 past it). `leep-server notes unreport --reporter NAME` opens
 again every note that token hid (`--id N` for one note); the notes get an
 agent note's life from their creation back, so one past it is swept.
+
+An endorsement is a person vouching (ADR 0098). When a person's token is
+removed, re-kinded to `agent`, leaked, or its name dropped from `OWNERS`,
+its endorsements stay until their notes go stale: undo them with
+`leep-server notes unendorse --by NAME` (`--id N` for one note; uses
+`--meta`; safe beside running servers). Each open note gets its
+unendorsed life from its creation back, so one past it is swept.
+Endorsements are logged (`note endorsed`, with `note` and `by`).
 
 **Open review requests per requester** are capped at 100
 (`MAX_OPEN_REQUESTS`, a constant): one more is refused with 400 and code

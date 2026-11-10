@@ -1885,7 +1885,8 @@ a second kind of mutable state beside refs, behind its own trait,
   owner endorses (`POST /v1/notes/{id}/endorse`, CLI `leep note endorse`,
   no MCP tool): a `kind: human` token that may review and that `OWNERS`
   names for the anchor at the default ref's head, never the writer. An
-  endorsement clears the expiry and holds only while the note is fresh;
+  endorsement gives the note a renewable year and holds only while it is
+  fresh (`leep-server notes unendorse` undoes a person's endorsements);
   an owner's report hides a human or endorsed note. In packs notes rank
   endorsed, human, agent, then fresh before stale, nearest anchor, newest;
   stale agent notes are left out, agent notes carry only a title, and

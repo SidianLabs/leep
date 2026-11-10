@@ -6,9 +6,11 @@
   staleness cannot be told is shown without it, never as an error.
 - **Added.** `POST /v1/notes/{id}/endorse` and `leep note endorse ID`: a
   person's token (`"kind": "human"`) that `OWNERS` names for the note's
-  path vouches for another's note. It then ranks first and no longer
-  expires, until its file changes (`endorsed` turns false; `endorsed_by`
-  and `endorsed_at` stay for audit). Agents' tokens, the note's writer
+  path vouches for another's note. It then ranks first and lives a year
+  from its newest endorsement (endorse again to renew), while its file is
+  unchanged (once stale, `endorsed` turns false; `endorsed_by` and
+  `endorsed_at` stay for audit). `leep-server notes unendorse --by P`
+  undoes a person's endorsements. Agents' tokens, the note's writer
   and non-owners are refused (403), as are closed or stale notes (409).
   There is no MCP tool for it.
 - **Added.** Context packs gain a `notes` section (10% of the budget,
@@ -16,7 +18,9 @@
   agents', fresh before stale, the nearest first. Agents' notes come as
   titles with their id, stale agents' notes are left out, and every word
   stays under `untrusted` (fenced in `leep_task_start` and `leep_context`,
-  quoted by `leep context`).
+  quoted by `leep context`). A crowd of agent notes never pushes an
+  endorsed or human note out, and a pack whose notes were capped or not
+  all checked says so in `omitted` (`bound`, `timeout`).
 - **Changed.** A report by a human owner of the note's path now hides a
   person's or an endorsed note too; other reports of those still only
   count.

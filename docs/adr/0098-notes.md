@@ -60,7 +60,8 @@ notes(id BIGSERIAL PRIMARY KEY, repo_id BIGINT NOT NULL DEFAULT 1,
   else is a conditional `UPDATE` of `state`, `superseded_by`,
   `endorsed_by`/`endorsed_at` and `expires`.
 - **One expiry column.** `expires` is when the sweep deletes the row: the
-  end of an open note's life, `NULL` once endorsed, and 30 days after a
+  end of an open note's life (a year from its newest endorsement once
+  endorsed, section 12), and 30 days after a
   note was superseded, retracted or reported. One index and one rule serve
   both.
 - `notes_anchor` is not partial (the design's `WHERE state = 'open'`):
@@ -103,8 +104,8 @@ before the file uses it (OPERATIONS.md, "Upgrading"). The field is
 additive and its absence is the safe default.
 
 **Endorsement** (the second change) is columns, not a third trust value:
-`endorsed_by` and `endorsed_at`, set once, by one conditional update that
-also clears `expires`. **Only a human owner may endorse**: the caller's
+`endorsed_by` and `endorsed_at`, set by one conditional update that also
+sets `expires` a year on (renewed by endorsing again; section 12). **Only a human owner may endorse**: the caller's
 token must be `kind: human`, may review, must own the anchor (OWNERS at
 the default ref's head, as ADR 0011 reads them), and must not be the
 note's writer. An agent token can never endorse, even one that owns the
@@ -166,7 +167,7 @@ route and its rules are in section 12.
 
 ### 6. Life
 - **Expiry.** Agent notes live 90 days, human notes 365, endorsed notes
-  until closed. The per-minute session sweep of each server also deletes,
+  a year from their newest endorsement (section 12). The per-minute session sweep of each server also deletes,
   in bounded steps of 1,000, open notes past `expires` and closed notes 30
   days after they closed.
 - **Supersede.** Only the writer, only an open note, once.
@@ -305,8 +306,25 @@ written.
   be unreadable: the answer is then unknown (`stale` absent), never an
   error. Bounds: 32 notes checked per pack and 100 per listing page (the
   largest), 8 at once, by a deadline inside the section bound (half of it
-  in a pack, so the lookup is never lost to the checks); past them,
-  unknown. Line-level staleness stays deferred.
+  in a pack, so the lookup is never lost to the checks); a check that
+  would start past the deadline is not started. Past them, unknown, and
+  a pack says so: `omitted` gains `{section: "notes", reason: "bound"}`
+  when notes went unchecked or the probe hit its 256-row cap, and
+  `reason: "timeout"` when checks ran out of time; the notes it has still
+  come. Unknown is never served as endorsed. Closed notes are not judged
+  (an `all=true` listing spends no lookups on them). A store whose schema
+  predates 0010 leaves the section `off`, not `error`. Line-level
+  staleness stays deferred.
+- **The probe ranks first.** `notes_at` returns endorsed, then human,
+  then agent notes, each newest first (`note_tier_key`, the same order
+  in SQL on both backends), so 300 newer agent notes on a hot path never
+  push an endorsed or human note past the cap.
+- **Where staleness is judged.** Reads judge it at a ref's head: `GET
+  /v1/notes?ref=` and `GET /v1/notes/{id}?ref=` (default the default
+  ref; 404 for a named ref that does not exist); the pack at its own
+  ref. A write's or retraction's answer has no `stale`: a note is fresh
+  at its `at` by construction, and judging it at another ref there
+  would tell a writer on a feature ref that its fresh note is stale.
 - **`NoteEntry`** gains `stale?`, `endorsed` (open, endorsed and checked
   fresh) and `endorsed_at?`. A stale note is never served as endorsed;
   `endorsed_by` stays for audit, so an endorsement lapses while the note
@@ -318,18 +336,25 @@ written.
   it); it did not write the note (403 otherwise; without a tokens file
   nobody may); the note is open, unexpired (409), on a path (400) and
   checked fresh at the default ref's head (409 when stale or unknown).
-  One conditional update writes `endorsed_by`, `endorsed_at` and `expires
-  = NULL`, so an endorsed note outlives an agent note's 90 days. An
-  endorsed note is answered as it is. Revocation is by staleness only,
-  as the plan chose: there is no un-endorse route; an owner who disagrees
-  reports the note (below), its writer retracts it, an operator revokes.
+  One conditional update writes `endorsed_by`, `endorsed_at` and
+  `expires = endorsed_at + 365 days`, so an endorsed note outlives an
+  agent note's 90 days but a note left stale for good is not kept for
+  good. Endorsing again renews it (and names the newest endorser; each
+  endorsement is logged). There is no un-endorse route: an endorsement
+  lapses by staleness; an owner who disagrees reports the note (below);
+  its writer retracts it; an operator undoes a person's endorsements with
+  `leep-server notes unendorse --by P` (or `--id N`), which gives each
+  open note its unendorsed life from its creation back, for a person's
+  token removed, re-kinded, leaked or dropped from `OWNERS`.
+  (`CoordStore::unendorse_notes`, with a default that answers no notes.)
   `leep_notes_endorsed_total`; refusals count in
   `leep_notes_refused_total{reason="endorse_forbidden"|"endorse_conflict"|"endorse_other"}`.
 - **Owners' reports**: a report by a human owner of the anchor (the same
   test as endorsing) hides a human or endorsed note at once
   (`NoteChange::Report { owner: true }`); anyone else's still only counts.
-  `leep-server notes unreport` gives such a note back the life it had:
-  none once endorsed, 365 days from `created` for a human note.
+  `leep-server notes unreport` gives such a note back the life it had: a
+  year from its endorsement once endorsed, 365 days from `created` for a
+  human note.
 - **The pack's `notes` section** (ADR 0097's seventh): items `note:N`,
   ranked as a total order: endorsed, human, agent; then fresh, unknown,
   stale; then the nearest anchor (a file before its directory); then the

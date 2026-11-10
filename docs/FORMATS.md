@@ -1158,7 +1158,15 @@ and `endorsed_at` existed since 0010 and are now written. Added:
   in it) and did not write the note; 400 for a changeset note; 409
   (`cas_lost`) for a note not open, expired or stale (or whose staleness
   could not be checked); 404 unknown. An endorsed note is answered as it
-  is. Endorsing clears `expires`.
+  is renewed. Endorsing sets `expires` to `endorsed_at` plus 365 days.
+- `notes_at` answers endorsed, then human, then agent notes, each newest
+  first, before its cap. `CoordStore::unendorse_notes(id?, endorser?)`
+  (default: no notes); `leep-server notes unendorse --id N | --by P`.
+- `GET /v1/notes/{id}` takes `ref=` as the listing does. The answers of
+  `POST /v1/notes` and `DELETE /v1/notes/{id}` carry no `stale`.
+- `omitted` may hold `{section: "notes", reason: "bound"}` (notes
+  unchecked past the budget, or the probe capped) or `reason: "timeout"`
+  (checks out of time) beside the section's items.
 - `POST /v1/notes/{id}/report` by a human owner of the anchor (as for
   endorsing) now hides a human or endorsed note too; `leep-server notes
   unreport` gives such a note back its life (none once endorsed, 365 days
