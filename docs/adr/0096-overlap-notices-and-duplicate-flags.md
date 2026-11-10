@@ -263,8 +263,9 @@ of a session with my task key, created by that session's principal when
 the server recorded one, and not of my own principal (my own restart), is
 tagged: `by: task_key`, `session` and `principal` of that session, and
 `untrusted.task_key`. It is still keyed by the changeset for saying once,
-and it replaces that session's `possible_duplicate` (one notice per
-session, the higher level). Clients add a hint: the CLI ends the line with
+and it stands only for its changeset: each land is its own notice, and
+the session's live work (a `possible_duplicate` or a path level) is still
+said beside it. Clients add a hint: the CLI ends the line with
 "your duplicate landed this task; check whether your work is still
 needed", the MCP tools say the same outside the fence and keep the task
 key in the fenced row. A context pack tags its `landed` items the same way

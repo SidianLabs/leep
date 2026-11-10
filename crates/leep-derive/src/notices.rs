@@ -357,11 +357,17 @@ pub(crate) fn tag_duplicate_lands(s: &Session, landed: &mut [Found], keyed: &[Se
 
 /// Each other session once, at its highest level (`found` is ranked),
 /// taking the paths a lower level of it named when the highest has none:
-/// a duplicate that also claims my file is one notice, not two.
+/// a duplicate that also claims my file is one notice, not two. A `landed`
+/// notice is about its changeset, not the session that landed it: each
+/// one passes through, and none stands for that session's live work.
 pub(crate) fn one_per_session(found: Vec<Found>) -> Vec<Found> {
     let mut at: HashMap<u64, usize> = HashMap::new();
     let mut out: Vec<Found> = Vec::with_capacity(found.len());
     for f in found {
+        if f.notice.changeset.is_some() {
+            out.push(f);
+            continue;
+        }
         let Some(id) = f.notice.session else {
             out.push(f);
             continue;

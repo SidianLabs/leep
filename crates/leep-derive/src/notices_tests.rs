@@ -780,3 +780,42 @@ async fn a_duplicates_land_is_named_as_such() {
     assert!(w.id.starts_with("landed:"), "{}", w.id);
     assert_eq!(w.notice.by.as_deref(), Some("task_key"));
 }
+
+/// Two lands by my duplicate are two `landed` notices, and its live work
+/// is still said beside them: a tagged land names the session but stands
+/// only for its changeset.
+#[tokio::test]
+async fn each_land_of_a_duplicate_is_its_own_notice() {
+    let r = repo();
+    let (seed, _) = commit(&r, "root", "r-0", &[], &["README"]).await;
+    let LandResponse::Landed { landed: base, .. } =
+        r.land_as(seed, "main", Some("root")).await.unwrap()
+    else {
+        panic!()
+    };
+    for (who, key) in [("dee", "d-1"), ("eli", "e-1")] {
+        let mut d = declare(key, "Fix invoice totals");
+        d.task_key = Some("BILL-42".into());
+        d.base = Some(base);
+        d.scope = Some(vec!["src/billing".into()]);
+        r.declare_session_with(who, d, None).await.unwrap();
+    }
+    // dee lands a stack of two changesets to the file; its session stays
+    // live (no land hook ran yet).
+    let (one, _) = commit(&r, "dee", "d-1", &[base], &["src/billing/invoice.rs"]).await;
+    let (two, _) = commit(&r, "dee", "d-1", &[one], &["src/billing/invoice.rs"]).await;
+    let LandResponse::Landed { landed, .. } = r.land_as(two, "main", Some("dee")).await.unwrap()
+    else {
+        panic!()
+    };
+    let n = r.notices_for("eli", "e-1", &NoticeAsk::default()).await;
+    assert_eq!(
+        levels(&n),
+        ["landed", "landed", "possible_duplicate"],
+        "{n:?}"
+    );
+    let lands: Vec<_> = n.iter().filter_map(|n| n.changeset).collect();
+    assert!(lands.contains(&landed) && lands.len() == 2, "{lands:?}");
+    assert!(n[..2].iter().all(|n| n.by.as_deref() == Some("task_key")));
+    assert_eq!(n[2].principal.as_deref(), Some("dee"));
+}
