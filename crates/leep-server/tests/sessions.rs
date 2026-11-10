@@ -667,12 +667,19 @@ impl leep_core::coord::CoordStore for Hanging {
     }
 }
 
-/// A coordination store that hangs costs a create at most its 250 ms
-/// bound, and changes neither the land's answer nor the ref log (ADR
-/// 0095): the same commits and lands on a server without sessions answer
-/// the same.
+/// A coordination store that hangs changes neither the land's answer nor
+/// the ref log (ADR 0095): the same commits and lands on a server without
+/// sessions answer the same. Only liveness is timed here, generously; the
+/// 250 ms bound on a create is tested on a paused clock beside the hook
+/// (`leep-server`'s `sessions::tests`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hanging_coordination_store_changes_no_answer() {
+    tokio::time::timeout(Duration::from_secs(10), hanging_store_answers_the_same())
+        .await
+        .expect("a hanging store never holds a request for long");
+}
+
+async fn hanging_store_answers_the_same() {
     let fresh = || {
         Repo::new(
             Arc::new(MemoryBlobStore::new()),
@@ -684,10 +691,7 @@ async fn a_hanging_coordination_store_changes_no_answer() {
     let mut answers = Vec::new();
     let mut logs = Vec::new();
     for api in [&hung, &none] {
-        let started = std::time::Instant::now();
         let first = api.commit("alice", "a-1", &[], &["src/a.rs"]).await;
-        let took = started.elapsed();
-        assert!(took < Duration::from_millis(300), "create took {took:?}");
         let second = api.commit("bob", "b-1", &[], &["web/b.ts"]).await;
         let t = token("alice");
         let mut got = Vec::new();

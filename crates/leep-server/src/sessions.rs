@@ -429,3 +429,84 @@ pub fn spawn_session_tasks(repo: Repo) {
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use async_trait::async_trait;
+    use leep_core::coord::*;
+    use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
+    use leep_core::{Changeset, FileChange, FileKind, Hash, RepoPath, Result};
+
+    use super::*;
+
+    /// A coordination store that never answers.
+    struct Hanging;
+
+    macro_rules! hang {
+        ($($name:ident($($arg:ty),*) -> $ret:ty;)*) => {
+            #[async_trait]
+            impl CoordStore for Hanging {
+                $(async fn $name(&self, $(_: $arg),*) -> Result<$ret> {
+                    std::future::pending().await
+                })*
+            }
+        };
+    }
+    hang! {
+        upsert_session(&SessionUpdate) -> (Session, bool);
+        get_session(u64) -> Option<Session>;
+        list_sessions(&SessionFilter) -> Vec<Session>;
+        end_session(u64, &SessionEnd) -> bool;
+        beat_sessions(&[Beat]) -> u64;
+        sweep_sessions(i64, usize) -> SweepReport;
+        count_sessions(SessionState, usize) -> u64;
+        near_paths(&NearQuery) -> Vec<NearRow>;
+        add_note(&NewNote) -> Note;
+        get_note(u64) -> Option<Note>;
+        list_notes(&NoteFilter) -> Vec<Note>;
+        notes_at(&[String], usize) -> Vec<Note>;
+        change_note(u64, &NoteChange, i64) -> bool;
+        revoke_notes(&str, i64) -> u64;
+        sweep_notes(i64, usize) -> NoteSweep;
+    }
+
+    /// A create waits for its session update exactly [`CREATE_HOOK_BOUND`]
+    /// when the store hangs, and answers no notices: on a paused clock, so
+    /// no machine's speed decides it.
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_store_costs_a_create_exactly_its_bound() {
+        let repo = Repo::new(
+            Arc::new(MemoryBlobStore::new()),
+            Arc::new(MemoryMetaStore::new()),
+        )
+        .with_coord(Some(Arc::new(Hanging)));
+        let mut changes = BTreeMap::new();
+        changes.insert(
+            RepoPath::new("src/a.rs").unwrap(),
+            FileChange::Modify {
+                content: Hash::of_blob(b"a"),
+                kind: FileKind::Regular,
+                size: 1,
+            },
+        );
+        let cs = Changeset {
+            parents: vec![],
+            author: "ada".into(),
+            timestamp: 1,
+            message: "m".into(),
+            changes,
+            extra: [(
+                leep_core::changeset::EXTRA_AGENT_SESSION.to_string(),
+                "s-1".to_string(),
+            )]
+            .into(),
+        };
+        let seed = SessionSeed::of(&cs).unwrap();
+        let started = tokio::time::Instant::now();
+        let notices = after_create(&repo, seed, cs.id(), &None, &HeaderMap::new()).await;
+        assert_eq!(started.elapsed(), CREATE_HOOK_BOUND);
+        assert!(notices.is_empty());
+    }
+}
