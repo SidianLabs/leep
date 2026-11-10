@@ -79,8 +79,13 @@ fn summary(n: &NoteEntry) -> String {
         word(&n.trust),
         word(&n.state)
     );
-    if let Some(by) = &n.endorsed_by {
-        s.push_str(&format!(", endorsed by {}", word(by)));
+    match (&n.endorsed_by, n.endorsed) {
+        (Some(by), true) => s.push_str(&format!(", endorsed by owner {}", word(by))),
+        (Some(by), false) => s.push_str(&format!(", endorsed by {} (not in force)", word(by))),
+        (None, _) => {}
+    }
+    if n.stale == Some(true) {
+        s.push_str(", stale: its file changed since it was written");
     }
     if let Some(next) = n.superseded_by {
         s.push_str(&format!(", superseded by #{next}"));
@@ -228,6 +233,9 @@ mod tests {
             kind: "gotcha".into(),
             trust: "agent".into(),
             endorsed_by: None,
+            endorsed_at: None,
+            endorsed: false,
+            stale: None,
             state: "open".into(),
             principal: "bo".into(),
             anchor_type: "path".into(),
@@ -271,11 +279,12 @@ mod tests {
             ] {
                 let mut n = entry(t, b, a);
                 n.endorsed_by = Some("hugo".into());
+                n.endorsed = true;
                 let text = notes_text("Notes", std::slice::from_ref(&n));
                 let (outside, fence) = text.split_once(UNTRUSTED_NOTE).unwrap();
                 assert_eq!(
                     outside,
-                    "Notes (1):\n#9 gotcha note by bo (agent), open, endorsed by hugo\n"
+                    "Notes (1):\n#9 gotcha note by bo (agent), open, endorsed by owner hugo\n"
                 );
                 let body = fence.trim_start_matches('\n');
                 let f: String = body.chars().take_while(|c| *c == '`').collect();

@@ -865,6 +865,10 @@ pub const NOTE_RATE_WINDOW_SECS: i64 = 60 * 60;
 pub const AGENT_NOTE_TTL_SECS: i64 = 90 * 24 * 60 * 60;
 /// How long a note written with a `kind: human` token lives unless endorsed.
 pub const HUMAN_NOTE_TTL_SECS: i64 = 365 * 24 * 60 * 60;
+/// How long an endorsement keeps a note alive: an endorsed note expires
+/// this long after its newest endorsement, so a note left stale for good is
+/// not kept forever. An owner renews it by endorsing it again.
+pub const ENDORSED_NOTE_TTL_SECS: i64 = 365 * 24 * 60 * 60;
 /// How long a superseded, retracted or reported note is kept before the
 /// sweep deletes it.
 pub const CLOSED_NOTE_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
@@ -1198,13 +1202,21 @@ pub enum NoteChange {
     Retract { by: String },
     /// `by` reports it: an agent-tier note that nobody endorsed becomes
     /// `reported` (hidden), recording `by` and the time; any other is left
-    /// as it is. Refused with [`reports_per_hour`] when `by` already hid
+    /// as it is unless `owner` (the caller checked that `by` is a human
+    /// owner of its anchor), which hides a human or endorsed note too.
+    /// Refused with [`reports_per_hour`] when `by` already hid
     /// `max_per_hour` notes in the last hour.
-    Report { by: String, max_per_hour: usize },
+    Report {
+        by: String,
+        max_per_hour: usize,
+        owner: bool,
+    },
     /// An operator withdraws it, whoever wrote it: `retracted`.
     Revoke,
-    /// An owner vouches for it: sets `endorsed_by` and `endorsed_at`, and
-    /// it no longer expires; once only.
+    /// A human owner vouches for it (the caller checked who may): sets
+    /// `endorsed_by` and `endorsed_at`, and its life to
+    /// [`ENDORSED_NOTE_TTL_SECS`] from now. Endorsing an endorsed note
+    /// renews it (the newest endorser is kept).
     Endorse { by: String },
 }
 
@@ -1511,7 +1523,9 @@ pub trait CoordStore: Send + Sync {
     async fn list_notes(&self, filter: &NoteFilter) -> Result<Vec<Note>>;
 
     /// Open path notes on any of `anchors` (exact probes on the anchor
-    /// index), newest first, at most `cap`.
+    /// index), at most `cap`: endorsed notes first, then human ones, then
+    /// agent ones, each newest first ([`note_tier_key`]), so a crowd of
+    /// newer agent notes never pushes an endorsed or human one out.
     async fn notes_at(&self, anchors: &[String], cap: usize) -> Result<Vec<Note>>;
 
     /// Apply `change` at `at` as one conditional update. Answers whether
@@ -1525,9 +1539,21 @@ pub trait CoordStore: Send + Sync {
 
     /// An operator's undo of reports: open again the reported note `id`, or
     /// every note `reporter` hid, clearing `reported_by` and `reported_at`
-    /// and giving back an agent note's life (`created` plus
-    /// [`AGENT_NOTE_TTL_SECS`]). One statement; answers how many.
+    /// and giving back the life it had: none for an endorsed note,
+    /// `created` plus [`HUMAN_NOTE_TTL_SECS`] for a human one, plus
+    /// [`AGENT_NOTE_TTL_SECS`] otherwise. One statement; answers how many.
     async fn unreport_notes(&self, id: Option<u64>, reporter: Option<&str>) -> Result<u64>;
+
+    /// An operator's undo of endorsements: clear `endorsed_by` and
+    /// `endorsed_at` of note `id`, or of every note `endorser` endorsed,
+    /// and give an open one back its unendorsed life from `created`
+    /// ([`HUMAN_NOTE_TTL_SECS`] or [`AGENT_NOTE_TTL_SECS`]); a closed one
+    /// keeps its expiry. One statement; answers how many. A store without
+    /// notes answers `Error::NotFound`.
+    async fn unendorse_notes(&self, id: Option<u64>, endorser: Option<&str>) -> Result<u64> {
+        let _ = (id, endorser);
+        Err(no_notes())
+    }
 
     /// One bounded step of the note sweep at `now`: delete up to `limit`
     /// open notes past their `expires`, and up to `limit` closed ones past
@@ -1560,6 +1586,17 @@ pub trait CoordStore: Send + Sync {
     async fn sweep_events(&self, _cutoff: i64, _limit: usize) -> Result<u64> {
         Ok(0)
     }
+}
+
+/// The order [`CoordStore::notes_at`] returns notes in: endorsed, then
+/// human, then agent, each newest first.
+pub fn note_tier_key(n: &Note) -> (u8, std::cmp::Reverse<u64>) {
+    let tier = match (&n.endorsed_by, n.trust) {
+        (Some(_), _) => 0,
+        (None, NoteTrust::Human) => 1,
+        (None, NoteTrust::Agent) => 2,
+    };
+    (tier, std::cmp::Reverse(n.id))
 }
 
 /// The answer of a store that keeps no notes (an older schema).

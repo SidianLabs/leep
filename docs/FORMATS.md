@@ -1147,6 +1147,52 @@ read by a land. Added:
   this change refuses a file that uses it. `WhoAmIResponse.kind?`
   (omitted when authentication is off).
 
+## Notes: staleness, endorsement and the pack section (additive, ADR 0098 second change)
+
+No table, column, migration or stored encoding changed: `endorsed_by`
+and `endorsed_at` existed since 0010 and are now written. Added:
+
+- `NoteEntry` gains `endorsed_at?` (Unix seconds), `endorsed` (true only
+  while the endorsement holds: the note is open, endorsed and checked not
+  stale; omitted when false) and `stale?` (`true` when the anchor's file
+  at the ref's head is not the content the note was written against, or
+  the path is gone; `false` when checked fresh; omitted when unknown: not
+  checked, a tree that could not be read, or a missing `at_changeset`).
+  `endorsed_by` stays set for audit when an endorsement lapses.
+  Changeset notes are never stale.
+- `GET /v1/notes` takes `ref=` (default the server's default ref; 404 if
+  a named ref does not exist): the head staleness is judged at. `GET
+  /v1/notes/{id}` judges it at the default ref.
+- `POST /v1/notes/{id}/endorse` with `{}` → `NoteEntry`. 403 (`forbidden`)
+  unless the token is `kind: human`, may review, is named by `OWNERS` for
+  the anchor at the default ref's head (a directory's owners are a file's
+  in it) and did not write the note; 400 for a changeset note; 409
+  (`cas_lost`) for a note not open, expired or stale (or whose staleness
+  could not be checked); 404 unknown. An endorsed note is answered as it
+  is renewed. Endorsing sets `expires` to `endorsed_at` plus 365 days.
+- `notes_at` answers endorsed, then human, then agent notes, each newest
+  first, before its cap. `CoordStore::unendorse_notes(id?, endorser?)`
+  (default: no notes); `leep-server notes unendorse --id N | --by P`.
+- `GET /v1/notes/{id}` takes `ref=` as the listing does. The answers of
+  `POST /v1/notes` and `DELETE /v1/notes/{id}` carry no `stale`.
+- `omitted` may hold `{section: "notes", reason: "bound"}` (notes
+  unchecked past the budget, or the probe capped) or `reason: "timeout"`
+  (checks out of time) beside the section's items.
+- `POST /v1/notes/{id}/report` by a human owner of the anchor (as for
+  endorsing) now hides a human or endorsed note too; `leep-server notes
+  unreport` gives such a note back its life (none once endorsed, 365 days
+  from `created` for a human note). `NoteChange::Report` gains `owner`.
+- `ContextPack` gains `notes: [ContextNote]` (`#[serde(default)]`), after
+  `duplicates`: `ContextNote {id: "note:N", bytes, note, kind, trust,
+  endorsed_by?, stale?, principal, created, more?, untrusted:
+  ContextNoteText {anchor, title, body?, paths?}}`. `endorsed_by` is
+  present only while the endorsement holds; `more` says the title or body
+  was cut or the body left out; `paths` are the pack's files below a
+  directory note. Section quotas are now files 20%, owners 10%, history
+  15%, in-flight 20%, ref health 5%, duplicates 20%, notes 10%; spare
+  budget goes to ref health, in-flight, duplicates, notes, files, history,
+  owners. `cut` and `omitted` may name `notes`.
+
 ## Events (new table, store trait, API, ADR 0099)
 
 No changeset, tree or hash changed. Events are coordination state, never

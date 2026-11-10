@@ -345,6 +345,7 @@ pub fn router_with_read_classes(
         .route("/v1/notes", get(notes::list).post(notes::add))
         .route("/v1/notes/{id}", get(notes::get_one).delete(notes::retract))
         .route("/v1/notes/{id}/report", post(notes::report))
+        .route("/v1/notes/{id}/endorse", post(notes::endorse))
         .route("/v1/context", post(context::pack))
         .route("/v1/refs", get(list_refs))
         .route("/v1/refs/{*name}", get(get_ref).post(post_ref))

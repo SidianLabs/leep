@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use leep_core::api::{AddNoteRequest, NoteEntry, NoteText, NotesResponse, ReportNoteResponse};
+use leep_core::api::{AddNoteRequest, NoteEntry, NotesResponse, ReportNoteResponse};
 use leep_core::coord::{
     check_anchor, check_key, normalize_path, AnchorType, CoordStore, NewNote, Note, NoteChange,
     NoteFilter, NoteKind, NoteState, NoteSweep, NoteTrust, SessionFilter, SessionState,
@@ -21,6 +21,9 @@ use leep_core::coord::{
 use leep_core::store::unix_now;
 use leep_core::{Error, Result, TreeEntry};
 
+use crate::context::SECTION_BOUND;
+use crate::notes_view::{NoteBudget, NoteSelect, ViewedNote, LIST_NOTES_CHECKED};
+use crate::owners::OwnersResolver;
 use crate::Repo;
 
 /// Default and largest page of a listing.
@@ -43,38 +46,39 @@ pub struct NoteQuery {
     pub all: bool,
     pub before: Option<u64>,
     pub limit: Option<usize>,
+    /// The ref whose head staleness is judged at; default the server's
+    /// default ref.
+    pub target_ref: Option<String>,
 }
 
-/// The wire form of `n` as seen at `now`: an open note past its `expires`
+/// The wire form of `n` as seen at `now`, its staleness not judged (a
+/// closed note, or an answer to a write): an open note past its `expires`
 /// that the sweep has not deleted yet shows as `expired`.
 pub fn note_entry(n: Note, now: i64) -> NoteEntry {
-    let state = if n.state == NoteState::Open && n.expires.is_some_and(|e| e <= now) {
-        "expired"
-    } else {
-        n.state.as_str()
-    };
-    NoteEntry {
-        id: n.id,
-        kind: n.kind.as_str().to_string(),
-        trust: n.trust.as_str().to_string(),
-        endorsed_by: n.endorsed_by,
-        state: state.to_string(),
-        principal: n.principal,
-        anchor_type: n.anchor_type.as_str().to_string(),
-        at: n.at_changeset,
-        lines: n.lines.map(|(a, b)| [a, b]),
-        session: n.session_id,
-        created: n.created,
-        expires: n.expires,
-        superseded_by: n.superseded_by,
-        reported_by: n.reported_by,
-        bytes: (n.title.len() + n.body.len()) as u64,
-        untrusted: NoteText {
-            title: n.title,
-            body: n.body,
-            anchor: n.anchor,
-            agent_model: n.agent_model,
-        },
+    ViewedNote {
+        note: n,
+        stale: None,
+    }
+    .entry(now)
+}
+
+/// Who asks to endorse or report a note: the token's name, whether it is
+/// a person's (`"kind": "human"`), and whether it may review.
+#[derive(Clone, Copy, Debug)]
+pub struct NoteActor<'a> {
+    pub name: &'a str,
+    pub human: bool,
+    pub may_review: bool,
+}
+
+impl<'a> NoteActor<'a> {
+    /// An agent's token that may review: what most callers are.
+    pub fn agent(name: &'a str) -> Self {
+        NoteActor {
+            name,
+            human: false,
+            may_review: true,
+        }
     }
 }
 
@@ -231,12 +235,16 @@ impl Repo {
         }
         check_anchor(n.anchor_type, &n.anchor)?;
         let note = coord.add_note(&n).await?;
+        // No `stale` on a write's answer: the note is fresh at `at` by
+        // construction, and judging it at another ref here would only
+        // confuse a writer on a feature ref. Reads judge it.
         Ok(note_entry(note, now))
     }
 
-    /// The notes `q` asks for, newest first.
+    /// The notes `q` asks for, newest first, each judged stale or not at
+    /// the head of `q.target_ref` by [`Repo::notes_for`], as the pack does.
     pub async fn notes(&self, q: &NoteQuery) -> Result<NotesResponse> {
-        let coord = self.notes_on()?;
+        self.notes_on()?;
         let limit = q
             .limit
             .unwrap_or(DEFAULT_NOTE_LIMIT)
@@ -269,29 +277,236 @@ impl Repo {
             before: q.before,
             limit,
         };
-        let rows = coord.list_notes(&filter).await?;
-        let next = (rows.len() == limit)
-            .then(|| rows.last().map(|n| n.id))
-            .flatten();
+        let head = self.judged_at(q.target_ref.as_deref()).await?;
         let now = unix_now();
+        let budget = NoteBudget {
+            checked: LIST_NOTES_CHECKED,
+            until: tokio::time::Instant::now() + SECTION_BOUND,
+        };
+        let rows = self
+            .notes_for(NoteSelect::Filter(&filter), head, budget, now)
+            .await?
+            .notes;
+        let next = (rows.len() == limit)
+            .then(|| rows.last().map(|n| n.note.id))
+            .flatten();
         let open_only = !q.all;
         let notes = rows
             .into_iter()
-            .map(|n| note_entry(n, now))
+            .map(|v| v.entry(now))
             // An open note past its life is not served as open.
             .filter(|e| !(open_only && e.state == "expired"))
             .collect();
         Ok(NotesResponse { notes, next })
     }
 
-    /// One note, in any state; 404 if unknown.
+    /// The head staleness is judged at: `target_ref`'s (404 when it names
+    /// no ref), else the default ref's, else none (everything unknown).
+    async fn judged_at(&self, target_ref: Option<&str>) -> Result<Option<leep_core::ChangesetId>> {
+        match target_ref.map(str::trim) {
+            Some(r) if !r.is_empty() => Ok(Some(
+                self.meta()
+                    .get_ref(r)
+                    .await?
+                    .ok_or_else(|| Error::NotFound(format!("ref {r:?}")))?,
+            )),
+            _ => self.meta().get_ref(self.default_ref()).await,
+        }
+    }
+
+    /// One note, in any state, its staleness judged at the default ref's
+    /// head as a listing judges it; 404 if unknown.
     pub async fn note(&self, id: u64) -> Result<NoteEntry> {
-        let coord = self.notes_on()?;
-        let n = coord
+        self.note_at(id, None).await
+    }
+
+    /// One note, its staleness judged at `target_ref`'s head (default the
+    /// default ref's), as `GET /v1/notes?ref=` judges it.
+    pub async fn note_at(&self, id: u64, target_ref: Option<&str>) -> Result<NoteEntry> {
+        let n = self.stored_note(id).await?;
+        let head = self.judged_at(target_ref).await?;
+        let budget = NoteBudget {
+            checked: 1,
+            until: tokio::time::Instant::now() + SECTION_BOUND,
+        };
+        let stale = self
+            .staleness(std::slice::from_ref(&n), head, budget)
+            .await
+            .stale;
+        Ok(ViewedNote {
+            note: n,
+            stale: stale[0],
+        }
+        .entry(unix_now()))
+    }
+
+    async fn stored_note(&self, id: u64) -> Result<Note> {
+        self.notes_on()?
             .get_note(id)
             .await?
-            .ok_or_else(|| Error::NotFound(format!("note {id}")))?;
-        Ok(note_entry(n, unix_now()))
+            .ok_or_else(|| Error::NotFound(format!("note {id}")))
+    }
+
+    /// Whether `who` is named by `OWNERS` for `n`'s path at `head` (ADR
+    /// 0011's reading). A directory note's owners are those of a file in
+    /// the directory.
+    async fn owns(&self, head: leep_core::ChangesetId, n: &Note, who: &str) -> Result<bool> {
+        if n.anchor_type != AnchorType::Path {
+            return Ok(false);
+        }
+        let dir = n.at_blob.is_none() && n.lines.is_none();
+        let probe = if dir {
+            format!("{}/{}", n.anchor, leep_core::review::OWNERS_FILE)
+        } else {
+            n.anchor.clone()
+        };
+        // A probe that is no repository path (a 256-byte directory anchor
+        // plus `/OWNERS`) has no owner: refused as not owned, not as a bad
+        // request.
+        let Ok(path) = leep_core::RepoPath::new(probe) else {
+            return Ok(false);
+        };
+        let mut r = OwnersResolver::new(self, Some(head)).await?;
+        Ok(r.owners_of(&path).await?.contains(who))
+    }
+
+    /// Whether `actor` is a human owner of `n`'s path at the default ref's
+    /// head: a person's token that may review and that `OWNERS` names.
+    async fn human_owner(&self, n: &Note, actor: &NoteActor<'_>) -> Result<bool> {
+        if !(actor.human && actor.may_review) {
+            return Ok(false);
+        }
+        match self.meta().get_ref(self.default_ref()).await? {
+            Some(head) => self.owns(head, n, actor.name).await,
+            None => Ok(false),
+        }
+    }
+
+    /// A human owner vouches for note `id` (ADR 0098): the caller's token
+    /// must be a person's, may review, must own the note's path at the
+    /// default ref's head and must not be its writer (`Error::Policy`,
+    /// 403); the note must be an open path note (`Invalid` for a changeset
+    /// note) that is not stale there (`Conflict`, 409). The endorsement
+    /// clears the note's expiry and lapses while the note is stale. An
+    /// endorsed note is answered as it is.
+    pub async fn endorse_note(&self, id: u64, actor: &NoteActor<'_>) -> Result<NoteEntry> {
+        let r = self.endorse_inner(id, actor).await;
+        match &r {
+            Ok((e, true)) => {
+                tracing::info!(note = id, by = actor.name, "note endorsed");
+                metrics::counter!("leep_notes_endorsed_total").increment(1);
+                self.note_endorsed_event(e, actor.name);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let reason = match e {
+                    Error::Policy(_) => "endorse_forbidden",
+                    Error::Conflict(_) => "endorse_conflict",
+                    _ => "endorse_other",
+                };
+                metrics::counter!("leep_notes_refused_total", "reason" => reason).increment(1);
+            }
+        }
+        r.map(|(e, _)| e)
+    }
+
+    async fn endorse_inner(&self, id: u64, actor: &NoteActor<'_>) -> Result<(NoteEntry, bool)> {
+        let coord = self.notes_on()?;
+        let n = self.stored_note(id).await?;
+        // Refusals name the note by number, never by its text.
+        if !actor.human {
+            return Err(Error::Policy(
+                "only a person's token (\"kind\": \"human\" in the tokens file) may endorse a \
+                 note; an agent's never can"
+                    .into(),
+            ));
+        }
+        if !actor.may_review {
+            return Err(Error::Policy(
+                "this token may not review (\"review\": false), so it may not endorse".into(),
+            ));
+        }
+        if n.principal == actor.name {
+            return Err(Error::Policy(format!(
+                "note {id} is yours; a note's writer cannot endorse it"
+            )));
+        }
+        let now = unix_now();
+        if n.state != NoteState::Open || n.expires.is_some_and(|e| e <= now) {
+            let state = note_entry(n, now).state;
+            return Err(Error::Conflict(format!(
+                "note {id} is {state}, not open; only an open note can be endorsed"
+            )));
+        }
+        if n.anchor_type != AnchorType::Path {
+            return Err(Error::Invalid(format!(
+                "note {id} is on a changeset; only a note on a path can be endorsed, since \
+                 owners are per path"
+            )));
+        }
+        let default_ref = self.default_ref().to_string();
+        let head = self
+            .meta()
+            .get_ref(&default_ref)
+            .await?
+            .ok_or_else(|| Error::Conflict(format!("ref {default_ref:?} does not exist")))?;
+        if !self.owns(head, &n, actor.name).await? {
+            return Err(Error::Policy(format!(
+                "{} is not named by OWNERS for note {id}'s path at {default_ref}; only an owner \
+                 may endorse it",
+                actor.name
+            )));
+        }
+        // Bounded like a read, and never a 500: a tree that cannot be read
+        // in time leaves staleness unknown, which is refused below.
+        let until = tokio::time::Instant::now() + SECTION_BOUND;
+        let checked = tokio::time::timeout_at(until, async {
+            let root = self.root_tree(head).await.ok()?;
+            self.stale_of(Some(root), &n).await
+        })
+        .await
+        .ok()
+        .flatten();
+        match checked {
+            Some(false) => {}
+            Some(true) => {
+                return Err(Error::Conflict(format!(
+                    "note {id} is stale: its path changed at {default_ref} since it was \
+                     written; ask for a new note instead"
+                )))
+            }
+            None => {
+                return Err(Error::Conflict(format!(
+                    "could not tell whether note {id} is stale at {default_ref}; not endorsed"
+                )))
+            }
+        }
+        let fresh = |n: Note| {
+            ViewedNote {
+                note: n,
+                stale: Some(false),
+            }
+            .entry(now)
+        };
+        // Endorsing an endorsed note renews its life (and names the newest
+        // endorser).
+        let by = actor.name.to_string();
+        if coord
+            .change_note(id, &NoteChange::Endorse { by: by.clone() }, now)
+            .await?
+        {
+            let mut n = n;
+            n.endorsed_by = Some(by);
+            n.endorsed_at = Some(now);
+            n.expires = Some(now + leep_core::coord::ENDORSED_NOTE_TTL_SECS);
+            return Ok((fresh(n), true));
+        }
+        // A concurrent change closed it first.
+        let n = self.stored_note(id).await?;
+        Err(Error::Conflict(format!(
+            "note {id} changed while it was endorsed; it is {}",
+            n.state.as_str()
+        )))
     }
 
     /// Retract `principal`'s note `id`. Another principal's is refused with
@@ -324,19 +539,28 @@ impl Repo {
         self.note(id).await
     }
 
-    /// `reporter` reports note `id`: an open agent note nobody endorsed is
-    /// hidden at once (`reported`, with the reporter and time recorded);
-    /// any other report is only counted. A reporter that hid
+    /// `actor` reports note `id`: an open agent note nobody endorsed is
+    /// hidden at once (`reported`, with the reporter and time recorded), as
+    /// is a human or endorsed one when `actor` is a human owner of its path
+    /// (as for endorsing); any other report is only counted. A reporter that hid
     /// [`MAX_REPORTS_PER_HOUR`] notes in the last hour is refused. Every
     /// report is logged with its reporter (never the note's text), so an
     /// operator can find and undo one token's reports
     /// (`leep-server notes unreport`).
-    pub async fn report_note(&self, id: u64, reporter: &str) -> Result<ReportNoteResponse> {
+    pub async fn report_note(&self, id: u64, actor: &NoteActor<'_>) -> Result<ReportNoteResponse> {
         let coord = self.notes_on()?;
-        self.note(id).await?;
+        let reporter = actor.name;
+        let n = self.stored_note(id).await?;
+        // A human or endorsed note is hidden only by a human owner of its
+        // path; ownership is read only when it could matter.
+        let shielded = n.trust == NoteTrust::Human || n.endorsed_by.is_some();
+        let owner = shielded
+            && n.state == NoteState::Open
+            && self.human_owner(&n, actor).await.unwrap_or(false);
         let change = NoteChange::Report {
             by: reporter.to_string(),
             max_per_hour: MAX_REPORTS_PER_HOUR,
+            owner,
         };
         let hidden = match coord.change_note(id, &change, unix_now()).await {
             Ok(h) => h,
@@ -362,6 +586,13 @@ impl Repo {
     /// `reporter` hid. Answers how many.
     pub async fn unreport_notes(&self, id: Option<u64>, reporter: Option<&str>) -> Result<u64> {
         self.notes_on()?.unreport_notes(id, reporter).await
+    }
+
+    /// An operator's undo of endorsements: note `id`, or every note
+    /// `endorser` endorsed (a person's token removed, re-kinded, leaked or
+    /// dropped from `OWNERS`). Answers how many.
+    pub async fn unendorse_notes(&self, id: Option<u64>, endorser: Option<&str>) -> Result<u64> {
+        self.notes_on()?.unendorse_notes(id, endorser).await
     }
 
     /// An operator's mass revoke: retract every open note of `principal`.
@@ -638,14 +869,17 @@ mod tests {
             r.retract_note(a.id, "bo").await,
             Err(Error::Policy(_))
         ));
-        let rep = r.report_note(h.id, "bo").await.unwrap();
+        let rep = r.report_note(h.id, &NoteActor::agent("bo")).await.unwrap();
         assert!(!rep.hidden && rep.note.state == "open");
-        let rep = r.report_note(a.id, "bo").await.unwrap();
+        let rep = r.report_note(a.id, &NoteActor::agent("bo")).await.unwrap();
         assert!(rep.hidden && rep.note.state == "reported");
         assert_eq!(rep.note.reported_by.as_deref(), Some("bo"));
-        assert!(r.report_note(a.id, "bo").await.is_ok_and(|r| !r.hidden));
+        assert!(r
+            .report_note(a.id, &NoteActor::agent("bo"))
+            .await
+            .is_ok_and(|r| !r.hidden));
         assert!(matches!(
-            r.report_note(999, "bo").await,
+            r.report_note(999, &NoteActor::agent("bo")).await,
             Err(Error::NotFound(_))
         ));
         let open = r.notes(&NoteQuery::default()).await.unwrap();

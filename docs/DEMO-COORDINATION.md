@@ -29,6 +29,7 @@ of retries of a command, so a loaded machine makes it slower, not flaky.
 |---|---|---|
 | ada, bo, cy | `leep` | `src/auth/`: ada rotates keys in `keys.rs`; bo claims `token.rs`, cy scopes it; both edit it |
 | (maintainer) | `leep` | starts documenting token refresh in `docs/auth.md` before fay arrives |
+| rhea (a person) | `leep` | an owner of `src/auth/` with a `"kind": "human"` token; endorses ada's note on `token.rs` |
 | dee, eli | `leep-mcp` | both handed issue `BILL-42` (`src/billing/invoice.rs`), worded differently |
 | fay | `leep-mcp` | arrives last, to add refresh tokens to `parse_token` |
 | gus ... tess (14) | 12 `leep`, 2 `leep-mcp` | one file each in their own area, concurrently with everything else; rex and sol share `src/api/` and ask for `near` notices |
@@ -71,6 +72,10 @@ ref is red with bo's land as a suspect.
     result names the changeset it made and eli's notice, and `main` has not
     moved. dee lands that changeset with `changeset` and `force: true`, and
     no second changeset is made.
+11. ada's note on `token.rs` (`leep note add`), endorsed by rhea, a human
+    owner (`leep note endorse`), is in fay's `leep_task_start` pack: the
+    line outside the fence says `endorsed by owner rhea`, and its title
+    and body are only in the fence (ADR 0098).
 
 ## Reading the transcript critically
 
@@ -100,3 +105,6 @@ The demo is also a check on how the notices read. Things to look at:
 - Packs list owners and last changes once per distinct answer, naming the
   files each covers, and `leep_task_start` does not repeat as a notice
   what its pack shows.
+- A note reaches the next agent in its pack, last: endorsed by a person,
+  it ranks first and brings its body; an agent's unendorsed note would
+  bring only its title. Its words are fenced like every other agent's.

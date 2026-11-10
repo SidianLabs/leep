@@ -20,7 +20,7 @@ use leep_core::coord::{
     NoteState, NOTES_PER_DAY_MARKER, NOTES_PER_HOUR_MARKER, REPORTS_PER_HOUR_MARKER,
 };
 use leep_core::Error;
-use leep_derive::notes::NoteQuery;
+use leep_derive::notes::{NoteActor, NoteQuery};
 use serde::Deserialize;
 
 use crate::sessions::{principal, session_key};
@@ -78,6 +78,8 @@ pub(crate) struct ListQuery {
     all: Option<String>,
     before: Option<String>,
     limit: Option<String>,
+    #[serde(rename = "ref")]
+    target_ref: Option<String>,
 }
 
 fn flag(name: &str, v: Option<&str>) -> ApiResult<bool> {
@@ -124,13 +126,26 @@ pub(crate) async fn list(
         all: flag("all", q.all.as_deref())?,
         before: number("before", q.before.as_deref())?,
         limit,
+        target_ref: q.target_ref.filter(|r| !r.is_empty()),
     };
     Ok(Json(repo.notes(&query).await?))
 }
 
-/// `GET /v1/notes/{id}`.
-pub(crate) async fn get_one(State(repo): S, Path(id): Path<String>) -> ApiResult<Json<NoteEntry>> {
-    Ok(Json(repo.note(note_id(&id)?).await?))
+#[derive(Deserialize)]
+pub(crate) struct OneQuery {
+    #[serde(rename = "ref")]
+    target_ref: Option<String>,
+}
+
+/// `GET /v1/notes/{id}?ref=`: staleness judged at `ref`'s head (default
+/// the default ref's).
+pub(crate) async fn get_one(
+    State(repo): S,
+    Path(id): Path<String>,
+    Query(q): Query<OneQuery>,
+) -> ApiResult<Json<NoteEntry>> {
+    let r = q.target_ref.as_deref().filter(|r| !r.is_empty());
+    Ok(Json(repo.note_at(note_id(&id)?, r).await?))
 }
 
 /// `DELETE /v1/notes/{id}`: retract it; only its principal may.
@@ -157,9 +172,42 @@ pub(crate) async fn report(
     auth::MaybePrincipal(who): auth::MaybePrincipal,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    match repo.report_note(note_id(&id)?, &principal(&who)).await {
+    let name = principal(&who);
+    match repo.report_note(note_id(&id)?, &actor(&who, &name)).await {
         Ok(r) => Ok(Json(r).into_response()),
         Err(Error::Invalid(m)) if m.contains(REPORTS_PER_HOUR_MARKER) => Ok(rate_limited(&m)),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The caller as an endorser or reporter: a person's token only when the
+/// tokens file says `"kind": "human"`; without a tokens file nobody is.
+fn actor<'a>(who: &Option<auth::Principal>, name: &'a str) -> NoteActor<'a> {
+    NoteActor {
+        name,
+        human: who
+            .as_ref()
+            .is_some_and(|p| p.kind == auth::TokenKind::Human),
+        may_review: who.as_ref().is_some_and(|p| p.review),
+    }
+}
+
+/// `POST /v1/notes/{id}/endorse`: a human owner vouches for a note. Not
+/// a person's token, not an owner, or the note's writer: 403; a closed or
+/// stale note: 409.
+pub(crate) async fn endorse(
+    State(repo): S,
+    auth::MaybePrincipal(who): auth::MaybePrincipal,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    let name = principal(&who);
+    match repo.endorse_note(note_id(&id)?, &actor(&who, &name)).await {
+        Ok(n) => Ok(Json(n).into_response()),
+        Err(Error::Policy(m)) => Ok(auth::reject(
+            StatusCode::FORBIDDEN,
+            error_code::FORBIDDEN,
+            &m,
+        )),
         Err(e) => Err(e.into()),
     }
 }

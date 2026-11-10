@@ -39,6 +39,7 @@ mod land_stage;
 pub mod lazy_tree;
 mod merge;
 pub mod notes;
+pub mod notes_view;
 pub mod notices;
 pub mod owners;
 pub mod pack_order;
@@ -63,6 +64,8 @@ mod blame_tests;
 mod bounded_tests;
 #[cfg(test)]
 mod budget_tests;
+#[cfg(test)]
+mod context_notes_tests;
 #[cfg(test)]
 mod context_tests;
 #[cfg(test)]
@@ -93,6 +96,8 @@ mod land_pipeline_tests;
 mod land_stack_tests;
 #[cfg(test)]
 mod lazy_tree_tests;
+#[cfg(test)]
+mod notes_view_tests;
 #[cfg(test)]
 mod notices_tests;
 #[cfg(test)]

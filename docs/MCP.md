@@ -82,7 +82,7 @@ printf '%s\n' \
 | `leep_who` | `path?`, `task_key?`, `principal?`, `all?`, `limit?` (default 20, max 200) | the sessions working on, above or below `path` (or of a task key or principal), newest first, each with principal, agent session, state (`active`, `idle`; with `all` also `landed`, `abandoned`, `expired`), scope, claims and touched paths |
 | `leep_overlaps` | – | everything overlapping this agent's session now, highest level first (ADR 0096): `{session, overlaps: [Notice]}`; an error before `leep_session_start` or a commit |
 | `leep_task_start` | `task`, `task_key?`, `paths?[]`, `ref?` (default `main`), `budget_bytes?` (default 32768, 1024 to 262144) | the first call of a task (ADR 0097): declares or resumes this agent's session (the task's first line its title, the rest its approach, `paths` its scope; a key is made when `LEEP_AGENT_SESSION` is unset; a session without a base takes the head the pack describes, so a later land on its files is a `landed` notice) and answers the context pack for it: `{session, created, agent_session, context: ContextPack}`. A pack the server shed (`Leep-Refused`, ADR 0060) with a `Retry-After` of at most 2 s is asked once more after that pause; otherwise, or when shed again, the result says "Context unavailable" with `retry_after` |
-| `leep_context` | `task?` (default: the session's title), `task_key?`, `paths?[]`, `ref?`, `budget_bytes?` | the context pack alone (ADR 0097): `files`, `owners`, `history`, `in_flight`, `duplicates`, `ref_health`, with `cut` and `omitted` |
+| `leep_context` | `task?` (default: the session's title), `task_key?`, `paths?[]`, `ref?`, `budget_bytes?` | the context pack alone (ADR 0097): `files`, `owners`, `history`, `in_flight`, `duplicates`, `ref_health`, `notes` (ADR 0098), with `cut` and `omitted` |
 | `leep_review_request` | `rev`, `reviewers?[]`, `message?`, `ref?` (default `main`) | opens a review request (ADR 0086), as `leep review request`: reviewers default to the owners still pending; an equal open request is answered (`existing: true`); needs authentication |
 | `leep_review_inbox` | `mine?`, `all?`, `limit?` (default 20, max 100) | open review requests naming this agent that it has not answered (or, with `mine`, the ones it made), as `leep review inbox`; `all` adds closed and answered ones; needs authentication |
 | `leep_note_add` | `title`, `path?` or `changeset?` (one of them), `kind?` (`finding` default, `gotcha`, `decision`, `howto`), `body?`, `lines?` (`[start, end]`), `at?`, `supersedes?` | writes a note other agents will read on that file, directory or changeset (ADR 0098), as `leep note add`: the `NoteEntry`; trust comes from the token, the model from `LEEP_AGENT_MODEL` |
@@ -112,7 +112,8 @@ in the fence the same way.
 
 **Notes** ([ADR 0098](adr/0098-notes.md)). `leep_notes` prints one line
 per note outside the fence with only what the server vouches for (id,
-kind, principal, trust `agent` or `human`, state, who endorsed it, what
+kind, principal, trust `agent` or `human`, state, the owner whose
+endorsement holds (or that it is not in force), whether it is stale, what
 superseded it), and each note's anchor, lines, title, body and model in
 the fenced `untrusted` block, one JSON row per note. Endorsed notes are
 fenced too: endorsement ranks a note higher, it never makes it an
@@ -122,7 +123,17 @@ most 4096 bytes, no control characters other than the body's newlines, no
 line separators, bidirectional controls or invisible characters (zero-width,
 tag characters). At most 30 notes an hour, 100 a day and
 200 open per token; an error says when either is reached. There is no tool
-to endorse a note.
+to endorse a note, and there never will be: only a human owner endorses,
+with `leep note endorse` and a person's token.
+
+**Notes in packs.** `leep_task_start` and `leep_context` end with the
+pack's notes on the task's files and the directories above them: endorsed
+notes first, then people's, then agents', fresh before stale, the nearest
+first. Outside the fence each line says `note:N`, the kind, the writer,
+`endorsed by owner NAME` or the trust, `stale` and how many files a
+directory note covers; agents' notes come as titles only (`title only:
+leep_notes for note N`), and stale agents' notes are left out. The
+anchor, title, body and covered paths are fenced rows keyed by `note:N`.
 
 **Notices** ([ADR 0096](adr/0096-overlap-notices-and-duplicate-flags.md)).
 Every tool result, error results included, ends with the notices of other
