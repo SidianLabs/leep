@@ -326,11 +326,26 @@ impl Repo {
             .ok_or_else(|| Error::NotFound("sessions: this server keeps none".into()))
     }
 
-    /// Declare or update `principal`'s session of `req.session`.
+    /// Declare or update `principal`'s session of `req.session`, with the
+    /// default notices (duplicates included).
     pub async fn declare_session(
         &self,
         principal: &str,
         req: DeclareSessionRequest,
+    ) -> Result<DeclareSessionResponse> {
+        let ask = crate::notices::NoticeAsk::default();
+        self.declare_session_with(principal, req, Some(&ask)).await
+    }
+
+    /// [`Repo::declare_session`] answering the notices `ask` wants (none
+    /// for `None`): overlaps of the declared paths and possible duplicates
+    /// (ADR 0096). A changed scope or set of claims counts the notices it
+    /// followed.
+    pub async fn declare_session_with(
+        &self,
+        principal: &str,
+        req: DeclareSessionRequest,
+        ask: Option<&crate::notices::NoticeAsk>,
     ) -> Result<DeclareSessionResponse> {
         let coord = self.coord_on()?;
         let now = unix_now();
@@ -360,10 +375,25 @@ impl Repo {
         if created {
             metrics::counter!("leep_sessions_started_total", "origin" => "declared").increment(1);
         }
+        let declared: Vec<String> = s.scope.iter().chain(&s.claims).cloned().collect();
+        if u.scope.is_some() || u.claims.is_some() {
+            self.note_scope_change(s.id, Some(&declared));
+        }
+        let notices = match ask {
+            Some(ask) => {
+                let ask = crate::notices::NoticeAsk {
+                    focus: declared,
+                    duplicates: true,
+                    ..ask.clone()
+                };
+                self.notices_for_session(&s, &ask).await
+            }
+            None => Vec::new(),
+        };
         Ok(DeclareSessionResponse {
             session: entry(s, now),
             created,
-            notices: Vec::new(),
+            notices,
         })
     }
 
@@ -461,7 +491,9 @@ impl Repo {
             principal: Some(principal.to_string()),
             if_head: None,
         };
-        coord.end_session(id, &end).await?;
+        if coord.end_session(id, &end).await? {
+            self.note_scope_change(id, None);
+        }
         self.session(id).await
     }
 
@@ -478,11 +510,25 @@ impl Repo {
         id: ChangesetId,
         principal: &str,
     ) -> Result<bool> {
+        Ok(self
+            .note_created_session(seed, id, principal)
+            .await?
+            .is_some())
+    }
+
+    /// [`Repo::note_created`], answering the session as written, for the
+    /// create's notices (ADR 0096).
+    pub async fn note_created_session(
+        &self,
+        seed: SessionSeed,
+        id: ChangesetId,
+        principal: &str,
+    ) -> Result<Option<Session>> {
         let Some(coord) = self.coord.as_ref() else {
-            return Ok(false);
+            return Ok(None);
         };
         if check_principal(principal).is_err() {
-            return Ok(false);
+            return Ok(None);
         }
         let mut u = SessionUpdate::new(principal, &seed.key, SessionOrigin::Inferred, unix_now());
         u.title = seed.title;
@@ -498,16 +544,16 @@ impl Repo {
             bound_paths(&seed.touch, MAX_TOUCHED_PATHS)
         };
         match coord.upsert_session(&u).await {
-            Ok((_, created)) => {
+            Ok((s, created)) => {
                 if created {
                     metrics::counter!("leep_sessions_started_total", "origin" => "inferred")
                         .increment(1);
                 }
-                Ok(true)
+                Ok(Some(s))
             }
             Err(e) if too_many(&e) => {
                 metrics::counter!("leep_sessions_refused_total").increment(1);
-                Ok(false)
+                Ok(None)
             }
             Err(e) => Err(e),
         }

@@ -87,6 +87,8 @@ mod land_stack_tests;
 #[cfg(test)]
 mod lazy_tree_tests;
 #[cfg(test)]
+mod notices_tests;
+#[cfg(test)]
 mod page_tests;
 #[cfg(test)]
 mod path_page_tests;

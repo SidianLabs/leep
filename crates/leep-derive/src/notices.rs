@@ -25,7 +25,7 @@ use leep_core::api::{Notice, NoticeText, OverlapsResponse};
 use leep_core::changeset::EXTRA_AGENT_SESSION;
 use leep_core::coord::{
     ancestors, parent_dir, paths_overlap, NearQuery, NoticeLevel, PathKind, Session, SessionFilter,
-    SessionState,
+    SessionOrigin, SessionState,
 };
 use leep_core::store::unix_now;
 use leep_core::{Changeset, ChangesetId, Error, RepoPath, Result};
@@ -530,7 +530,8 @@ impl Repo {
 
     /// Live sessions that look like `s`'s task: the same task key, or an
     /// intent (title and approach) at least [`SIMILAR_PERCENT`] alike by
-    /// trigrams among the [`DUPLICATE_CANDIDATES`] newest active sessions.
+    /// trigrams among the [`DUPLICATE_CANDIDATES`] newest active sessions
+    /// (declared ones only, on both sides).
     async fn duplicates(&self, s: &Session) -> Result<Vec<Found>> {
         let Some(coord) = self.coord.as_ref() else {
             return Ok(Vec::new());
@@ -562,8 +563,10 @@ impl Repo {
                 });
             }
         }
+        // Only declared intents are compared: an inferred title is a commit
+        // subject, and two commits to one file often read alike.
         let me = intent_trigrams(&s.title, &s.approach);
-        if me.is_empty() {
+        if me.is_empty() || s.origin != SessionOrigin::Declared {
             return Ok(out);
         }
         let recent = coord
@@ -576,7 +579,7 @@ impl Repo {
             .await?;
         let mut similar: Vec<(u32, &Session)> = recent
             .iter()
-            .filter(|o| live(o) && !flagged.contains(&o.id))
+            .filter(|o| live(o) && !flagged.contains(&o.id) && o.origin == SessionOrigin::Declared)
             .map(|o| (similarity(&me, &intent_trigrams(&o.title, &o.approach)), o))
             .filter(|(p, _)| *p >= SIMILAR_PERCENT)
             .collect();
