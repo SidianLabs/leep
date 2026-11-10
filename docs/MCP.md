@@ -85,6 +85,8 @@ printf '%s\n' \
 | `leep_context` | `task?` (default: the session's title), `task_key?`, `paths?[]`, `ref?`, `budget_bytes?` | the context pack alone (ADR 0097): `files`, `owners`, `history`, `in_flight`, `duplicates`, `ref_health`, with `cut` and `omitted` |
 | `leep_review_request` | `rev`, `reviewers?[]`, `message?`, `ref?` (default `main`) | opens a review request (ADR 0086), as `leep review request`: reviewers default to the owners still pending; an equal open request is answered (`existing: true`); needs authentication |
 | `leep_review_inbox` | `mine?`, `all?`, `limit?` (default 20, max 100) | open review requests naming this agent that it has not answered (or, with `mine`, the ones it made), as `leep review inbox`; `all` adds closed and answered ones; needs authentication |
+| `leep_note_add` | `title`, `path?` or `changeset?` (one of them), `kind?` (`finding` default, `gotcha`, `decision`, `howto`), `body?`, `lines?` (`[start, end]`), `at?`, `supersedes?` | writes a note other agents will read on that file, directory or changeset (ADR 0098), as `leep note add`: the `NoteEntry`; trust comes from the token, the model from `LEEP_AGENT_MODEL` |
+| `leep_notes` | `path?`, `changeset?`, `principal?`, `mine?`, `all?`, `limit?` (default 20, max 100) | notes on `path` and the directories above it (or on a changeset, or by a principal), newest first, open ones unless `all`: `{notes, next?}` |
 
 Sessions are advisory: nothing in them can stop or change a land. Every
 request the MCP server sends carries `Leep-Session` with its agent session,
@@ -107,6 +109,19 @@ them all; a `carry` rule is explained once. `leep_task_start` leaves out
 of its notices any the pack already lists.
 `leep_review_inbox` keeps requesters' messages, changeset titles and paths
 in the fence the same way.
+
+**Notes** ([ADR 0098](adr/0098-notes.md)). `leep_notes` prints one line
+per note outside the fence with only what the server vouches for (id,
+kind, principal, trust `agent` or `human`, state, who endorsed it, what
+superseded it), and each note's anchor, lines, title, body and model in
+the fenced `untrusted` block, one JSON row per note. Endorsed notes are
+fenced too: endorsement ranks a note higher, it never makes it an
+instruction. `leep_note_add` answers with the note's id, kind and trust
+only. A note's text is plain: one line of title (200 bytes), a body of at
+most 4096 bytes, no control characters other than the body's newlines, no
+line separators or bidirectional controls. At most 30 notes an hour and
+200 open per token; an error says when either is reached. There is no tool
+to endorse a note.
 
 **Notices** ([ADR 0096](adr/0096-overlap-notices-and-duplicate-flags.md)).
 Every tool result, error results included, ends with the notices of other

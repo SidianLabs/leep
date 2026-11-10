@@ -283,6 +283,14 @@ see [CLI.md](CLI.md#author-of-new-changesets)), `leep` stamps that on its change
 back to the token's `name`. It is a default, not enforcement: a client that
 sets `LEEP_AUTHOR` still wins.
 
+An entry may also say who holds it: `"kind": "human"` for a person's
+token (`gen-token --kind human`), `"kind": "agent"` or nothing for an
+agent's. Notes written with a human token are trusted as a person's, and
+only a person's token will be able to endorse a note (ADR 0098). No
+request can claim the kind; mark only tokens people hold. Upgrade every
+server before a tokens file uses `kind`: older servers refuse fields they
+do not know ([OPERATIONS.md](OPERATIONS.md#upgrading)).
+
 **Give every agent its own token**, named for the agent (`gen-token --name
 agent-7 --role write --no-review --author "agent-7 <...>"`), rather than one
 token shared by a fleet. The token's name is the only identity the server

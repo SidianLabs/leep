@@ -1354,7 +1354,7 @@ async fn upgrade_from_v9_adds_notes() {
         };
         assert_eq!(
             coord.list_sessions(&every).await.unwrap(),
-            [before.clone()],
+            std::slice::from_ref(&before),
             "{kind}"
         );
         // The contract runs on an empty store: end and forget that session.

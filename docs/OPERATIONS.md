@@ -155,11 +155,15 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_sessions_ended_total` | counter | `state` = `landed`, `expired` | Sessions ended by a land of their head, or by the expiry sweep. |
 | `leep_sessions_refused_total` | counter | none | Sessions not inferred because their principal already had 1000 active (`MAX_ACTIVE_PER_PRINCIPAL`). |
 | `leep_session_beats_dropped_total` | counter | `reason` = `full`, `principal` | Heartbeats of new keys not held because this server already holds 100,000 sessions' beats (`full`) or 2,000 of that principal's (`principal`, a token sending made-up keys); those sessions only look idle sooner. |
-| `leep_session_hook_errors_total` | counter | `hook` = `created`, `landed`, `beats`, `sweep`; `reason` = `error`, `timeout`, `busy` | Session updates that failed, timed out or were skipped. The answer they followed was not affected (ADR 0095); a steady rate means the coordination writes are failing and `leep who` is going stale. |
+| `leep_session_hook_errors_total` | counter | `hook` = `created`, `landed`, `beats`, `sweep`, `notes_sweep`; `reason` = `error`, `timeout`, `busy` | Session updates that failed, timed out or were skipped. The answer they followed was not affected (ADR 0095); a steady rate means the coordination writes are failing and `leep who` is going stale. |
 | `leep_overlap_notices_total` | counter | `level` = `near`, `same_file`, `claimed`, `possible_duplicate`, `landed` | Notices put in answers (ADR 0096), each counted once when said. |
 | `leep_duplicate_sessions_flagged_total` | counter | `by` = `task_key`, `similar` | `possible_duplicate` notices said: the same task key, or a declared title and approach at least 60% alike. |
 | `leep_notices_followed_total` | counter | `level` | Notices followed within 10 minutes: the session's declared scope and claims stopped covering the path the notice was about, or the session ended. Against `leep_overlap_notices_total` it is the share of notices agents act on; a level that is almost never followed is noise (design F.3). |
 | `leep_notices_omitted_total` | counter | `reason` = `timeout`, `error`, `full` | Parts of notices left out of an answer: the path, `landed` or duplicate part took over 150 ms (`timeout`; 2 s for an overlaps query) or failed (`error`), or the server's memory of said notices was full (`full`, 100,000 sessions, purged of expired entries at most once a minute). The other parts still came, and the answers themselves were unaffected; a steady `timeout` rate means the coordination store, or the history reads of `landed`, are slow. |
+| `leep_notes_added_total` | counter | `trust` = `agent`, `human`; `kind` = `finding`, `gotcha`, `decision`, `howto` | Notes written (`POST /v1/notes`, ADR 0098). `trust` is the writing token's `kind`. |
+| `leep_notes_refused_total` | counter | `reason` = `too_many`, `rate`, `invalid`, `supersede` | Notes refused: the principal had 200 open (`too_many`, 400) or wrote 30 in the last hour (`rate`, 429), the text, anchor or kind was bad (`invalid`; also a path not at the revision), or the note it superseded was another's or no longer open (`supersede`). A steady `rate` or `too_many` from one token is a runaway or hostile writer: look at its notes (`leep note list --principal NAME`). |
+| `leep_notes_reported_total` | counter | `effect` = `hidden`, `counted` | Notes reported: an open agent note nobody endorsed is hidden at once (`hidden`); a human or endorsed one, or one already closed, is only counted. Many `hidden` reports of one principal's notes are a reason to revoke them (`leep-server notes revoke`). |
+| `leep_notes_swept_total` | counter | `reason` = `expired`, `closed` | Notes deleted by the per-minute sweep: open ones past their life (90 days for agents, 365 for humans), and superseded, retracted or reported ones 30 days after they closed. |
 | `leep_context_packs_total` | counter | none | Context packs answered (`POST /v1/context`, ADR 0097). Against `leep_sessions_started_total{origin="declared"}`, roughly packs per session. |
 | `leep_context_bytes_total` | counter | none | Bytes of items those packs returned (the envelope aside). Divided by `leep_context_packs_total`, the average pack. |
 | `leep_context_items_cut_total` | counter | `section` = `files`, `owners`, `history`, `in_flight`, `ref_health`, `duplicates`, `suspects` | Items left out to keep packs within their budget. A section cut on most packs at the default budget is a sign its quota is too small. |
@@ -1486,6 +1490,41 @@ at most once a minute per session, in one batch every 5 seconds, and sweeps
 every minute: sessions not heard from for 24 hours expire, paths of ended
 sessions are deleted after 24 hours and the sessions after 30 days.
 
+**Migration 10 (`notes`, ADR 0098).** Creates one new, empty table
+(`notes`) and its indexes, and touches no existing table, so it may run
+beside v9 servers, which never read it. Notes are kept only by upgraded
+servers; `--sessions off` keeps none (the routes answer 404). Unlike
+sessions, notes are in backups, and a restore brings them back.
+
+**The tokens file's `kind`.** A token entry may say `"kind": "human"` (or
+`"agent"`, the default when absent): notes written with a human token are
+trusted as a person's, and only a human owner will be able to endorse a
+note. The tokens file refuses fields it does not know, so **upgrade every
+server before any tokens file uses `kind`**: a server from before ADR
+0098 would refuse the file at startup, or keep its old tokens on SIGHUP
+(a failed reload). Mark only tokens a person holds; an agent with a human
+token writes notes that rank like a person's. `leep-server gen-token
+--kind human` writes the field.
+
+To go back to v9 without restoring a backup, stop every server, drop the
+table (losing the notes) and remove `kind` from the tokens file:
+
+```sql
+BEGIN;
+DROP TABLE notes;
+DELETE FROM schema_migrations WHERE version = 10;
+COMMIT;
+```
+
+**Notes per principal** are capped at 200 open (400 `too_many_notes`) and
+30 written an hour (429 `rate_limited`, `Retry-After: 60`), each counted
+exactly under a per-principal lock. A token writing hostile notes is
+answered by reporting them (each agent note is hidden at once) or, for all
+of them, `leep-server notes revoke --principal NAME` (uses `--meta`; safe
+beside running servers): it retracts every open note of that token, which
+stays listable as `retracted` for 30 days. Then take the token out of the
+tokens file.
+
 **Open review requests per requester** are capped at 100
 (`MAX_OPEN_REQUESTS`, a constant): one more is refused with 400 and code
 `too_many_review_requests`. An agent that hits it should cancel requests it
@@ -2757,7 +2796,7 @@ procedure, not an extra.
 
 | What | Where it lives | How |
 |---|---|---|
-| Metadata: changesets and their compression dictionaries, refs, ref log, signatures, reviews, derived data | SQLite file or Postgres database (`--meta`) | `leep-server backup` |
+| Metadata: changesets and their compression dictionaries, refs, ref log, signatures, reviews, review requests, notes, derived data (not leases or sessions, which describe live servers and agents) | SQLite file or Postgres database (`--meta`) | `leep-server backup` |
 | Blobs: file contents and tree nodes | filesystem directory or S3 bucket (`--blobs`) | `leep-server backup` |
 | Configuration: tokens file, signing keys file, review policy file, TLS/proxy config | wherever you keep it | your configuration management; **not in the stores and not in the backup** |
 
