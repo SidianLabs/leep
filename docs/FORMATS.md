@@ -959,10 +959,13 @@ persisted. Added:
 - `CoordStore::near_paths(NearQuery {paths, siblings, exclude, per_range,
   limit}) -> Vec<NearRow {session, kind, path}>` (checked by the coord
   contract): path rows of active sessions equal to a path or a directory
-  above it, below it, and with `siblings` below its directory; each range
-  capped at `per_range`, the whole at `limit`; the sessions come without
-  their path lists. `SessionFilter.skip_paths` (default `false`) leaves a
-  listing's path lists empty.
+  above it, below it, and with `siblings` below its directory; each exact
+  path (claims first) and each range capped at `per_range`, the whole at
+  `limit`, ordered claims first, then rows on an exact probe, then by path
+  and session (`NearQuery::order`); the sessions come without their path
+  lists. `SessionFilter.skip_paths` (default `false`) leaves a listing's
+  path lists empty, and `SessionFilter.origin` (default `None`) keeps only
+  sessions of that origin.
 - `Notice {level, session?, principal?, changeset?, count?, by?,
   similarity?, untrusted: {title?, path?, other_path?, task_key?}}`.
   `level` is `near`, `same_file`, `claimed`, `possible_duplicate` or

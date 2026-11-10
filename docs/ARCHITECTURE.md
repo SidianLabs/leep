@@ -1813,10 +1813,12 @@ a second kind of mutable state beside refs, behind its own trait,
   `possible_duplicate` (same task key, or a declared title and approach at
   least 60% alike by trigrams), `claimed`, `same_file` and `near` (one
   `CoordStore::near_paths` call: exact probes plus capped range scans on
-  `(repo_id, path)`). Each is said once per session for 30 minutes (per
-  server); `Leep-Notices` picks the lowest level (default `same_file`) or
-  `off`. They are computed after the answer is decided, within 150 ms or
-  not at all, and never change it; the land answer travels as
+  `(repo_id, path)`, claims and exact rows first). Each other session is
+  one notice at its highest level, said once per session for 30 minutes
+  (per server) unless it comes back higher; a crowded path of theirs is
+  one count. `Leep-Notices` picks the lowest level (default `same_file`)
+  or `off`. They are computed after the answer is decided, each part
+  within 150 ms or left out, and never change it; the land answer travels as
   `LandAnswer`, the same object with `notices` beside it. `GET
   /v1/notices` answers only the notices, `GET /v1/sessions/{id}/overlaps`
   everything overlapping a session. The CLI prints them on stderr,

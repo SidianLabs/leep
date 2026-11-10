@@ -37,18 +37,27 @@ A notice says how another live session's work meets mine, lowest first:
 paths, a declaration's scope and claims) first, then claims, scope and
 touched paths. "Live" is a session stored `active` (an idle one counts;
 one past its expiry does not). A session sees each other session once,
-at its highest level. More than 50 sessions at `same_file` on one of my
-paths make it crowded: one notice with a `count` replaces theirs (claims
-are still named).
+at its highest level, carrying the paths a lower level named when the
+highest has none (a duplicate that also claims my file is one notice).
+More than 50 sessions at `same_file` or above on one path of theirs make
+it crowded: one notice with a `count`, keyed by that path, replaces
+their rows on it, however many of my paths it holds. Claims are still
+named, and a crowd member that also meets me on an uncrowded path is
+named there. Sessions of my own principal with my task key are my own
+earlier sessions (an agent restarted under a new key) and are never a
+notice.
 
 **Path levels** come from one call, `CoordStore::near_paths` (a new
 trait method in the contract): an exact probe of my paths and every
 directory above them, plus one range scan below each of my paths and
-below each one's directory, each scan capped at 64 rows and the whole at
-512, all on the `(repo_id, path)` index of migration 0009. Postgres runs
-it as one statement with a `LATERAL ... LIMIT` per range, so one crowded
-directory cannot crowd out the rest; SQLite runs one short statement per
-probe. No new table, column or index.
+below each one's directory, each exact path and each scan capped at 64
+rows (claims first on an exact path) and the whole at 512, all on the
+`(repo_id, path)` index of migration 0009. The answer is ordered claims
+first, then exact rows, then by path, so sessions scoped to a directory
+above my file never crowd out a claim on the file itself. Postgres runs
+it as one statement with a `LATERAL ... LIMIT` per exact path and per
+range; SQLite runs one short statement per probe. No new table, column
+or index.
 
 **`landed`** needs the session's `target_ref` and a base or head. Its base
 is its declared base plus every parent outside the session of the
@@ -56,22 +65,32 @@ session's own changesets, walked from its head (at most 32): a merge of
 the target into the work counts, so work already merged is not reported.
 The server walks the target ref's first parents from its head, at most
 64 changesets, until it meets one of those, and reports each changeset
-not carrying the session's `agent.session` that changed a path equal to,
-above or below one of mine, naming the changeset. The answer is kept per
-session until the ref or the session's head moves. This reads history,
-not the coordination store, so it holds across servers and restarts; the
-land path itself is unchanged.
+that changed a path equal to, above or below one of mine, naming the
+changeset; one carrying the session's `agent.session` is skipped only
+when the server recorded the session's principal as its creator. Both
+walks read ahead in batches (the history walk's `ReadAhead`, ADR 0030,
+which uses the skiplists' ancestors). Progress is kept per session as
+the walk goes, so a walk cut short by the bound resumes on the next
+answer; a moved ref restarts the walk but keeps the base, and a moved
+head recomputes both. A changeset that is gone (collected) ends the base
+walk where it is; with no base known, there is no `landed` part. This
+reads history, not the coordination store, so it holds across servers
+and restarts; the land path itself is unchanged.
 
 **Duplicates** are flagged when a session is declared (start or update):
 live sessions with the same `task_key` (an indexed lookup, at most 20),
-and, among the 200 newest active sessions, declared ones whose title and
-approach are at least 60% alike by trigram Jaccard similarity, with the
-search index's trigram extraction (`search::trigram::extract`) over the
-lowercased words. Intents shorter than 16 bytes are never compared.
-Inferred sessions are not compared by wording: their titles are commit
-subjects, and two commits to one file read alike. Tests fix the
-threshold with a paraphrase that must flag and a near miss (same shape,
-other words) that must not. This finds "the same goal, described alike"
+and, among the 200 newest active declared sessions (`SessionFilter.origin`),
+those whose title and approach are at least 60% alike by trigram Jaccard
+similarity, with the search index's trigram extraction
+(`search::trigram::extract`) over the lowercased words. Intents shorter
+than 16 bytes are never compared. Two intents that both name paths
+(words with a `/`, or a name and an extension) and share none are not
+alike: a template filled in with other files ("Fix flaky test in
+<path>") is other work. Inferred sessions are not compared by wording:
+their titles are commit subjects, and two commits to one file read
+alike. Tests fix the threshold with a paraphrase that must flag, a near
+miss (same shape, other words) and titles sharing a long path prefix
+that must not. This finds "the same goal, described alike"
 and no more; differently described duplicates wait for embeddings.
 
 ### 2. Notices in answers
@@ -93,28 +112,44 @@ unaffected):
   field;
 - `POST /v1/sessions`: the declared session, with duplicates;
 - `GET /v1/sessions`: the caller's session named by `Leep-Session`;
-- `GET /v1/notices` (new): only that, as `NoticesResponse`.
+- `GET /v1/notices` (new): only that, as `NoticesResponse`. Like every
+  answer that carries notices, it marks what it returns as said: a
+  client that asks and drops the answer does not hear those notices
+  again for 30 minutes.
 
 `GET /v1/sessions/{id}/overlaps` (new) answers `OverlapsResponse
 {session, overlaps}`: everything overlapping a session now, every level
-and duplicates, highest first, at most 50, nothing held back as said. It
-answers with `--notices off` too: it is a question, not an interruption.
+and duplicates, highest first, at most 50, nothing held back as said or
+marked said. It answers with `--notices off` too: it is a question, not
+an interruption. Reading the session and each part waits at most 2 s
+(`OVERLAPS_BOUND`); a part past it is left out.
 
 **Ranking, cap, once.** Highest level first; at most 3 per answer. The
 request header `Leep-Notices` picks the lowest level carried (default
 `same_file`, the design's minimum, F.3) or `off`. Each server keeps, per
-session, the notices it has said, keyed by level and the other session
-(or landed changeset), for 30 minutes, at most 64 per session and
-100,000 sessions; a notice already said is not said again, and the ones
-past the cap of 3 come on a later answer. With several servers a notice
-can be said once per server.
+session, the notices it has said, keyed by the other session (with the
+level said), the landed changeset or the crowded path, for 30 minutes. A
+notice already said is not said again; another session is said again
+only when it comes back at a higher level. The ones past the cap of 3
+come on a later answer. Only the 64 best-ranked overlaps are considered,
+and a said entry is never dropped before it expires, so a session with
+more overlaps than that hears the first 64 once, never in a loop.
+Sessions told nothing keep no entry; at 100,000 sessions the memory is
+purged of expired entries at most once a minute, and while it stays
+full nothing new is said. With several servers a notice can be said once
+per server.
 
 ### 3. Never an answer's cost or content
 Notices follow the land-equivalence rule of ADR 0095. Nothing a land
 decides reads them; they are computed after the answer is decided, in
-the handler, and only added beside it. Every in-band computation runs
-within 150 ms (`NOTICE_BOUND`); past it, or on an error, the answer goes
-out without notices and `leep_notices_omitted_total{reason}` counts it.
+the handler, and only added beside it; a land's notices are computed
+before the hooks that end its session start. The path, `landed` and
+duplicate parts run together, each within 150 ms (`NOTICE_BOUND`); a
+part past it, or one that fails, is left out and counted in
+`leep_notices_omitted_total{reason}`, and the others still come. A
+create waits at most 250 ms for its session update (ADR 0095) and then
+at most 150 ms for its notices: 400 ms in the worst case, on a store
+that is failing to answer.
 The property test of ADR 0095 now computes notices and overlaps on every
 create, declaration and land of the populated repository, checks some
 were said, and still requires the same answers, refs and ref logs on all
@@ -127,14 +162,16 @@ within the bound without notices.
   command prints them on stderr when it ends, one line each, with every
   agent-written part and every name quoted and escaped (`{:?}`), as ADR
   0095 does for sessions. `leep status` also asks `GET /v1/notices`, best
-  effort. `leep who --overlaps` lists the overlaps of your session.
+  effort, giving up after 3 s (as the MCP server does). `leep who --overlaps` lists the overlaps of your session.
   `LEEP_NOTICE_LEVEL` is sent as `Leep-Notices`.
 - **MCP.** Every tool result ends with the notices its answers carried;
   when they carried none and the agent has a session, the server is asked
   (`GET /v1/notices`) at most every 30 seconds. Outside the fence go only
   the level, ids, principal, changeset and counts (a level or name that
-  is not a plain word shows as `?`); titles, paths and task keys go in a
-  fenced `untrusted` block under the fixed line of ADR 0095. Structured
+  is not a word of letters, digits, `_`, `-` and `.` shows as `?`);
+  titles, paths and task keys go in a fenced `untrusted` block under the
+  fixed line of ADR 0095, with line separators and bidirectional
+  controls escaped. Structured
   results gain a `notices` list. New tool `leep_overlaps`.
 
 ### 5. Measuring it
