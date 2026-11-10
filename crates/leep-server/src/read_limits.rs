@@ -31,7 +31,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// A class of expensive read with a concurrency limit of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadClass {
-    /// `GET /v1/search/{rev}`.
+    /// `GET /v1/search/{rev}`, and `POST /v1/context`, which searches
+    /// (ADR 0097).
     Search,
     /// `POST /v1/land/check` (ADR 0060, section 3; not built).
     LandCheck,
@@ -361,6 +362,9 @@ impl ReadLimits {
     /// The limited class a request belongs to, if any. Decided from the
     /// method, path and query alone, before any store is read.
     fn class_of(&self, method: &Method, uri: &Uri) -> Option<&Arc<Class>> {
+        if method == Method::POST && uri.path() == "/v1/context" {
+            return self.search.as_ref();
+        }
         if method != Method::GET && method != Method::HEAD {
             return None;
         }
@@ -608,6 +612,7 @@ mod tests {
             (Method::GET, "/v1/log/x?extra=k%3Dv", "log_filtered"),
             (Method::GET, "/v1/last-change/x?path=a.txt", "log_filtered"),
             (Method::GET, "/v1/refs/main/checks", "log_filtered"),
+            (Method::POST, "/v1/context", "search"),
             (
                 Method::GET,
                 "/v1/refs/team/x/culprits?bad=a",

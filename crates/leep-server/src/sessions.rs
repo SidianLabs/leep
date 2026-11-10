@@ -56,7 +56,7 @@ pub const SWEEP_EVERY: Duration = Duration::from_secs(60);
 /// Most active sessions the `leep_sessions_active` gauge counts.
 const GAUGE_CAP: usize = 100_000;
 
-fn principal(who: &Option<auth::Principal>) -> String {
+pub(crate) fn principal(who: &Option<auth::Principal>) -> String {
     who.as_ref()
         .map_or_else(|| ANONYMOUS.to_string(), |p| p.name.clone())
 }
@@ -67,7 +67,7 @@ fn ask(headers: &HeaderMap) -> Option<NoticeAsk> {
 }
 
 /// The caller's agent session key (`Leep-Session`), if any.
-fn session_key(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn session_key(headers: &HeaderMap) -> Option<String> {
     headers
         .get(SESSION_HEADER)
         .and_then(|v| v.to_str().ok())

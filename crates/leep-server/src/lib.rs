@@ -10,6 +10,7 @@ pub mod background_repack;
 pub mod backup;
 pub mod checks;
 pub mod conn;
+mod context;
 pub mod coord;
 pub mod errors;
 pub mod fingerprint;
@@ -334,6 +335,7 @@ pub fn router_with_read_classes(
         )
         .route("/v1/sessions/{id}/overlaps", get(sessions::overlaps))
         .route("/v1/notices", get(sessions::notices))
+        .route("/v1/context", post(context::pack))
         .route("/v1/refs", get(list_refs))
         .route("/v1/refs/{*name}", get(get_ref).post(post_ref))
         .route("/v1/reflog", get(ref_log_all))
@@ -996,7 +998,7 @@ async fn get_changeset(State(repo): S, Path(id): Path<String>) -> ApiResult<Resp
 }
 
 /// The config snapshot the request started with.
-type Cfg = Extension<Arc<reload::RuntimeConfig>>;
+pub(crate) type Cfg = Extension<Arc<reload::RuntimeConfig>>;
 
 async fn add_signature(
     State(repo): S,
