@@ -510,6 +510,9 @@ pub const REFUSED_ADMISSION: &str = "admission";
 /// [`REFUSED_HEADER`] value: a request refused because the request bodies
 /// in flight were at the server's limit (`--max-inflight-bytes`).
 pub const REFUSED_BODY_BUDGET: &str = "body-budget";
+/// [`REFUSED_HEADER`] value: a note write or report that waited 2 s for
+/// another of the same principal (ADR 0098). Nothing was written.
+pub const REFUSED_NOTE_LOCK: &str = "note-lock";
 
 /// Body of `GET /v1/whoami`. Lets a client name the author of its changesets
 /// after the token when nothing local names one.

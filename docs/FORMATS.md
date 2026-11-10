@@ -590,7 +590,7 @@ notes(id BIGSERIAL PRIMARY KEY,                                -- migration 0010
       line_start INT, line_end INT,                             -- lines of a file anchor, from 1; both or neither
       title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',       -- agent-written plain text
       principal TEXT NOT NULL,                                  -- a token name, or 'anonymous'
-      agent_model TEXT, session_id BIGINT,
+      agent_model TEXT, session_id BIGINT,                      -- informational: may name a session long gone
       trust TEXT NOT NULL DEFAULT 'agent',                      -- 'agent' or 'human', fixed at write
       endorsed_by TEXT, endorsed_at BIGINT,
       state TEXT NOT NULL DEFAULT 'open',                       -- 'open', 'superseded', 'retracted' or 'reported'
@@ -1764,7 +1764,9 @@ new response header `Leep-Refused: <reason>`.
 - Values: `read-class` (an expensive read whose class is full),
   `admission` (a land refused because its ref's queue is full, see
   [Land admission](#land-admission-additive-header-value-adr-0060)) and
-  `body-budget` (the in-flight body budget's `503`, `--max-inflight-bytes`).
+  `body-budget` (the in-flight body budget's `503`, `--max-inflight-bytes`)
+  and `note-lock` (a note write or report that waited 2 s for another of
+  the same principal, ADR 0098).
   Clients should treat any value as "refused before any work" and must
   not depend on the list being closed.
 - A follower that relays a forwarded land's answer (ADR 0056) copies

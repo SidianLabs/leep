@@ -39,7 +39,7 @@ pub(crate) const NOTES_SCHEMA_VERSION: i64 = 10;
 /// The first key of the Postgres advisory lock a note write takes, with
 /// the principal's hash as the second: one writer per principal at a time,
 /// so its caps are exact.
-const NOTES_LOCK: i32 = 0x4c4e_4f54;
+pub(crate) const NOTES_LOCK: i32 = 0x4c4e_4f54;
 
 const NOTE_COLUMNS: &str = "id, kind, anchor_type, anchor, at_changeset, at_blob, line_start, \
      line_end, title, body, principal, agent_model, session_id, trust, endorsed_by, endorsed_at, \
@@ -445,6 +445,45 @@ impl PgCoordStore {
     }
 }
 
+/// How long a note write waits for the same principal's other write.
+const NOTE_LOCK_TIMEOUT: &str = "2s";
+
+/// Take the per-principal note lock for the rest of `tx`, waiting at most
+/// [`NOTE_LOCK_TIMEOUT`]: a stuck writer then costs others of the same
+/// principal a refusal that is safe to retry, never a pool connection held
+/// behind it.
+async fn note_lock(tx: &mut sqlx::Transaction<'_, Postgres>, principal: &str) -> Result<()> {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL lock_timeout = '{NOTE_LOCK_TIMEOUT}'"
+    )))
+    .execute(&mut **tx)
+    .await
+    .map_err(storage)?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
+        .bind(NOTES_LOCK)
+        .bind(principal)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| {
+            let timed_out = e
+                .as_database_error()
+                .and_then(|d| d.code())
+                .is_some_and(|c| c == "55P03");
+            if timed_out {
+                Error::Refused {
+                    refused: leep_core::api::REFUSED_NOTE_LOCK,
+                    retry_after_ms: 1000,
+                    message: "another note write of this principal is in progress; nothing was \
+                              written, try again"
+                        .into(),
+                }
+            } else {
+                storage(e)
+            }
+        })?;
+    Ok(())
+}
+
 async fn pg_paths(conn: &mut sqlx::PgConnection, sessions: Vec<Session>) -> Result<Vec<Session>> {
     if sessions.is_empty() {
         return Ok(sessions);
@@ -840,12 +879,7 @@ impl CoordStore for PgCoordStore {
         }
         n.check()?;
         let mut tx = self.pool("note_add").begin().await.map_err(storage)?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
-            .bind(NOTES_LOCK)
-            .bind(&n.principal)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
+        note_lock(&mut tx, &n.principal).await?;
         if let Some(old) = n.supersedes {
             let row: Option<(String, String)> = sqlx::query_as(
                 "SELECT principal, state FROM notes WHERE id = $1 AND repo_id = 1 FOR UPDATE",
@@ -983,12 +1017,7 @@ impl CoordStore for PgCoordStore {
         // A report counts the reporter's hidden notes in the same
         // transaction as it hides one, so the cap holds.
         let mut tx = self.pool("note_change").begin().await.map_err(storage)?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
-            .bind(NOTES_LOCK)
-            .bind(by)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
+        note_lock(&mut tx, by).await?;
         let hid: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM (SELECT 1 FROM notes WHERE reported_by = $1 AND reported_at > $2 LIMIT $3) t",
         )

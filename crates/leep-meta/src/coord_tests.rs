@@ -169,3 +169,63 @@ async fn lose_beats_check(c: &dyn CoordStore, id: u64) {
         .unwrap();
     assert_eq!(r.expired, 1);
 }
+
+/// A note write waits at most 2 s for the same principal's other write
+/// (the per-principal advisory lock on Postgres), then is refused before
+/// writing anything: it never holds a pool connection behind a stuck one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stuck_note_writer_does_not_hold_others_for_long() {
+    use leep_core::coord::{AnchorType, NewNote, NoteFilter, NoteKind, NoteTrust};
+    let Some((s, _schema)) = crate::tests::pg_store("coordnotelock").await else {
+        return;
+    };
+    let c = s.coord_store().unwrap();
+    let mut held = s.pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1, hashtext($2))")
+        .bind(crate::coord::NOTES_LOCK)
+        .bind("ada")
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let n = NewNote {
+        kind: NoteKind::Finding,
+        anchor_type: AnchorType::Path,
+        anchor: "a".into(),
+        at_changeset: None,
+        at_blob: None,
+        lines: None,
+        title: "t".into(),
+        body: String::new(),
+        principal: "ada".into(),
+        agent_model: None,
+        session_id: None,
+        trust: NoteTrust::Agent,
+        supersedes: None,
+        created: T0,
+        expires: None,
+        max_open: 10,
+        max_per_hour: 10,
+        max_per_day: 10,
+    };
+    let r = tokio::time::timeout(std::time::Duration::from_secs(20), c.add_note(&n))
+        .await
+        .expect("refused within its lock timeout, not hung");
+    assert!(matches!(r, Err(leep_core::Error::Refused { .. })), "{r:?}");
+    let all = NoteFilter {
+        limit: 10,
+        ..Default::default()
+    };
+    assert!(c.list_notes(&all).await.unwrap().is_empty());
+    // Another principal is not held back, and ada writes once it is free.
+    let mut bo = n.clone();
+    bo.principal = "bo".into();
+    c.add_note(&bo).await.unwrap();
+    sqlx::query("SELECT pg_advisory_unlock($1, hashtext($2))")
+        .bind(crate::coord::NOTES_LOCK)
+        .bind("ada")
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    drop(held);
+    c.add_note(&n).await.unwrap();
+}

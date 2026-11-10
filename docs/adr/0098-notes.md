@@ -241,9 +241,14 @@ restores with no notes.
   ever: it should not sit in an agent's tool list.
 
 ### 10. Costs
-- A write: one transaction with an advisory lock, two bounded counts on
-  `notes_principal` (at most 201 and 30 rows), an insert, and with
-  `supersedes` one locked read and one update. A path anchor costs one
+- A write: one transaction with an advisory lock, a bounded count on
+  `notes_open` (at most 201 rows) and two on `notes_principal` (at most 30
+  and 100), an insert, and with `supersedes` one locked read and one
+  update. The lock is waited for at most 2 s (`SET LOCAL lock_timeout`):
+  past it the write is refused before anything is written (503,
+  `Leep-Refused: note-lock`), so a stuck writer never holds pool
+  connections of others behind it. Reports take the same lock for their
+  reporter. A path anchor costs one
   tree lookup at `at` (O(depth), node cache).
 - A listing by path: one statement probing the anchor index for the path
   and each ancestor.
@@ -252,7 +257,8 @@ restores with no notes.
   principal holds at most 200 open notes, and at most 100 written a day
   closed ones kept 30 days: 3,200 rows, about 15 MiB plus index entries.
   The open count reads only the partial index `notes_open`.
-- The sweep: two bounded deletes a minute per server on `notes_expires`;
+- The sweep: two bounded deletes a minute per server on `notes_expires`,
+  given at most 10 s (it shares a loop with heartbeat writes);
   on SQLite each is guarded by a read, so an idle sweep takes no write
   lock.
 
@@ -268,6 +274,14 @@ restores with no notes.
   `leep_notes_refused_total{reason}` (with `report_rate`),
   `leep_notes_reported_total{effect}`,
   `leep_notes_swept_total{reason}`.
+
+### 11. Loose references
+- `at_changeset` may be any stored changeset, landed or not; nothing makes
+  it a GC root (session heads as roots are deferred), so changeset GC may
+  delete it. Staleness in the second change must treat a missing
+  `at_changeset` (and a missing `at_blob`) as unknown, never as an error.
+- `session_id` is informational: sessions expire and are not backed up,
+  so it may name a session that no longer exists. Nothing follows it.
 
 ## Not in this change
 Staleness (`stale` on `NoteEntry`, computed from `at_blob` against the

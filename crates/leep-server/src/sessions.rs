@@ -388,6 +388,24 @@ pub(crate) fn after_land(
     });
 }
 
+/// One bounded step of the note sweep (ADR 0098), at most [`HOOK_TIMEOUT`]:
+/// it shares a loop with heartbeat writes, which a slow store must not stop.
+async fn sweep_notes(repo: &Repo) {
+    let reason = match tokio::time::timeout(HOOK_TIMEOUT, repo.sweep_notes(16)).await {
+        Ok(Ok(_)) => return,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "sweeping notes failed");
+            "error"
+        }
+        Err(_) => {
+            tracing::warn!("sweeping notes timed out");
+            "timeout"
+        }
+    };
+    metrics::counter!("leep_session_hook_errors_total", "hook" => "notes_sweep", "reason" => reason)
+        .increment(1);
+}
+
 /// Write held heartbeats every [`FLUSH_EVERY`], and sweep expired and
 /// long-ended sessions, expired and long-closed notes (ADR 0098), and
 /// refresh `leep_sessions_active` every [`SWEEP_EVERY`], until the process
@@ -417,11 +435,7 @@ pub fn spawn_session_tasks(repo: Repo) {
                     .increment(1);
                 tracing::warn!(error = %e, "sweeping sessions failed");
             }
-            if let Err(e) = repo.sweep_notes(16).await {
-                metrics::counter!("leep_session_hook_errors_total", "hook" => "notes_sweep", "reason" => "error")
-                    .increment(1);
-                tracing::warn!(error = %e, "sweeping notes failed");
-            }
+            sweep_notes(&repo).await;
             match repo.count_active_sessions(GAUGE_CAP).await {
                 Ok(n) => metrics::gauge!("leep_sessions_active").set(n as f64),
                 Err(e) => tracing::debug!(error = %e, "counting active sessions failed"),
@@ -509,5 +523,19 @@ mod tests {
         let notices = after_create(&repo, seed, cs.id(), &None, &HeaderMap::new()).await;
         assert_eq!(started.elapsed(), CREATE_HOOK_BOUND);
         assert!(notices.is_empty());
+    }
+
+    /// A note sweep against a store that never answers gives up after
+    /// [`HOOK_TIMEOUT`], so the heartbeat loop it shares goes on.
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_store_costs_the_note_sweep_its_bound() {
+        let repo = Repo::new(
+            Arc::new(MemoryBlobStore::new()),
+            Arc::new(MemoryMetaStore::new()),
+        )
+        .with_coord(Some(Arc::new(Hanging)));
+        let started = tokio::time::Instant::now();
+        sweep_notes(&repo).await;
+        assert_eq!(started.elapsed(), HOOK_TIMEOUT);
     }
 }
