@@ -816,3 +816,57 @@ async fn a_tight_budget_keeps_a_red_ref_and_drops_its_suspects() {
     assert_eq!(cut.items as usize, 5 - h.suspects.len());
     assert!(p.bytes <= 1024, "{}", p.bytes);
 }
+
+/// Most lands in a busy repository are server-made rebased copies, which
+/// have no creator row of their own: the last change to a file is still
+/// named after the agent whose changeset the copy came from.
+#[tokio::test]
+async fn history_names_the_creator_of_a_rebased_land() {
+    let r = repo();
+    land(
+        &r,
+        "ada",
+        "model-a",
+        "seed",
+        &[("src/a.rs", "a\n"), ("src/b.rs", "b\n")],
+    )
+    .await;
+    let stale = r.meta().get_ref("main").await.unwrap();
+    let body = "a2\n";
+    let cs = Changeset {
+        parents: stale.into_iter().collect(),
+        author: "bo".into(),
+        timestamp: 1_700_000_000,
+        message: "touch a".into(),
+        changes: [(
+            RepoPath::new("src/a.rs").unwrap(),
+            FileChange::Modify {
+                content: r.put_blob(Bytes::from(body)).await.unwrap(),
+                kind: FileKind::Regular,
+                size: body.len() as u64,
+            },
+        )]
+        .into(),
+        extra: [(EXTRA_AGENT_MODEL.to_string(), "model-b".to_string())].into(),
+    };
+    let id = r.create_changeset_by(cs, Some("bo")).await.unwrap();
+    // main moves on before bo lands: the server rebases bo's changeset.
+    land(&r, "cy", "model-c", "touch b", &[("src/b.rs", "b2\n")]).await;
+    let LandResponse::Landed { landed, .. } = r.land_as(id, "main", Some("bo")).await.unwrap()
+    else {
+        panic!("land")
+    };
+    assert_ne!(landed, id, "a rebased copy");
+    let p = r
+        .context_pack(&ask("dee", "fix a", &["src/a.rs"]))
+        .await
+        .unwrap();
+    let h = p
+        .history
+        .iter()
+        .find(|h| h.untrusted.path.as_deref() == Some("src/a.rs"))
+        .unwrap();
+    assert_eq!(h.changeset, landed);
+    assert_eq!(h.created_by.as_deref(), Some("bo"));
+    assert_eq!(h.untrusted.agent_model.as_deref(), Some("model-b"));
+}
