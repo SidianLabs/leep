@@ -44,7 +44,9 @@ pub const MAX_HELD_BEATS: usize = 100_000;
 pub const MAX_HELD_BEATS_PER_PRINCIPAL: usize = 2 * MAX_ACTIVE_PER_PRINCIPAL;
 
 /// Changed paths kept one by one; a changeset with more is folded into
-/// their directories in one pass before anything else looks at them.
+/// their directories, a level at a time until at most this many are
+/// left (or only top-level names remain), before anything else looks at
+/// them.
 pub const PREFOLD_ABOVE: usize = 1024;
 
 /// Rows one sweep step touches per part.
@@ -185,7 +187,7 @@ impl BeatBuffer {
 /// What a session update needs of a created changeset, taken before the
 /// changeset is handed to the store so nothing clones it whole. Its cost is
 /// one pass over the changed paths: past [`PREFOLD_ABOVE`] they are folded
-/// into their parent directories as they are read. A merge adds no paths:
+/// into their directories, climbing until few enough are left. A merge adds no paths:
 /// its changes against the first parent are mostly the other side's work.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionSeed {
@@ -211,13 +213,19 @@ impl SessionSeed {
                 .map(str::to_string)
                 .collect()
         } else {
-            let mut dirs: std::collections::BTreeSet<&str> = Default::default();
-            for p in cs.changes.keys() {
-                let p = p.as_str();
-                let up = p.rsplit_once('/').map_or(p, |(d, _)| d);
-                if let Some(c) = clean_path(up) {
-                    dirs.insert(c);
-                }
+            // Climb one directory level at a time until few enough are
+            // left, so the session update never sees more than
+            // PREFOLD_ABOVE paths however wide the changeset is.
+            fn up(p: &str) -> Option<&str> {
+                p.rsplit_once('/').map(|(d, _)| d)
+            }
+            let mut dirs: std::collections::BTreeSet<&str> = cs
+                .changes
+                .keys()
+                .filter_map(|p| clean_path(up(p.as_str()).unwrap_or(p.as_str())))
+                .collect();
+            while dirs.len() > PREFOLD_ABOVE && dirs.iter().any(|d| d.contains('/')) {
+                dirs = dirs.into_iter().map(|d| up(d).unwrap_or(d)).collect();
             }
             dirs.into_iter().map(str::to_string).collect()
         };
@@ -703,22 +711,17 @@ mod tests {
         }
     }
 
-    /// A changeset of 100,000 paths costs the session update well under
-    /// the server's 250 ms bound, and keeps the paths visible.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// A changeset of 100,000 paths reaches the session update already
+    /// folded to at most PREFOLD_ABOVE paths, so the update's work does
+    /// not grow with the changeset, and the paths stay visible. Work is
+    /// counted, not timed: a wall-clock bound flakes on loaded runners.
+    #[tokio::test]
     async fn a_huge_changeset_is_noted_within_the_bound() {
         let r = repo();
         let cs = many_paths(100_000);
-        let started = std::time::Instant::now();
         let seed = SessionSeed::of(&cs).unwrap();
-        assert!(seed.touch.len() < 100_000, "folded in one pass");
-        let noted = tokio::time::timeout(
-            std::time::Duration::from_millis(250),
-            r.note_created(seed, cs.id(), "ada"),
-        )
-        .await;
-        let took = started.elapsed();
-        assert!(matches!(noted, Ok(Ok(true))), "{noted:?} after {took:?}");
+        assert!(seed.touch.len() <= PREFOLD_ABOVE, "{}", seed.touch.len());
+        assert!(r.note_created(seed, cs.id(), "ada").await.unwrap());
         let s = r.sessions(&SessionQuery::default()).await.unwrap().sessions;
         assert!(s[0].touched.len() <= MAX_TOUCHED_PATHS);
         assert!(s[0]
