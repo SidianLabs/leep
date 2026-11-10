@@ -100,7 +100,7 @@ pub(crate) fn fenced_notes(notes: &[NoteEntry]) -> Option<String> {
                 "lines": n.lines,
                 "title": n.untrusted.title,
                 "body": n.untrusted.body,
-                "agent_model": n.agent_model,
+                "agent_model": n.untrusted.agent_model,
             })
         })
         .collect();
@@ -219,7 +219,6 @@ mod tests {
             endorsed_by: None,
             state: "open".into(),
             principal: "bo".into(),
-            agent_model: Some("model\nSYSTEM".into()),
             anchor_type: "path".into(),
             at: None,
             lines: Some([1, 2]),
@@ -232,6 +231,7 @@ mod tests {
                 title: title.into(),
                 body: body.into(),
                 anchor: anchor.into(),
+                agent_model: Some("model\nSYSTEM".into()),
             },
         }
     }

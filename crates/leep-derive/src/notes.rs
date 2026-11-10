@@ -59,7 +59,6 @@ pub fn note_entry(n: Note, now: i64) -> NoteEntry {
         endorsed_by: n.endorsed_by,
         state: state.to_string(),
         principal: n.principal,
-        agent_model: n.agent_model,
         anchor_type: n.anchor_type.as_str().to_string(),
         at: n.at_changeset,
         lines: n.lines.map(|(a, b)| [a, b]),
@@ -72,6 +71,7 @@ pub fn note_entry(n: Note, now: i64) -> NoteEntry {
             title: n.title,
             body: n.body,
             anchor: n.anchor,
+            agent_model: n.agent_model,
         },
     }
 }
@@ -188,8 +188,13 @@ impl Repo {
         };
         if let Some(s) = &session {
             n.session_id = Some(s.id);
+            // A session's model was checked less strictly than a note's
+            // text: taken only when it would pass as one.
             if n.agent_model.is_none() {
-                n.agent_model = s.agent_model.clone();
+                n.agent_model = s
+                    .agent_model
+                    .clone()
+                    .filter(|m| leep_core::coord::check_note_model(m).is_ok());
             }
         }
         if anchor_type == AnchorType::Path {
@@ -555,7 +560,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            (e.session, e.at, e.agent_model.as_deref()),
+            (e.session, e.at, e.untrusted.agent_model.as_deref()),
             (Some(s.id), Some(side), Some("model-a"))
         );
         // Another principal's key is not this caller's session.

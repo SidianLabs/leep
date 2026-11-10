@@ -1048,6 +1048,12 @@ fn check_note_text(what: &str, s: &str, max: usize, newlines: bool) -> Result<()
     Ok(())
 }
 
+/// A note's agent model: at most [`MAX_KEY_BYTES`] of plain text, under
+/// the rule of the note's own text (it is the writer's word too).
+pub fn check_note_model(m: &str) -> Result<()> {
+    check_note_text("agent model", m, MAX_KEY_BYTES, false)
+}
+
 /// A note's anchor value: a repository path of at most
 /// [`MAX_PATH_BYTES`] in plain text, or a full changeset id.
 pub fn check_anchor(t: AnchorType, a: &str) -> Result<()> {
@@ -1082,7 +1088,7 @@ impl NewNote {
         check_note_text("body", &self.body, MAX_NOTE_BODY_BYTES, true)?;
         check_anchor(self.anchor_type, &self.anchor)?;
         if let Some(m) = &self.agent_model {
-            check_line("agent model", m, MAX_KEY_BYTES)?;
+            check_note_model(m)?;
         }
         if let Some((a, b)) = self.lines {
             if self.anchor_type != AnchorType::Path {

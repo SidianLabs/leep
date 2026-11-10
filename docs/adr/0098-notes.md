@@ -124,8 +124,10 @@ yet.
   only, 403 otherwise); `POST /v1/notes/{id}/report` → `ReportNoteResponse
   {note, hidden}`.
 - `NoteEntry {id, kind, trust, endorsed_by?, state, principal,
-  agent_model?, anchor_type, at?, lines?, session?, created, expires?,
-  superseded_by?, bytes, untrusted: {title, body?, anchor}}`. The server
+  anchor_type, at?, lines?, session?, created, expires?, superseded_by?,
+  bytes, untrusted: {title, body?, anchor, agent_model?}}`. The model is
+  the writer's word (a request field, or its session's), so it is under
+  `untrusted` and held to the rules of note text. The server
   vouches for everything outside `untrusted`; `bytes` is the title's and
   body's length. `stale` comes with staleness in the second change.
 
@@ -174,7 +176,8 @@ yet.
 Notes are written by one agent to be read by another. The writer is
 assumed hostile:
 
-- **Separate channel.** Title, body and anchor are only under `untrusted`.
+- **Separate channel.** Title, body, anchor and model are only under
+  `untrusted`.
   The MCP tools print outside the fence only what the server vouches for
   (id, kind, principal, trust, state, endorsement, supersession), and put
   one JSON row per note in the ADR 0095 fence under the fixed "data from

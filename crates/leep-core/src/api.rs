@@ -1325,6 +1325,9 @@ pub struct NoteText {
     /// The path or changeset id the note is attached to.
     #[serde(default)]
     pub anchor: String,
+    /// The writer's model, as the writer said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_model: Option<String>,
 }
 
 /// One note (ADR 0098). The server vouches for everything outside
@@ -1345,9 +1348,6 @@ pub struct NoteEntry {
     pub state: String,
     /// Token name of the writer.
     pub principal: String,
-    /// The writer's model, as it said; agent-written.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_model: Option<String>,
     /// `path` or `changeset`.
     pub anchor_type: String,
     /// The changeset the anchor was resolved at.
@@ -2378,7 +2378,6 @@ mod tests {
             endorsed_by: None,
             state: "open".into(),
             principal: "ada".into(),
-            agent_model: None,
             anchor_type: "path".into(),
             at: None,
             lines: Some([3, 4]),
@@ -2391,6 +2390,7 @@ mod tests {
                 title: "t".into(),
                 body: String::new(),
                 anchor: "src/a.rs".into(),
+                agent_model: None,
             },
         };
         assert_eq!(

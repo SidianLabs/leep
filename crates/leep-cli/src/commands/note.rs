@@ -284,7 +284,7 @@ pub fn note_lines(n: &NoteEntry, full: bool) -> Vec<String> {
         out.push(format!("    body: {:?}", n.untrusted.body));
     }
     if full {
-        if let Some(m) = &n.agent_model {
+        if let Some(m) = &n.untrusted.agent_model {
             out.push(format!("    model: {m:?}"));
         }
         if let Some(s) = n.session {
@@ -310,7 +310,6 @@ mod tests {
             endorsed_by: None,
             state: "open".into(),
             principal: "bo".into(),
-            agent_model: Some("m\u{1b}[31m".into()),
             anchor_type: "path".into(),
             at: None,
             lines: Some([3, 9]),
@@ -323,6 +322,7 @@ mod tests {
                 title: title.into(),
                 body: body.into(),
                 anchor: anchor.into(),
+                agent_model: Some("m\u{1b}[31m".into()),
             },
         }
     }

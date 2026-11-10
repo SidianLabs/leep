@@ -1090,7 +1090,8 @@ read by a land. Added:
   it. `at_changeset` is set for every note the server wrote (the
   changeset anchor itself, or the revision a path anchor was resolved
   at); `at_blob` only for a file anchor. Limits: `title` one line of 1 to
-  200 bytes, `body` at most 4096 bytes, neither with a C0 or C1 control
+  200 bytes, `body` at most 4096 bytes, `agent_model` at most 128 bytes,
+  none with a C0 or C1 control
   (a body may hold `\n`), U+2028, U+2029, or U+202A to U+202E and U+2066
   to U+2069; `anchor` a repository path of at most 256 bytes under the
   same rule, or a full changeset id; `lines` need a file anchor, `1 <=
@@ -1111,8 +1112,8 @@ read by a land. Added:
   next?}`), `GET /v1/notes/{id}` and `DELETE /v1/notes/{id}` (→
   `NoteEntry`), `POST /v1/notes/{id}/report` (→ `ReportNoteResponse
   {note, hidden}`). An entry is `{id, kind, trust, endorsed_by?, state,
-  principal, agent_model?, anchor_type, at?, lines?, session?, created,
-  expires?, superseded_by?, bytes, untrusted: {title, body?, anchor}}`:
+  principal, anchor_type, at?, lines?, session?, created, expires?,
+  superseded_by?, bytes, untrusted: {title, body?, anchor, agent_model?}}`:
   text an agent wrote is only under `untrusted`; `kind`, `trust` and
   `state` are strings a client shows as they are when it does not know
   them (`state` may be `expired`: open, past `expires`, not yet swept).
