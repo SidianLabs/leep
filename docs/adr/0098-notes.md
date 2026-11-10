@@ -20,9 +20,9 @@ working there. It is also the largest new prompt-injection surface: text
 one agent writes that another agent reads, by design, with no human in
 between. Every rule below is shaped by that.
 
-This change is the first part: the store, the API, the limits and the
-fencing. Staleness, endorsement and the context pack's notes section come
-in a second change under this ADR.
+The first change brought the store, the API, the limits and the
+fencing; the second (section 12) staleness, endorsement and the context
+pack's notes section.
 
 ## Decision
 
@@ -109,9 +109,8 @@ token must be `kind: human`, may review, must own the anchor (OWNERS at
 the default ref's head, as ADR 0011 reads them), and must not be the
 note's writer. An agent token can never endorse, even one that owns the
 path: endorsement is the one place a person vouches for what an agent
-wrote. Endorsement raises ranking, never authority (section 7). The store
-already supports the update (`NoteChange::Endorse`); no route calls it
-yet.
+wrote. Endorsement raises ranking, never authority (section 7). The
+route and its rules are in section 12.
 
 ### 4. API (additive)
 - `POST /v1/notes {kind, anchor: {type, value}, at?, lines?, title,
@@ -135,7 +134,8 @@ yet.
   the writer's word (a request field, or its session's), so it is under
   `untrusted` and held to the rules of note text. The server
   vouches for everything outside `untrusted`; `bytes` is the title's and
-  body's length. `stale` comes with staleness in the second change.
+  body's length. `stale`, `endorsed` and `endorsed_at` came with the
+  second change (section 12).
 
 ### 5. Limits
 - Title: one line, at most 200 bytes. Body: at most 4096 bytes. Anchor: a
@@ -175,9 +175,8 @@ yet.
   `reported` at once, recording `reported_by` (the reporter's token name)
   and `reported_at`: hidden from default listings (and, later, packs),
   still readable by id and with `all=true`, for audit. A human or endorsed
-  note is only counted (`leep_notes_reported_total{effect="counted"}`);
-  letting an owner's report hide one comes with the ownership checks of
-  the second change. Reports are writes with a cap of their own: a
+  note is only counted (`leep_notes_reported_total{effect="counted"}`)
+  unless the reporter is a human owner of its path (section 12). Reports are writes with a cap of their own: a
   principal that hid 30 notes in the last hour gets 429 for its next
   report, counted in the same transaction as the hide. Every report is
   logged at INFO with the note id, the reporter and its effect (never the
@@ -273,7 +272,9 @@ restores with no notes.
 - Metrics: `leep_notes_added_total{trust,kind}`,
   `leep_notes_refused_total{reason}` (with `report_rate`),
   `leep_notes_reported_total{effect}`,
-  `leep_notes_swept_total{reason}`.
+  `leep_notes_swept_total{reason}`; with the second change
+  `leep_notes_endorsed_total`, `leep_notes_stale_suppressed_total` and
+  `leep_context_notes_total{trust}`.
 
 ### 11. Loose references
 - `at_changeset` may be any stored changeset, landed or not; nothing makes
@@ -283,12 +284,72 @@ restores with no notes.
 - `session_id` is informational: sessions expire and are not backed up,
   so it may name a session that no longer exists. Nothing follows it.
 
+### 12. Staleness, endorsement and the pack (second change)
+No migration and no new column: `endorsed_by` and `endorsed_at` are now
+written.
+
+- **One function for every reader.** `Repo::notes_for(select, head,
+  budget)` (`leep-derive/src/notes_view.rs`) answers `GET /v1/notes`
+  (a listing's filter, newest first) and the context pack (the pack's
+  first 32 files and the directories above them: one exact probe of
+  `notes_anchor`, at most 512 anchors and 256 rows, ranked). Each note
+  comes with its staleness and whether its endorsement holds, so the pack
+  and the listing cannot disagree about a note. `GET /v1/notes` takes
+  `ref=` (default the default ref) for the head it judges at.
+- **Staleness by tree lookup**, not by `last-change`: a file note is
+  stale when the file at the head is not its `at_blob` (or is gone, or is
+  a directory now); a directory note when the directory is gone; a
+  changeset note never. One path walk per note through the node cache,
+  no index. A path note without `at_blob` is told apart by what was at
+  `at_changeset`. `at_changeset` may be gone (section 11) and a tree may
+  be unreadable: the answer is then unknown (`stale` absent), never an
+  error. Bounds: 32 notes checked per pack and 100 per listing page (the
+  largest), 8 at once, by a deadline inside the section bound (half of it
+  in a pack, so the lookup is never lost to the checks); past them,
+  unknown. Line-level staleness stays deferred.
+- **`NoteEntry`** gains `stale?`, `endorsed` (open, endorsed and checked
+  fresh) and `endorsed_at?`. A stale note is never served as endorsed;
+  `endorsed_by` stays for audit, so an endorsement lapses while the note
+  is stale and holds again if the file returns to that content.
+- **Endorsement**: `POST /v1/notes/{id}/endorse`, CLI `leep note
+  endorse ID`, and no MCP tool. Allowed only when all hold: the token is
+  `kind: human`; it may review; `OWNERS` at the default ref's head names
+  it for the anchor (a directory note's owners are those of a file in
+  it); it did not write the note (403 otherwise; without a tokens file
+  nobody may); the note is open, unexpired (409), on a path (400) and
+  checked fresh at the default ref's head (409 when stale or unknown).
+  One conditional update writes `endorsed_by`, `endorsed_at` and `expires
+  = NULL`, so an endorsed note outlives an agent note's 90 days. An
+  endorsed note is answered as it is. Revocation is by staleness only,
+  as the plan chose: there is no un-endorse route; an owner who disagrees
+  reports the note (below), its writer retracts it, an operator revokes.
+  `leep_notes_endorsed_total`; refusals count in
+  `leep_notes_refused_total{reason="endorse_forbidden"|"endorse_conflict"|"endorse_other"}`.
+- **Owners' reports**: a report by a human owner of the anchor (the same
+  test as endorsing) hides a human or endorsed note at once
+  (`NoteChange::Report { owner: true }`); anyone else's still only counts.
+  `leep-server notes unreport` gives such a note back the life it had:
+  none once endorsed, 365 days from `created` for a human note.
+- **The pack's `notes` section** (ADR 0097's seventh): items `note:N`,
+  ranked as a total order: endorsed, human, agent; then fresh, unknown,
+  stale; then the nearest anchor (a file before its directory); then the
+  newest. An endorsed note, or a human one that is not stale, carries its
+  title and its body cut to 1 KiB; any other carries its title cut to 80
+  bytes and `more`, the rest one `leep_notes` call away. A stale agent
+  note is left out (`leep_notes_stale_suppressed_total`); a stale human
+  note stays at title weight. A directory note names the pack's files
+  below it (at most 16), one item per note. Every word (anchor, title,
+  body, paths) is under `untrusted`; the server vouches for id, kind,
+  trust, `endorsed_by`, `stale`, principal and time. Quota 10%, taken
+  from files (25 to 20%) and history (20 to 15%); spare budget goes to
+  notes after ref health, in-flight work and duplicates, so notes never
+  displace the ref's health. `leep_context_notes_total{trust}`
+  (`endorsed`, `human`, `agent`) counts the items kept. MCP renders the
+  section last, its words in the fence; the CLI quotes them.
+
 ## Not in this change
-Staleness (`stale` on `NoteEntry`, computed from `at_blob` against the
-ref head), `POST /v1/notes/{id}/endorse` and `leep note endorse`, owners'
-reports hiding human and endorsed notes, the context pack's `notes`
-section (ADR 0097 amendment): the second change. Later: symbol and issue
-anchors, line-level staleness by blame, events (ADR 0099).
+Later: symbol and issue anchors, line-level staleness by blame, events
+(ADR 0099), an un-endorse route if staleness proves too coarse.
 
 ## Alternatives considered
 - **Bodies in the blob store.** They would need a GC root of their own.
