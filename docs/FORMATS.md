@@ -987,6 +987,40 @@ persisted. Added:
   (default `same_file`); an unknown value counts as absent. Forwarded lands
   carry it and `Leep-Session` to the coordinating server.
 
+## Context packs (additive API, ADR 0097)
+
+No table, column, index or stored encoding changed; nothing is persisted.
+Added:
+
+- `POST /v1/context`: `ContextRequest {task, paths?, ref?, session?,
+  task_key?, budget_bytes?}` (every field but `task` optional, `task`
+  default empty; `ref` default `main`; `session` default the
+  `Leep-Session` header) → `ContextPack {ref, head, session?,
+  budget_bytes, bytes, files, owners, history, in_flight, ref_health?,
+  duplicates, cut?, omitted?}`. A read token may call it. 400 for a task
+  over 4096 bytes, more than 64 paths, a path with a control character, a
+  bad ref name, or no task and no session with a title; 404 for a ref that
+  does not exist. `budget_bytes` is clamped to 1024..=262144 (default
+  32768).
+- Items, each with `id` (stable; safe to print) and `bytes` (the exact
+  size of the item's JSON), and agent-written text only under `untrusted`
+  (`ContextText {path?, title?, author?, agent_model?, agent_session?,
+  owners?, owners_files?, carry_file?, paths?}`, each absent when empty):
+  `ContextFile {id, bytes, why, matches?, co_changes?, untrusted}` (`why`
+  holds `seed`, `search`, `co_change`); `ContextOwners {id, bytes, carry?,
+  untrusted}` (`carry` is `identical` or `merged`); `ContextChange {id,
+  bytes, changeset, time, created_by?, concurrent?, untrusted}`;
+  `ContextWork {id, bytes, ...Notice}` (a `Notice` of ADR 0096 flattened
+  beside `id` and `bytes`); `ContextRefHealth {id, bytes, head, green_ref,
+  green?, behind?, red?, required_checks?, suspects?}` with
+  `ContextSuspect {changeset, seq, actor?, time, created_by?, untrusted}`.
+- `cut: [{section, items, bytes}]` (what the budget left out) and
+  `omitted: [{section, reason}]` (`section` is `search`, `co_change`,
+  `owners`, `history`, `in_flight`, `ref_health` or `duplicates`;
+  `reason` is `timeout`, `error` or `off`), both omitted when empty. A
+  client shows a section, `why` or reason it does not know as it is.
+- Same request on the same state, same bytes.
+
 ## Index leases and bounded queries (additive, ADR 0058)
 
 No table, column or stored encoding changed.

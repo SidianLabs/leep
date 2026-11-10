@@ -1824,6 +1824,23 @@ a second kind of mutable state beside refs, behind its own trait,
   everything overlapping a session. The CLI prints them on stderr,
   escaped; MCP appends them, fenced, to every tool result and adds
   `leep_overlaps`. `--notices off` leaves them out of answers.
+- **Context packs** ([ADR 0097](adr/0097-context-pack.md)). `POST
+  /v1/context {task, paths?, ref?, session?, task_key?, budget_bytes?}`
+  answers, with no model, what the server already has on a task: files
+  (the request's paths, a literal search for identifiers in the task, files
+  that changed with the paths in their newest 200 path-history changesets),
+  owners and `carry` directives, the last change per file with its creator
+  and model, in-flight work and duplicates (ADR 0096's overlap functions,
+  marking nothing said) and the ref's green, red and suspects touching the
+  files. Each section within 1 s and the call within 2 s; a section that
+  fails or runs out of time is listed as omitted and the rest still comes.
+  Items carry ids and exact sizes and are cut to the byte budget by
+  per-section quotas, each section a ranked prefix; the same request on the
+  same state is the same bytes. Agent-written text is under `untrusted`.
+  A read token may ask; it takes a `search` read-class permit. MCP
+  `leep_task_start` declares the session and answers the pack in one call;
+  `leep_context`, `leep_review_request` and `leep_review_inbox` beside it;
+  CLI `leep context` and `leep work start`.
 - **Scale.** Every table is keyed by `repo_id` first (ADR 0054), and
   nothing joins coordination to the land path, so the next steps are a
   separate coordination database and then sharding by path prefix (ADR
