@@ -671,6 +671,10 @@ pub fn run(stores: &Stores, root: &Path, n: &Narrator) -> Report {
         tokens.insert(name, t);
         entries.push(e);
     }
+    // rhea, an owner of `src/auth/`, is a person: her token says so.
+    let (rhea_t, mut rhea_e) = gen_token("rhea", "write");
+    rhea_e["kind"] = json!("human");
+    entries.push(rhea_e);
     let (ci_t, mut ci_e) = gen_token("ci", "write");
     ci_e["checks"] = json!(["test"]);
     ci_e["review"] = json!(false);
@@ -730,6 +734,7 @@ pub fn run(stores: &Stores, root: &Path, n: &Narrator) -> Report {
         None,
     );
     let ci_agent = Agent::new("ci", Via::Cli, "", ci_t, seed_wc.clone(), None);
+    let rhea = Agent::new("rhea", Via::Cli, "", rhea_t, seed_wc.clone(), None);
     let a = |name: &str| &agents[name];
 
     n.say(
@@ -1063,6 +1068,31 @@ pub fn run(stores: &Stores, root: &Path, n: &Narrator) -> Report {
         ],
     );
 
+    // ---- A note for the next agent, endorsed by a human owner.
+    n.say("ada, working beside `token.rs`, leaves a note for whoever changes it next. rhea, a person who owns `src/auth/`, endorses it.\n\n");
+    let note_title = "parse_token must check expiry before audience";
+    let added = a("ada").leep_ok(
+        &w,
+        &[
+            "note",
+            "add",
+            "src/auth/token.rs",
+            "--kind",
+            "gotcha",
+            "-t",
+            note_title,
+            "-b",
+            "An expired token with the right audience passed review twice.",
+        ],
+    );
+    let note_id: u64 = added
+        .stdout
+        .split_whitespace()
+        .nth(1)
+        .and_then(|w| w.parse().ok())
+        .unwrap_or_else(|| panic!("no note id in {:?}", added.stdout));
+    let endorsed = rhea.leep_ok(&w, &["note", "endorse", &note_id.to_string()]);
+
     // ---- Act 5: a new agent's first call.
     n.say("## 5. A new agent's first call\n\nfay is new, and is asked to add refresh tokens to `parse_token`. Its first call is `leep_task_start`; nothing else has told it anything.\n\n");
     // The maintainer starts documenting token refresh in `docs/auth.md`, a
@@ -1148,6 +1178,39 @@ pub fn run(stores: &Stores, root: &Path, n: &Narrator) -> Report {
             health["red"]["check"],
             health["suspects"].as_array().map_or(0, |s| s.len()),
             pack["omitted"]
+        ),
+    });
+
+    let note_item = pack["notes"]
+        .as_array()
+        .and_then(|v| v.iter().find(|x| x["note"] == json!(note_id)).cloned());
+    let (outside, fenced) = fay_pack_text
+        .split_once("The fenced block below")
+        .unwrap_or((fay_pack_text.as_str(), ""));
+    let note_line = format!("- note:{note_id} gotcha by ada, endorsed by owner rhea");
+    let note_ok = endorsed.stdout.contains("endorsed by rhea")
+        && note_item.as_ref().is_some_and(|x| {
+            x["endorsed_by"] == "rhea"
+                && x["untrusted"]["title"] == note_title
+                && x["untrusted"]["body"]
+                    .as_str()
+                    .is_some_and(|b| !b.is_empty())
+        })
+        && outside.contains(&note_line)
+        && !outside.contains(note_title)
+        && fenced.contains(note_title);
+    claims.push(Claim {
+        n: 11,
+        what: "an agent's note on a file reaches a later agent's first call, endorsed by a human owner, its words fenced",
+        pass: note_ok,
+        evidence: format!(
+            "note {note_id}: {}; in fay's pack: {}; line outside the fence: {}",
+            endorsed.stdout.trim(),
+            note_item.as_ref().map_or("absent".to_string(), |x| format!(
+                "endorsed_by {}, stale {}",
+                x["endorsed_by"], x["stale"]
+            )),
+            outside.contains(&note_line)
         ),
     });
 
