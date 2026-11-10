@@ -197,12 +197,17 @@ async fn a_pack_holds_files_owners_history_live_work_and_duplicates() {
         h.untrusted.title.as_deref(),
         Some("auth: document parse_token")
     );
+    // Files whose last change is one changeset are one item covering them.
     let mod_rs = p
         .history
         .iter()
-        .find(|h| h.untrusted.path.as_deref() == Some("src/auth/mod.rs"))
+        .find(|h| h.untrusted.paths.iter().any(|q| q == "src/auth/mod.rs"))
         .unwrap();
     assert_eq!(mod_rs.created_by.as_deref(), Some("ada"));
+    assert_eq!(
+        mod_rs.untrusted.paths[0],
+        *mod_rs.untrusted.path.as_ref().unwrap()
+    );
 
     // Live work: cy's session on the file, which may be the same task:
     // listed once, as a duplicate, with the path it works on.
@@ -956,4 +961,85 @@ async fn related_files_never_outrank_my_own() {
     assert_eq!(sol.len(), 1, "{n:?}");
     assert_eq!(sol[0].level, p.in_flight[0].notice.level);
     assert!(n.iter().all(|n| n.via.is_none()), "{n:?}");
+}
+
+/// Owners and history rows that would repeat for every co-changed file are
+/// one item each, listing the files they cover in rank order; ids stay the
+/// first file's, sizes stay exact, and the pack stays byte-identical (the
+/// demo's billing pack said `carry identical` four times).
+#[tokio::test]
+async fn identical_owners_and_history_rows_are_one_item() {
+    let r = repo();
+    land(
+        &r,
+        "maint",
+        "m",
+        "billing",
+        &[
+            ("OWNERS", "maint\n"),
+            ("src/billing/OWNERS", "carry identical\nmoe\n"),
+            ("src/billing/invoice.rs", "i\n"),
+            ("src/billing/mod.rs", "m\n"),
+            ("src/billing/tax.rs", "t\n"),
+        ],
+    )
+    .await;
+    land(
+        &r,
+        "bo",
+        "model-b",
+        "tax: round",
+        &[("src/billing/tax.rs", "t2\n")],
+    )
+    .await;
+    let a = ask("dee", "Fix invoice totals", &["src/billing/invoice.rs"]);
+    let p = r.context_pack(&a).await.unwrap();
+    let files = paths_of(&p);
+    assert_eq!(files[0], "src/billing/invoice.rs");
+    // The billing files share one answer; the root OWNERS file has its own.
+    assert_eq!(p.owners.len(), 2, "{:?}", p.owners);
+    let o = &p.owners[0];
+    assert_eq!(p.owners[1].untrusted.path.as_deref(), Some("OWNERS"));
+    let billing: Vec<&String> = files
+        .iter()
+        .filter(|f| f.starts_with("src/billing/"))
+        .collect();
+    assert_eq!(o.untrusted.paths.iter().collect::<Vec<_>>(), billing);
+    assert_eq!(o.untrusted.path.as_deref(), Some("src/billing/invoice.rs"));
+    assert_eq!(o.carry.as_deref(), Some("identical"));
+    // Two last changes: the seed's (most files) and bo's (tax.rs alone).
+    assert_eq!(p.history.len(), 2, "{:?}", p.history);
+    let tax = p
+        .history
+        .iter()
+        .find(|h| h.created_by.as_deref() == Some("bo"))
+        .unwrap();
+    assert_eq!(tax.untrusted.path.as_deref(), Some("src/billing/tax.rs"));
+    assert!(tax.untrusted.paths.is_empty(), "one file: no list");
+    let seed = p
+        .history
+        .iter()
+        .find(|h| h.created_by.as_deref() == Some("maint"))
+        .unwrap();
+    assert!(seed.untrusted.paths.len() >= 2, "{seed:?}");
+    assert!(!seed
+        .untrusted
+        .paths
+        .iter()
+        .any(|q| q == "src/billing/tax.rs"));
+    for b in p
+        .owners
+        .iter()
+        .map(|i| i.bytes)
+        .chain(p.history.iter().map(|i| i.bytes))
+    {
+        assert!(b > 0);
+    }
+    assert_eq!(o.bytes, serde_json::to_vec(o).unwrap().len() as u64);
+    assert_eq!(seed.bytes, serde_json::to_vec(seed).unwrap().len() as u64);
+    let again = r.context_pack(&a).await.unwrap();
+    assert_eq!(
+        serde_json::to_vec(&p).unwrap(),
+        serde_json::to_vec(&again).unwrap()
+    );
 }

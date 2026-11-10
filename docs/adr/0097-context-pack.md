@@ -214,3 +214,21 @@ related to your task: ...)" instead of "(your ...)"; the MCP tools add "on
 a file related to your task, not yours" and key the fenced path
 `related_path` instead of `your_path`.
 
+### One item per distinct owners answer and last change (2026-11-10)
+Packs repeated the same owners and last change for every co-changed file
+(in the demo, a billing pack explained `carry identical` four times). An
+owners item now stands for every pack file with the same owners, `OWNERS`
+files and `carry` directive, and a history item for every file whose
+newest change is the same changeset (with the same count of concurrent
+changes). The item keeps the id and `path` of its first file in rank
+order and lists every file it covers, that one first, in
+`untrusted.paths` when there is more than one; `bytes` is measured after
+grouping, so budget accounting stays exact and the order deterministic.
+The MCP tools say "N owner(s) of M files" and "for M files", and explain
+a `carry` rule once per pack; the CLI prints all the covered paths.
+Clients that print a pack and the notices of the same answer
+(`leep_task_start`, `leep work start`) drop a notice the pack already
+lists (`ContextPack::shows`: an in-flight or duplicate item about the
+same session or landed changeset at the same level), so eli's duplicate
+is said once. The notice is still marked said, which is right: it was
+shown.

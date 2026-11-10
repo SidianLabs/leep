@@ -70,4 +70,6 @@ The demo is also a check on how the notices read. Things to look at:
   and telling eli its duplicate landed the task.
 - `leep_commit_and_land` creates and lands in one call, so an MCP agent
   hears of overlaps on its commit after it has landed.
-- Packs repeat the same owners and last change for every co-changed file.
+- Packs list owners and last changes once per distinct answer, naming the
+  files each covers, and `leep_task_start` does not repeat as a notice
+  what its pack shows.

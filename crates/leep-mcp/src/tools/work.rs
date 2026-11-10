@@ -233,11 +233,17 @@ pub(crate) fn pack_text(p: &ContextPack) -> String {
         p.owners.len(),
         &mut text,
     );
+    // A policy is explained once per pack, however many items carry it.
+    let mut explained = false;
     for o in &p.owners {
         let mut line = format!("\n- {} {} owner(s)", name(&o.id), o.untrusted.owners.len());
+        if o.untrusted.paths.len() > 1 {
+            line.push_str(&format!(" of {} files", o.untrusted.paths.len()));
+        }
         if let Some(c) = &o.carry {
             line.push_str(&format!(", carry {}", word(c)));
-            if c == "identical" {
+            if c == "identical" && !explained {
+                explained = true;
                 line.push_str(
                     " (a review carries only to an identical change: re-request review after \
                      a rebase)",
@@ -255,6 +261,9 @@ pub(crate) fn pack_text(p: &ContextPack) -> String {
         }
         if h.concurrent > 0 {
             line.push_str(&format!(" (+{} concurrent)", h.concurrent));
+        }
+        if h.untrusted.paths.len() > 1 {
+            line.push_str(&format!(" for {} files", h.untrusted.paths.len()));
         }
         text.push_str(&line);
         rows.push(untrusted_row(&h.id, &h.untrusted));
@@ -482,6 +491,9 @@ impl Server {
         });
         match pack {
             Ok(pack) => {
+                // The declaration's notices the pack already lists are not
+                // said again at the end of the result.
+                self.client.forget_notices(|n| pack.shows(n));
                 text.push_str(&pack_text(&pack));
                 v["context"] = json!(pack);
             }
@@ -770,6 +782,83 @@ mod tests {
         };
         let t = pack_text(&p);
         assert!(t.contains("RED: check ci/test fails"), "{t}");
+    }
+
+    /// Grouped owners name how many files they cover, a policy is
+    /// explained once, and the pack knows which notices it already shows.
+    #[test]
+    fn policy_text_is_said_once() {
+        use leep_core::api::{ContextOwners, ContextText, ContextWork, Notice};
+        let id = ChangesetId(Hash::of_blob(b"x"));
+        let owners = |i: &str, paths: Vec<String>| ContextOwners {
+            id: format!("owners:{i}"),
+            bytes: 1,
+            carry: Some("identical".into()),
+            untrusted: ContextText {
+                path: paths.first().cloned(),
+                owners: vec!["moe".into()],
+                paths,
+                ..Default::default()
+            },
+        };
+        let dup = Notice {
+            level: "possible_duplicate".into(),
+            session: Some(18),
+            principal: Some("dee".into()),
+            changeset: None,
+            count: None,
+            by: Some("task_key".into()),
+            similarity: None,
+            via: None,
+            untrusted: Default::default(),
+        };
+        let p = ContextPack {
+            target_ref: "main".into(),
+            head: id,
+            session: None,
+            budget_bytes: 1024,
+            bytes: 0,
+            files: vec![],
+            owners: vec![
+                owners("1", vec!["a/x.rs".into(), "a/y.rs".into(), "a/z.rs".into()]),
+                owners("2", vec![]),
+            ],
+            history: vec![],
+            in_flight: vec![],
+            ref_health: None,
+            duplicates: vec![ContextWork {
+                id: "session:18".into(),
+                bytes: 1,
+                notice: dup.clone(),
+            }],
+            cut: vec![],
+            omitted: vec![],
+        };
+        let t = pack_text(&p);
+        assert_eq!(
+            t.matches("re-request review after a rebase").count(),
+            1,
+            "{t}"
+        );
+        assert!(
+            t.contains("- owners:1 1 owner(s) of 3 files, carry identical ("),
+            "{t}"
+        );
+        assert!(
+            t.contains("- owners:2 1 owner(s), carry identical\n"),
+            "{t}"
+        );
+        assert!(p.shows(&dup));
+        let higher = Notice {
+            level: "landed".into(),
+            ..dup.clone()
+        };
+        assert!(!p.shows(&higher), "a different level is news");
+        let other = Notice {
+            session: Some(19),
+            ..dup
+        };
+        assert!(!p.shows(&other));
     }
 
     #[test]

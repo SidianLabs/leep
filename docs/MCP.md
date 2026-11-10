@@ -102,6 +102,9 @@ server vouches for (item id, `why`, level, principal, changeset, counts,
 and agent session key in the fenced `untrusted` block, one JSON row per
 item keyed by the same id. Sections the server could not make in time are
 listed as omitted; the rest still comes. A pack marks no notice as said.
+Files with the same owners, or the same last change, are one item listing
+them all; a `carry` rule is explained once. `leep_task_start` leaves out
+of its notices any the pack already lists.
 `leep_review_inbox` keeps requesters' messages, changeset titles and paths
 in the fence the same way.
 

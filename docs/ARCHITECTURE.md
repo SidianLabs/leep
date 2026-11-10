@@ -1840,6 +1840,7 @@ a second kind of mutable state beside refs, behind its own trait,
   listed after) and the ref's green, red and suspects touching the
   files. Each section within 1 s and the call within 2 s; a section that
   fails or runs out of time is listed as omitted and the rest still comes.
+  Owners and history items each cover every file with the same answer.
   Items carry ids and exact sizes and are cut to the byte budget by
   per-section quotas, each section a ranked prefix; the same request on the
   same state is the same bytes. Agent-written text is under `untrusted`.

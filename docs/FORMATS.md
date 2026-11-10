@@ -1044,6 +1044,11 @@ Added:
 - `Notice.by` may be `task_key` on a `landed` notice too: the changeset
   was landed by a session with the caller's task key, which `session`,
   `principal` and `untrusted.task_key` then name. No shape changed.
+- `ContextOwners` and `ContextChange` items may cover several files: one
+  item per distinct owners answer, or per changeset that last changed the
+  files, with `untrusted.path` its first file (and the id of that file)
+  and `untrusted.paths` every file it covers, that one first, when more
+  than one. An older client reading only `path` sees the first file.
 
 ## Index leases and bounded queries (additive, ADR 0058)
 

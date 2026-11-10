@@ -3263,7 +3263,11 @@ fn run_two_agents_context(stores: &Stores, root: &Path) {
     );
     assert!(text.contains("work in flight:"), "{text}");
     assert!(text.contains("of \"ada\""), "{text}");
-    assert!(text.contains("\"src/auth/token.rs\": \"rhea\""), "{text}");
+    // Files with the same owners share one line, the seed first.
+    assert!(
+        text.contains("owners:\n  \"src/auth/token.rs\"") && text.contains(": \"rhea\""),
+        "{text}"
+    );
     assert!(
         text.contains("from \"ada\"") && text.contains("model \"model-a\""),
         "{text}"

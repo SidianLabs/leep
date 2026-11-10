@@ -759,14 +759,16 @@ impl Repo {
     }
 
     /// Owners and `carry` directives of `paths` as of `head`, for the paths
-    /// that have either.
+    /// that have either: one item per distinct answer, in the order of its
+    /// first path, listing in `paths` every path it covers when more than
+    /// one (a directory's files share their `OWNERS` files).
     async fn context_owners(
         &self,
         head: ChangesetId,
         paths: &[String],
     ) -> Result<Vec<ContextOwners>> {
         let mut r = OwnersResolver::new(self, Some(head)).await?;
-        let mut out = Vec::new();
+        let mut groups: Vec<ContextOwners> = Vec::new();
         for p in paths {
             let Ok(path) = RepoPath::new(p.as_str()) else {
                 continue;
@@ -790,27 +792,37 @@ impl Repo {
                 ),
                 None => (None, None),
             };
-            out.push(sized(
-                ContextOwners {
-                    id: item_id("owners", p),
-                    bytes: 0,
-                    carry,
-                    untrusted: ContextText {
-                        path: Some(p.clone()),
-                        owners: owners
-                            .iter()
-                            .take(MAX_OWNERS)
-                            .map(|o| cut(o, NAME_BYTES))
-                            .collect(),
-                        owners_files: files.iter().take(MAX_OWNERS).cloned().collect(),
-                        carry_file,
-                        ..Default::default()
-                    },
+            let item = ContextOwners {
+                id: item_id("owners", p),
+                bytes: 0,
+                carry,
+                untrusted: ContextText {
+                    path: Some(p.clone()),
+                    owners: owners
+                        .iter()
+                        .take(MAX_OWNERS)
+                        .map(|o| cut(o, NAME_BYTES))
+                        .collect(),
+                    owners_files: files.iter().take(MAX_OWNERS).cloned().collect(),
+                    carry_file,
+                    ..Default::default()
                 },
-                |i, n| i.bytes = n,
-            ));
+            };
+            let same = |g: &ContextOwners| {
+                g.carry == item.carry
+                    && g.untrusted.owners == item.untrusted.owners
+                    && g.untrusted.owners_files == item.untrusted.owners_files
+                    && g.untrusted.carry_file == item.untrusted.carry_file
+            };
+            match groups.iter_mut().find(|g| same(g)) {
+                Some(g) => cover(&mut g.untrusted, p),
+                None => groups.push(item),
+            }
         }
-        Ok(out)
+        Ok(groups
+            .into_iter()
+            .map(|g| sized(g, |i, n| i.bytes = n))
+            .collect())
     }
 
     /// The newest change to each of `paths` at `head`, and who made it.
@@ -834,37 +846,45 @@ impl Repo {
             })
             .buffered(HISTORY_CONCURRENCY);
         let found: Vec<Result<_>> = reads.collect().await;
-        let mut out = Vec::new();
+        let mut out: Vec<ContextChange> = Vec::new();
         for f in found {
             let Some((p, info, concurrent, by)) = f? else {
                 continue;
             };
+            // Files whose newest change is the same changeset are one item.
+            if let Some(g) = out
+                .iter_mut()
+                .find(|g| g.changeset == info.id && g.concurrent == concurrent)
+            {
+                cover(&mut g.untrusted, &p);
+                continue;
+            }
             let cs = &info.changeset;
             let title = crate::sessions::title_of(&cs.message);
-            out.push(sized(
-                ContextChange {
-                    id: item_id("change", &p),
-                    bytes: 0,
-                    changeset: info.id,
-                    time: cs.timestamp,
-                    created_by: by.map(|b| b.principal),
-                    concurrent,
-                    untrusted: ContextText {
-                        path: Some(p),
-                        title: Some(cut(&title, NOTICE_TITLE_BYTES)),
-                        author: Some(cut(&cs.author, NOTICE_TITLE_BYTES)),
-                        agent_model: cs.extra.get(EXTRA_AGENT_MODEL).map(|m| cut(m, NAME_BYTES)),
-                        agent_session: cs
-                            .extra
-                            .get(EXTRA_AGENT_SESSION)
-                            .map(|k| cut(k, NAME_BYTES)),
-                        ..Default::default()
-                    },
+            out.push(ContextChange {
+                id: item_id("change", &p),
+                bytes: 0,
+                changeset: info.id,
+                time: cs.timestamp,
+                created_by: by.map(|b| b.principal),
+                concurrent,
+                untrusted: ContextText {
+                    path: Some(p),
+                    title: Some(cut(&title, NOTICE_TITLE_BYTES)),
+                    author: Some(cut(&cs.author, NOTICE_TITLE_BYTES)),
+                    agent_model: cs.extra.get(EXTRA_AGENT_MODEL).map(|m| cut(m, NAME_BYTES)),
+                    agent_session: cs
+                        .extra
+                        .get(EXTRA_AGENT_SESSION)
+                        .map(|k| cut(k, NAME_BYTES)),
+                    ..Default::default()
                 },
-                |i, n| i.bytes = n,
-            ));
+            });
         }
-        Ok(out)
+        Ok(out
+            .into_iter()
+            .map(|c| sized(c, |i, n| i.bytes = n))
+            .collect())
     }
 
     /// Live work overlapping the request's paths and the session's own,
@@ -977,6 +997,15 @@ impl Repo {
             |i, n| i.bytes = n,
         ))
     }
+}
+
+/// Add `p` to the paths an owners or history item covers: `paths` lists
+/// them all, its `path` first, once there is more than one.
+fn cover(t: &mut ContextText, p: &str) {
+    if t.paths.is_empty() {
+        t.paths.extend(t.path.clone());
+    }
+    t.paths.push(p.to_string());
 }
 
 /// Each other session once: a session that is a possible duplicate and

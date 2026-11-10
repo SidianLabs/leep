@@ -1346,7 +1346,9 @@ pub struct ContextText {
     /// The `OWNERS` file stating the `carry` directive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carry_file: Option<String>,
-    /// A suspect's changed paths that meet the pack's files.
+    /// A suspect's changed paths that meet the pack's files; or every
+    /// file an owners or history item covers, `path` first, when it covers
+    /// more than one (files with the same owners, or the same last change).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
 }
@@ -1441,6 +1443,26 @@ pub struct ContextRefHealth {
     pub required_checks: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suspects: Vec<ContextSuspect>,
+}
+
+impl ContextPack {
+    /// Whether the pack already shows `n`: an in-flight or duplicate item
+    /// about the same session or landed changeset, at the same level. A
+    /// client printing the pack and the notices of the same answer drops
+    /// such a notice rather than say it twice.
+    pub fn shows(&self, n: &Notice) -> bool {
+        self.in_flight
+            .iter()
+            .chain(&self.duplicates)
+            .map(|w| &w.notice)
+            .any(|w| {
+                w.level == n.level
+                    && w.changeset == n.changeset
+                    && w.session == n.session
+                    && w.count == n.count
+                    && (w.session.is_some() || w.changeset.is_some())
+            })
+    }
 }
 
 /// Items of a section left out to keep within the budget.

@@ -18,3 +18,8 @@
   key says so: `by: task_key`, naming that session and the key, and the
   CLI and MCP tools add "your duplicate landed this task; check whether
   your work is still needed" (ADR 0096 amendment).
+- **Changed.** Context packs give one owners item per distinct owners
+  answer and one history item per changeset, listing the files each covers
+  in `untrusted.paths`; MCP explains a `carry` rule once; `leep_task_start`
+  and `leep work start` no longer repeat as a notice what the pack lists
+  (ADR 0097 amendment).

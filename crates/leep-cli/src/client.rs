@@ -547,6 +547,12 @@ impl Client {
         all
     }
 
+    /// Forget the gathered notices `shown` says were already shown (in a
+    /// context pack printed with them), so none is said twice.
+    pub fn forget_notices(&self, shown: impl Fn(&Notice) -> bool) {
+        self.notices.lock().unwrap().retain(|n| !shown(n));
+    }
+
     /// Gather notices into `sink`, shared with other clients of one command.
     pub fn with_notice_sink(mut self, sink: Arc<Mutex<Vec<Notice>>>) -> Self {
         self.notices = sink;

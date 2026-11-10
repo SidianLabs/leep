@@ -122,6 +122,10 @@ fn start(r: &Remote, a: &WorkStartArgs, wc: Option<&mut WorkCopy>) -> Result<i32
     // The session is declared: a pack the server cannot give now (shed,
     // rate limited, failing) is reported, and `leep context` asks again.
     let pack = r.client.context(&req).map_err(unsupported);
+    // A notice of the declaration the pack already lists is not repeated.
+    if let Ok(p) = &pack {
+        r.client.forget_notices(|n| p.shows(n));
+    }
     if r.json {
         let mut v = serde_json::json!({ "session": declared });
         match &pack {
@@ -192,8 +196,13 @@ fn written(t: &ContextText) -> String {
     s
 }
 
+/// The path an item is about, or every path it covers, quoted.
 fn path_of(t: &ContextText) -> String {
-    format!("{:?}", t.path.as_deref().unwrap_or_default())
+    if t.paths.is_empty() {
+        format!("{:?}", t.path.as_deref().unwrap_or_default())
+    } else {
+        quoted(&t.paths)
+    }
 }
 
 /// How a pack is shown: a heading, then each non-empty section, then
