@@ -7,7 +7,8 @@
 //! whichever backend it came from, so a ref log entry and the ref it moved
 //! always appear together. Because it is an ordinary Leep metadata database,
 //! `verify` and the server open it unchanged, and it restores into either
-//! backend.
+//! backend. Leases and sessions (ADR 0095) are left out: both describe the
+//! live servers and agents of the old store, not its history.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -692,6 +693,11 @@ impl Sink for SqliteSink {
             "review_request_reviewers",
             // Leases name servers of the old store; never restored.
             "leases",
+            // Sessions are advisory and expiring (ADR 0095): never backed
+            // up, and none of the old store's are kept.
+            "sessions",
+            "session_paths",
+            "session_beats",
         ] {
             sqlx::query(AssertSqlSafe(format!("DELETE FROM {t}")))
                 .execute(&mut *self.0)
@@ -1033,6 +1039,11 @@ impl Sink for PgSink {
             "review_request_reviewers",
             // Leases name servers of the old store; never restored.
             "leases",
+            // Sessions are advisory and expiring (ADR 0095): never backed
+            // up, and none of the old store's are kept.
+            "sessions",
+            "session_paths",
+            "session_beats",
         ] {
             sqlx::query(AssertSqlSafe(format!("DELETE FROM {t}")))
                 .execute(&mut *self.0)

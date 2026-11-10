@@ -416,7 +416,8 @@ async fn schema_version_rules_follow_adr_0023() {
     // From an un-versioned database (before ADR 0023): adopted, then restored.
     let older = edit(
         "older.db",
-        "DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP TABLE schema_migrations; DROP TABLE changeset_dicts; DROP TABLE store_features; \
+        "DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+         DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP TABLE schema_migrations; DROP TABLE changeset_dicts; DROP TABLE store_features; \
          DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; \
          DROP TABLE leases; ALTER TABLE changesets DROP COLUMN stored_at",
@@ -440,7 +441,8 @@ async fn schema_version_rules_follow_adr_0023() {
     // SQLite) and 3: migrated on the scratch copy, then restored.
     let v1 = edit(
         "v1.db",
-        "DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP TABLE changeset_dicts; DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
+        "DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+         DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP TABLE changeset_dicts; DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 1",
     )
@@ -464,7 +466,8 @@ async fn schema_version_rules_follow_adr_0023() {
     // the scratch copy, empty, and the plain rows restore as they were.
     let v2 = edit(
         "v2.db",
-        "DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP TABLE changeset_dicts; DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
+        "DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+         DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP TABLE changeset_dicts; DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 2",
     )
@@ -488,7 +491,8 @@ async fn schema_version_rules_follow_adr_0023() {
     // copy; the source had no dictionary, so it names no feature.
     let v3 = edit(
         "v3.db",
-        "DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
+        "DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+         DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 3",
     )
@@ -513,7 +517,8 @@ async fn schema_version_rules_follow_adr_0023() {
     // scratch copy, and every restored entry has none.
     let v4 = edit(
         "v4.db",
-        "DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
+        "DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+         DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; DROP TABLE leases; \
          ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 4",
@@ -541,7 +546,8 @@ async fn schema_version_rules_follow_adr_0023() {
     // migration ran.
     let v6 = edit(
         "v6.db",
-        "DROP TABLE review_requests; DROP TABLE review_request_reviewers; ALTER TABLE changesets DROP COLUMN stored_at; \
+        "DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+         DROP TABLE review_requests; DROP TABLE review_request_reviewers; ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 6",
     )
     .await;
@@ -567,7 +573,8 @@ async fn schema_version_rules_follow_adr_0023() {
     // the scratch copy, empty, and everything else restores as it was.
     let v7 = edit(
         "v7.db",
-        "DROP TABLE review_requests; DROP TABLE review_request_reviewers; \
+        "DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+         DROP TABLE review_requests; DROP TABLE review_request_reviewers; \
          DELETE FROM schema_migrations WHERE version > 7",
     )
     .await;
@@ -585,6 +592,26 @@ async fn schema_version_rules_follow_adr_0023() {
     assert!(d.6.is_empty() && !src_dump.6.is_empty());
     src_dump.6.clear();
     assert_eq!(d, src_dump);
+
+    // From v8, before sessions (ADR 0095): the tables are created on the
+    // scratch copy, empty, and everything else restores as it was.
+    let v8 = edit(
+        "v8.db",
+        "DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+         DELETE FROM schema_migrations WHERE version > 8",
+    )
+    .await;
+    assert_eq!(snapshot_schema_version(&v8).await.unwrap(), 8);
+    let dest_url = sqlite_url(dir.path(), "d10.db");
+    import_snapshot(&v8, &dest_url, false, SchemaMode::Migrate)
+        .await
+        .unwrap();
+    let d10 = open_meta_store(&dest_url).await.unwrap();
+    assert_eq!(
+        d10.schema_version().await.unwrap(),
+        Some(latest_schema_version())
+    );
+    assert_eq!(dump(&*d10).await, dump(&*src).await);
 
     // Not a snapshot at all.
     let junk = dir.path().join("junk.db");

@@ -967,6 +967,15 @@ pub trait MetaStore: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// The coordination store kept beside this store's tables, if it keeps
+    /// one (ADR 0095). Coordination state is a trait of its own, never
+    /// joined to a ref's transaction; this only lets a database that holds
+    /// both hand out the second. Wrappers need not forward it: without one
+    /// a server keeps no sessions and answers everything else the same.
+    fn coord_store(&self) -> Option<std::sync::Arc<dyn crate::coord::CoordStore>> {
+        None
+    }
+
     /// Whether the review request methods below work (ADR 0086). Without
     /// them the server answers the review request endpoints with 400 and
     /// lands close nothing.

@@ -150,6 +150,12 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_review_requests_created_total` | counter | none | Review requests opened (`POST /v1/review-requests` that did not answer an existing one; ADR 0086). |
 | `leep_review_requests_closed_total` | counter | `state` = `landed`, `withdrawn` | Review requests closed: by the follow-up of a land or by a listing that found the changeset on its ref (`landed`), or by their requester (`withdrawn`). |
 | `leep_review_request_close_errors_total` | counter | none | Land follow-ups that failed or timed out while closing review requests. The land itself had succeeded; the requests close at the next listing when their changeset is on the ref's first-parent chain, else stay open until withdrawn. A steady rate means the metadata store is failing these small writes. |
+| `leep_sessions_active` | gauge | none | Sessions stored as active (ADR 0095), counted at most 100,000, refreshed every minute by each server. Idle ones (not heard from for 10 minutes) are included until the sweep expires them after 24 hours. |
+| `leep_sessions_started_total` | counter | `origin` = `declared`, `inferred` | Sessions created or revived: by `POST /v1/sessions`, or from a changeset carrying `agent.session`. |
+| `leep_sessions_ended_total` | counter | `state` = `landed`, `expired` | Sessions ended by a land of their head, or by the expiry sweep. |
+| `leep_sessions_refused_total` | counter | none | Sessions not inferred because their principal already had 1000 active (`MAX_ACTIVE_PER_PRINCIPAL`). |
+| `leep_session_beats_dropped_total` | counter | `reason` = `full`, `principal` | Heartbeats of new keys not held because this server already holds 100,000 sessions' beats (`full`) or 2,000 of that principal's (`principal`, a token sending made-up keys); those sessions only look idle sooner. |
+| `leep_session_hook_errors_total` | counter | `hook` = `created`, `landed`, `beats`, `sweep`; `reason` = `error`, `timeout`, `busy` | Session updates that failed, timed out or were skipped. The answer they followed was not affected (ADR 0095); a steady rate means the coordination writes are failing and `leep who` is going stale. |
 | `leep_land_leases_held` | gauge | none | Refs whose land lease this server holds ([Several servers on one ref](#several-servers-on-one-ref), ADR 0056). |
 | `leep_land_lease_acquired_total` | counter | none | Land leases this server took. Under steady traffic about one per hot ref per server restart; more means leases change hands. |
 | `leep_land_lease_lost_total` | counter | `reason` = `taken`, `idle` | Leases this server stopped holding: another server took it after this one failed to renew it for the TTL (`taken`), or it released it after 30 s without a land (`idle`). |
@@ -1424,6 +1430,39 @@ COMMIT;
 The same SQL works on Postgres and SQLite (dropping a table drops its
 indexes). `created-by-v1` rows stay in `derived`; v7 servers never read
 them. Otherwise restore a backup taken before the upgrade.
+
+**Migration 9 (`sessions`, ADR 0095).** Creates three new, empty tables
+(`sessions`, `session_paths`, `session_beats`; on Postgres the last is
+`UNLOGGED`) and their indexes, and touches no existing table, so it takes no
+lock another statement waits on and may run beside servers of the previous
+version, which never read the tables. Sessions are kept only by upgraded
+servers; a v8 server's lands do not end sessions, so their sessions stay
+active until the next commit of the same agent session or the 24-hour
+expiry. `--sessions off` (`LEEP_SESSIONS=off`) keeps none and answers
+`/v1/sessions` with 404. Backups leave the tables out, as they do leases:
+a restore starts with no sessions.
+
+There is no down migration, and a v8 server refuses to start on a v9
+database. To go back to v8 without restoring a backup, stop every server and
+drop what migration 9 added; nothing else reads the tables, and dropping
+them loses no history and changes no land (ADR 0095):
+
+```sql
+BEGIN;
+DROP TABLE session_beats;
+DROP TABLE session_paths;
+DROP TABLE sessions;
+DELETE FROM schema_migrations WHERE version = 9;
+COMMIT;
+```
+
+**Active sessions per principal** are capped at 1000
+(`MAX_ACTIVE_PER_PRINCIPAL`): declaring one more is refused with 400 and
+code `too_many_sessions`, and inferring one more is skipped
+(`leep_sessions_refused_total`). Each server writes the heartbeats it hears
+at most once a minute per session, in one batch every 5 seconds, and sweeps
+every minute: sessions not heard from for 24 hours expire, paths of ended
+sessions are deleted after 24 hours and the sessions after 30 days.
 
 **Open review requests per requester** are capped at 100
 (`MAX_OPEN_REQUESTS`, a constant): one more is refused with 400 and code

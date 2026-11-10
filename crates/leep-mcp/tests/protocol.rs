@@ -59,6 +59,8 @@ fn tools_list_schemas_are_sane() {
         "leep_resolve",
         "leep_merge_base",
         "leep_provenance",
+        "leep_session_start",
+        "leep_who",
     ] {
         assert!(names.contains(&expected), "missing {expected}");
     }

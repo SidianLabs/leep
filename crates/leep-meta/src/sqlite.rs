@@ -73,6 +73,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/sqlite/0008_review_requests.sql"),
         satisfied_by: &[],
     },
+    Migration {
+        version: 9,
+        name: "sessions",
+        sql: include_str!("../migrations/sqlite/0009_sessions.sql"),
+        satisfied_by: &[],
+    },
 ];
 
 pub struct SqliteMetaStore {
@@ -88,6 +94,8 @@ pub struct SqliteMetaStore {
     pub(crate) has_stored_at: bool,
     /// Whether the schema has the review request tables (ADR 0086).
     pub(crate) has_review_requests: bool,
+    /// Sessions (ADR 0095), when the schema has their tables.
+    pub(crate) coord: Option<std::sync::Arc<dyn leep_core::coord::CoordStore>>,
 }
 
 /// `sqlite:///C:/path` (a Windows drive letter after the third slash, as
@@ -308,6 +316,13 @@ impl SqliteMetaStore {
     }
 
     fn with_pool(pool: SqlitePool, migrations: &[Migration]) -> Self {
+        let coord = migrations
+            .iter()
+            .any(|m| m.version >= crate::coord::SESSIONS_SCHEMA_VERSION)
+            .then(|| {
+                std::sync::Arc::new(crate::coord::SqliteCoordStore { pool: pool.clone() })
+                    as std::sync::Arc<dyn leep_core::coord::CoordStore>
+            });
         Self {
             pool,
             codec: Codec::default(),
@@ -323,6 +338,7 @@ impl SqliteMetaStore {
             has_review_requests: migrations
                 .iter()
                 .any(|m| m.version >= crate::review_requests::REVIEW_REQUESTS_SCHEMA_VERSION),
+            coord,
         }
     }
 
@@ -734,6 +750,10 @@ impl MetaStore for SqliteMetaStore {
             .map_err(|e| log_insert_error(name, e))?;
         tx.commit().await.map_err(storage)?;
         Ok(true)
+    }
+
+    fn coord_store(&self) -> Option<std::sync::Arc<dyn leep_core::coord::CoordStore>> {
+        self.coord.clone()
     }
 
     fn supports_review_requests(&self) -> bool {

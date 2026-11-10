@@ -21,6 +21,7 @@ pub mod read_limits;
 pub mod reload;
 pub mod review;
 mod review_requests;
+pub mod sessions;
 pub mod signing;
 pub mod timing;
 
@@ -326,6 +327,11 @@ pub fn router_with_read_classes(
             "/v1/review-requests/{id}/withdraw",
             post(review_requests::withdraw),
         )
+        .route("/v1/sessions", get(sessions::list).post(sessions::declare))
+        .route(
+            "/v1/sessions/{id}",
+            get(sessions::get_one).delete(sessions::end),
+        )
         .route("/v1/refs", get(list_refs))
         .route("/v1/refs/{*name}", get(get_ref).post(post_ref))
         .route("/v1/reflog", get(ref_log_all))
@@ -346,8 +352,14 @@ pub fn router_with_read_classes(
         .route("/v1/merge", post(merge))
         .route("/v1/rebase", post(rebase))
         .route("/v1/land", post(land));
-    // Innermost: a request spends its token's limits before it takes a
-    // read class permit (ADR 0060).
+    // Innermost: a request that reached its handler is a heartbeat of the
+    // caller's session (ADR 0095); memory only.
+    let router = router.layer(middleware::from_fn_with_state(
+        repo.clone(),
+        sessions::heartbeat,
+    ));
+    // Next: a request spends its token's limits before it takes a read
+    // class permit (ADR 0060).
     let router = router.layer(middleware::from_fn_with_state(
         read_limits,
         read_limits::enforce,
@@ -918,9 +930,17 @@ async fn create_changeset(
     body: Bytes,
 ) -> ApiResult<Json<CreateChangesetResponse>> {
     let cs: Changeset = parse_json(&body)?;
+    // What the session update needs, taken in one pass before the store
+    // owns the changeset (ADR 0095); nothing when sessions are off.
+    let seed = repo
+        .coord()
+        .and_then(|_| leep_derive::sessions::SessionSeed::of(&cs));
     let id = repo
         .create_changeset_by(cs, who.as_ref().map(|p| p.name.as_str()))
         .await?;
+    if let Some(seed) = seed {
+        sessions::after_create(&repo, seed, id, &who).await;
+    }
     Ok(Json(CreateChangesetResponse { id }))
 }
 
@@ -1801,6 +1821,7 @@ async fn land(
         let resp = repo
             .land_keyed(req.changeset, &req.target_ref, actor, create, req.land_id)
             .await?;
+        sessions::after_land(&repo, req.changeset, actor, &resp);
         review_requests::after_land(
             repo.clone(),
             &config,
@@ -1829,6 +1850,7 @@ async fn land(
             .await?
         {
             Coordinated::Landed(r) => {
+                sessions::after_land(&repo, req.changeset, actor, &r);
                 review_requests::after_land(
                     repo.clone(),
                     &config,

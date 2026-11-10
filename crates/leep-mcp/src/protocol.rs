@@ -40,20 +40,25 @@ pub struct Server {
     pub(crate) pending_lands: Mutex<HashMap<(ChangesetId, String), LandId>>,
     /// Conflict reports `leep_resolve_and_land` can still finish.
     pub(crate) conflicts: Mutex<tools::Conflicts>,
+    /// The token's name, once asked (`leep_who` marks your own session).
+    pub(crate) principal: std::sync::OnceLock<String>,
 }
 
 impl Server {
     pub fn new(cfg: Config) -> Self {
         // A tool call never sleeps: a read the server refused for being busy
         // goes back to the agent with when to ask again (ADR 0060).
-        let client =
-            Client::with_token(&cfg.server, cfg.token.as_deref()).with_refusal_retries(false);
+        // Every request is a heartbeat of the agent's session (ADR 0095).
+        let client = Client::with_token(&cfg.server, cfg.token.as_deref())
+            .with_refusal_retries(false)
+            .with_session(cfg.agent_session.as_deref());
         Server {
             client,
             cfg,
             requests: Mutex::default(),
             pending_lands: Mutex::default(),
             conflicts: Mutex::default(),
+            principal: std::sync::OnceLock::new(),
         }
     }
 

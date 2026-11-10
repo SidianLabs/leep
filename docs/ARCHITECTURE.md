@@ -27,9 +27,15 @@ These are load-bearing. A change that breaks one needs an ADR.
 2. **Immutable, content-addressed data.** Blobs, trees, changesets and
    derived values never change once written. Any cache at any tier may keep
    them forever, with no invalidation.
-3. **Minimal global mutable state.** Refs are the only mutable state. They exist
-   for `main` and release branches. Work in progress is identified by
-   changeset id. A ref moves only by compare-and-swap on one row.
+3. **Minimal global mutable state.** Refs are the only mutable *history*
+   state. They exist for `main` and release branches. Work in progress is
+   identified by changeset id. A ref moves only by compare-and-swap on one
+   row. Beside history there is *coordination* state (sessions: who is
+   working on what before it lands): advisory, expiring rows that never
+   change a land's answer, so dropping them loses no history and changes no
+   ref (the land-equivalence rule, [ADR 0095](adr/0095-coordination-state.md),
+   §12). Bookkeeping rows of the same kind (land records, leases, review
+   requests) follow the same rule.
 4. **Store the minimum, derive the rest.** A changeset lists only the paths it
    changed. Full trees, generation numbers, ancestry indexes, path history and
    blame are *derived data*, computed from parents and cached.
@@ -73,9 +79,9 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 
 | Crate | Role | May depend on |
 |---|---|---|
-| `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits (including listing and blob deletion for GC, a changeset id prefix lookup for short ids, listing and dropping derived rows by kind for repair, batched changeset and derived reads for history walks, derived reads of several kinds in one call, and batched derived writes and changeset-with-rows writes for changeset creation), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
+| `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits and the `CoordStore` trait for coordination state (ADR 0095) (including listing and blob deletion for GC, a changeset id prefix lookup for short ids, listing and dropping derived rows by kind for repair, batched changeset and derived reads for history walks, derived reads of several kinds in one call, and batched derived writes and changeset-with-rows writes for changeset creation), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
 | `leep-store` | `BlobStore` backends: filesystem (loose objects plus delta-compressed packs, the repack writer, and packs written by `put_many`, ADR 0029, ADR 0039, ADR 0068), `object_store` (S3/MinIO; loose objects plus the same packs, ADR 0040), `CachedBlobStore`, `open_blob_store(url)`, and the incremental blob and pack copy backup and restore use (`sync`, `packfiles`, ADR 0026, ADR 0039) | core |
-| `leep-meta` | `MetaStore` backends: SQLite, Postgres, `open_meta_store(url)`, the versioned schema migrator (`migrate`, ADR 0023), metadata snapshots and their import (`snapshot`, ADR 0026), and `analyze_meta_store`, which bulk loaders call to refresh Postgres planner statistics (ADR 0042) | core |
+| `leep-meta` | `MetaStore` backends: SQLite, Postgres (each also keeps the `CoordStore` of sessions, ADR 0095), `open_meta_store(url)`, the versioned schema migrator (`migrate`, ADR 0023), metadata snapshots and their import (`snapshot`, ADR 0026), and `analyze_meta_store`, which bulk loaders call to refresh Postgres planner statistics (ADR 0042) | core |
 | `leep-derive` | `Repo`: derived data framework and kinds (including the git ids of ADR 0090, through `leep-gitobj`), plus all operations, blob garbage collection (`gc`), the delta-base walks for `repack` (`pack_order`, full or loose-only) and store verification and repair (`integrity`) | core (traits only, never a concrete backend) |
 | `leep-server` | HTTP server binary `leep-server`, and its offline subcommands (`gc`, `migrate`, `verify`, `repair`, `backup`, `restore`, `backup-verify`) | core, store, meta, derive |
 | `leep-cli` | Client binary `leep` | core only |
@@ -1416,6 +1422,7 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
 | Store call applies, then reports an error (lost commit acknowledgement, timeout after commit) | The write may exist. For a blob, changeset or derived row that is harmless. For `cas_ref` the caller cannot tell | `land` reads the ref again and recognises its own result (by land id at any age, ADR 0057; otherwise within the last 1024 changesets); other ref callers must read the ref before repeating |
 | Request cancelled by `--request-timeout` or a client disconnect | Same as a dead server for the work it had done; it performs no further writes, though a Postgres statement already sent runs on until it ends or `--meta-statement-timeout` (the request timeout plus 5 s by default) cancels it | Client retries |
 | MetaStore unavailable | Writes and uncached reads fail | Fail fast with 500; no local fallback |
+| Coordination writes fail or are slow (sessions, ADR 0095) | `leep who` goes stale; every other answer is unchanged: session updates follow the answer they ride on (a create waits at most 250 ms for its own), and failures are counted in `leep_session_hook_errors_total`, never returned | Nothing to repair: the next commit, heartbeat or sweep catches up; the tables can be dropped without losing history |
 | BlobStore slow | Cache tiers absorb repeated reads | — |
 | Land CAS contention | Bounded retries, then an error | Client retries `land` |
 | Server started on a database from a newer release, or whose applied migration was edited | The store refuses to open (`database schema vN is newer than this server`), before any write | Upgrade the server; never edit an applied migration (ADR 0023) |
@@ -1753,3 +1760,52 @@ so does the object store backend since ADR 0040. Since ADR 0039 the
 scheduled repack is incremental (it costs the new history, not all of it)
 and backups copy packs as files; incremental repacks of object stores are
 next.
+
+## 12. Coordination
+
+Leep's server sees work before it lands, so it can say who is working on
+what. That is coordination state ([ADR 0095](adr/0095-coordination-state.md)):
+a second kind of mutable state beside refs, behind its own trait,
+`CoordStore`, with its own contract (`check_coord_contract`).
+
+- **The land-equivalence rule.** Coordination state never changes a land's
+  answer. No land reads it; every coordination write happens after the
+  answer it follows is decided; a failure is counted and logged, never
+  returned. Dropping every coordination table loses no history and changes
+  no land result, ref or ref log entry. A property test runs one random land
+  sequence with busy sessions, with none, and with a store that fails every
+  call, and requires identical answers. There are no locks: a claim is a
+  louder warning, never a gate.
+- **Storage.** Migration 0009: `sessions` (one row per repository,
+  principal and agent session), `session_paths` (scope, claims and touched
+  paths, indexed on `(repo_id, path)` for prefix overlap) and
+  `session_beats` (when each was last heard from; `UNLOGGED` on Postgres).
+  JSON on the wire, columns at rest, never hashed. A SQL meta store hands
+  out its `CoordStore` (`MetaStore::coord_store`) over its data pool, never
+  the land or index lanes; `Repo::with_coord` replaces it, and
+  `--sessions off` keeps none. Backups leave the tables out.
+- **Sessions.** Keyed by the token's name and the `agent.session` key the
+  agent's changesets already carry. Declared through `POST /v1/sessions`
+  (title, approach, task key, scope, claims), or inferred from any created
+  changeset carrying `agent.session` (head, base, touched paths, commit
+  subject as title), so clients that never declare anything still appear.
+  A land of a session's head ends it as `landed`. Upserts hold the row's
+  lock while they merge, so concurrent commits never lose each other's
+  paths. Touched paths are capped at 256, folding the deepest into their
+  directories, which still overlap everything below.
+- **Liveness.** A request carrying `Leep-Session: KEY` is a heartbeat, held
+  in memory and written in batches every 5 s, at most once a minute per
+  session. Idle after 10 minutes, expired after 24 hours; the sweep runs
+  every minute on every server in bounded, conditional steps and deletes
+  ended sessions' paths after a day and the sessions after 30 days.
+- **Queries.** `GET /v1/sessions?path=` ("who is working on or near X"):
+  sessions with a path equal to X, a directory above it, or below it: one
+  range scan plus a probe per ancestor. Also by task key, principal, key and
+  state. CLI `leep who`, MCP `leep_who`.
+- **Untrusted text.** Titles and approaches are other agents' words, kept
+  in an `untrusted` object on the wire and fenced in MCP results under a
+  line saying they are data, not instructions.
+- **Scale.** Every table is keyed by `repo_id` first (ADR 0054), and
+  nothing joins coordination to the land path, so the next steps are a
+  separate coordination database and then sharding by path prefix (ADR
+  0095, section 9, has the costs).

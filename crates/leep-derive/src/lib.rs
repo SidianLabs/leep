@@ -48,6 +48,7 @@ mod review_requests;
 mod reviews;
 mod revision;
 pub mod search;
+pub mod sessions;
 mod signatures;
 mod tree_ops;
 pub mod warm;
@@ -90,6 +91,8 @@ mod page_tests;
 mod path_page_tests;
 #[cfg(test)]
 mod rebase_onto_tests;
+#[cfg(test)]
+mod sessions_equivalence_tests;
 #[cfg(test)]
 mod tests;
 

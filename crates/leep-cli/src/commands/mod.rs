@@ -24,6 +24,7 @@ pub mod review;
 pub mod review_request;
 pub mod review_show;
 pub mod search;
+pub mod session;
 pub mod stash;
 pub mod status;
 

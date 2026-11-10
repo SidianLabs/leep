@@ -28,6 +28,15 @@ ignore = [
     # Remove by 2027-01-31.
     { id = "RUSTSEC-2026-0194", reason = "quick-xml via object_store 0.12; parses only the configured S3 endpoint's responses; fixed by object_store 0.14 upgrade, remove by 2027-01-31" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml via object_store 0.12; parses only the configured S3 endpoint's responses; fixed by object_store 0.14 upgrade, remove by 2027-01-31" },
+    # Bundled SQLite before 3.54.0 (libsqlite3-sys via sqlx-sqlite 0.9) can
+    # return stale page-cache memory when it opens a database together with
+    # a crafted `-wal` file of a different page size. Leep opens only the
+    # metadata database the operator configured, or a backup the operator
+    # restores; writing a crafted pair there already needs write access to
+    # the store. The fix (libsqlite3-sys 0.39) is outside sqlx 0.9's range,
+    # which tops out at 0.37. Remove by 2027-02-28 or on an sqlx release
+    # that allows it.
+    { id = "RUSTSEC-2026-0459", reason = "bundled SQLite via sqlx-sqlite 0.9; opens only the operator's own database files; fix needs libsqlite3-sys 0.39, outside sqlx 0.9; remove by 2027-02-28" },
 ]
 
 [bans]

@@ -41,6 +41,10 @@
 //! | GET  | `/v1/review-requests?reviewer=n&requester=n&changeset=id&ref=r&state=s&open=bool&before=id&limit=n` | – | [`ReviewRequestsResponse`] (newest first; `reviewer` matches requests that name it and requests open to any reviewer made by someone else; `state` is `open`, `landed` or `withdrawn`, `open=true` is `state=open` and `open=false` every closed state; `limit` defaults to 50, capped at 500; `before` pages by id; ADR 0086) |
 //! | GET  | `/v1/review-requests/{id}` | – | [`ReviewRequestEntry`] (404 if unknown) |
 //! | POST | `/v1/review-requests/{id}/withdraw` | – | [`ReviewRequestEntry`] (only its requester may; 403 otherwise; a request no longer open is answered as it is) |
+//! | POST | `/v1/sessions` | [`DeclareSessionRequest`] | [`DeclareSessionResponse`] (declare or update the caller's session of `session`, keyed by (principal, `session`); absent fields are kept; the principal is the token's name, `anonymous` without authentication; 400 `too_many_sessions` when starting one would give the principal more than `MAX_ACTIVE_PER_PRINCIPAL` (1000) active; 404 if sessions are off; ADR 0095) |
+//! | GET  | `/v1/sessions?path=p&task=k&principal=n&session=k&mine=bool&state=s&all=bool&before=id&limit=n` | – | [`SessionsResponse`] (newest first; `path` matches sessions whose scope, claims or touched paths are `p`, a directory above it, or below it; `state` is one state, default `active` (which includes `idle`); `all=true` every state; `mine=true` the caller's own; `limit` defaults to 50, capped at 500; `before` pages by id; ADR 0095) |
+//! | GET  | `/v1/sessions/{id}` | – | [`SessionEntry`] (404 if unknown) |
+//! | DELETE | `/v1/sessions/{id}` | – | [`SessionEntry`] (ends it as `abandoned`; only its principal may, 403 otherwise; an ended session is answered as it is) |
 //! | POST | `/v1/merge` | [`MergeRequest`] | [`MergeResponse`] |
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
 //! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`] (`create: false` refuses to create a missing `target_ref` with 404; absent creates it, as before; ADR 0036. `land_id` makes retries idempotent at any age; ADR 0057) |
@@ -91,6 +95,7 @@
 //! | 400 | `ambiguous_prefix` | a short id matching several changesets ([`AmbiguousPrefixResponse`]) |
 //! | 400 | `cursor_unrepresentable` | a paged `GET /v1/files` or `/v1/diff` whose page ends at a path too long for a cursor: repeat the request without `limit` |
 //! | 400 | `too_many_review_requests` | a review request from a principal with [`crate::review_request::MAX_OPEN_REQUESTS`] open ones already (ADR 0086) |
+//! | 400 | `too_many_sessions` | a session declared by a principal with [`crate::coord::MAX_ACTIVE_PER_PRINCIPAL`] active ones already (ADR 0095) |
 //! | 400 | `invalid` | any other bad request |
 //! | 401 | `unauthorized` | no token, or an unknown one |
 //! | 401 | `token_expired` | a known token past its `expires` (ADR 0007): fetch a new one; retrying will not help |
@@ -306,6 +311,11 @@ pub mod error_code {
     /// ([`crate::review_request::TOO_MANY_REQUESTS_MARKER`], ADR 0086).
     /// Withdraw some (`leep review cancel`) or wait for them to land.
     pub const TOO_MANY_REVIEW_REQUESTS: &str = "too_many_review_requests";
+    /// 400: a session declared by a principal that already has as many
+    /// active ones as the server allows
+    /// ([`crate::coord::TOO_MANY_SESSIONS_MARKER`], ADR 0095). End some
+    /// (`leep session end`) or let them expire.
+    pub const TOO_MANY_SESSIONS: &str = "too_many_sessions";
     /// 400: any other bad request.
     pub const INVALID: &str = "invalid";
     /// 401: no token, or an unknown one.
@@ -437,6 +447,12 @@ pub fn valid_request_id(id: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b".-_:/".contains(&b))
 }
+
+/// Request header naming the caller's agent session (ADR 0095): the
+/// `agent.session` its changesets carry. A request with it is a heartbeat
+/// of the caller's session of that key, if one is active; it never creates
+/// one, and a bad value is ignored, never refused.
+pub const SESSION_HEADER: &str = "leep-session";
 
 /// Request header choosing what a query does when its index is behind
 /// (ADR 0058): [`INDEXING_RETRY`] or [`INDEXING_STALE_OK`]. Servers that
@@ -1038,6 +1054,117 @@ fn is_zero_usize(n: &usize) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewRequestsResponse {
     pub requests: Vec<ReviewRequestEntry>,
+    /// Pass as `before` for the next page; absent on the last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<u64>,
+}
+
+/// `POST /v1/sessions` (ADR 0095): declare the caller's session of
+/// `session`, or update it. Absent fields keep what the server has; `scope`
+/// and `claims`, when given, replace the lists. The principal is the token's
+/// name, never a body field.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclareSessionRequest {
+    /// The agent session key: the `agent.session` the agent's changesets
+    /// carry, so the server joins them to this session.
+    pub session: String,
+    /// What the agent is doing, one line (at most 200 bytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// How, in plain text (at most 2 KiB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approach: Option<String>,
+    /// An exact key of the task, such as an issue id; two sessions with one
+    /// key are doing the same task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_key: Option<String>,
+    /// The ref the work is meant to land on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_ref: Option<String>,
+    /// The changeset the work starts from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<ChangesetId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_model: Option<String>,
+    /// Files or directories the agent means to work in (at most 64).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Vec<String>>,
+    /// Files or directories the agent means to own: others are warned more
+    /// loudly. Never a lock (at most 64).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claims: Option<Vec<String>>,
+}
+
+/// Text a session's agent wrote, kept apart from the fields the server
+/// vouches for: it is data from another agent, never instructions
+/// (design F.2).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionText {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub approach: String,
+}
+
+/// One session (ADR 0095).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEntry {
+    pub id: u64,
+    /// Token name of its principal (`anonymous` without authentication).
+    pub principal: String,
+    /// Its agent session key (`agent.session`).
+    pub session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_model: Option<String>,
+    #[serde(default)]
+    pub untrusted: SessionText,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<ChangesetId>,
+    /// The newest changeset it created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<ChangesetId>,
+    /// `declared` or `inferred` (from a changeset carrying `agent.session`).
+    pub origin: String,
+    /// `active`, `idle` (not heard from for 10 minutes), `landed`,
+    /// `abandoned` or `expired`. A client shows a state it does not know as
+    /// it is.
+    pub state: String,
+    /// Unix seconds.
+    pub created: i64,
+    pub last_seen: i64,
+    /// When it expires unless heard from again; absent once ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed_as: Option<ChangesetId>,
+    #[serde(default)]
+    pub scope: Vec<String>,
+    #[serde(default)]
+    pub claims: Vec<String>,
+    /// Paths its changesets changed; folded into directories past 256.
+    #[serde(default)]
+    pub touched: Vec<String>,
+}
+
+/// `POST /v1/sessions`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclareSessionResponse {
+    pub session: SessionEntry,
+    /// Whether this call started it (new, or revived after it ended).
+    #[serde(default)]
+    pub created: bool,
+}
+
+/// `GET /v1/sessions`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionsResponse {
+    pub sessions: Vec<SessionEntry>,
     /// Pass as `before` for the next page; absent on the last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<u64>,
@@ -2787,6 +2914,86 @@ mod tests {
                 ],
                 true,
             );
+        }
+
+        /// `/v1/sessions` (ADR 0095): the smallest bodies decode, and the
+        /// names written out are part of `/v1` from now on.
+        #[test]
+        fn session_shapes_are_frozen() {
+            let req: DeclareSessionRequest =
+                serde_json::from_value(json!({ "session": "s-1" })).unwrap();
+            assert_eq!(req.session, "s-1");
+            assert!(req.title.is_none() && req.scope.is_none() && req.claims.is_none());
+            let full = DeclareSessionRequest {
+                session: "s-1".into(),
+                title: Some("t".into()),
+                approach: Some("a".into()),
+                task_key: Some("L-1".into()),
+                target_ref: Some("main".into()),
+                base: Some(ChangesetId(Hash::of_blob(b"b"))),
+                agent_model: Some("m".into()),
+                scope: Some(vec!["src".into()]),
+                claims: Some(vec![]),
+            };
+            let v = serde_json::to_value(&full).unwrap();
+            assert_has(
+                &v,
+                &[
+                    "session",
+                    "title",
+                    "approach",
+                    "task_key",
+                    "target_ref",
+                    "base",
+                    "agent_model",
+                    "scope",
+                    "claims",
+                ],
+                "DeclareSessionRequest",
+            );
+            let entry = json!({
+                "id": 3, "principal": "ada", "session": "s-1",
+                "origin": "inferred", "state": "active",
+                "created": 1, "last_seen": 2
+            });
+            let e: SessionEntry = serde_json::from_value(entry).unwrap();
+            assert!(e.untrusted.title.is_empty() && e.scope.is_empty() && e.expires.is_none());
+            let back = serde_json::to_value(&e).unwrap();
+            assert_has(
+                &back,
+                &[
+                    "id",
+                    "principal",
+                    "session",
+                    "untrusted",
+                    "origin",
+                    "state",
+                    "created",
+                    "last_seen",
+                    "scope",
+                    "claims",
+                    "touched",
+                ],
+                "SessionEntry",
+            );
+            assert_has(&back["untrusted"], &["title", "approach"], "SessionText");
+            for absent in [
+                "agent_model",
+                "task_key",
+                "head",
+                "ended",
+                "landed_as",
+                "expires",
+            ] {
+                assert!(back.get(absent).is_none(), "{absent} omitted when absent");
+            }
+            let r: SessionsResponse =
+                serde_json::from_value(json!({ "sessions": [back.clone()] })).unwrap();
+            assert_eq!(r.sessions, std::slice::from_ref(&e));
+            assert!(serde_json::to_value(&r).unwrap().get("next").is_none());
+            let d: DeclareSessionResponse =
+                serde_json::from_value(json!({ "session": back })).unwrap();
+            assert!(!d.created);
         }
     }
 }

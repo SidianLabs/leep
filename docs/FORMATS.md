@@ -559,6 +559,28 @@ review_request_reviewers(request_id BIGINT NOT NULL,           -- migration 0008
                          reviewer TEXT NOT NULL,                -- a token name; no rows = any reviewer
                          PRIMARY KEY (request_id, reviewer))
 review_request_reviewers_reviewer: INDEX ON review_request_reviewers(reviewer, request_id)
+sessions(id BIGSERIAL PRIMARY KEY,                             -- migration 0009; SQLite: INTEGER PRIMARY KEY AUTOINCREMENT
+         repo_id BIGINT NOT NULL DEFAULT 1,                     -- SQLite: INTEGER (and below)
+         principal TEXT NOT NULL,                               -- a token name, or 'anonymous'
+         agent_session TEXT NOT NULL,                           -- the agent.session key
+         agent_model TEXT, title TEXT NOT NULL DEFAULT '', approach TEXT NOT NULL DEFAULT '',
+         task_key TEXT, target_ref TEXT, base BYTEA, head BYTEA,
+         origin TEXT NOT NULL,                                  -- 'declared' or 'inferred'
+         state TEXT NOT NULL DEFAULT 'active',                  -- 'active', 'landed', 'abandoned' or 'expired'
+         created BIGINT NOT NULL, ended BIGINT, landed_as BYTEA) -- unix seconds, the server's clock
+sessions_key: UNIQUE INDEX ON sessions(repo_id, principal, agent_session)
+sessions_state: INDEX ON sessions(repo_id, state, id)
+sessions_task: INDEX ON sessions(repo_id, task_key, id)
+sessions_ended: INDEX ON sessions(ended)
+session_paths(repo_id BIGINT NOT NULL DEFAULT 1,               -- migration 0009
+              session_id BIGINT NOT NULL,
+              kind TEXT NOT NULL,                               -- 'scope', 'claim' or 'touched'
+              path TEXT COLLATE "C" NOT NULL,                   -- a repository path; SQLite compares bytewise anyway
+              PRIMARY KEY (session_id, kind, path))
+session_paths_path: INDEX ON session_paths(repo_id, path)
+session_beats(session_id BIGINT PRIMARY KEY,                   -- migration 0009; UNLOGGED on Postgres
+              at BIGINT NOT NULL)                               -- unix seconds the session was last heard from
+session_beats_at: INDEX ON session_beats(at)
 ```
 
 `ref_log` (ADR 0018) is appended in the transaction of every ref create, move
@@ -615,6 +637,10 @@ migrations run later, keeps every row's age.
 Migration 0008 (`review_requests`, ADR 0086) adds the two review request
 tables and their indexes, empty. Older servers never read them, so the
 migration tolerates them. See "Review requests" below.
+
+Migration 0009 (`sessions`, ADR 0095) adds the three session tables and
+their indexes, empty. Older servers never read them, so the migration
+tolerates them. See "Sessions" below.
 
 ### Changeset rows (ADR 0053)
 
@@ -872,6 +898,58 @@ persisted changed.
   `/culprits` is answered as itself only when it does not.
 - Error code `promotion_only` (422): a land, create or move of any
   `green/` ref, or a delete of one the checks policy names.
+
+## Sessions (new tables, store trait, API and header, ADR 0095)
+
+No changeset, tree or hash changed. Sessions are coordination state:
+advisory and expiring, never read by a land (the land-equivalence rule).
+Added:
+
+- The `sessions`, `session_paths` and `session_beats` tables above. A
+  session is keyed by `(repo_id, principal, agent_session)`; ids only grow.
+  An upsert is one transaction holding the row (`FOR UPDATE` on Postgres,
+  `BEGIN IMMEDIATE` on SQLite) that rewrites the row, the path kinds whose
+  lists changed and the beat (`at` only ever grows). An end is one
+  `UPDATE ... WHERE state = 'active'` with optional conditions on the
+  principal and the head. `state` text is fixed: `active`, `landed`,
+  `abandoned`, `expired` (`idle` is never stored: it is an active session
+  not heard from for 10 minutes); `origin`: `declared`, `inferred`; path
+  `kind`: `scope`, `claim`, `touched`. A session's `last_seen` is its beat,
+  or `created` when it has none (a Postgres crash empties the `UNLOGGED`
+  table). The sweep sets `state = 'expired'` 24 hours after the last beat,
+  deletes the paths 24 hours after `ended` and the session (with its paths
+  and beat) 30 days after. Limits: keys (`agent_session`, `task_key`) 1
+  to 128 bytes of printable ASCII without spaces; `principal` 1 to 128
+  bytes without control characters; `title` one
+  line of at most 200 bytes; `approach` at most 2048 bytes without control
+  characters other than newline and tab; at most 64 scope paths and 64
+  claims, each a repository path of at most 256 bytes; at most 256 touched
+  paths, the deepest folded into their directories, and none with a
+  control character; at most 1000 active
+  sessions per principal. Backups (ADR 0026) leave the tables out, and a
+  restore clears them, as for `leases`.
+- `leep_core::coord::CoordStore` (`upsert_session`, `get_session`,
+  `list_sessions`, `end_session`, `beat_sessions`, `sweep_sessions`,
+  `count_sessions`), checked by `leep_core::memory::check_coord_contract`,
+  and `MetaStore::coord_store()` (default `None`), which the SQL stores and
+  `MemoryMetaStore` implement.
+- Request header `Leep-Session: KEY` on any request: a heartbeat of the
+  caller's active session of that key. Never refused; an unknown key or a
+  value that is no key is ignored.
+- `POST /v1/sessions` (`DeclareSessionRequest {session, title?, approach?,
+  task_key?, target_ref?, base?, agent_model?, scope?, claims?}` →
+  `DeclareSessionResponse {session, created}`), `GET /v1/sessions` (filters
+  `path`, `task`, `principal`, `session`, `mine`, `state`, `all`, `before`,
+  `limit` → `SessionsResponse {sessions, next?}`), `GET /v1/sessions/{id}`
+  and `DELETE /v1/sessions/{id}` (→ `SessionEntry`). An entry is `{id,
+  principal, session, agent_model?, untrusted: {title, approach}, task_key?,
+  target_ref?, base?, head?, origin, state, created, last_seen, expires?,
+  ended?, landed_as?, scope, claims, touched}`: text another agent wrote is
+  under `untrusted`, and `state` and `origin` are strings a client shows as
+  they are when it does not know them. Every field a client may omit has a
+  default, and every optional answer field is omitted when absent. A server
+  without sessions (`--sessions off`, or older) answers the routes 404.
+- Error code `too_many_sessions` (400).
 
 ## Index leases and bounded queries (additive, ADR 0058)
 
@@ -1578,6 +1656,7 @@ client treats an unknown or absent code by its HTTP status.
 | 400 | `ambiguous_prefix` | a short id matching several changesets (`AmbiguousPrefixResponse`) |
 | 400 | `cursor_unrepresentable` | a paged `GET /v1/files` or `/v1/diff` whose page would end at a path too long for a cursor (added with file and diff paging): repeat the request without `limit` |
 | 400 | `too_many_review_requests` | a review request from a principal that already has 100 open ones (ADR 0086) |
+| 400 | `too_many_sessions` | a session declared by a principal that already has 1000 active ones (ADR 0095) |
 | 400 | `invalid` | any other bad request (also `405`) |
 | 401 | `unauthorized` | no token, or an unknown one |
 | 401 | `token_expired` | a known token past its `expires` (ADR 0007): fetch a new one; retrying will not help |

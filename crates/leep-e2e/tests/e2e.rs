@@ -2834,3 +2834,140 @@ fn a_fake_ci_loop_promotes_green_and_narrows_suspects_to_a_planted_break() {
     let out = alice.run(root, &["checks", "post", &bad, "test", "pass"]);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
 }
+
+/// Two agents' sessions (ADR 0095) through the real binaries: one declared
+/// with `leep session start`, one inferred from a commit carrying
+/// LEEP_AGENT_SESSION; `leep who` shows both near the path, the declared
+/// key rides on the first agent's commits, and a land ends its session.
+#[test]
+fn two_agents_sessions_are_visible_with_leep_who() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let stores = Stores::sqlite(&tmp.path().join("data"));
+    run_two_agents_sessions(&stores, tmp.path());
+}
+
+#[test]
+fn two_agents_sessions_are_visible_with_leep_who_postgres() {
+    let _g = serial();
+    let Some(db) = PgDb::create("leep_e2e") else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let stores = Stores::with_meta(&tmp.path().join("data"), db.url.clone());
+    run_two_agents_sessions(&stores, tmp.path());
+}
+
+fn run_two_agents_sessions(stores: &Stores, root: &Path) {
+    let server = Server::start(stores, root);
+    let client = Client::new(&server.url, &root.join("cache"));
+    let seed = root.join("seed");
+    client.ok(root, &["init", seed.to_str().unwrap()]);
+    write(&seed, "README", "hi\n");
+    client.ok(&seed, &["commit", "-m", "seed"]);
+    client.ok(&seed, &["land"]);
+    let (a, b) = (root.join("a"), root.join("b"));
+    client.ok(root, &["init", a.to_str().unwrap()]);
+    client.ok(root, &["init", b.to_str().unwrap()]);
+
+    // Agent a declares its work; the key it gets is kept in the working copy.
+    let started = client.json(
+        &a,
+        &[
+            "session",
+            "start",
+            "-t",
+            "Split the auth module",
+            "--scope",
+            "src/auth",
+            "--task",
+            "L-12",
+        ],
+    );
+    assert_eq!(started["created"], true, "{started}");
+    let a_key = started["session"]["session"].as_str().unwrap().to_string();
+    assert!(a_key.starts_with("leep-"), "{a_key}");
+
+    // Agent b commits under src/auth with its own key, without declaring.
+    write(&b, "src/auth/token.rs", "fn parse() {}\n");
+    let run_b = |args: &[&str]| {
+        let out = client
+            .cmd(&b)
+            .env("LEEP_AGENT_SESSION", "b-1")
+            .env("LEEP_AGENT_MODEL", "model-b")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_ok(&out, &format!("leep {args:?}"));
+        stdout(&out)
+    };
+    run_b(&["commit", "-m", "auth: parse tokens"]);
+
+    let who = client.json(root, &["who", "src/auth/token.rs"]);
+    let sessions = who["sessions"].as_array().unwrap();
+    let keys: Vec<&str> = sessions
+        .iter()
+        .map(|s| s["session"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, ["b-1", a_key.as_str()], "{who}");
+    assert_eq!(sessions[0]["origin"], "inferred");
+    assert_eq!(
+        sessions[0]["touched"],
+        serde_json::json!(["src/auth/token.rs"])
+    );
+    assert_eq!(sessions[0]["agent_model"], "model-b");
+    assert_eq!(sessions[0]["untrusted"]["title"], "auth: parse tokens");
+    assert_eq!(sessions[1]["origin"], "declared");
+    assert_eq!(sessions[1]["scope"], serde_json::json!(["src/auth"]));
+    let text = client.ok(&a, &["who", "src"]);
+    assert!(text.contains("b-1") && text.contains(&a_key), "{text}");
+    assert!(text.contains("(this session)"), "{text}");
+    assert!(text.contains("\"Split the auth module\""), "{text}");
+    let by_task = client.json(&b, &["who", "--task", "L-12"]);
+    assert_eq!(by_task["sessions"].as_array().unwrap().len(), 1);
+    assert!(client.ok(&a, &["who", "docs"]).contains("nobody"));
+
+    // a's commits carry its session key as agent.session.
+    write(&a, "src/auth/mod.rs", "mod token;\n");
+    client.ok(&a, &["commit", "-m", "auth: split"]);
+    let log = client.json(&a, &["log", "-n", "1"]);
+    let entry = &log["entries"][0];
+    let recorded = entry["changeset"]["extra"]["agent.session"]
+        .as_str()
+        .or_else(|| entry["agent"]["session"].as_str());
+    assert_eq!(recorded, Some(a_key.as_str()), "{log}");
+    let shown = client.json(&a, &["session", "show"]);
+    assert_eq!(shown["touched"], serde_json::json!(["src/auth/mod.rs"]));
+
+    // b lands: its session ends as landed and leaves the live list.
+    run_b(&["land"]);
+    let mut live = Vec::new();
+    for _ in 0..100 {
+        let who = client.json(&a, &["who", "src/auth"]);
+        live = who["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["session"].as_str().unwrap().to_string())
+            .collect();
+        if live.len() == 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(live, std::slice::from_ref(&a_key));
+    let all = client.json(&a, &["who", "--all", "src/auth"]);
+    let b_state = all["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session"] == "b-1")
+        .map(|s| s["state"].clone());
+    assert_eq!(b_state, Some(serde_json::json!("landed")));
+
+    // a ends its own session.
+    let ended = client.json(&a, &["session", "end"]);
+    assert_eq!(ended["state"], "abandoned");
+    assert!(client.ok(&a, &["who", "src/auth"]).contains("nobody"));
+    drop(server);
+}
