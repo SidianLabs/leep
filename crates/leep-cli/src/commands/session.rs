@@ -152,6 +152,26 @@ pub fn run(r: &Remote, cmd: &SessionCmd, wc: Option<&mut WorkCopy>) -> Result<i3
 }
 
 fn declare(r: &Remote, a: &DeclareArgs, wc: Option<&mut WorkCopy>, start: bool) -> Result<i32> {
+    let (key, resp) = declare_session(r, a, wc, start)?;
+    if r.json {
+        print_json(&resp)?;
+        return Ok(0);
+    }
+    for line in declared_lines(&key, &resp, start) {
+        outln!("{line}");
+    }
+    Ok(0)
+}
+
+/// Declare (`start`) or update the caller's session from `a`, keeping a
+/// key it made in the working copy. Answers the key and the server's
+/// answer.
+pub fn declare_session(
+    r: &Remote,
+    a: &DeclareArgs,
+    wc: Option<&mut WorkCopy>,
+    start: bool,
+) -> Result<(String, leep_core::api::DeclareSessionResponse)> {
     let key =
         match session_key(a.session.as_deref(), wc.as_deref()) {
             Some(k) => k,
@@ -201,27 +221,32 @@ fn declare(r: &Remote, a: &DeclareArgs, wc: Option<&mut WorkCopy>, start: bool) 
             wc.save_state()?;
         }
     }
-    if r.json {
-        print_json(&resp)?;
-        return Ok(0);
-    }
+    Ok((key, resp))
+}
+
+/// What `leep session start` and `update` say about the declared session.
+pub fn declared_lines(
+    key: &str,
+    resp: &leep_core::api::DeclareSessionResponse,
+    start: bool,
+) -> Vec<String> {
     let verb = match (start, resp.created) {
         (_, true) => "started",
         (true, false) => "already active,",
         (false, false) => "updated",
     };
-    outln!(
+    let mut out = vec![format!(
         "session {} {verb} as {} ({key})",
-        resp.session.id,
-        resp.session.principal
-    );
-    for line in entry_lines(&resp.session, false) {
-        outln!("{line}");
-    }
+        resp.session.id, resp.session.principal
+    )];
+    out.extend(entry_lines(&resp.session, false));
     if start {
-        outln!("Your commits here record agent.session={key}; `leep who` shows who else works near you.");
+        out.push(format!(
+            "Your commits here record agent.session={key}; `leep who` shows who else works \
+             near you."
+        ));
     }
-    Ok(0)
+    out
 }
 
 /// The caller's session of `key`, through `GET /v1/sessions?mine=true`.
@@ -358,7 +383,7 @@ fn overlaps(r: &Remote, wc: Option<&WorkCopy>) -> Result<i32> {
 
 /// A server-written word (a level, a `by`) as it is when it is a plain
 /// word, else quoted and escaped.
-fn word(w: &str) -> String {
+pub fn word(w: &str) -> String {
     if !w.is_empty() && w.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
         w.to_string()
     } else {

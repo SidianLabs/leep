@@ -886,6 +886,11 @@ impl Client {
         Ok(r)
     }
 
+    /// `POST /v1/context` (ADR 0097): a context pack for a task.
+    pub fn context(&self, req: &ContextRequest) -> Result<ContextPack> {
+        self.json(self.http.post(self.url("/v1/context")).json(req))
+    }
+
     /// `GET /v1/sessions/{id}/overlaps`.
     pub fn session_overlaps(&self, id: u64) -> Result<OverlapsResponse> {
         self.json(
