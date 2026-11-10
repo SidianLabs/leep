@@ -440,7 +440,7 @@ impl Repo {
         };
         let me = self.context_session(ask, &c, session.clone(), session_key, &task_text);
         let section_until = || deadline.min(Instant::now() + SECTION_BOUND);
-        let (owners, history, in_flight, health, dups) = tokio::join!(
+        let (owners, history, (in_flight, dups), health) = tokio::join!(
             bounded(
                 "owners",
                 section_until(),
@@ -451,13 +451,12 @@ impl Repo {
                 section_until(),
                 self.context_history(head, &detail)
             ),
-            self.context_in_flight(&me, &c.paths, &paths, section_until()),
+            self.context_live(&me, &c.paths, &paths, section_until()),
             bounded(
                 "ref_health",
                 section_until(),
                 self.context_ref_health(ask, &c.target_ref, &paths)
             ),
-            self.context_duplicates(&me, section_until()),
         );
         let owners = take(&mut omitted, "owners", owners);
         let history = take(&mut omitted, "history", history);
@@ -887,46 +886,56 @@ impl Repo {
             .collect())
     }
 
-    /// Live work overlapping the request's paths and the session's own,
-    /// each other session once at its highest level, then work met only on
-    /// the pack's other files (`via: related`), plus lands on the target
-    /// ref since the session's base. Nothing is marked said. The path and
-    /// `landed` parts are bounded together.
-    async fn context_in_flight(
+    /// The `in_flight` and `duplicates` sections. In flight: live work
+    /// overlapping the request's paths and the session's own, each other
+    /// session once at its highest level, then work met only on the pack's
+    /// other files (`via: related`), plus lands on the target ref since the
+    /// session's base. Duplicates: live sessions with the same task key, or
+    /// a title and approach much like the task (ADR 0096). The sessions of
+    /// the task key are read once for both: they are the duplicates by key
+    /// and tag a duplicate's land; when that read fails, lands go untagged
+    /// and only `duplicates` is omitted. Nothing is marked said.
+    async fn context_live(
         &self,
         s: &Session,
         own: &[String],
         related: &[String],
         until: Instant,
-    ) -> Part<Vec<ContextWork>> {
+    ) -> (Part<Vec<ContextWork>>, Part<Vec<ContextWork>>) {
         if self.coord.is_none() {
-            return Err(Omit::Off);
+            return (Err(Omit::Off), Err(Omit::Off));
         }
-        let work = async {
-            let (p, l, keyed) = tokio::join!(
-                self.path_overlaps(s, own, related),
-                self.landed_overlaps(s),
-                self.key_sessions(s)
-            );
-            let mut landed = l?;
-            crate::notices::tag_duplicate_lands(s, &mut landed, &keyed?);
-            let mut found = p?;
-            found.extend(landed);
-            found.sort_by_key(|f| std::cmp::Reverse(crate::notices::rank(f)));
-            Ok(one_per_session(found))
+        let (p, l, keyed, similar) = tokio::join!(
+            bounded("in_flight", until, self.path_overlaps(s, own, related)),
+            bounded("in_flight", until, self.landed_overlaps(s)),
+            bounded("duplicates", until, self.key_sessions(s)),
+            bounded("duplicates", until, self.similar_duplicates(s)),
+        );
+        let in_flight = match (p, l) {
+            (Ok(mut found), Ok(mut landed)) => {
+                if let Ok(k) = &keyed {
+                    crate::notices::tag_duplicate_lands(s, &mut landed, k);
+                }
+                found.extend(landed);
+                found.sort_by_key(|f| std::cmp::Reverse(crate::notices::rank(f)));
+                Ok(works(one_per_session(found), MAX_OVERLAPS))
+            }
+            (Err(o), _) | (_, Err(o)) => Err(o),
         };
-        let found = bounded("in_flight", until, work).await?;
-        Ok(works(found, MAX_OVERLAPS))
-    }
-
-    /// Live sessions that may be doing this task: the same task key, or a
-    /// title and approach much like the task (ADR 0096).
-    async fn context_duplicates(&self, s: &Session, until: Instant) -> Part<Vec<ContextWork>> {
-        if self.coord.is_none() {
-            return Err(Omit::Off);
-        }
-        let found = bounded("duplicates", until, self.duplicates(s)).await?;
-        Ok(works(found, MAX_DUPLICATES))
+        let duplicates = match (keyed, similar) {
+            (Ok(k), Ok(similar)) => {
+                let mut out = crate::notices::key_duplicates(s, &k);
+                let flagged: BTreeSet<u64> = out.iter().filter_map(|f| f.notice.session).collect();
+                out.extend(
+                    similar
+                        .into_iter()
+                        .filter(|f| f.notice.session.is_none_or(|id| !flagged.contains(&id))),
+                );
+                Ok(works(out, MAX_DUPLICATES))
+            }
+            (Err(o), _) | (_, Err(o)) => Err(o),
+        };
+        (in_flight, duplicates)
     }
 
     /// The ref's known-good state and red, and the suspects of a red head

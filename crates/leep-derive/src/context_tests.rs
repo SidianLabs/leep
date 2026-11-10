@@ -1043,3 +1043,51 @@ async fn identical_owners_and_history_rows_are_one_item() {
         serde_json::to_vec(&again).unwrap()
     );
 }
+
+/// A coordination store whose task-key listings fail and the rest answer.
+struct KeyListingFails(MemoryCoordStore);
+
+#[async_trait]
+impl CoordStore for KeyListingFails {
+    async fn upsert_session(&self, u: &SessionUpdate) -> Result<(Session, bool)> {
+        self.0.upsert_session(u).await
+    }
+    async fn get_session(&self, id: u64) -> Result<Option<Session>> {
+        self.0.get_session(id).await
+    }
+    async fn list_sessions(&self, f: &SessionFilter) -> Result<Vec<Session>> {
+        if f.task_key.is_some() {
+            return Err(Error::Storage("task-key index down".into()));
+        }
+        self.0.list_sessions(f).await
+    }
+    async fn end_session(&self, id: u64, e: &SessionEnd) -> Result<bool> {
+        self.0.end_session(id, e).await
+    }
+    async fn beat_sessions(&self, b: &[Beat]) -> Result<u64> {
+        self.0.beat_sessions(b).await
+    }
+    async fn sweep_sessions(&self, now: i64, limit: usize) -> Result<SweepReport> {
+        self.0.sweep_sessions(now, limit).await
+    }
+    async fn count_sessions(&self, s: SessionState, cap: usize) -> Result<u64> {
+        self.0.count_sessions(s, cap).await
+    }
+    async fn near_paths(&self, q: &NearQuery) -> Result<Vec<NearRow>> {
+        self.0.near_paths(q).await
+    }
+}
+
+/// A failed task-key listing costs the pack its duplicates, never its live
+/// work: the in-flight section still lists the session on the file.
+#[tokio::test]
+async fn a_failed_task_key_listing_keeps_live_work() {
+    let r = repo().with_coord(Some(Arc::new(KeyListingFails(MemoryCoordStore::new()))));
+    busy_repo(&r).await;
+    let mut a = ask("dee", "Make `parse_token` faster", &["src/auth/token.rs"]);
+    a.req.task_key = Some("T-9".into());
+    let p = r.context_pack(&a).await.unwrap();
+    assert_eq!(omitted(&p), [("duplicates", "error")]);
+    assert_eq!(p.in_flight.len(), 1, "{p:?}");
+    assert_eq!(p.in_flight[0].notice.principal.as_deref(), Some("cy"));
+}

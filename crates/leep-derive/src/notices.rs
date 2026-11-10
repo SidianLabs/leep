@@ -924,22 +924,6 @@ impl Repo {
         Ok((!bases.is_empty()).then_some((bases, own)))
     }
 
-    /// Live sessions that look like `s`'s task: the same task key, or an
-    /// intent (title and approach) at least [`SIMILAR_PERCENT`] alike by
-    /// trigrams among the [`DUPLICATE_CANDIDATES`] newest active sessions
-    /// (declared ones only, on both sides).
-    pub(crate) async fn duplicates(&self, s: &Session) -> Result<Vec<Found>> {
-        let mut out = key_duplicates(s, &self.key_sessions(s).await?);
-        let flagged: BTreeSet<u64> = out.iter().filter_map(|f| f.notice.session).collect();
-        out.extend(
-            self.similar_duplicates(s)
-                .await?
-                .into_iter()
-                .filter(|f| f.notice.session.is_none_or(|id| !flagged.contains(&id))),
-        );
-        Ok(out)
-    }
-
     /// Sessions with `s`'s task key, live or landed, newest first, at
     /// most [`KEY_SESSIONS`]: one indexed listing, none without a key.
     /// Live ones are duplicates; landed ones tell a duplicate's land.
