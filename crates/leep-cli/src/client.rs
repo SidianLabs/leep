@@ -982,6 +982,15 @@ impl Client {
         )
     }
 
+    /// `POST /v1/notes/{id}/endorse`: a human owner vouches for it.
+    pub fn endorse_note(&self, id: u64) -> Result<NoteEntry> {
+        self.json(
+            self.http
+                .post(self.url(&format!("/v1/notes/{id}/endorse")))
+                .json(&serde_json::json!({})),
+        )
+    }
+
     pub fn whoami(&self) -> Result<WhoAmIResponse> {
         self.json(self.http.get(self.url("/v1/whoami")))
     }

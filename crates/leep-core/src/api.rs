@@ -47,12 +47,13 @@
 //! | DELETE | `/v1/sessions/{id}` | – | [`SessionEntry`] (ends it as `abandoned`; only its principal may, 403 otherwise; an ended session is answered as it is) |
 //! | GET  | `/v1/sessions/{id}/overlaps` | – | [`OverlapsResponse`] (every overlap of the session now, every level, highest first, at most 50; 404 if unknown; ADR 0096) |
 //! | GET  | `/v1/notices` | – | [`NoticesResponse`] (notices for the caller's session named by `Leep-Session`, at most 3, each said once; empty without the header; ADR 0096) |
-//! | POST | `/v1/context` | [`ContextRequest`] | [`ContextPack`] (what the server knows that bears on a task, assembled without a model: files (the request's paths, files where the task's identifiers occur, files that changed with the paths), owners and `carry` directives, the newest change to each file and who made it, live work overlapping them, the ref's known-good state and suspects touching them, possible duplicates of the task; deterministic; cut to `budget_bytes` by per-section quotas, `cut` saying what was left out; a part that fails or runs out of time is listed in `omitted` and the rest still comes; a read: a read token may call it, and it marks no notice said; 404 if `ref` does not exist; ADR 0097) |
+//! | POST | `/v1/context` | [`ContextRequest`] | [`ContextPack`] (what the server knows that bears on a task, assembled without a model: files (the request's paths, files where the task's identifiers occur, files that changed with the paths), owners and `carry` directives, the newest change to each file and who made it, live work overlapping them, the ref's known-good state and suspects touching them, possible duplicates of the task, notes on the files and the directories above them (ADR 0098: endorsed, then human, then agent; stale agent notes left out; agent notes as titles only); deterministic; cut to `budget_bytes` by per-section quotas, `cut` saying what was left out; a part that fails or runs out of time is listed in `omitted` and the rest still comes; a read: a read token may call it, and it marks no notice said; 404 if `ref` does not exist; ADR 0097) |
 //! | POST | `/v1/notes` | [`AddNoteRequest`] | [`NoteEntry`] (a note on a path or changeset, written by the caller's token: `trust` is `human` for a `"kind": "human"` token, else `agent`; a path anchor is resolved at `at` (default the caller's session's target ref, else the default ref) and must exist there; 400 `too_many_notes` past 200 open notes of the principal, 429 `rate_limited` past 30 in an hour; `supersedes` replaces an open note of the caller's (403 another's, 409 one not open); needs a write token; 404 if notes are off; ADR 0098) |
-//! | GET  | `/v1/notes?path=p&changeset=id&principal=n&mine=bool&state=s&all=bool&before=id&limit=n` | – | [`NotesResponse`] (newest first; `path` matches notes on `p` and on directories above it; `state` one state, default `open`; `all=true` every state; `limit` 50, at most 100; title, body and anchor only under `untrusted`; ADR 0098) |
+//! | GET  | `/v1/notes?path=p&changeset=id&principal=n&mine=bool&state=s&all=bool&before=id&limit=n&ref=r` | – | [`NotesResponse`] (newest first; `path` matches notes on `p` and on directories above it; `state` one state, default `open`; `all=true` every state; `limit` 50, at most 100; title, body and anchor only under `untrusted`; `stale` and `endorsed` judged at `ref`'s head (default the server's default ref; 404 if a named ref does not exist), by the same function as the context pack's notes; ADR 0098) |
 //! | GET  | `/v1/notes/{id}` | – | [`NoteEntry`] (404 if unknown) |
 //! | DELETE | `/v1/notes/{id}` | – | [`NoteEntry`] (retracts it; only its principal may, 403 otherwise; a closed note is answered as it is) |
-//! | POST | `/v1/notes/{id}/report` | `{}` | [`ReportNoteResponse`] (an open agent note nobody endorsed is hidden at once; any other is only counted) |
+//! | POST | `/v1/notes/{id}/report` | `{}` | [`ReportNoteResponse`] (an open agent note nobody endorsed is hidden at once; a human or endorsed note is hidden only when the reporter is a human owner of its path (as for endorsing), otherwise only counted) |
+//! | POST | `/v1/notes/{id}/endorse` | `{}` | [`NoteEntry`] (a human owner vouches for an open, fresh path note: the token must be `kind: human`, may review, must be named by `OWNERS` for the anchor at the default ref's head, and must not be the note's writer (403 otherwise); a closed, expired or stale note is 409; once endorsed the note no longer expires, and the endorsement lapses while the note is stale; an endorsed note is answered as it is; ADR 0098) |
 //! | POST | `/v1/merge` | [`MergeRequest`] | [`MergeResponse`] |
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
 //! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`], sent as [`LandAnswer`] with `notices` beside it (ADR 0096) (`create: false` refuses to create a missing `target_ref` with 404; absent creates it, as before; ADR 0036. `land_id` makes retries idempotent at any age; ADR 0057) |
@@ -1396,9 +1397,24 @@ pub struct NoteEntry {
     pub kind: String,
     /// `agent` or `human`: the writer's token kind, fixed when written.
     pub trust: String,
-    /// The owner who endorsed it, if any.
+    /// The human owner who endorsed it, if one did (kept for audit even
+    /// once the endorsement has lapsed; `endorsed` says whether it holds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endorsed_by: Option<String>,
+    /// Unix seconds of the endorsement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endorsed_at: Option<i64>,
+    /// Whether the endorsement holds now: the note is open, endorsed and
+    /// checked not stale. A stale note is never served as endorsed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub endorsed: bool,
+    /// Whether the anchor changed since the note was written (ADR 0098): a
+    /// file whose content at the ref's head differs from what the note was
+    /// written against, or a path that is gone. Absent when unknown (not
+    /// checked, or its tree could not be read). Changeset anchors are
+    /// never stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<bool>,
     /// `open`, `superseded`, `retracted`, `reported`, or `expired` (open
     /// past `expires`, not yet swept).
     pub state: String,
@@ -1656,6 +1672,52 @@ impl ContextPack {
     }
 }
 
+/// What a note's writer wrote, as a pack repeats it: untrusted text.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextNoteText {
+    /// The path the note is on: a pack file, or a directory above some.
+    #[serde(default)]
+    pub anchor: String,
+    /// The title; an agent's, or a stale one, cut to 80 bytes.
+    #[serde(default)]
+    pub title: String,
+    /// The body, for an endorsed or a fresh human note only, cut to 1 KiB.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub body: String,
+    /// For a note on a directory: the pack's files below it, in pack order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+}
+
+/// A note on a file of the pack (ADR 0098). The server vouches for
+/// everything outside `untrusted`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextNote {
+    /// `note:` and the note's number.
+    pub id: String,
+    pub bytes: u64,
+    /// The note's number, for `GET /v1/notes/{id}`.
+    pub note: u64,
+    /// `finding`, `gotcha`, `decision` or `howto`.
+    pub kind: String,
+    /// `agent` or `human`: the writer's token kind.
+    pub trust: String,
+    /// The human owner whose endorsement holds now; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endorsed_by: Option<String>,
+    /// As on [`NoteEntry`]: absent when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<bool>,
+    /// Token name of the writer.
+    pub principal: String,
+    pub created: i64,
+    /// Whether the title or body was cut or the body left out: the whole
+    /// note is one `GET /v1/notes/{id}` away.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub more: bool,
+    pub untrusted: ContextNoteText,
+}
+
 /// Items of a section left out to keep within the budget.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextCut {
@@ -1698,6 +1760,11 @@ pub struct ContextPack {
     pub ref_health: Option<ContextRefHealth>,
     #[serde(default)]
     pub duplicates: Vec<ContextWork>,
+    /// Notes other agents and people left on the pack's files and the
+    /// directories above them (ADR 0098), ranked; absent from older
+    /// servers.
+    #[serde(default)]
+    pub notes: Vec<ContextNote>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cut: Vec<ContextCut>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2481,6 +2548,9 @@ mod tests {
             kind: "gotcha".into(),
             trust: "agent".into(),
             endorsed_by: None,
+            endorsed_at: None,
+            endorsed: false,
+            stale: None,
             state: "open".into(),
             principal: "ada".into(),
             anchor_type: "path".into(),
@@ -2507,6 +2577,28 @@ mod tests {
                 "created": 1, "expires": 2, "bytes": 1,
                 "untrusted": { "title": "t", "anchor": "src/a.rs" }
             })
+        );
+        // Staleness and endorsement (the second change): additive, absent
+        // when unknown or not endorsed.
+        let mut endorsed = e.clone();
+        endorsed.endorsed_by = Some("hugo".into());
+        endorsed.endorsed_at = Some(5);
+        endorsed.endorsed = true;
+        endorsed.stale = Some(false);
+        let v = serde_json::to_value(&endorsed).unwrap();
+        assert_eq!(
+            (
+                &v["endorsed_by"],
+                &v["endorsed_at"],
+                &v["endorsed"],
+                &v["stale"]
+            ),
+            (
+                &serde_json::json!("hugo"),
+                &serde_json::json!(5),
+                &serde_json::json!(true),
+                &serde_json::json!(false)
+            )
         );
         let back: NotesResponse = serde_json::from_value(serde_json::json!({
             "notes": [{
@@ -3789,6 +3881,7 @@ mod tests {
             }))
             .unwrap();
             assert!(pack.files.is_empty() && pack.ref_health.is_none() && pack.omitted.is_empty());
+            assert!(pack.notes.is_empty(), "older servers send no notes");
             let text = ContextText {
                 path: Some("src/a.rs".into()),
                 ..Default::default()
@@ -3851,6 +3944,24 @@ mod tests {
                         untrusted: text.clone(),
                     }],
                 }),
+                notes: vec![ContextNote {
+                    id: "note:7".into(),
+                    bytes: 10,
+                    note: 7,
+                    kind: "gotcha".into(),
+                    trust: "human".into(),
+                    endorsed_by: Some("hugo".into()),
+                    stale: Some(false),
+                    principal: "ada".into(),
+                    created: 1,
+                    more: true,
+                    untrusted: ContextNoteText {
+                        anchor: "src".into(),
+                        title: "t".into(),
+                        body: "b".into(),
+                        paths: vec!["src/a.rs".into()],
+                    },
+                }],
                 cut: vec![ContextCut {
                     section: "files".into(),
                     items: 1,
@@ -3876,10 +3987,32 @@ mod tests {
                     "in_flight",
                     "ref_health",
                     "duplicates",
+                    "notes",
                     "cut",
                     "omitted",
                 ],
                 "ContextPack",
+            );
+            assert_has(
+                &v["notes"][0],
+                &[
+                    "id",
+                    "bytes",
+                    "note",
+                    "kind",
+                    "trust",
+                    "endorsed_by",
+                    "stale",
+                    "principal",
+                    "created",
+                    "more",
+                    "untrusted",
+                ],
+                "ContextNote",
+            );
+            assert_eq!(
+                v["notes"][0]["untrusted"],
+                json!({ "anchor": "src", "title": "t", "body": "b", "paths": ["src/a.rs"] })
             );
             assert_has(
                 &v["files"][0],

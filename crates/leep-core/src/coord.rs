@@ -1198,13 +1198,19 @@ pub enum NoteChange {
     Retract { by: String },
     /// `by` reports it: an agent-tier note that nobody endorsed becomes
     /// `reported` (hidden), recording `by` and the time; any other is left
-    /// as it is. Refused with [`reports_per_hour`] when `by` already hid
+    /// as it is unless `owner` (the caller checked that `by` is a human
+    /// owner of its anchor), which hides a human or endorsed note too.
+    /// Refused with [`reports_per_hour`] when `by` already hid
     /// `max_per_hour` notes in the last hour.
-    Report { by: String, max_per_hour: usize },
+    Report {
+        by: String,
+        max_per_hour: usize,
+        owner: bool,
+    },
     /// An operator withdraws it, whoever wrote it: `retracted`.
     Revoke,
-    /// An owner vouches for it: sets `endorsed_by` and `endorsed_at`, and
-    /// it no longer expires; once only.
+    /// A human owner vouches for it (the caller checked who may): sets
+    /// `endorsed_by` and `endorsed_at`, and it no longer expires; once only.
     Endorse { by: String },
 }
 
@@ -1364,8 +1370,9 @@ pub trait CoordStore: Send + Sync {
 
     /// An operator's undo of reports: open again the reported note `id`, or
     /// every note `reporter` hid, clearing `reported_by` and `reported_at`
-    /// and giving back an agent note's life (`created` plus
-    /// [`AGENT_NOTE_TTL_SECS`]). One statement; answers how many.
+    /// and giving back the life it had: none for an endorsed note,
+    /// `created` plus [`HUMAN_NOTE_TTL_SECS`] for a human one, plus
+    /// [`AGENT_NOTE_TTL_SECS`] otherwise. One statement; answers how many.
     async fn unreport_notes(&self, id: Option<u64>, reporter: Option<&str>) -> Result<u64>;
 
     /// One bounded step of the note sweep at `now`: delete up to `limit`

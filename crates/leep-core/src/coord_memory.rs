@@ -49,7 +49,9 @@ pub(crate) fn changed_note(n: &Note, change: &NoteChange, at: i64) -> Option<Not
     };
     match change {
         NoteChange::Retract { by } if *by == n.principal => close(&mut n, NoteState::Retracted),
-        NoteChange::Report { by, .. } if n.trust == NoteTrust::Agent && n.endorsed_by.is_none() => {
+        NoteChange::Report { by, owner, .. }
+            if *owner || (n.trust == NoteTrust::Agent && n.endorsed_by.is_none()) =>
+        {
             close(&mut n, NoteState::Reported);
             n.reported_by = Some(by.clone());
             n.reported_at = Some(at);
@@ -372,7 +374,10 @@ impl CoordStore for MemoryCoordStore {
 
     async fn change_note(&self, id: u64, change: &NoteChange, at: i64) -> Result<bool> {
         let mut rows = self.rows.lock().unwrap();
-        if let NoteChange::Report { by, max_per_hour } = change {
+        if let NoteChange::Report {
+            by, max_per_hour, ..
+        } = change
+        {
             let hid = rows
                 .notes
                 .values()
@@ -422,7 +427,11 @@ impl CoordStore for MemoryCoordStore {
                 n.state = NoteState::Open;
                 n.reported_by = None;
                 n.reported_at = None;
-                n.expires = Some(n.created + crate::coord::AGENT_NOTE_TTL_SECS);
+                n.expires = match (&n.endorsed_by, n.trust) {
+                    (Some(_), _) => None,
+                    (None, NoteTrust::Human) => Some(n.created + crate::coord::HUMAN_NOTE_TTL_SECS),
+                    (None, NoteTrust::Agent) => Some(n.created + crate::coord::AGENT_NOTE_TTL_SECS),
+                };
                 count += 1;
             }
         }
@@ -1256,6 +1265,7 @@ pub async fn check_notes_contract(store: &dyn CoordStore) {
     let report = NoteChange::Report {
         by: "rex".into(),
         max_per_hour: 2,
+        owner: false,
     };
     assert!(!store.change_note(dir.id, &report, at1).await.unwrap());
     assert_eq!(
@@ -1306,6 +1316,7 @@ pub async fn check_notes_contract(store: &dyn CoordStore) {
     let other = NoteChange::Report {
         by: "rae".into(),
         max_per_hour: 5,
+        owner: false,
     };
     assert!(store.change_note(dying.id, &other, at1).await.unwrap());
     assert_eq!(
@@ -1323,6 +1334,36 @@ pub async fn check_notes_contract(store: &dyn CoordStore) {
         (Some("hugo"), Some(at1), None)
     );
     assert!(!store.change_note(below.id, &other, at1).await.unwrap());
+    // An owner's report (the caller checked ownership) hides an endorsed
+    // note and a human one; the undo gives each back the life it had:
+    // none once endorsed, a human note's from its creation.
+    let by_owner = NoteChange::Report {
+        by: "olga".into(),
+        max_per_hour: 5,
+        owner: true,
+    };
+    for n in [below.id, dir.id] {
+        assert!(store.change_note(n, &by_owner, at1).await.unwrap());
+        let hid = store.get_note(n).await.unwrap().unwrap();
+        assert_eq!(
+            (hid.state, hid.reported_by.as_deref()),
+            (NoteState::Reported, Some("olga"))
+        );
+    }
+    assert_eq!(store.unreport_notes(None, Some("olga")).await.unwrap(), 2);
+    let e = store.get_note(below.id).await.unwrap().unwrap();
+    assert_eq!(
+        (e.state, e.endorsed_by.as_deref(), e.expires),
+        (NoteState::Open, Some("hugo"), None)
+    );
+    let h = store.get_note(dir.id).await.unwrap().unwrap();
+    assert_eq!(
+        (h.state, h.expires),
+        (
+            NoteState::Open,
+            Some(h.created + crate::coord::HUMAN_NOTE_TTL_SECS)
+        )
+    );
     // An operator's mass revoke: every open note of one principal.
     assert_eq!(store.revoke_notes("eve", at1).await.unwrap(), 1);
     assert_eq!(store.revoke_notes("eve", at1).await.unwrap(), 0);

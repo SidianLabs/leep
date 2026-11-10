@@ -23,8 +23,9 @@ use leep_core::coord::{
     reports_per_hour, too_many_notes, AnchorType, Beat, CoordStore, NearQuery, NearRow, NewNote,
     Note, NoteChange, NoteFilter, NoteKind, NoteState, NoteSweep, NoteTrust, PathKind, Session,
     SessionEnd, SessionFilter, SessionOrigin, SessionState, SessionUpdate, SweepReport,
-    AGENT_NOTE_TTL_SECS, CLOSED_NOTE_RETENTION_SECS, EXPIRE_AFTER_SECS, NOTE_DAY_WINDOW_SECS,
-    NOTE_RATE_WINDOW_SECS, PATHS_RETENTION_SECS, SESSION_RETENTION_SECS, TOO_MANY_SESSIONS_MARKER,
+    AGENT_NOTE_TTL_SECS, CLOSED_NOTE_RETENTION_SECS, EXPIRE_AFTER_SECS, HUMAN_NOTE_TTL_SECS,
+    NOTE_DAY_WINDOW_SECS, NOTE_RATE_WINDOW_SECS, PATHS_RETENTION_SECS, SESSION_RETENTION_SECS,
+    TOO_MANY_SESSIONS_MARKER,
 };
 use leep_core::{ChangesetId, Error, Result};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Sqlite, SqlitePool};
@@ -308,9 +309,10 @@ macro_rules! change_note {
             NoteChange::Retract { by } => {
                 q.push(" AND principal = ").push_bind(by.clone());
             }
-            NoteChange::Report { .. } => {
+            NoteChange::Report { owner: false, .. } => {
                 q.push(" AND trust = 'agent' AND endorsed_by IS NULL");
             }
+            NoteChange::Report { owner: true, .. } => {}
             NoteChange::Revoke => {}
             NoteChange::Endorse { .. } => {
                 q.push(" AND endorsed_by IS NULL");
@@ -1005,7 +1007,10 @@ impl CoordStore for PgCoordStore {
         if !self.notes {
             return Err(no_notes());
         }
-        let NoteChange::Report { by, max_per_hour } = change else {
+        let NoteChange::Report {
+            by, max_per_hour, ..
+        } = change
+        else {
             let n = change_note!(Postgres, id, change, at)
                 .build()
                 .execute(self.pool("note_change"))
@@ -1063,12 +1068,14 @@ impl CoordStore for PgCoordStore {
         }
         Ok(sqlx::query(
             "UPDATE notes SET state = 'open', reported_by = NULL, reported_at = NULL, \
-             expires = created + $1 WHERE repo_id = 1 AND state = 'reported' \
-             AND (id = $2 OR reported_by = $3)",
+             expires = CASE WHEN endorsed_by IS NOT NULL THEN NULL \
+             WHEN trust = 'human' THEN created + $4 ELSE created + $1 END \
+             WHERE repo_id = 1 AND state = 'reported' AND (id = $2 OR reported_by = $3)",
         )
         .bind(AGENT_NOTE_TTL_SECS)
         .bind(id.map(to_i64))
         .bind(reporter)
+        .bind(HUMAN_NOTE_TTL_SECS)
         .execute(self.pool("note_unreport"))
         .await
         .map_err(storage)?
@@ -1718,7 +1725,10 @@ impl CoordStore for SqliteCoordStore {
         if !self.notes {
             return Err(no_notes());
         }
-        let NoteChange::Report { by, max_per_hour } = change else {
+        let NoteChange::Report {
+            by, max_per_hour, ..
+        } = change
+        else {
             let n = change_note!(Sqlite, id, change, at)
                 .build()
                 .execute(self.pool("note_change"))
@@ -1779,12 +1789,14 @@ impl CoordStore for SqliteCoordStore {
         }
         Ok(sqlx::query(
             "UPDATE notes SET state = 'open', reported_by = NULL, reported_at = NULL, \
-             expires = created + ?1 WHERE repo_id = 1 AND state = 'reported' \
-             AND (id = ?2 OR reported_by = ?3)",
+             expires = CASE WHEN endorsed_by IS NOT NULL THEN NULL \
+             WHEN trust = 'human' THEN created + ?4 ELSE created + ?1 END \
+             WHERE repo_id = 1 AND state = 'reported' AND (id = ?2 OR reported_by = ?3)",
         )
         .bind(AGENT_NOTE_TTL_SECS)
         .bind(id.map(to_i64))
         .bind(reporter)
+        .bind(HUMAN_NOTE_TTL_SECS)
         .execute(self.pool("note_unreport"))
         .await
         .map_err(storage)?

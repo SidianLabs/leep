@@ -740,3 +740,188 @@ async fn reports_are_attributed_capped_and_undone() {
     );
     assert_eq!(api.list("").await.notes.len(), MAX_REPORTS_PER_HOUR);
 }
+
+/// Land `files` on `main` over its head.
+async fn land_files(repo: &Repo, files: &[(&str, &str)]) -> ChangesetId {
+    let head = repo.meta().get_ref("main").await.unwrap();
+    let mut changes = BTreeMap::new();
+    for (p, body) in files {
+        changes.insert(
+            RepoPath::new(*p).unwrap(),
+            FileChange::Modify {
+                content: repo.put_blob(Bytes::from(body.to_string())).await.unwrap(),
+                kind: FileKind::Regular,
+                size: body.len() as u64,
+            },
+        );
+    }
+    let cs = Changeset {
+        parents: head.into_iter().collect(),
+        author: "alice".into(),
+        timestamp: 1_700_000_001,
+        message: "more".into(),
+        changes,
+        extra: Default::default(),
+    };
+    let id = repo.create_changeset(cs).await.unwrap();
+    assert!(repo.meta().cas_ref("main", head, Some(id)).await.unwrap());
+    id
+}
+
+/// `POST /v1/notes/{id}/endorse` (ADR 0098): only a person's token that
+/// OWNERS names may, never the note's writer, an agent's token (even an
+/// owner's), a read token or an open server; a closed or stale note is
+/// 409. An endorsement shows in listings and packs, and lapses when the
+/// file changes.
+#[tokio::test]
+async fn endorsement_is_for_human_owners() {
+    let api = Api::new(true).await;
+    land_files(&api.repo, &[("src/OWNERS", "hugo\nalice\n")]).await;
+    let endorse = |id: u64, tok: Option<String>| {
+        let api = &api;
+        async move {
+            api.call(
+                Method::POST,
+                &format!("/v1/notes/{id}/endorse"),
+                tok.as_deref(),
+                None,
+                b"{}".to_vec(),
+            )
+            .await
+        }
+    };
+    let n: NoteEntry = api
+        .add("bob", note("src/auth/token.rs", "Take the lock first"))
+        .await
+        .ok();
+    for (who, status) in [
+        (Some(token("alice")), StatusCode::FORBIDDEN), // an owner, but an agent's token
+        (Some(token("bob")), StatusCode::FORBIDDEN),   // the writer
+        (Some(VIEWER.to_string()), StatusCode::FORBIDDEN), // read only
+        (None, StatusCode::UNAUTHORIZED),
+    ] {
+        let r = endorse(n.id, who.clone()).await;
+        assert_eq!(r.status, status, "{who:?}: {}", r.text());
+    }
+    let mine: NoteEntry = api
+        .add("hugo", note("src/auth/token.rs", "My own"))
+        .await
+        .ok();
+    assert_eq!(
+        endorse(mine.id, Some(token("hugo"))).await.status,
+        StatusCode::FORBIDDEN
+    );
+    let on_docs: NoteEntry = api.add("bob", note("docs/a.md", "unowned")).await.ok();
+    assert_eq!(
+        endorse(on_docs.id, Some(token("hugo"))).await.status,
+        StatusCode::FORBIDDEN,
+        "nobody owns docs/"
+    );
+    let closed: NoteEntry = api.add("bob", note("src/auth/token.rs", "gone")).await.ok();
+    api.call(
+        Method::DELETE,
+        &format!("/v1/notes/{}", closed.id),
+        Some(&token("bob")),
+        None,
+        vec![],
+    )
+    .await
+    .ok::<NoteEntry>();
+    assert_eq!(
+        endorse(closed.id, Some(token("hugo"))).await.status,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        endorse(999_999, Some(token("hugo"))).await.status,
+        StatusCode::NOT_FOUND
+    );
+
+    let e: NoteEntry = endorse(n.id, Some(token("hugo"))).await.ok();
+    assert_eq!(
+        (e.endorsed_by.as_deref(), e.endorsed, e.stale, e.expires),
+        (Some("hugo"), true, Some(false), None)
+    );
+    let listed = api.list("?path=src/auth/token.rs").await;
+    let l = listed.notes.iter().find(|x| x.id == n.id).unwrap();
+    assert!(l.endorsed && l.stale == Some(false));
+    let pack: ContextPack = api
+        .call(
+            Method::POST,
+            "/v1/context",
+            Some(VIEWER),
+            None,
+            json!({ "task": "fix the token", "paths": ["src/auth/token.rs"] })
+                .to_string()
+                .into(),
+        )
+        .await
+        .ok();
+    assert_eq!(pack.notes[0].note, n.id);
+    assert_eq!(pack.notes[0].endorsed_by.as_deref(), Some("hugo"));
+    // The file changes: the endorsement lapses (kept for audit), and the
+    // stale agent note leaves the pack.
+    land_files(&api.repo, &[("src/auth/token.rs", "v2\n")]).await;
+    let listed = api.list("?path=src/auth/token.rs").await;
+    let l = listed.notes.iter().find(|x| x.id == n.id).unwrap();
+    assert_eq!(
+        (l.endorsed, l.stale, l.endorsed_by.as_deref()),
+        (false, Some(true), Some("hugo"))
+    );
+    let fresh: NoteEntry = api
+        .add("bob", note("src/auth/token.rs", "after v2"))
+        .await
+        .ok();
+    land_files(&api.repo, &[("src/auth/token.rs", "v3\n")]).await;
+    assert_eq!(
+        endorse(fresh.id, Some(token("hugo"))).await.status,
+        StatusCode::CONFLICT,
+        "a stale note"
+    );
+    let pack: ContextPack = api
+        .call(
+            Method::POST,
+            "/v1/context",
+            Some(VIEWER),
+            None,
+            json!({ "task": "fix the token", "paths": ["src/auth/token.rs"] })
+                .to_string()
+                .into(),
+        )
+        .await
+        .ok();
+    assert!(
+        !pack
+            .notes
+            .iter()
+            .any(|x| x.note == n.id || x.note == fresh.id),
+        "{:?}",
+        pack.notes
+    );
+    assert!(
+        pack.notes.iter().any(|x| x.note == mine.id),
+        "a human note stays"
+    );
+
+    // An open server has no people: nobody may endorse.
+    let open = Api::new(false).await;
+    let n: NoteEntry = open
+        .call(
+            Method::POST,
+            "/v1/notes",
+            None,
+            None,
+            note("docs/a.md", "x").to_string().into(),
+        )
+        .await
+        .ok();
+    let r = open
+        .call(
+            Method::POST,
+            &format!("/v1/notes/{}/endorse", n.id),
+            None,
+            None,
+            b"{}".to_vec(),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+}

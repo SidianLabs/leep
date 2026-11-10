@@ -23,7 +23,7 @@ use crate::context::{ContextAsk, CONTEXT_BOUND};
 use crate::notices::NoticeAsk;
 use crate::Repo;
 
-fn repo() -> Repo {
+pub(crate) fn repo() -> Repo {
     Repo::new(
         Arc::new(MemoryBlobStore::new()),
         Arc::new(MemoryMetaStore::new()),
@@ -32,7 +32,7 @@ fn repo() -> Repo {
 
 /// Land a changeset of `files` (path, content) on `main` as `who`, with
 /// `message` and the agent `model`.
-async fn land(
+pub(crate) async fn land(
     r: &Repo,
     who: &str,
     model: &str,
@@ -85,7 +85,7 @@ async fn land_by(
 
 /// A repository with owners, two agents' landed work on the auth code and
 /// a third agent's live session on the same file.
-async fn busy_repo(r: &Repo) {
+pub(crate) async fn busy_repo(r: &Repo) {
     land(
         r,
         "ada",
@@ -125,7 +125,7 @@ async fn busy_repo(r: &Repo) {
     r.declare_session_with("cy", d, None).await.unwrap();
 }
 
-fn ask(principal: &str, task: &str, paths: &[&str]) -> ContextAsk {
+pub(crate) fn ask(principal: &str, task: &str, paths: &[&str]) -> ContextAsk {
     ContextAsk {
         principal: principal.into(),
         req: ContextRequest {
@@ -536,11 +536,18 @@ async fn a_failing_section_is_omitted_and_the_rest_returned() {
         .context_pack(&ask("dee", "fix it", &["src/a.rs"]))
         .await
         .unwrap();
-    assert_eq!(omitted(&p), [("in_flight", "off"), ("duplicates", "off")]);
+    assert_eq!(
+        omitted(&p),
+        [
+            ("in_flight", "off"),
+            ("duplicates", "off"),
+            ("notes", "off")
+        ]
+    );
 }
 
 /// `v` without any `untrusted` object, anywhere.
-fn strip_untrusted(v: &mut Value) {
+pub(crate) fn strip_untrusted(v: &mut Value) {
     match v {
         Value::Object(m) => {
             m.remove("untrusted");
