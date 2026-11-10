@@ -715,8 +715,8 @@ pub struct NearQuery {
     pub siblings: bool,
     /// Leave this session's rows out.
     pub exclude: Option<u64>,
-    /// At most this many rows from each range scan, so one crowded
-    /// directory cannot fill the answer.
+    /// At most this many rows from each range scan and from each exact
+    /// path (claims first), so one crowded path cannot fill the answer.
     pub per_range: usize,
     /// At most this many rows in all.
     pub limit: usize,
@@ -753,6 +753,22 @@ impl NearQuery {
             .map(|d| (format!("{d}/"), format!("{d}0")))
             .collect();
         (exact.into_iter().collect(), ranges)
+    }
+
+    /// Put `rows` in the order every store answers: claims first, then
+    /// rows on an exact probe (a path asked about or a directory above
+    /// one), then by path and session, so a crowd below or above never
+    /// crowds out a claim on the very file. `exact` is the first half of
+    /// [`NearQuery::probes`].
+    pub fn order(exact: &[String], rows: &mut [NearRow]) {
+        rows.sort_by_cached_key(|r| {
+            (
+                r.kind != PathKind::Claim,
+                exact.binary_search(&r.path).is_err(),
+                r.path.clone(),
+                r.session.id,
+            )
+        });
     }
 
     /// Whether `path` is one this query finds, for stores that filter in

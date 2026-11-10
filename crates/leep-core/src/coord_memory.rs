@@ -202,11 +202,12 @@ impl CoordStore for MemoryCoordStore {
             }
         }
         all.sort();
-        let mut picked: BTreeSet<(&str, u64, PathKind)> = all
-            .iter()
-            .filter(|(p, _, _)| exact.binary_search_by(|e| e.as_str().cmp(p)).is_ok())
-            .copied()
-            .collect();
+        let mut picked: BTreeSet<(&str, u64, PathKind)> = BTreeSet::new();
+        for e in &exact {
+            let mut on: Vec<_> = all.iter().filter(|(p, _, _)| *p == e.as_str()).collect();
+            on.sort_by_key(|(_, id, k)| (*k != PathKind::Claim, *id));
+            picked.extend(on.into_iter().take(q.per_range).copied());
+        }
         for (lo, hi) in &ranges {
             picked.extend(
                 all.iter()
@@ -215,9 +216,8 @@ impl CoordStore for MemoryCoordStore {
                     .copied(),
             );
         }
-        Ok(picked
+        let mut out: Vec<NearRow> = picked
             .into_iter()
-            .take(q.limit)
             .map(|(path, id, kind)| {
                 let mut session = rows.sessions[&id].clone();
                 session.scope.clear();
@@ -229,7 +229,10 @@ impl CoordStore for MemoryCoordStore {
                     path: path.to_string(),
                 }
             })
-            .collect())
+            .collect();
+        NearQuery::order(&exact, &mut out);
+        out.truncate(q.limit);
+        Ok(out)
     }
 }
 
@@ -717,6 +720,36 @@ async fn check_near_contract(store: &dyn CoordStore, t0: i64) {
         .unwrap();
     assert_eq!(bare.len(), 1);
     assert!(bare[0].touched.is_empty() && bare[0].title == "same file");
+    // Claims and exact matches first: a crowd scoped to a directory above
+    // never crowds out a claim on the very file, and each exact path is
+    // bounded on its own.
+    for n in 0..12 {
+        let mut u = declare("wide", &format!("w-{n}"));
+        u.scope = Some(vec!["cl".into()]);
+        crowd.push(store.upsert_session(&u).await.unwrap().0);
+    }
+    let mut claim = declare("owner", "cl-claim");
+    claim.claims = Some(vec!["cl/a/x.rs".into()]);
+    let (claim, _) = store.upsert_session(&claim).await.unwrap();
+    crowd.push(claim.clone());
+    let narrow = NearQuery {
+        paths: vec!["cl/a/x.rs".into()],
+        per_range: 4,
+        limit: 3,
+        ..q.clone()
+    };
+    let got = rows(store.near_paths(&narrow).await.unwrap());
+    assert!(
+        got.contains(&(claim.id, PathKind::Claim, "cl/a/x.rs".into())),
+        "{got:?}"
+    );
+    assert_eq!(got.len(), 3, "{got:?}");
+    let per_path = NearQuery {
+        limit: 100,
+        ..narrow.clone()
+    };
+    let got = rows(store.near_paths(&per_path).await.unwrap());
+    assert_eq!(got.iter().filter(|r| r.2 == "cl").count(), 4, "{got:?}");
     for s in [me, same, above, beside].into_iter().chain(crowd) {
         assert!(store.end_session(s.id, &end).await.unwrap());
     }

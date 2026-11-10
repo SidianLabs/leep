@@ -521,13 +521,22 @@ impl CoordStore for PgCoordStore {
             return Ok(Vec::new());
         }
         let (exact, ranges) = q.probes();
+        let order_exact = exact.clone();
         let (lo, hi): (Vec<String>, Vec<String>) = ranges.into_iter().unzip();
         // One statement: the exact probes, then each range under its own
         // LIMIT, so one crowded directory cannot crowd out the rest.
+        // One statement: each exact path and each range under its own
+        // LIMIT (claims first on an exact path), so one crowded path cannot
+        // crowd out the rest; claims and exact rows first overall.
         let sql = format!(
             "SELECT {COLUMNS}, x.kind AS path_kind, x.path AS path_text FROM ( \
-               SELECT p.session_id, p.kind, p.path FROM session_paths p \
-                 WHERE p.repo_id = 1 AND p.path = ANY($1) \
+               SELECT z.session_id, z.kind, z.path \
+                 FROM unnest($1::text[]) AS e(path) \
+                 CROSS JOIN LATERAL ( \
+                   SELECT p.session_id, p.kind, p.path FROM session_paths p \
+                     JOIN sessions t ON t.id = p.session_id AND t.state = 'active' \
+                     WHERE p.repo_id = 1 AND p.path = e.path AND p.session_id <> $4 \
+                     ORDER BY (p.kind = 'claim') DESC, p.session_id LIMIT $5) z \
                UNION \
                SELECT y.session_id, y.kind, y.path \
                  FROM unnest($2::text[], $3::text[]) AS r(lo, hi) \
@@ -540,7 +549,8 @@ impl CoordStore for PgCoordStore {
              ) x JOIN sessions s ON s.id = x.session_id \
              LEFT JOIN session_beats b ON b.session_id = s.id \
              WHERE s.repo_id = 1 AND s.state = 'active' AND s.id <> $4 \
-             ORDER BY x.path, s.id LIMIT $6"
+             ORDER BY (x.kind = 'claim') DESC, (x.path = ANY($1)) DESC, \
+               x.path COLLATE \"C\", s.id LIMIT $6"
         );
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(exact)
@@ -552,7 +562,9 @@ impl CoordStore for PgCoordStore {
             .fetch_all(self.pool("session_near"))
             .await
             .map_err(storage)?;
-        near_rows(&rows)
+        let mut out = near_rows(&rows)?;
+        NearQuery::order(&order_exact, &mut out);
+        Ok(out)
     }
 }
 
@@ -1012,14 +1024,13 @@ impl CoordStore for SqliteCoordStore {
         let mut conn = self.pool("session_near").acquire().await.map_err(storage)?;
         let mut rows = Vec::new();
         // SQLite is local: one short statement per probe costs little.
-        for chunk in exact.chunks(500) {
+        for p in &exact {
             let mut b = QueryBuilder::<Sqlite>::new(head.clone());
-            b.push_bind(exclude).push(" AND p.path IN (");
-            let mut sep = b.separated(", ");
-            for p in chunk {
-                sep.push_bind(p.clone());
-            }
-            b.push(") LIMIT ").push_bind(to_i64(q.limit as u64));
+            b.push_bind(exclude)
+                .push(" AND p.path = ")
+                .push_bind(p.clone())
+                .push(" ORDER BY (p.kind = 'claim') DESC, s.id LIMIT ")
+                .push_bind(to_i64(q.per_range as u64));
             rows.extend(b.build().fetch_all(&mut *conn).await.map_err(storage)?);
         }
         for (lo, hi) in ranges {
@@ -1034,7 +1045,7 @@ impl CoordStore for SqliteCoordStore {
             rows.extend(b.build().fetch_all(&mut *conn).await.map_err(storage)?);
         }
         let mut out = near_rows(&rows)?;
-        out.sort_by(|a, b| (&a.path, a.session.id).cmp(&(&b.path, b.session.id)));
+        NearQuery::order(&exact, &mut out);
         out.truncate(q.limit);
         Ok(out)
     }
