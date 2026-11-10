@@ -60,6 +60,28 @@ pub struct NoteBudget {
     pub until: Instant,
 }
 
+/// What [`Repo::notes_for`] found, and how complete it is.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NotesView {
+    pub notes: Vec<ViewedNote>,
+    /// The store's probe hit its cap ([`PACK_NOTE_ROWS`]): older agent
+    /// notes may be missing.
+    pub capped: bool,
+    /// Open path notes past the check budget, left unknown.
+    pub unchecked: usize,
+    /// Checks the deadline cut short, left unknown.
+    pub timed_out: usize,
+}
+
+/// [`Repo::staleness`]'s answer: one entry per note, and what went
+/// unjudged.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Staleness {
+    pub stale: Vec<Option<bool>>,
+    pub unchecked: usize,
+    pub timed_out: usize,
+}
+
 /// A note with what a reader is told about it now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewedNote {
@@ -189,27 +211,32 @@ impl Repo {
     /// The notes `select` names, each with its staleness at `head` (unknown
     /// without one): for [`NoteSelect::Paths`] open, unexpired path notes in
     /// rank order ([`rank_key`]); for [`NoteSelect::Filter`] the listing in
-    /// its own order. The first `budget.checked` are checked, in that order
-    /// (for paths, the order before staleness is known), 8 at once, until
-    /// `budget.until`. Only the store's read can fail the call; staleness
-    /// never does.
+    /// its own order. The first `budget.checked` open path notes are
+    /// checked, in that order (for paths, the order before staleness is
+    /// known), 8 at once, until `budget.until`; closed notes are never
+    /// looked up. What was left unchecked or capped is counted in the
+    /// answer, so a caller can say the view is partial. Only the store's
+    /// read can fail the call; staleness never does.
     pub async fn notes_for(
         &self,
         select: NoteSelect<'_>,
         head: Option<ChangesetId>,
         budget: NoteBudget,
         now: i64,
-    ) -> Result<Vec<ViewedNote>> {
+    ) -> Result<NotesView> {
         let coord = self.coord.as_ref().ok_or_else(leep_core::coord::no_notes)?;
+        let mut capped = false;
         let mut rows = match select {
             NoteSelect::Paths(paths) => {
                 let anchors = pack_anchors(paths);
                 if anchors.is_empty() {
-                    return Ok(Vec::new());
+                    return Ok(NotesView::default());
                 }
-                let mut rows: Vec<Note> = coord
-                    .notes_at(&anchors, PACK_NOTE_ROWS)
-                    .await?
+                // The store answers endorsed, then human, then agent notes,
+                // so the cap only ever drops the lowest tier.
+                let found = coord.notes_at(&anchors, PACK_NOTE_ROWS).await?;
+                capped = found.len() >= PACK_NOTE_ROWS;
+                let mut rows: Vec<Note> = found
                     .into_iter()
                     .filter(|n| {
                         n.anchor_type == AnchorType::Path
@@ -222,52 +249,88 @@ impl Repo {
             }
             NoteSelect::Filter(f) => coord.list_notes(f).await?,
         };
-        let stale = self.staleness(&rows, head, budget).await;
-        let mut out: Vec<ViewedNote> = rows
+        let checked = self.staleness(&rows, head, budget).await;
+        let mut notes: Vec<ViewedNote> = rows
             .drain(..)
-            .zip(stale)
+            .zip(checked.stale)
             .map(|(note, stale)| ViewedNote { note, stale })
             .collect();
         if matches!(select, NoteSelect::Paths(_)) {
-            out.sort_by_key(rank_key);
+            notes.sort_by_key(rank_key);
         }
-        Ok(out)
+        Ok(NotesView {
+            notes,
+            capped,
+            unchecked: checked.unchecked,
+            timed_out: checked.timed_out,
+        })
     }
 
     /// The staleness of each of `notes` at `head`: the first
-    /// `budget.checked` looked up, the rest unknown.
+    /// `budget.checked` open path notes looked up, the rest unknown and
+    /// counted; changeset notes are never stale and closed notes are not
+    /// judged.
     pub(crate) async fn staleness(
         &self,
         notes: &[Note],
         head: Option<ChangesetId>,
         budget: NoteBudget,
-    ) -> Vec<Option<bool>> {
-        let root = match head {
-            Some(h) => tokio::time::timeout_at(budget.until, self.root_tree(h))
-                .await
-                .ok()
-                .and_then(|r| r.ok()),
-            None => None,
+    ) -> Staleness {
+        let mut out = Staleness {
+            stale: vec![None; notes.len()],
+            ..Default::default()
         };
-        let checked = notes.len().min(budget.checked);
+        let mut todo: Vec<(usize, Note)> = Vec::new();
+        for (i, n) in notes.iter().enumerate() {
+            if n.anchor_type == AnchorType::Changeset {
+                out.stale[i] = Some(false);
+            } else if n.state == NoteState::Open {
+                if todo.len() < budget.checked {
+                    todo.push((i, n.clone()));
+                } else {
+                    out.unchecked += 1;
+                }
+            }
+        }
+        if todo.is_empty() {
+            return out;
+        }
+        let root = match head {
+            Some(h) if Instant::now() < budget.until => {
+                match tokio::time::timeout_at(budget.until, self.root_tree(h)).await {
+                    Ok(r) => r.ok(),
+                    Err(_) => {
+                        out.timed_out += todo.len();
+                        return out;
+                    }
+                }
+            }
+            Some(_) => {
+                out.timed_out += todo.len();
+                return out;
+            }
+            None => return out,
+        };
         // Owned items, so the futures name no borrowed lifetime of their
-        // own (they must be `Send` for any lifetime in a handler).
-        let mut out: Vec<Option<bool>> = futures_util::stream::iter(notes[..checked].to_vec())
-            .map(|n| async move {
-                tokio::time::timeout_at(budget.until, self.stale_of(root, &n))
-                    .await
-                    .ok()
-                    .flatten()
+        // own (they must be `Send` for any lifetime in a handler). A check
+        // that would start past the deadline is not started.
+        let results: Vec<(usize, Option<Option<bool>>)> = futures_util::stream::iter(todo)
+            .map(|(i, n)| async move {
+                if Instant::now() >= budget.until {
+                    return (i, None);
+                }
+                let r = tokio::time::timeout_at(budget.until, self.stale_of(root, &n)).await;
+                (i, r.ok())
             })
             .buffered(STALE_CONCURRENCY)
             .collect()
             .await;
-        // Changeset anchors are never stale by content, checked or not.
-        out.extend(
-            notes[checked..]
-                .iter()
-                .map(|n| (n.anchor_type == AnchorType::Changeset).then_some(false)),
-        );
+        for (i, r) in results {
+            match r {
+                Some(v) => out.stale[i] = v,
+                None => out.timed_out += 1,
+            }
+        }
         out
     }
 

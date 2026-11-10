@@ -233,8 +233,10 @@ impl Repo {
         }
         check_anchor(n.anchor_type, &n.anchor)?;
         let note = coord.add_note(&n).await?;
-        // Answered as a read would show it, staleness included.
-        Ok(self.viewed(note).await)
+        // No `stale` on a write's answer: the note is fresh at `at` by
+        // construction, and judging it at another ref here would only
+        // confuse a writer on a feature ref. Reads judge it.
+        Ok(note_entry(note, now))
     }
 
     /// The notes `q` asks for, newest first, each judged stale or not at
@@ -273,15 +275,7 @@ impl Repo {
             before: q.before,
             limit,
         };
-        let head = match q.target_ref.as_deref().map(str::trim) {
-            Some(r) if !r.is_empty() => Some(
-                self.meta()
-                    .get_ref(r)
-                    .await?
-                    .ok_or_else(|| Error::NotFound(format!("ref {r:?}")))?,
-            ),
-            _ => self.meta().get_ref(self.default_ref()).await?,
-        };
+        let head = self.judged_at(q.target_ref.as_deref()).await?;
         let now = unix_now();
         let budget = NoteBudget {
             checked: LIST_NOTES_CHECKED,
@@ -289,7 +283,8 @@ impl Repo {
         };
         let rows = self
             .notes_for(NoteSelect::Filter(&filter), head, budget, now)
-            .await?;
+            .await?
+            .notes;
         let next = (rows.len() == limit)
             .then(|| rows.last().map(|n| n.note.id))
             .flatten();
@@ -303,27 +298,44 @@ impl Repo {
         Ok(NotesResponse { notes, next })
     }
 
+    /// The head staleness is judged at: `target_ref`'s (404 when it names
+    /// no ref), else the default ref's, else none (everything unknown).
+    async fn judged_at(&self, target_ref: Option<&str>) -> Result<Option<leep_core::ChangesetId>> {
+        match target_ref.map(str::trim) {
+            Some(r) if !r.is_empty() => Ok(Some(
+                self.meta()
+                    .get_ref(r)
+                    .await?
+                    .ok_or_else(|| Error::NotFound(format!("ref {r:?}")))?,
+            )),
+            _ => self.meta().get_ref(self.default_ref()).await,
+        }
+    }
+
     /// One note, in any state, its staleness judged at the default ref's
     /// head as a listing judges it; 404 if unknown.
     pub async fn note(&self, id: u64) -> Result<NoteEntry> {
-        let n = self.stored_note(id).await?;
-        Ok(self.viewed(n).await)
+        self.note_at(id, None).await
     }
 
-    /// `n` as `GET /v1/notes/{id}` shows it: staleness judged at the
-    /// default ref's head (unknown when that cannot be read).
-    async fn viewed(&self, n: Note) -> NoteEntry {
-        let head = self.meta().get_ref(self.default_ref()).await.ok().flatten();
+    /// One note, its staleness judged at `target_ref`'s head (default the
+    /// default ref's), as `GET /v1/notes?ref=` judges it.
+    pub async fn note_at(&self, id: u64, target_ref: Option<&str>) -> Result<NoteEntry> {
+        let n = self.stored_note(id).await?;
+        let head = self.judged_at(target_ref).await?;
         let budget = NoteBudget {
             checked: 1,
             until: tokio::time::Instant::now() + SECTION_BOUND,
         };
-        let stale = self.staleness(std::slice::from_ref(&n), head, budget).await;
-        ViewedNote {
+        let stale = self
+            .staleness(std::slice::from_ref(&n), head, budget)
+            .await
+            .stale;
+        Ok(ViewedNote {
             note: n,
             stale: stale[0],
         }
-        .entry(unix_now())
+        .entry(unix_now()))
     }
 
     async fn stored_note(&self, id: u64) -> Result<Note> {
@@ -346,7 +358,12 @@ impl Repo {
         } else {
             n.anchor.clone()
         };
-        let path = leep_core::RepoPath::new(probe)?;
+        // A probe that is no repository path (a 256-byte directory anchor
+        // plus `/OWNERS`) has no owner: refused as not owned, not as a bad
+        // request.
+        let Ok(path) = leep_core::RepoPath::new(probe) else {
+            return Ok(false);
+        };
         let mut r = OwnersResolver::new(self, Some(head)).await?;
         Ok(r.owners_of(&path).await?.contains(who))
     }
@@ -437,8 +454,17 @@ impl Repo {
                 actor.name
             )));
         }
-        let root = self.root_tree(head).await?;
-        match self.stale_of(Some(root), &n).await {
+        // Bounded like a read, and never a 500: a tree that cannot be read
+        // in time leaves staleness unknown, which is refused below.
+        let until = tokio::time::Instant::now() + SECTION_BOUND;
+        let checked = tokio::time::timeout_at(until, async {
+            let root = self.root_tree(head).await.ok()?;
+            self.stale_of(Some(root), &n).await
+        })
+        .await
+        .ok()
+        .flatten();
+        match checked {
             Some(false) => {}
             Some(true) => {
                 return Err(Error::Conflict(format!(
@@ -459,9 +485,8 @@ impl Repo {
             }
             .entry(now)
         };
-        if n.endorsed_by.is_some() {
-            return Ok((fresh(n), false));
-        }
+        // Endorsing an endorsed note renews its life (and names the newest
+        // endorser).
         let by = actor.name.to_string();
         if coord
             .change_note(id, &NoteChange::Endorse { by: by.clone() }, now)
@@ -470,14 +495,11 @@ impl Repo {
             let mut n = n;
             n.endorsed_by = Some(by);
             n.endorsed_at = Some(now);
-            n.expires = None;
+            n.expires = Some(now + leep_core::coord::ENDORSED_NOTE_TTL_SECS);
             return Ok((fresh(n), true));
         }
-        // A concurrent change won: endorsed by another owner, or closed.
+        // A concurrent change closed it first.
         let n = self.stored_note(id).await?;
-        if n.state == NoteState::Open && n.endorsed_by.is_some() {
-            return Ok((fresh(n), false));
-        }
         Err(Error::Conflict(format!(
             "note {id} changed while it was endorsed; it is {}",
             n.state.as_str()
@@ -508,7 +530,7 @@ impl Repo {
             let mut n = n;
             n.state = NoteState::Retracted;
             n.expires = leep_core::coord::closed_expiry(n.expires, now);
-            return Ok(self.viewed(n).await);
+            return Ok(note_entry(n, now));
         }
         // Closed already (or by a concurrent change): as it is now.
         self.note(id).await
@@ -561,6 +583,13 @@ impl Repo {
     /// `reporter` hid. Answers how many.
     pub async fn unreport_notes(&self, id: Option<u64>, reporter: Option<&str>) -> Result<u64> {
         self.notes_on()?.unreport_notes(id, reporter).await
+    }
+
+    /// An operator's undo of endorsements: note `id`, or every note
+    /// `endorser` endorsed (a person's token removed, re-kinded, leaked or
+    /// dropped from `OWNERS`). Answers how many.
+    pub async fn unendorse_notes(&self, id: Option<u64>, endorser: Option<&str>) -> Result<u64> {
+        self.notes_on()?.unendorse_notes(id, endorser).await
     }
 
     /// An operator's mass revoke: retract every open note of `principal`.

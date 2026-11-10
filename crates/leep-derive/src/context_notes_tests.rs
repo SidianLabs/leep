@@ -142,7 +142,7 @@ fn pack_ask() -> crate::context::ContextAsk {
 /// anchor first. Endorsed and fresh human notes bring their bodies, the
 /// rest only a title of at most 80 bytes; a stale agent note is left out;
 /// a directory note names the pack files below it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn notes_are_ranked_and_weighted_by_trust() {
     let r = repo();
     let [endorsed, human_dir, stale_human, agent_file, agent_dir, stale_agent] =
@@ -195,7 +195,7 @@ async fn notes_are_ranked_and_weighted_by_trust() {
 /// The pack and `GET /v1/notes` answer from one function: every note the
 /// pack shows is listed with the same staleness and endorsement, and the
 /// listing holds nothing else but stale agent notes.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_pack_and_the_listing_agree() {
     let r = repo();
     let ids = noted_repo(&r).await;
@@ -238,8 +238,10 @@ async fn the_pack_and_the_listing_agree() {
     );
 }
 
+/// The default deadlines are real: these tests run on a paused clock, so a
+/// slow machine cannot turn a check into "unknown" and change the bytes.
 /// Four identical asks with notes present are the same bytes.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn packs_with_notes_are_byte_identical() {
     let r = repo();
     noted_repo(&r).await;
@@ -256,7 +258,7 @@ async fn packs_with_notes_are_byte_identical() {
 /// Notes have their own quota and come after ref health, live work and
 /// duplicates for spare budget: however many there are, the ref health
 /// item is kept whole, and the notes kept are a ranked prefix.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn notes_never_displace_ref_health() {
     let r = repo();
     land(&r, "ada", "m", "seed", &[("src/a.rs", "a\n")]).await;
@@ -299,6 +301,8 @@ async fn notes_never_displace_ref_health() {
 struct RawNotes {
     inner: MemoryCoordStore,
     rows: Vec<Note>,
+    /// Answer as a store whose schema predates notes.
+    old_schema: bool,
 }
 
 #[async_trait]
@@ -337,6 +341,9 @@ impl CoordStore for RawNotes {
         Ok(self.rows.clone())
     }
     async fn notes_at(&self, _: &[String], _: usize) -> Result<Vec<Note>> {
+        if self.old_schema {
+            return Err(leep_core::coord::no_notes());
+        }
         Ok(self.rows.clone())
     }
     async fn change_note(&self, id: u64, c: &NoteChange, at: i64) -> Result<bool> {
@@ -357,7 +364,7 @@ impl CoordStore for RawNotes {
 /// characters, U+2028, a fence-breaking backtick run, "ignore previous
 /// instructions") in note titles, bodies and anchors appear in the pack
 /// only under `untrusted`, whatever the tier.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn note_text_appears_only_under_untrusted() {
     let marks = [
         "PWNED-NL",
@@ -428,6 +435,7 @@ async fn note_text_appears_only_under_untrusted() {
     let r = repo().with_coord(Some(Arc::new(RawNotes {
         inner: MemoryCoordStore::new(),
         rows,
+        old_schema: false,
     })));
     land(&r, "ada", "m", "seed", &[("src/a.rs", "a\n")]).await;
     let mut a = ask("dee", "fix it", &["src/a.rs"]);
@@ -455,4 +463,130 @@ async fn note_text_appears_only_under_untrusted() {
     for m in marks {
         assert!(!outside.contains(m), "{m} outside untrusted: {outside}");
     }
+}
+
+/// A store whose schema predates notes leaves the section `off`, as a
+/// server without a coordination store does, not `error`.
+#[tokio::test(start_paused = true)]
+async fn an_old_schema_turns_notes_off() {
+    let r = repo().with_coord(Some(Arc::new(RawNotes {
+        inner: MemoryCoordStore::new(),
+        rows: vec![],
+        old_schema: true,
+    })));
+    land(&r, "ada", "m", "seed", &[("src/a.rs", "a\n")]).await;
+    let p = r
+        .context_pack(&ask("dee", "fix it", &["src/a.rs"]))
+        .await
+        .unwrap();
+    assert!(p
+        .omitted
+        .iter()
+        .any(|o| (o.section.as_str(), o.reason.as_str()) == ("notes", "off")));
+    assert!(
+        !p.omitted.iter().any(|o| o.reason == "error"),
+        "{:?}",
+        p.omitted
+    );
+}
+
+/// 300 newer agent notes on a file and its directory never push an older
+/// endorsed note out of the pack: the store answers by tier first, and the
+/// pack says it was capped (`omitted: notes, bound`).
+#[tokio::test(start_paused = true)]
+async fn a_crowd_of_agent_notes_never_hides_an_endorsed_one() {
+    let r = repo();
+    land(
+        &r,
+        "ada",
+        "m",
+        "seed",
+        &[("src/OWNERS", "rhea\n"), ("src/a.rs", "a\n")],
+    )
+    .await;
+    let endorsed = note(&r, "ada", NoteTrust::Agent, "src/a.rs", "the one", "").await;
+    r.endorse_note(endorsed.id, &RHEA).await.unwrap();
+    let c = r.coord().unwrap().clone();
+    let head = r.meta().get_ref("main").await.unwrap().unwrap();
+    let blob = leep_core::Hash::of_blob(b"a\n");
+    for i in 0..300 {
+        let mut n = leep_core::coord::NewNote {
+            kind: NoteKind::Finding,
+            anchor_type: AnchorType::Path,
+            anchor: if i % 2 == 0 { "src/a.rs" } else { "src" }.into(),
+            at_changeset: Some(head),
+            at_blob: None,
+            lines: None,
+            title: format!("crowd {i}"),
+            body: String::new(),
+            principal: format!("crowd-{}", i % 10),
+            agent_model: None,
+            session_id: None,
+            trust: NoteTrust::Agent,
+            supersedes: None,
+            created: leep_core::store::unix_now(),
+            expires: None,
+            max_open: 1000,
+            max_per_hour: 1000,
+            max_per_day: 1000,
+        };
+        if i % 2 == 0 {
+            n.at_blob = Some(blob);
+        }
+        c.add_note(&n).await.unwrap();
+    }
+    let mut a = ask("dee", "fix it", &["src/a.rs"]);
+    a.req.budget_bytes = Some(256 * 1024);
+    let p = r.context_pack(&a).await.unwrap();
+    assert_eq!(p.notes[0].note, endorsed.id, "{:?}", &p.notes[..3]);
+    assert_eq!(p.notes[0].endorsed_by.as_deref(), Some("rhea"));
+    assert!(p
+        .omitted
+        .iter()
+        .any(|o| (o.section.as_str(), o.reason.as_str()) == ("notes", "bound")));
+}
+
+/// At most 32 notes are checked per pack: the rest are unknown, never
+/// served as endorsed, and the pack says so (`omitted: notes, bound`).
+#[tokio::test(start_paused = true)]
+async fn a_pack_checks_at_most_32_notes() {
+    use crate::notes_view::PACK_NOTES_CHECKED;
+    let r = repo();
+    land(&r, "ada", "m", "seed", &[("src/a.rs", "a\n")]).await;
+    for who in ["h1", "h2"] {
+        for i in 0..20 {
+            note(
+                &r,
+                who,
+                NoteTrust::Human,
+                "src/a.rs",
+                &format!("{who} {i}"),
+                "",
+            )
+            .await;
+        }
+    }
+    let mut a = ask("dee", "fix it", &["src/a.rs"]);
+    a.req.budget_bytes = Some(256 * 1024);
+    let p = r.context_pack(&a).await.unwrap();
+    assert_eq!(p.notes.len(), 40);
+    let known = p.notes.iter().filter(|n| n.stale.is_some()).count();
+    assert_eq!(known, PACK_NOTES_CHECKED);
+    assert!(p.notes[..PACK_NOTES_CHECKED]
+        .iter()
+        .all(|n| n.stale == Some(false)));
+    assert!(p
+        .omitted
+        .iter()
+        .any(|o| (o.section.as_str(), o.reason.as_str()) == ("notes", "bound")));
+    // Fewer notes than the bound: nothing partial.
+    let r = repo();
+    land(&r, "ada", "m", "seed", &[("src/a.rs", "a\n")]).await;
+    note(&r, "h1", NoteTrust::Human, "src/a.rs", "one", "").await;
+    let p = r.context_pack(&a).await.unwrap();
+    assert!(
+        p.omitted.iter().all(|o| o.section != "notes"),
+        "{:?}",
+        p.omitted
+    );
 }

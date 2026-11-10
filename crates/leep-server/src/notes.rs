@@ -131,9 +131,21 @@ pub(crate) async fn list(
     Ok(Json(repo.notes(&query).await?))
 }
 
-/// `GET /v1/notes/{id}`.
-pub(crate) async fn get_one(State(repo): S, Path(id): Path<String>) -> ApiResult<Json<NoteEntry>> {
-    Ok(Json(repo.note(note_id(&id)?).await?))
+#[derive(Deserialize)]
+pub(crate) struct OneQuery {
+    #[serde(rename = "ref")]
+    target_ref: Option<String>,
+}
+
+/// `GET /v1/notes/{id}?ref=`: staleness judged at `ref`'s head (default
+/// the default ref's).
+pub(crate) async fn get_one(
+    State(repo): S,
+    Path(id): Path<String>,
+    Query(q): Query<OneQuery>,
+) -> ApiResult<Json<NoteEntry>> {
+    let r = q.target_ref.as_deref().filter(|r| !r.is_empty());
+    Ok(Json(repo.note_at(note_id(&id)?, r).await?))
 }
 
 /// `DELETE /v1/notes/{id}`: retract it; only its principal may.

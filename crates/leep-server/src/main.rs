@@ -541,6 +541,16 @@ enum NotesCmd {
         #[arg(long)]
         reporter: Option<String>,
     },
+    /// Undo endorsements: of one note (`--id`), or every note one person's
+    /// token endorsed (`--by`: a token removed, re-kinded, leaked or
+    /// dropped from OWNERS). Each open note gets its unendorsed life back
+    /// from its creation. Prints how many.
+    Unendorse {
+        #[arg(long, required_unless_present = "by", conflicts_with = "by")]
+        id: Option<u64>,
+        #[arg(long)]
+        by: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1379,6 +1389,17 @@ async fn run_unreport_notes(
     Ok(())
 }
 
+/// `notes unendorse --id N | --by P` (ADR 0098): one statement.
+async fn run_unendorse_notes(meta: &str, id: Option<u64>, by: Option<&str>) -> anyhow::Result<()> {
+    let meta = open_meta(meta).await.context("opening meta store")?;
+    let coord = meta
+        .coord_store()
+        .context("this metadata store keeps no notes (its schema is older than migration 10)")?;
+    let n = coord.unendorse_notes(id, by).await?;
+    outln!("cleared {n} endorsements");
+    Ok(())
+}
+
 async fn run_derive_search(meta: &str, blobs: &str, rev: &str) -> anyhow::Result<()> {
     let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
     let meta = open_meta(meta).await.context("opening meta store")?;
@@ -1893,6 +1914,9 @@ async fn run() -> anyhow::Result<()> {
         Some(Cmd::Notes {
             cmd: NotesCmd::Unreport { id, reporter },
         }) => return run_unreport_notes(&args.meta, id, reporter.as_deref()).await,
+        Some(Cmd::Notes {
+            cmd: NotesCmd::Unendorse { id, by },
+        }) => return run_unendorse_notes(&args.meta, id, by.as_deref()).await,
         Some(Cmd::Verify(v)) => {
             std::process::exit(repair::run_verify(&args.meta, &args.blobs, v).await)
         }
@@ -2606,6 +2630,8 @@ mod tests {
             &["notes", "revoke", "--principal", "p"],
             &["notes", "unreport", "--reporter", "p"],
             &["notes", "unreport", "--id", "3"],
+            &["notes", "unendorse", "--by", "p"],
+            &["notes", "unendorse", "--id", "3"],
             &[
                 "gen-token",
                 "--name",

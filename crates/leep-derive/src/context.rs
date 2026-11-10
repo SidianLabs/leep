@@ -113,6 +113,9 @@ enum Omit {
     Timeout,
     Error,
     Off,
+    /// Part of a section was left out by a bound on its work (notes: the
+    /// probe's row cap, or notes past the check budget); the rest came.
+    Bound,
 }
 
 impl Omit {
@@ -121,6 +124,7 @@ impl Omit {
             Omit::Timeout => "timeout",
             Omit::Error => "error",
             Omit::Off => "off",
+            Omit::Bound => "bound",
         }
     }
 }
@@ -465,7 +469,16 @@ impl Repo {
         let history = take(&mut omitted, "history", history);
         let in_flight = take(&mut omitted, "in_flight", in_flight);
         let duplicates = take(&mut omitted, "duplicates", dups);
-        let notes = take(&mut omitted, "notes", notes);
+        let notes = match notes {
+            Ok((items, partial)) => {
+                omitted.extend(partial.into_iter().map(|o| ("notes", o)));
+                items
+            }
+            Err(o) => {
+                omitted.push(("notes", o));
+                Vec::new()
+            }
+        };
         let (in_flight, duplicates) = merge_duplicates(in_flight, duplicates);
         let ref_health: Vec<ContextRefHealth> = match health {
             Ok(h) => vec![h],
@@ -957,33 +970,54 @@ impl Repo {
 
     /// Notes on `paths` and the directories above them, as
     /// [`Repo::notes_for`] ranks them for `GET /v1/notes` too, staleness
-    /// judged at `head`; stale agent notes left out (counted).
+    /// judged at `head`; stale agent notes left out (counted). Answers the
+    /// items and why the section is partial, if it is: `bound` when the
+    /// probe hit its row cap or notes went unchecked past the check budget,
+    /// `timeout` when checks ran out of time (those notes are unknown, so
+    /// none of them is served as endorsed). A store whose schema predates
+    /// notes is `off`, as without a coordination store.
     async fn context_notes(
         &self,
         head: ChangesetId,
         paths: &[String],
         until: Instant,
-    ) -> Part<Vec<ContextNote>> {
+    ) -> Part<(Vec<ContextNote>, Vec<Omit>)> {
         if self.coord.is_none() {
             return Err(Omit::Off);
         }
         // Staleness checks stop first, so the lookup is never lost to them.
         let checks = until.min(Instant::now() + SECTION_BOUND / 2);
-        bounded("notes", until, async {
-            let budget = NoteBudget {
-                checked: PACK_NOTES_CHECKED,
-                until: checks,
-            };
-            let viewed = self
-                .notes_for(NoteSelect::Paths(paths), Some(head), budget, unix_now())
-                .await?;
-            let (items, suppressed) = pack_notes(viewed, paths);
-            if suppressed > 0 {
-                metrics::counter!("leep_notes_stale_suppressed_total").increment(suppressed);
+        let budget = NoteBudget {
+            checked: PACK_NOTES_CHECKED,
+            until: checks,
+        };
+        let found = tokio::time::timeout_at(
+            until,
+            self.notes_for(NoteSelect::Paths(paths), Some(head), budget, unix_now()),
+        )
+        .await;
+        let view = match found {
+            Ok(Ok(v)) => v,
+            // Only `no_notes` answers NotFound here: a schema before 0010.
+            Ok(Err(Error::NotFound(_))) => return Err(Omit::Off),
+            Ok(Err(e)) => {
+                tracing::debug!(section = "notes", error = %e, "context section failed");
+                return Err(Omit::Error);
             }
-            Ok(items)
-        })
-        .await
+            Err(_) => return Err(Omit::Timeout),
+        };
+        let mut partial = Vec::new();
+        if view.capped || view.unchecked > 0 {
+            partial.push(Omit::Bound);
+        }
+        if view.timed_out > 0 {
+            partial.push(Omit::Timeout);
+        }
+        let (items, suppressed) = pack_notes(view.notes, paths);
+        if suppressed > 0 {
+            metrics::counter!("leep_notes_stale_suppressed_total").increment(suppressed);
+        }
+        Ok((items, partial))
     }
 
     /// The ref's known-good state and red, and the suspects of a red head

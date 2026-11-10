@@ -38,6 +38,9 @@ fn auth() -> Auth {
     tokens.push(json!({ "name": "hugo", "role": "write", "kind": "human",
                         "hash": hash_token(&token("hugo")) }));
     tokens.push(json!({ "name": "viewer", "role": "read", "hash": hash_token(VIEWER) }));
+    // A person's read-only token: kind human, but no write.
+    tokens.push(json!({ "name": "hilda", "role": "read", "kind": "human",
+                        "hash": hash_token(&token("hilda")) }));
     Auth::parse(&json!({ "tokens": tokens }).to_string()).unwrap()
 }
 
@@ -231,7 +234,37 @@ async fn notes_round_trip_with_trust_from_the_token() {
         )
         .await
         .ok();
-    assert_eq!(got, a);
+    // A write's answer leaves staleness to reads, which judge it at the
+    // default ref (or `?ref=`).
+    assert_eq!(a.stale, None);
+    assert_eq!(
+        got,
+        NoteEntry {
+            stale: Some(false),
+            ..a.clone()
+        }
+    );
+    let at_main: NoteEntry = api
+        .call(
+            Method::GET,
+            &format!("/v1/notes/{}?ref=main", a.id),
+            Some(VIEWER),
+            None,
+            vec![],
+        )
+        .await
+        .ok();
+    assert_eq!(at_main, got);
+    let r = api
+        .call(
+            Method::GET,
+            &format!("/v1/notes/{}?ref=nonesuch", a.id),
+            Some(VIEWER),
+            None,
+            vec![],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
     let on = api.list("?path=src/auth/token.rs").await;
     assert_eq!(
         on.notes.iter().map(|n| n.id).collect::<Vec<_>>(),
@@ -607,7 +640,13 @@ async fn session_and_anchor_resolution() {
     let e: NoteEntry = api.add("alice", c).await.ok();
     assert_eq!(e.anchor_type, "changeset");
     let on = api.list(&format!("?changeset={}", api.main)).await;
-    assert_eq!(on.notes, [e]);
+    assert_eq!(
+        on.notes,
+        [NoteEntry {
+            stale: Some(false),
+            ..e
+        }]
+    );
 }
 
 /// Without a tokens file every note is `anonymous`'s and an agent's;
@@ -776,7 +815,7 @@ async fn land_files(repo: &Repo, files: &[(&str, &str)]) -> ChangesetId {
 #[tokio::test]
 async fn endorsement_is_for_human_owners() {
     let api = Api::new(true).await;
-    land_files(&api.repo, &[("src/OWNERS", "hugo\nalice\n")]).await;
+    land_files(&api.repo, &[("src/OWNERS", "hugo\nalice\nhilda\n")]).await;
     let endorse = |id: u64, tok: Option<String>| {
         let api = &api;
         async move {
@@ -794,14 +833,19 @@ async fn endorsement_is_for_human_owners() {
         .add("bob", note("src/auth/token.rs", "Take the lock first"))
         .await
         .ok();
-    for (who, status) in [
-        (Some(token("alice")), StatusCode::FORBIDDEN), // an owner, but an agent's token
-        (Some(token("bob")), StatusCode::FORBIDDEN),   // the writer
-        (Some(VIEWER.to_string()), StatusCode::FORBIDDEN), // read only
-        (None, StatusCode::UNAUTHORIZED),
+    for (who, status, says) in [
+        // An owner, but an agent's token: the kind check.
+        (Some(token("alice")), StatusCode::FORBIDDEN, "kind"),
+        // The writer (an agent's token too: the kind check says so first).
+        (Some(token("bob")), StatusCode::FORBIDDEN, "kind"),
+        // A person and an owner, but read only: the write check, first.
+        (Some(token("hilda")), StatusCode::FORBIDDEN, "write"),
+        (Some(VIEWER.to_string()), StatusCode::FORBIDDEN, "write"),
+        (None, StatusCode::UNAUTHORIZED, ""),
     ] {
         let r = endorse(n.id, who.clone()).await;
         assert_eq!(r.status, status, "{who:?}: {}", r.text());
+        assert!(r.text().contains(says), "{who:?}: {}", r.text());
     }
     let mine: NoteEntry = api
         .add("hugo", note("src/auth/token.rs", "My own"))
@@ -838,8 +882,13 @@ async fn endorsement_is_for_human_owners() {
 
     let e: NoteEntry = endorse(n.id, Some(token("hugo"))).await.ok();
     assert_eq!(
-        (e.endorsed_by.as_deref(), e.endorsed, e.stale, e.expires),
-        (Some("hugo"), true, Some(false), None)
+        (e.endorsed_by.as_deref(), e.endorsed, e.stale),
+        (Some("hugo"), true, Some(false))
+    );
+    assert_eq!(
+        e.expires,
+        e.endorsed_at
+            .map(|t| t + leep_core::coord::ENDORSED_NOTE_TTL_SECS)
     );
     let listed = api.list("?path=src/auth/token.rs").await;
     let l = listed.notes.iter().find(|x| x.id == n.id).unwrap();
