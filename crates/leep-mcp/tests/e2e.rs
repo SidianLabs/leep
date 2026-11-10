@@ -2235,6 +2235,24 @@ fn task_start_answers_live_work_owners_and_history() {
     assert!(text(&r).contains("leep_task_start"), "{}", text(&r));
     let r = call(&b, "leep_task_start", json!({ "task": "  " }));
     assert_eq!(r["isError"], true);
+    // A pack the server cannot give after the session is declared is
+    // reported beside the session, not as a failed call.
+    let r = call(
+        &b,
+        "leep_task_start",
+        json!({ "task": "Port it", "ref": "nope" }),
+    );
+    let st = data(&r);
+    assert_eq!(st["created"], false, "resumed: {st}");
+    assert!(
+        st["context"].is_null() && st["context_error"].is_string(),
+        "{st}"
+    );
+    let t = text(&r);
+    assert!(
+        t.contains("Context unavailable") && t.contains("call leep_context"),
+        "{t}"
+    );
 }
 
 /// `leep_review_request` and `leep_review_inbox` (ADR 0086), as the CLI's

@@ -119,16 +119,36 @@ fn start(r: &Remote, a: &WorkStartArgs, wc: Option<&mut WorkCopy>) -> Result<i32
         task_key: d.task_key.clone(),
         budget_bytes: a.budget,
     };
-    let pack = r.client.context(&req).map_err(unsupported)?;
+    // The session is declared: a pack the server cannot give now (shed,
+    // rate limited, failing) is reported, and `leep context` asks again.
+    let pack = r.client.context(&req).map_err(unsupported);
     if r.json {
-        print_json(&serde_json::json!({ "session": declared, "context": pack }))?;
-        return Ok(0);
+        let mut v = serde_json::json!({ "session": declared });
+        match &pack {
+            Ok(p) => v["context"] = serde_json::json!(p),
+            Err(e) => {
+                v["context"] = serde_json::Value::Null;
+                v["context_error"] = serde_json::json!(e.message());
+            }
+        }
+        print_json(&v)?;
+    } else {
+        for line in session::declared_lines(&key, &declared, true) {
+            outln!("{line}");
+        }
+        if let Ok(p) = &pack {
+            for line in pack_lines(p) {
+                outln!("{line}");
+            }
+        }
     }
-    for line in session::declared_lines(&key, &declared, true) {
-        outln!("{line}");
-    }
-    for line in pack_lines(&pack) {
-        outln!("{line}");
+    if let Err(e) = &pack {
+        let secs = e.retry_after_ms().unwrap_or(1000).div_ceil(1000).max(1);
+        eprintln!(
+            "context unavailable: {}; the session is started, run `leep context` again in \
+             about {secs}s",
+            e.message()
+        );
     }
     Ok(0)
 }

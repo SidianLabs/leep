@@ -3266,5 +3266,20 @@ fn run_two_agents_context(stores: &Stores, root: &Path) {
     );
     assert!(text.contains("possible duplicates:"), "{text}");
     assert!(text.contains("by task_key \"T-3\""), "{text}");
+    // A pack the server cannot give after the session is declared is
+    // reported on stderr; the session stands and the command succeeds.
+    let out = client
+        .cmd(&b)
+        .env("LEEP_TOKEN", &bo_t)
+        .args(["work", "start", "-t", "Port it", "--ref", "nope"])
+        .output()
+        .unwrap();
+    assert_ok(&out, "leep work start --ref nope");
+    assert!(stdout(&out).contains("already active,"), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("context unavailable"),
+        "{}",
+        stderr(&out)
+    );
     drop(server);
 }

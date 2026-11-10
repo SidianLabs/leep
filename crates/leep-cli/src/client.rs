@@ -549,7 +549,11 @@ impl Client {
     fn send(&self, req: RequestBuilder) -> Result<Response> {
         let (http, built) = self.named(req).build_split();
         let built = built.map_err(|e| CliError::user(format!("bad request: {e}")))?;
-        let idempotent = built.method() == reqwest::Method::GET;
+        // `POST /v1/context` is a query (ADR 0097): sent again on a shed
+        // or a rate limit like a search.
+        let idempotent = built.method() == reqwest::Method::GET
+            || (built.method() == reqwest::Method::POST
+                && built.url().path().ends_with("/v1/context"));
         let blob_upload =
             built.method() == reqwest::Method::PUT && built.url().path().starts_with("/v1/blobs/");
         let mut current = built;
@@ -2269,6 +2273,36 @@ mod tests {
             }
         });
         (url, seen)
+    }
+
+    /// A context pack is a query: a shed or a rate limit is waited out and
+    /// asked again with the same body, as a search is.
+    #[test]
+    fn a_shed_or_limited_context_request_is_sent_again() {
+        let id = ChangesetId(Hash::of_blob(b"x"));
+        let pack = reply(
+            "200 OK",
+            "",
+            &format!(r#"{{"ref":"main","head":"{id}","budget_bytes":1024,"bytes":0}}"#),
+        );
+        let limited = reply(
+            "429 Too Many Requests",
+            "retry-after: 0\r\n",
+            r#"{"error":"rate limited","code":"rate_limited"}"#,
+        );
+        let (url, seen) = body_stub(vec![shed(0), limited, pack]);
+        let req = ContextRequest {
+            task: "t".into(),
+            ..Default::default()
+        };
+        let p = Client::new(&url).context(&req).unwrap();
+        assert_eq!(p.head, id);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert!(seen
+            .iter()
+            .all(|(line, body, _)| line.starts_with("post /v1/context")
+                && body.contains("\"task\":\"t\"")));
     }
 
     fn not_admitted(retry_after: u32) -> String {

@@ -417,7 +417,10 @@ impl Server {
             .map_err(sessions_off)?;
         let s = &declared.session;
         let req = self.context_request(a.task, a.task_key, a.paths, Some(target), a.budget_bytes);
-        let pack = self.client.context(&req).map_err(context_off)?;
+        // The session is declared: a pack the server cannot give now (shed,
+        // rate limited, failing) is reported beside it, never as a failure
+        // of the call, so the agent does not declare again.
+        let pack = self.client.context(&req);
         let mut text = format!(
             "Session {} {} as {} (agent.session={key}). Your commits through \
              leep_commit_and_land record this key, and the session ends by itself when its \
@@ -432,13 +435,28 @@ impl Server {
             },
             word(&s.principal)
         );
-        text.push_str(&pack_text(&pack));
-        let v = json!({
+        let mut v = json!({
             "session": s,
             "created": declared.created,
             "agent_session": key,
-            "context": pack,
         });
+        match pack {
+            Ok(pack) => {
+                text.push_str(&pack_text(&pack));
+                v["context"] = json!(pack);
+            }
+            Err(e) => {
+                let secs = e.retry_after_ms().unwrap_or(1000).div_ceil(1000).max(1);
+                let why = context_off(e).0;
+                text.push_str(&format!(
+                    "Context unavailable: {why}. Your session is started; call leep_context in \
+                     about {secs}s for the context of this task."
+                ));
+                v["context"] = Value::Null;
+                v["context_error"] = json!(why);
+                v["retry_after"] = json!(secs);
+            }
+        }
         Ok(ToolOutput {
             text,
             structured: Some(v),
