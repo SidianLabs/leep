@@ -2235,6 +2235,13 @@ fn task_start_answers_live_work_owners_and_history() {
     assert!(text(&r).contains("leep_task_start"), "{}", text(&r));
     let r = call(&b, "leep_task_start", json!({ "task": "  " }));
     assert_eq!(r["isError"], true);
+    // Resuming without paths keeps the session's scope.
+    let r = data(&call(
+        &b,
+        "leep_task_start",
+        json!({ "task": "Make `parse_x` faster" }),
+    ));
+    assert_eq!(r["session"]["scope"], json!(["src/x/a.rs"]), "{r}");
     // A pack the server cannot give after the session is declared is
     // reported beside the session, not as a failed call.
     let r = call(

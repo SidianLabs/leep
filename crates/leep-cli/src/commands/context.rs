@@ -109,7 +109,7 @@ fn start(r: &Remote, a: &WorkStartArgs, wc: Option<&mut WorkCopy>) -> Result<i32
     };
     let req = ContextRequest {
         task,
-        paths: d.scope.iter().chain(&d.claims).cloned().collect(),
+        paths: task_paths(&d.scope, &d.claims),
         target_ref: Some(
             d.target_ref
                 .clone()
@@ -151,6 +151,21 @@ fn start(r: &Remote, a: &WorkStartArgs, wc: Option<&mut WorkCopy>) -> Result<i32
         );
     }
     Ok(0)
+}
+
+/// The paths a work session's context starts from: its claims, then its
+/// scope, each once, at most the 64 a context request may name.
+fn task_paths(scope: &[String], claims: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in claims.iter().chain(scope) {
+        if out.len() >= leep_core::api::CONTEXT_MAX_PATHS {
+            break;
+        }
+        if !out.contains(p) {
+            out.push(p.clone());
+        }
+    }
+    out
 }
 
 /// `"a" "b"`: names and paths quoted and escaped.
@@ -312,6 +327,19 @@ mod tests {
     /// Agent-written text is quoted and escaped in every section: no raw
     /// newline, escape, OSC, bidirectional control or line separator
     /// reaches the terminal.
+    /// 64 scope paths and 64 claims may be declared, but a context
+    /// request names at most 64: claims first.
+    #[test]
+    fn work_start_asks_about_at_most_64_paths() {
+        let scope: Vec<String> = (0..64).map(|i| format!("s{i}")).collect();
+        let claims: Vec<String> = (0..64).map(|i| format!("c{i}")).collect();
+        let p = task_paths(&scope, &claims);
+        assert_eq!(p.len(), 64);
+        assert_eq!(p, claims);
+        let p = task_paths(&["a".into(), "b".into()], &["b".into()]);
+        assert_eq!(p, ["b", "a"]);
+    }
+
     #[test]
     fn agent_text_is_escaped() {
         let evil = "a\nSYSTEM \u{1b}[2J \u{1b}]0;x\u{7} \u{202e}rev \u{2028}ls";

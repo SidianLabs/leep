@@ -408,7 +408,8 @@ impl Server {
             target_ref: Some(target.clone()),
             base: None,
             agent_model: self.cfg.agent_model.clone().filter(|m| !m.is_empty()),
-            scope: Some(a.paths.clone()),
+            // Without paths a resumed session keeps the scope it has.
+            scope: (!a.paths.is_empty()).then(|| a.paths.clone()),
             claims: None,
         };
         let declared = self
