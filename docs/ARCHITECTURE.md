@@ -1828,7 +1828,16 @@ a second kind of mutable state beside refs, behind its own trait,
   /v1/notices` answers only the notices, `GET /v1/sessions/{id}/overlaps`
   everything overlapping a session. The CLI prints them on stderr,
   escaped; MCP appends them, fenced, to every tool result and adds
-  `leep_overlaps`. `--notices off` leaves them out of answers.
+  `leep_overlaps`. `--notices off` leaves them out of answers. Before
+  landing, `leep_commit_and_land` and `leep_resolve_and_land` read the
+  notices their create got and stop, unlanded, on one not shown before
+  that `Notice::stops_land` says should be read first (a duplicate, a
+  claim or another session on a changed file, a land on one since the
+  base; never `near`, a scope directory or a related file); a stopped
+  changeset lands only with `force`, and a retry reuses it. A create's
+  answer carries every notice that stops a land of its files, past the
+  cap, and a notice is said again when it comes to stop a file it did not
+  before (ADR 0096 amendment).
 - **Context packs** ([ADR 0097](adr/0097-context-pack.md)). `POST
   /v1/context {task, paths?, ref?, session?, task_key?, budget_bytes?}`
   answers, with no model, what the server already has on a task: files

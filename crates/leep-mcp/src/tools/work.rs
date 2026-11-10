@@ -11,6 +11,8 @@
 //! changesets, counts, plain words); the rest goes in the fenced block
 //! under [`super::UNTRUSTED_NOTE`], one JSON row per item.
 
+use std::time::Duration;
+
 use leep_core::api::{
     ContextPack, ContextRequest, ContextText, ContextWork, CreateReviewRequest,
     DeclareSessionRequest, ReviewRequestEntry,
@@ -116,6 +118,19 @@ fn context_off(e: leep_cli::error::CliError) -> ToolError {
         );
     }
     ToolError(describe(&e))
+}
+
+/// The longest `leep_task_start` waits to ask for a shed pack again.
+const PACK_RETRY_WAIT: Duration = Duration::from_secs(2);
+
+/// How long to wait before asking again for a pack the server shed
+/// (`Leep-Refused`, ADR 0060): its `Retry-After`, when that is at most
+/// [`PACK_RETRY_WAIT`]. `None` for any other error, or a longer pause,
+/// which goes back to the agent instead.
+fn shed_pause(e: &leep_cli::error::CliError) -> Option<Duration> {
+    e.refused()?;
+    let pause = Duration::from_millis(e.retry_after_ms().unwrap_or(1000));
+    (pause <= PACK_RETRY_WAIT).then_some(pause)
 }
 
 /// An older server has no `/v1/review-requests`.
@@ -449,7 +464,14 @@ impl Server {
         // The session is declared: a pack the server cannot give now (shed,
         // rate limited, failing) is reported beside it, never as a failure
         // of the call, so the agent does not declare again.
-        let pack = self.client.context(&req);
+        let mut pack = self.client.context(&req);
+        // A pack the server shed before doing any work (ADR 0060) is asked
+        // once more after the pause it named, when that is short: the
+        // agent's first call should carry its context.
+        if let Some(pause) = pack.as_ref().err().and_then(shed_pause) {
+            std::thread::sleep(pause);
+            pack = self.client.context(&req);
+        }
         // An agent without a working copy reads the ref as the pack
         // describes it: that head is the session's base, so a later land
         // on its files is a `landed` notice (ADR 0096). A resumed session
