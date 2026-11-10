@@ -2971,3 +2971,103 @@ fn run_two_agents_sessions(stores: &Stores, root: &Path) {
     assert!(client.ok(&a, &["who", "src/auth"]).contains("nobody"));
     drop(server);
 }
+
+/// Overlap notices (ADR 0096) through the real binaries: two agents given
+/// one task are told at start, two agents editing one file are warned
+/// before either lands, and once one lands the other hears that a change
+/// to its file landed, naming it. Notices go to stderr, escaped.
+#[test]
+fn two_agents_on_one_file_are_warned_before_landing() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let stores = Stores::sqlite(&tmp.path().join("data"));
+    run_two_agents_notices(&stores, tmp.path());
+}
+
+#[test]
+fn two_agents_on_one_file_are_warned_before_landing_postgres() {
+    let _g = serial();
+    let Some(db) = PgDb::create("leep_e2e") else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let stores = Stores::with_meta(&tmp.path().join("data"), db.url.clone());
+    run_two_agents_notices(&stores, tmp.path());
+}
+
+fn run_two_agents_notices(stores: &Stores, root: &Path) {
+    let server = Server::start(stores, root);
+    let client = Client::new(&server.url, &root.join("cache"));
+    let seed = root.join("seed");
+    client.ok(root, &["init", seed.to_str().unwrap()]);
+    write(&seed, "README", "hi\n");
+    client.ok(&seed, &["commit", "-m", "seed"]);
+    client.ok(&seed, &["land"]);
+    let (a, b) = (root.join("a"), root.join("b"));
+    client.ok(root, &["init", a.to_str().unwrap()]);
+    client.ok(root, &["init", b.to_str().unwrap()]);
+    let run = |wc: &Path, args: &[&str]| {
+        let out = client.cmd(wc).args(args).output().unwrap();
+        assert_ok(&out, &format!("leep {args:?}"));
+        stderr(&out)
+    };
+
+    let start = |wc: &Path, title: &str| {
+        run(
+            wc,
+            &[
+                "session",
+                "start",
+                "-t",
+                title,
+                "--task",
+                "L-7",
+                "--scope",
+                "src/auth/token.rs",
+            ],
+        )
+    };
+    let first = start(&a, "Parse tokens");
+    assert!(!first.contains("notice:"), "{first}");
+    // b is given the same task: told at start.
+    let second = start(&b, "Rewrite the \"token\" parser");
+    assert!(second.contains("notice: [possible_duplicate]"), "{second}");
+    assert!(second.contains("by task_key \"L-7\""), "{second}");
+
+    // Both edit the file; each is warned before landing.
+    write(&b, "src/auth/token.rs", "fn b() {}\n");
+    let b_commit = run(&b, &["commit", "-m", "auth: b's parser"]);
+    write(&a, "src/auth/token.rs", "fn a() {}\n");
+    let a_commit = run(&a, &["commit", "-m", "auth: a's parser"]);
+    let warned = [&b_commit, &a_commit, &second]
+        .iter()
+        .any(|e| e.contains("notice: [same_file]"));
+    assert!(warned, "b: {b_commit}\na: {a_commit}\nstart: {second}");
+    for e in [&first, &second, &b_commit, &a_commit] {
+        assert!(!e.chars().any(|c| c.is_control() && c != '\n'), "{e:?}");
+    }
+    let overlaps = client.json(&a, &["who", "--overlaps"]);
+    let levels: Vec<&str> = overlaps["overlaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["level"].as_str().unwrap())
+        .collect();
+    assert_eq!(levels, ["possible_duplicate", "same_file"], "{overlaps}");
+    assert!(client
+        .ok(&a, &["who", "--overlaps"])
+        .contains("[same_file]"));
+
+    // b lands; a's next command names the landed changeset.
+    run(&b, &["land"]);
+    let head = client.json(&a, &["log", "-n", "1", "main"])["entries"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let status = run(&a, &["status"]);
+    assert!(status.contains("notice: [landed]"), "{status}");
+    assert!(status.contains(&head[..12]), "{status}");
+    // Said once.
+    assert!(!run(&a, &["status"]).contains("[landed]"));
+    drop(server);
+}
