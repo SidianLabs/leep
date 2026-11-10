@@ -62,6 +62,10 @@ fn tools_list_schemas_are_sane() {
         "leep_session_start",
         "leep_who",
         "leep_overlaps",
+        "leep_task_start",
+        "leep_context",
+        "leep_review_request",
+        "leep_review_inbox",
     ] {
         assert!(names.contains(&expected), "missing {expected}");
     }

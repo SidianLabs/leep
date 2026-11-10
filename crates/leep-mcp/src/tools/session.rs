@@ -53,12 +53,12 @@ struct WhoArgs {
     limit: Option<usize>,
 }
 
-fn non_empty(s: Option<String>) -> Option<String> {
+pub(crate) fn non_empty(s: Option<String>) -> Option<String> {
     s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// A fresh session key, when the MCP server was given none.
-fn new_key() -> String {
+pub(crate) fn new_key() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
@@ -71,7 +71,7 @@ fn new_key() -> String {
     format!("mcp-{}", &blake3::hash(seed.as_bytes()).to_hex()[..16])
 }
 
-fn sessions_off(e: leep_cli::error::CliError) -> ToolError {
+pub(crate) fn sessions_off(e: leep_cli::error::CliError) -> ToolError {
     if e.kind() == leep_cli::error::ErrorKind::NotFound
         && (e.server_code().is_none() || e.message().contains("keeps none"))
     {
@@ -133,7 +133,7 @@ fn fenced(sessions: &[SessionEntry]) -> Option<String> {
 
 /// `rows`, one JSON object a line, in a fence longer than any backtick run
 /// inside, under [`UNTRUSTED_NOTE`].
-fn fence_rows(rows: &[Value]) -> String {
+pub(crate) fn fence_rows(rows: &[Value]) -> String {
     let body = rows
         .iter()
         .map(|r| escape_invisible(&r.to_string()))
@@ -168,7 +168,7 @@ fn escape_invisible(json: &str) -> String {
 
 /// A server-written word as it is when it is a plain word (letters,
 /// digits, `_`, `-`, `.`), else `?`.
-fn word(w: &str) -> &str {
+pub(crate) fn word(w: &str) -> &str {
     if !w.is_empty()
         && w.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
