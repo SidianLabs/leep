@@ -241,6 +241,49 @@ async fn a_crowded_path_is_one_count() {
     assert!(n[0].session.is_none());
 }
 
+/// A crowded directory of theirs is one notice however many of my files
+/// it holds, and a crowd member that also overlaps me elsewhere, on an
+/// uncrowded path, is still named there.
+#[tokio::test]
+async fn a_crowded_directory_is_one_count_for_all_my_files() {
+    let r = repo();
+    for i in 0..=HOT_SESSIONS {
+        let mut d = declare(&format!("k{i}"), "crates work");
+        let mut scope = vec!["crates".to_string()];
+        if i == 0 {
+            scope.push("docs/guide.md".into());
+        }
+        d.scope = Some(scope);
+        r.declare_session(&format!("p{i}"), d).await.unwrap();
+    }
+    let mut mine: Vec<String> = (0..100).map(|i| format!("crates/x/f{i}.rs")).collect();
+    mine.push("docs/guide.md".into());
+    let paths: Vec<&str> = mine.iter().map(String::as_str).collect();
+    let (_, first) = commit(&r, "me", "m-1", &[], &paths).await;
+    let id = mine_id(&r, "me").await;
+    let all = r.session_overlaps(id).await.unwrap().overlaps;
+    let hot: Vec<_> = all.iter().filter(|n| n.count.is_some()).collect();
+    assert_eq!(hot.len(), 1, "{all:?}");
+    assert_eq!(hot[0].count, Some(HOT_SESSIONS as u64 + 1));
+    assert_eq!(hot[0].untrusted.other_path.as_deref(), Some("crates"));
+    let named: Vec<_> = all.iter().filter(|n| n.session.is_some()).collect();
+    assert_eq!(named.len(), 1, "{all:?}");
+    assert_eq!(named[0].principal.as_deref(), Some("p0"));
+    assert_eq!(
+        named[0].untrusted.other_path.as_deref(),
+        Some("docs/guide.md")
+    );
+    // Said once each, over any number of answers.
+    let mut said = first.len();
+    for _ in 0..5 {
+        said += r
+            .notices_for("me", "m-1", &NoticeAsk::default())
+            .await
+            .len();
+    }
+    assert_eq!(said, 2);
+}
+
 #[tokio::test]
 async fn duplicates_by_task_key_and_by_similar_intent() {
     let r = repo();

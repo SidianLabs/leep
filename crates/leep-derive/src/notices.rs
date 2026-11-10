@@ -398,54 +398,64 @@ impl Repo {
         };
         let rows = coord.near_paths(&q).await?;
         let now = unix_now();
-        // The best (level, my path, their path) per other session.
-        type Best = (NoticeLevel, usize, String);
-        let mut best: BTreeMap<u64, (Session, Best)> = BTreeMap::new();
-        // Sessions per my path at `same_file` or above.
-        let mut crowd: BTreeMap<usize, BTreeSet<u64>> = BTreeMap::new();
-        for r in rows {
+        // Each row with my first path it meets and how.
+        let mut met: Vec<(&leep_core::coord::NearRow, NoticeLevel, usize)> = Vec::new();
+        // Sessions at `same_file` or above per path of theirs: a crowded
+        // path is one notice, whichever and however many of mine it holds.
+        let mut crowd: BTreeMap<&str, (usize, BTreeSet<u64>)> = BTreeMap::new();
+        for r in &rows {
             if r.session.state_at(now) == SessionState::Expired {
                 continue;
             }
-            for (i, (p, _)) in mine.iter().enumerate() {
-                let Some(level) = path_level(p, &r.path, r.kind) else {
-                    continue;
-                };
-                if level >= NoticeLevel::SameFile {
-                    crowd.entry(i).or_default().insert(r.session.id);
-                }
-                let e = best
-                    .entry(r.session.id)
-                    .or_insert_with(|| (r.session.clone(), (level, i, r.path.clone())));
-                if level > e.1 .0 {
-                    e.1 = (level, i, r.path.clone());
-                }
+            let best = mine
+                .iter()
+                .enumerate()
+                .filter_map(|(i, (p, _))| path_level(p, &r.path, r.kind).map(|l| (l, i)))
+                .max_by_key(|(l, i)| (*l, std::cmp::Reverse(*i)));
+            let Some((level, i)) = best else { continue };
+            if level >= NoticeLevel::SameFile {
+                let e = crowd.entry(r.path.as_str()).or_insert((i, BTreeSet::new()));
+                e.1.insert(r.session.id);
             }
+            met.push((r, level, i));
         }
         let mut out = Vec::new();
-        let mut hot: BTreeSet<u64> = BTreeSet::new();
-        for (i, ids) in &crowd {
+        let mut hot: BTreeSet<&str> = BTreeSet::new();
+        for (theirs, (i, ids)) in &crowd {
             if ids.len() > HOT_SESSIONS {
                 let (p, declared) = &mine[*i];
                 let mut n = notice(NoticeLevel::SameFile, None);
                 n.count = Some(ids.len() as u64);
                 n.untrusted.path = Some(p.clone());
+                n.untrusted.other_path = Some(theirs.to_string());
                 out.push(Found {
                     level: NoticeLevel::SameFile,
-                    key: format!("hot:{p}"),
+                    key: format!("hot:{theirs}"),
                     notice: n,
                     mine: Some((p.clone(), *declared)),
                 });
-                hot.extend(ids);
+                hot.insert(theirs);
+            }
+        }
+        // The best (level, my path, their path) per other session, leaving
+        // out its rows on crowded paths (their count) unless they claim:
+        // a session that also meets me on an uncrowded path is named there.
+        type Best = (NoticeLevel, usize, String);
+        let mut best: BTreeMap<u64, (&Session, Best)> = BTreeMap::new();
+        for (r, level, i) in met {
+            if hot.contains(r.path.as_str()) && level < NoticeLevel::Claimed {
+                continue;
+            }
+            let e = best
+                .entry(r.session.id)
+                .or_insert_with(|| (&r.session, (level, i, r.path.clone())));
+            if level > e.1 .0 {
+                e.1 = (level, i, r.path.clone());
             }
         }
         for (id, (o, (level, i, theirs))) in best.into_iter().rev() {
-            // A crowded path's sessions are its count, unless they claimed.
-            if hot.contains(&id) && level < NoticeLevel::Claimed {
-                continue;
-            }
             let (p, declared) = &mine[i];
-            let mut n = notice(level, Some(&o));
+            let mut n = notice(level, Some(o));
             n.untrusted.path = Some(p.clone());
             n.untrusted.other_path = Some(theirs);
             out.push(Found {
