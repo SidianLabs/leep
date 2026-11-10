@@ -2284,6 +2284,103 @@ fn task_start_answers_live_work_owners_and_history() {
     );
 }
 
+/// Two agents given one task through `leep_task_start`, with no working
+/// copy and no `base`: when one lands a change to the shared file, the
+/// other is told, naming the changeset. The session's base is the head the
+/// first pack described; without one there is no `landed` part (ADR 0096).
+#[test]
+fn a_task_started_over_mcp_hears_of_a_land_on_its_files() {
+    let list: Vec<Value> = ["ana", "ben"]
+        .iter()
+        .map(|n| json!({ "name": n, "role": "write", "hash": auth::hash_token(&format!("{n}-t")) }))
+        .collect();
+    let url = serve(leep_server::router_with_auth(
+        common::repo(),
+        leep_server::DEFAULT_MAX_BODY_BYTES,
+        Some(Auth::parse(&json!({ "tokens": list }).to_string()).unwrap()),
+    ));
+    let agent = |name: &str| {
+        let mut c = config(&url);
+        c.token = Some(format!("{name}-t"));
+        c.agent_session = None;
+        Server::new(c)
+    };
+    let (a, b) = (agent("ana"), agent("ben"));
+    let seed = commit(
+        &a,
+        json!({ "message": "seed", "changes": [{ "path": "src/x/a.rs", "content": "a\n" }] }),
+    );
+    assert_eq!(seed["isError"], false, "{seed}");
+    let head = data(&call(&a, "leep_refs", json!({})))["refs"]["main"].clone();
+    let task = json!({ "task": "Fix the parser", "paths": ["src/x/a.rs"], "task_key": "T-9" });
+    let st = data(&call(&a, "leep_task_start", task.clone()));
+    assert_eq!(st["session"]["base"], head, "{st}");
+    let st = data(&call(&b, "leep_task_start", task.clone()));
+    assert_eq!(st["session"]["base"], head, "{st}");
+
+    let landed = data(&commit(
+        &a,
+        json!({ "message": "parser: fix", "changes": [{ "path": "src/x/a.rs", "content": "b\n" }] }),
+    ));
+    let id = landed["landed"].as_str().unwrap().to_string();
+    let o = call(&b, "leep_overlaps", json!({}));
+    let t = text(&o);
+    assert!(t.contains(&format!("[landed] changeset {id}")), "{t}");
+    // A resumed session keeps its base, so the land stays in view.
+    let st = data(&call(&b, "leep_task_start", task));
+    assert_eq!(st["created"], false);
+    assert_eq!(st["session"]["base"], head, "{st}");
+}
+
+/// A pack the server cannot give (here a task past the pack's 4 KiB
+/// limit; on a busy server, a shed) still leaves the new session a base:
+/// the ref's head, read directly. Without it the session never hears of a
+/// land on its files, as the coordination demo showed on a 2-core runner.
+#[test]
+fn a_task_whose_pack_fails_still_hears_of_a_land() {
+    let list: Vec<Value> = ["ana", "ben"]
+        .iter()
+        .map(|n| json!({ "name": n, "role": "write", "hash": auth::hash_token(&format!("{n}-t")) }))
+        .collect();
+    let url = serve(leep_server::router_with_auth(
+        common::repo(),
+        leep_server::DEFAULT_MAX_BODY_BYTES,
+        Some(Auth::parse(&json!({ "tokens": list }).to_string()).unwrap()),
+    ));
+    let agent = |name: &str| {
+        let mut c = config(&url);
+        c.token = Some(format!("{name}-t"));
+        c.agent_session = None;
+        Server::new(c)
+    };
+    let (a, b) = (agent("ana"), agent("ben"));
+    let seed = commit(
+        &a,
+        json!({ "message": "seed", "changes": [{ "path": "src/x/a.rs", "content": "a\n" }] }),
+    );
+    assert_eq!(seed["isError"], false, "{seed}");
+    let head = data(&call(&a, "leep_refs", json!({})))["refs"]["main"].clone();
+    let long = format!(
+        "Fix the parser\n{}",
+        "x".repeat(leep_core::api::CONTEXT_MAX_TASK_BYTES)
+    );
+    let st = call(
+        &b,
+        "leep_task_start",
+        json!({ "task": long, "paths": ["src/x/a.rs"] }),
+    );
+    assert!(text(&st).contains("Context unavailable"), "{}", text(&st));
+    assert_eq!(data(&st)["session"]["base"], head, "{st}");
+
+    let landed = data(&commit(
+        &a,
+        json!({ "message": "parser: fix", "changes": [{ "path": "src/x/a.rs", "content": "b\n" }] }),
+    ));
+    let id = landed["landed"].as_str().unwrap().to_string();
+    let t = text(&call(&b, "leep_overlaps", json!({})));
+    assert!(t.contains(&format!("[landed] changeset {id}")), "{t}");
+}
+
 /// `leep_review_request` and `leep_review_inbox` (ADR 0086), as the CLI's
 /// `leep review request` and `inbox`: the reviewer sees the request until
 /// it answers, the requester sees its own, and the requester's note stays

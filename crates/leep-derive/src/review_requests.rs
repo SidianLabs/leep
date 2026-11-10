@@ -93,6 +93,22 @@ impl Repo {
         Ok(row.and_then(|b| CreatedBy::decode(&b).ok()))
     }
 
+    /// Who created `id` or, for a copy the server made by rebasing, the
+    /// nearest changeset of its rebase chain that has a creator: the agent
+    /// whose work it is. A busy ref's lands are mostly such copies.
+    pub async fn created_by_through_rebases(&self, id: ChangesetId) -> Result<Option<CreatedBy>> {
+        let mut chain = vec![id];
+        chain.extend(self.rebase_chain(id).await?);
+        let keys: Vec<_> = chain.iter().map(|c| c.0).collect();
+        Ok(self
+            .meta()
+            .get_derived_many(CREATED_BY_KIND, &keys)
+            .await?
+            .into_iter()
+            .flatten()
+            .find_map(|b| CreatedBy::decode(&b).ok()))
+    }
+
     /// Open a review request, or answer the open one of the same requester,
     /// changeset, ref and reviewers (true). The changeset must exist and
     /// not be on the ref already. `rules` are the review policy's, for

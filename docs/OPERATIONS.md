@@ -3102,7 +3102,10 @@ for a long time when hardening. CI runs it weekly for 30 minutes
 working. For load rather than endurance, `leep-swarm` drives thousands of
 simulated agents with think time, reads and hot files against servers you
 start yourself, and checks history for double lands at the end
-(PERFORMANCE.md, "Many-agent workload").
+(PERFORMANCE.md, "Many-agent workload"). To see what agents are told about each
+other's work before they land (sessions, notices, context packs), run the
+twenty-agent coordination demo, `scripts/demo-coordination.sh`
+([DEMO-COORDINATION.md](DEMO-COORDINATION.md)).
 
 ```sh
 cargo build --release --workspace    # leep-soak starts leep-server and leep from its own directory

@@ -825,7 +825,7 @@ impl Repo {
                 match self.last_change_indexed(head, &p, Freshness::StaleOk).await {
                     Ok(a) => {
                         let (info, concurrent) = a.value;
-                        let by = self.created_by(info.id).await?;
+                        let by = self.created_by_through_rebases(info.id).await?;
                         Ok(Some((p, info, concurrent.len() as u64, by)))
                     }
                     Err(Error::NotFound(_)) | Err(Error::Invalid(_)) => Ok(None),

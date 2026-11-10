@@ -15,7 +15,6 @@ use leep_core::api::{
 };
 use leep_core::changeset::EXTRA_AGENT_MODEL;
 use leep_core::check::{green_ref, Check, Outcome, CHECK_KIND};
-use leep_core::review_request::{CreatedBy, CREATED_BY_KIND};
 use leep_core::{ChangesetId, Error, Hash, RefLogEntry, RefUpdateContext, Result};
 
 use crate::changeset_gc::RescueBy;
@@ -497,16 +496,10 @@ impl Repo {
         // a server-made rebased copy came from.
         // The nearest one in the rebase chain with a recorded creator.
         let about = e.land_changeset.unwrap_or(new);
-        let mut chain = vec![about];
-        chain.extend(self.rebase_chain(about).await?);
-        let keys: Vec<Hash> = chain.iter().map(|c| c.0).collect();
         let created_by = self
-            .meta()
-            .get_derived_many(CREATED_BY_KIND, &keys)
+            .created_by_through_rebases(about)
             .await?
-            .into_iter()
-            .flatten()
-            .find_map(|b| CreatedBy::decode(&b).ok().map(|c| c.principal));
+            .map(|c| c.principal);
         // Every changeset the move added on the first-parent chain: a land
         // of a stack moves the ref once.
         let floor = match e.old {
