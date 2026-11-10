@@ -1832,9 +1832,11 @@ a second kind of mutable state beside refs, behind its own trait,
   notices their create got and stop, unlanded, on one not shown before
   that `Notice::stops_land` says should be read first (a duplicate, a
   claim or another session on a changed file, a land on one since the
-  base; never `near`, a scope directory or a related file); `force`
-  lands anyway, and a retry reuses the stopped changeset (ADR 0096
-  amendment).
+  base; never `near`, a scope directory or a related file); a stopped
+  changeset lands only with `force`, and a retry reuses it. A create's
+  answer carries every notice that stops a land of its files, past the
+  cap, and a notice is said again when it comes to stop a file it did not
+  before (ADR 0096 amendment).
 - **Context packs** ([ADR 0097](adr/0097-context-pack.md)). `POST
   /v1/context {task, paths?, ref?, session?, task_key?, budget_bytes?}`
   answers, with no model, what the server already has on a task: files

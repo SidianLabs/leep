@@ -43,6 +43,11 @@ pub(crate) struct Stopped {
     content: Changeset,
     /// The request it belongs to, which keeps naming its land.
     request_id: Option<String>,
+    /// Whether the call that made it may create the ref.
+    create: bool,
+    /// The notices that stopped it, said again when a call without
+    /// `force` asks to land it.
+    notices: Vec<Notice>,
 }
 
 #[derive(Default)]
@@ -53,6 +58,22 @@ impl StoppedLands {
         self.0
             .iter()
             .find(|s| s.id == id && s.target_ref == target_ref)
+    }
+
+    /// The newest stop of `id`, on whichever ref.
+    fn find_id(&self, id: ChangesetId) -> Option<&Stopped> {
+        self.0.iter().rev().find(|s| s.id == id)
+    }
+
+    /// The stopped changeset a call making `cs` for `target_ref` reuses:
+    /// one with the same parents, author, message, changes and metadata
+    /// (`agent.request_id` among them), whatever its timestamp.
+    fn reusable(&self, cs: &Changeset, target_ref: &str) -> Option<ChangesetId> {
+        let content = timeless(cs);
+        self.0
+            .iter()
+            .find(|s| s.target_ref == target_ref && s.content == content)
+            .map(|s| s.id)
     }
 
     fn remember(&mut self, s: Stopped) {
@@ -192,13 +213,8 @@ impl Edit {
 impl Server {
     pub(super) fn commit_and_land(&self, args: Value) -> ToolResult {
         let a: Args = parse_args(args)?;
-        let target_ref = a
-            .target_ref
-            .as_deref()
-            .map(str::trim)
-            .filter(|r| !r.is_empty())
-            .unwrap_or("main")
-            .to_string();
+        let named_ref = non_empty(a.target_ref.as_deref());
+        let target_ref = named_ref.unwrap_or("main").to_string();
         if let Some(rev) = non_empty(a.changeset.as_deref()) {
             if !a.changes.is_empty() {
                 return Err(ToolError::new(
@@ -206,14 +222,21 @@ impl Server {
                 ));
             }
             let id = self.resolve_rev(Some(rev))?;
-            // A changeset a stopped call made keeps naming its request.
-            let request = self
-                .stopped
-                .lock()
-                .unwrap()
-                .find(id, &target_ref)
-                .and_then(|s| s.request_id.clone());
-            return self.land_existing(id, &target_ref, a.create_ref, request.as_deref(), a.force);
+            // A changeset a stopped call made lands where that call meant
+            // it to, unless this call names a ref, and keeps naming its
+            // request.
+            let stopped = {
+                let st = self.stopped.lock().unwrap();
+                match named_ref {
+                    Some(r) => st.find(id, r).cloned(),
+                    None => st.find_id(id).cloned(),
+                }
+            };
+            let (target_ref, create, request) = match stopped {
+                Some(s) => (s.target_ref, a.create_ref || s.create, s.request_id),
+                None => (target_ref, a.create_ref, None),
+            };
+            return self.land_existing(id, &target_ref, create, request.as_deref(), a.force);
         }
         let request_id = non_empty(a.request_id.as_deref()).map(str::to_string);
         if let Some(r) = &request_id {
@@ -321,6 +344,7 @@ impl Server {
             made.then_some(&cs),
             a.force,
             request_id.as_deref(),
+            a.create_ref,
             Lander::Commit,
         )? {
             return Ok(stop);
@@ -368,8 +392,8 @@ impl Server {
 
     /// Land a changeset that already exists. Safe to repeat: one already on
     /// the ref, or landed there as a rebased copy, is reported as landed
-    /// rather than added again. One the pre-flight check stopped is checked
-    /// again unless `force`.
+    /// rather than added again. One the pre-flight check stopped lands only
+    /// with `force`.
     fn land_existing(
         &self,
         id: ChangesetId,
@@ -379,9 +403,15 @@ impl Server {
         force: bool,
     ) -> ToolResult {
         let files = self.client.get_changeset(&id)?.changeset.changes.len();
-        if let Some(stop) =
-            self.preflight(id, target_ref, None, force, request_id, Lander::Commit)?
-        {
+        if let Some(stop) = self.preflight(
+            id,
+            target_ref,
+            None,
+            force,
+            request_id,
+            create,
+            Lander::Commit,
+        )? {
             return Ok(stop);
         }
         self.land_and_report(id, target_ref, create, files, request_id)
@@ -389,7 +419,8 @@ impl Server {
 
     /// Store `cs`, or reuse the changeset a stopped call made with the same
     /// changes, message, parents and metadata for `target_ref`, so calling
-    /// again (with `force` or not) never makes a second one. Answers the id
+    /// again (with `force` or not) never makes a second one; without
+    /// `force`, that call is stopped again. Answers the id
     /// and whether this call made it. `send_target` names the ref to the
     /// server (`Leep-Target-Ref`) as `leep_commit_and_land` does.
     pub(super) fn create_or_reuse(
@@ -398,15 +429,7 @@ impl Server {
         target_ref: &str,
         send_target: bool,
     ) -> Result<(ChangesetId, bool), ToolError> {
-        let content = timeless(cs);
-        let reused = self
-            .stopped
-            .lock()
-            .unwrap()
-            .0
-            .iter()
-            .find(|s| s.target_ref == target_ref && s.content == content)
-            .map(|s| s.id);
+        let reused = self.stopped.lock().unwrap().reusable(cs, target_ref);
         if let Some(id) = reused {
             return Ok((id, false));
         }
@@ -419,17 +442,19 @@ impl Server {
     }
 
     /// The pre-flight check (ADR 0096 amendment), before landing `id` on
-    /// `target_ref`: a stop answer when a notice the agent has not been
-    /// shown says another agent's work meets this change
-    /// ([`Notice::stops_land`]), else `None` and the land goes ahead.
+    /// `target_ref`: a stop answer, or `None` and the land goes ahead.
     ///
-    /// `made` is the changeset when this call just created it: its create's
-    /// answer carries the notices (ADR 0096), so a clean check costs no
-    /// request. The server says each notice once per session, so one that
-    /// stopped a call never stops another. Landing a changeset a call
-    /// stopped before asks the server (`GET /v1/notices`) for anything new
-    /// since; any other existing changeset (finishing a call whose answer
-    /// was lost) lands unchecked, as before. `force` skips the check.
+    /// `made` is the changeset when this call just created it. Its create's
+    /// answer carries the notices for the session (ADR 0096), every one
+    /// that stops a land of its files included and each said once, so a
+    /// clean check costs no request: the call stops when one of them stops
+    /// a land of the changed files ([`Notice::stops_land`]). A changeset a
+    /// call stopped before lands only with `force`: without it the call is
+    /// stopped again, with those notices and any the server has said since
+    /// (`GET /v1/notices`). Any other existing changeset (finishing a call
+    /// whose answer was lost) lands unchecked, as before. A stopped
+    /// changeset is forgotten only once it lands.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn preflight(
         &self,
         id: ChangesetId,
@@ -437,46 +462,62 @@ impl Server {
         made: Option<&Changeset>,
         force: bool,
         request_id: Option<&str>,
+        create: bool,
         lander: Lander,
     ) -> Result<Option<ToolOutput>, ToolError> {
-        let earlier = self.stopped.lock().unwrap().find(id, target_ref).cloned();
         if force {
-            self.stopped.lock().unwrap().forget(id);
             return Ok(None);
         }
-        let content = match (made, earlier) {
-            (Some(cs), _) => timeless(cs),
+        let earlier = self.stopped.lock().unwrap().find(id, target_ref).cloned();
+        let (content, mut stops, again) = match (made, earlier) {
+            (Some(cs), _) => (timeless(cs), Vec::new(), false),
             (None, Some(s)) => {
-                // Best effort, like every notice read: a server that does
-                // not answer leaves nothing new to stop for.
+                // Best effort, like every notice read: what the server
+                // cannot say now is said on a later answer.
                 if self.client.notices_now().is_ok() {
                     *self.notice_poll.lock().unwrap() = Some(std::time::Instant::now());
                 }
-                s.content
+                (s.content, s.notices, true)
             }
             (None, None) => return Ok(None),
         };
         let changed: Vec<String> = content.changes.keys().map(|p| p.to_string()).collect();
-        let mut stops: Vec<Notice> = Vec::new();
+        let mut fresh: Vec<Notice> = Vec::new();
         for n in self.client.pending_notices() {
-            if n.stops_land(&changed) && !stops.contains(&n) {
-                stops.push(n);
+            if n.stops_land(&changed) && !fresh.contains(&n) {
+                fresh.push(n);
             }
         }
-        if stops.is_empty() {
-            self.stopped.lock().unwrap().forget(id);
+        if fresh.is_empty() && !again {
             return Ok(None);
         }
         // Said here, in the stop answer; the rest still end the result.
-        self.client.forget_notices(|n| stops.contains(n));
+        self.client.forget_notices(|n| fresh.contains(n));
+        let new = fresh.len();
+        for n in fresh.into_iter().rev() {
+            if !stops.contains(&n) {
+                stops.insert(0, n);
+            }
+        }
         let files = content.changes.len();
         self.stopped.lock().unwrap().remember(Stopped {
             id,
             target_ref: target_ref.to_string(),
             content,
             request_id: request_id.map(str::to_string),
+            create,
+            notices: stops.clone(),
         });
-        Ok(Some(stop_report(id, target_ref, files, &stops, lander)))
+        let stop = Stop {
+            id,
+            target_ref,
+            create,
+            files,
+            notices: &stops,
+            again: again.then_some(new),
+            lander,
+        };
+        Ok(Some(stop.report()))
     }
 
     /// Land `created` and report the outcome. A conflict forgets the
@@ -498,6 +539,9 @@ impl Server {
                 rebased,
                 attempts,
             } => {
+                // Landed (now, or before by this request): nothing stopped
+                // is left to land.
+                self.stopped.lock().unwrap().forget(created);
                 let mut v = json!({
                     "status": "landed",
                     "landed": landed.to_string(),
@@ -793,54 +837,84 @@ impl Server {
     }
 }
 
-/// The answer of a land the pre-flight check stopped: not landed, which
-/// changeset was made, the notices that stopped it (other agents' words
-/// fenced) and exactly how to go on.
-fn stop_report(
+/// A land the pre-flight check stopped.
+struct Stop<'a> {
     id: ChangesetId,
-    target_ref: &str,
+    target_ref: &'a str,
+    create: bool,
     files: usize,
-    stops: &[Notice],
+    /// The notices that stopped it, newest first.
+    notices: &'a [Notice],
+    /// A changeset stopped before, asked to land again without `force`:
+    /// how many of `notices` are new since.
+    again: Option<usize>,
     lander: Lander,
-) -> ToolOutput {
-    let land_it = match lander {
-        Lander::Commit => format!(
-            "call leep_commit_and_land with changeset: \"{id}\" and force: true (or repeat \
-             this call with force: true)"
-        ),
-        Lander::Resolve => {
-            "call leep_resolve_and_land again with the same arguments and force: true".to_string()
+}
+
+impl Stop<'_> {
+    /// Not landed, which changeset was made, the notices that stopped it
+    /// (other agents' words fenced) and exactly how to go on. Not an error
+    /// result, like a conflict report: nothing failed, and an agent that
+    /// retries blindly is stopped again, never landed.
+    fn report(&self) -> ToolOutput {
+        let (id, target_ref) = (self.id, self.target_ref);
+        let (land_it, change_it) = match self.lander {
+            Lander::Commit => (
+                format!(
+                    "call leep_commit_and_land with changeset: \"{id}\", target_ref: \
+                     \"{target_ref}\"{} and force: true",
+                    if self.create {
+                        ", create_ref: true"
+                    } else {
+                        ""
+                    }
+                ),
+                "call leep_commit_and_land with the new changes",
+            ),
+            Lander::Resolve => (
+                "call leep_resolve_and_land again with the same arguments and force: true"
+                    .to_string(),
+                "call leep_resolve_and_land with the new resolutions",
+            ),
+        };
+        let why = match self.again {
+            None => format!(
+                "Changeset {id} was created but NOT landed, because the notices below, which \
+                 you had not been shown, say other agents' work meets this change."
+            ),
+            Some(new) => format!(
+                "Changeset {id} was stopped before and lands only with force: true. The \
+                 notices below stopped it ({new} new since)."
+            ),
+        };
+        let guidance = format!(
+            "Nothing was landed: {target_ref} is unchanged. {why} Read them; leep_overlaps \
+             lists everything overlapping your work and leep_read_file shows {target_ref} now. \
+             Then either land it as it is: {land_it}; that lands this changeset and makes no \
+             new one. Or change your work and {change_it}: different changes are stopped only \
+             by a notice you have not been shown. Calling again without force stops again."
+        );
+        let v = json!({
+            "status": "stopped",
+            "landed": false,
+            "changeset": id.to_string(),
+            "target_ref": target_ref,
+            "files_changed": self.files,
+            "stopped_by": self.notices,
+            "guidance": guidance,
+        });
+        let notices = notices_text(
+            "Notices about other agents' work near yours that stopped this land",
+            self.notices,
+        )
+        .unwrap_or_default();
+        ToolOutput {
+            text: format!(
+                "NOT LANDED: stopped before landing (pre-flight check).\n{guidance}\n\n{notices}"
+            ),
+            structured: Some(v),
+            is_error: false,
         }
-    };
-    let guidance = format!(
-        "Nothing was landed: {target_ref} is unchanged. Changeset {id} was created but NOT \
-         landed, because the notices below, which you had not been shown, say other agents' \
-         work meets this change. Read them; leep_overlaps lists everything overlapping your \
-         work and leep_read_file shows {target_ref} now. Then either land it as it is: \
-         {land_it}; that lands this changeset and makes no new one. Or change your work and \
-         call leep_commit_and_land with the new changes. These notices never stop a call \
-         again: without force, a call stops only for a notice you have not been shown."
-    );
-    let v = json!({
-        "status": "stopped",
-        "landed": false,
-        "changeset": id.to_string(),
-        "target_ref": target_ref,
-        "files_changed": files,
-        "stopped_by": stops,
-        "guidance": guidance,
-    });
-    let notices = notices_text(
-        "Notices about other agents' work near yours that stopped this land",
-        stops,
-    )
-    .unwrap_or_default();
-    ToolOutput {
-        text: format!(
-            "NOT LANDED: stopped before landing (pre-flight check).\n{guidance}\n\n{notices}"
-        ),
-        structured: Some(v),
-        is_error: true,
     }
 }
 
@@ -936,6 +1010,61 @@ mod tests {
             "invalid input: land id {id} already landed {earlier}; use a new land id to land \
              {requested}"
         )
+    }
+
+    fn stopped(n: usize, message: &str, request: Option<&str>) -> (Changeset, Stopped) {
+        let mut extra = BTreeMap::new();
+        if let Some(r) = request {
+            extra.insert(EXTRA_AGENT_REQUEST_ID.to_string(), r.to_string());
+        }
+        let cs = Changeset {
+            parents: vec![cs('a')],
+            author: "ana".into(),
+            timestamp: n as i64,
+            message: message.into(),
+            changes: BTreeMap::new(),
+            extra,
+        };
+        let id = ChangesetId(Hash::of_blob(format!("{n}{message}").as_bytes()));
+        let s = Stopped {
+            id,
+            target_ref: "main".into(),
+            content: timeless(&cs),
+            request_id: request.map(str::to_string),
+            create: false,
+            notices: Vec::new(),
+        };
+        (cs, s)
+    }
+
+    #[test]
+    fn a_stopped_changeset_is_reused_only_for_the_same_content() {
+        let mut st = StoppedLands::default();
+        let (made, s) = stopped(1, "fix", Some("r1"));
+        let id = s.id;
+        st.remember(s);
+        // Another moment, the same content: reused, on its ref only.
+        let mut later = made.clone();
+        later.timestamp = 99;
+        assert_eq!(st.reusable(&later, "main"), Some(id));
+        assert_eq!(st.reusable(&later, "feature"), None);
+        // Another message or request id is another changeset.
+        let mut other = later.clone();
+        other.message = "fix it".into();
+        assert_eq!(st.reusable(&other, "main"), None);
+        let (other, _) = stopped(1, "fix", Some("r2"));
+        assert_eq!(st.reusable(&other, "main"), None);
+        let (other, _) = stopped(1, "fix", None);
+        assert_eq!(st.reusable(&other, "main"), None);
+        // At most MAX_STOPPED, the oldest forgotten first.
+        for n in 2..=MAX_STOPPED + 1 {
+            st.remember(stopped(n, &format!("more {n}"), None).1);
+        }
+        assert_eq!(st.0.len(), MAX_STOPPED);
+        assert_eq!(st.reusable(&later, "main"), None, "the oldest went first");
+        assert!(st.find_id(id).is_none());
+        let (newest, s) = stopped(MAX_STOPPED + 1, &format!("more {}", MAX_STOPPED + 1), None);
+        assert_eq!(st.reusable(&newest, "main"), Some(s.id));
     }
 
     #[test]

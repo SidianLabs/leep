@@ -582,13 +582,14 @@ pub fn definitions() -> Vec<Value> {
              have landed: call again with `changeset` set to the id the error names, or with \
              the same `request_id`; that never lands the change twice. PRE-FLIGHT: before \
              landing, the tool checks the notices its commit got; when one you have not been \
-             shown says another agent claimed or edits one of your files, may have your task, or \
-             landed a change to one of your files since your base, it stops: the result has \
-             status `stopped`, NOTHING is landed, and it names the changeset it made and the \
-             notices. To land that changeset as it is, call again with `changeset` set to its id \
-             and force:true (or repeat the call with force:true; the changeset is reused, not \
-             made again). Each notice stops at most one call: a call without force stops only \
-             for a notice you have not been shown. Notices about nearby files (`near`), a \
+             shown says another agent claimed or edits one of the files you change, may have \
+             your task, or landed a change to one of them since your base, it stops: the result \
+             has status `stopped`, NOTHING is landed, and it names the changeset it made, its \
+             target_ref and every notice that stopped it. That changeset lands only with \
+             force:true: call with `changeset` set to its id, the `target_ref` given, and \
+             force:true (repeating the call with force:true also lands it, without making \
+             another). Calling again without force stops again. Different changes are stopped \
+             only by notices you have not been shown. Notices about nearby files (`near`), a \
              directory someone scoped, or a file only related to your task never stop.",
             json!({
                 "type": "object",
@@ -615,7 +616,7 @@ pub fn definitions() -> Vec<Value> {
                     "create_ref": { "type": "boolean", "description": "Create target_ref if it does not exist (default false, so a mistyped ref is an error). The first land onto `main` of an empty repository creates it without this." },
                     "prompt": { "type": "string", "description": "The request that led to this change, recorded as provenance." },
                     "tests": { "type": "string", "description": "Tests run and their results, recorded as provenance." },
-                    "changeset": { "type": "string", "description": "Land this existing changeset (id or unique prefix) instead of creating one, e.g. to finish a call that timed out or one the pre-flight check stopped (with force:true). Give no changes with it." },
+                    "changeset": { "type": "string", "description": "Land this existing changeset (id or unique prefix) instead of creating one, e.g. to finish a call that timed out or one the pre-flight check stopped (with force:true; without target_ref it lands where the stopped call meant to). Give no changes with it." },
                     "force": { "type": "boolean", "description": "Land without the pre-flight check (default false): set it after reading the notices of a `stopped` result, to land anyway." },
                     "request_id": { "type": "string", "description": "Your own id for this request, unique per change (among your own requests; another agent may use the same id). A retry with the same id and target_ref lands at most once, at any age and even from a restarted MCP server: if the first call landed, the result is that land (`from_record: true`). Keep it when you retry after a conflict." }
                 },
@@ -640,7 +641,8 @@ pub fn definitions() -> Vec<Value> {
              server restarted), call leep_commit_and_land again with base set to `onto` and ALL \
              files you meant to change. Like leep_commit_and_land it may stop before landing \
              (status `stopped`) for notices you have not been shown; call it again with the same \
-             arguments and force:true to land the changeset it made.",
+             arguments and force:true to land the changeset it made (without force it stops \
+             again).",
             json!({
                 "type": "object",
                 "properties": {

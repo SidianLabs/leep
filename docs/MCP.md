@@ -125,7 +125,9 @@ same fixed line, with C1 controls, line separators and bidirectional controls
 escaped. Structured results also get a `notices` list. Each MCP server
 asks with a 3 s timeout, and a notice it was given is not given again. Notices are advisory: they never change what the
 server does; the one thing they change on the client is the pre-flight
-check of `leep_commit_and_land` and `leep_resolve_and_land` (below). Duplicates are found by task key (on every answer, so the first
+check of `leep_commit_and_land` and `leep_resolve_and_land` (below), and
+an answer to a create carries, past the three, every notice that stops a
+land of its files. Duplicates are found by task key (on every answer, so the first
 of a pair hears of the second too) or by similar wording (when a session
 is declared) only.
 
@@ -183,43 +185,64 @@ overlap, the server rebases automatically (`rebased: true`).
 **Pre-flight check** ([ADR 0096](adr/0096-overlap-notices-and-duplicate-flags.md),
 amendment). The create's answer already carries the notices for the
 agent's session, so before landing the tool reads them, and lands only
-when none of them should be read first. One stops the land when
-(`Notice::stops_land` in `leep-core`, the one place the rule lives):
+when none of them should be read first. One stops the land of the files
+the changeset changes when (`Notice::stops_land` in `leep-core`, the one
+place the rule lives; it reads the other side's path, `other_path`):
 
 | Level | Stops when |
 |---|---|
 | `possible_duplicate` | always |
-| `landed` | its changeset changed a file of this change, or it is a duplicate's land (`by task_key`) |
-| `claimed` | the claim is on a file of this change or a directory holding it |
-| `same_file` | the other session names a file of this change itself, not only a directory holding it (a scope) |
+| `landed` | its changeset changed one of the files, or it is a duplicate's land (`by task_key`) |
+| `claimed` | the claim is on one of the files or a directory holding it |
+| `same_file` | the other session names one of the files itself, not only a directory holding it (a scope) |
 | `near`, a level the client does not know, anything `via` a related file | never |
 
-A stopped call has created the changeset but not landed it. Its result has
-`isError: true`, starts `NOT LANDED: stopped before landing`, and carries
+A stopped call has created the changeset but not landed it. Like a
+conflict report its result is not an error (`isError: false`; nothing
+failed), starts `NOT LANDED: stopped before landing`, and carries
 `{status: "stopped", landed: false, changeset, target_ref, files_changed,
-stopped_by: [Notice], guidance}`; the text lists the notices that stopped
+stopped_by: [Notice], guidance}`; the text lists every notice that stopped
 it under "Notices about other agents' work near yours that stopped this
 land", with other agents' words in the usual fence, and the other notices
 end the result as usual. The guidance says how to go on: land it as it
-is with `changeset` set to the id and `force: true` (or the same call with
-`force: true`), or change the work and call again.
+is with `changeset` set to the id, the `target_ref` given (and
+`create_ref: true` when the call had it) and `force: true`, or change the
+work and call again.
 
-**Only notices not shown before stop a land.** The server says each
-notice once per session (30 minutes), so the notices that stopped a call
-never stop another: a commit with changed work lands unless something new
-turned up. The changeset a stopped call made is remembered by the MCP
-server (64 per process): a later call with the same changes, message,
-base and metadata reuses it instead of making another, with `force` or
-without; without `force` the tool asks the server for new notices (`GET
-/v1/notices`) and lands unless one stops it. `force: true` skips the check;
-`changeset` with `force` lands the stopped changeset by its id (keeping its
-`request_id`'s land id). A call with nothing that stops it is the same one
-create and one land as before: the check costs no request. After an MCP
-server restart the remembered changesets are gone: the same call makes a
-new changeset, which lands since its notices were said. A call that omits
+**A stopped changeset lands only with `force`.** The MCP server remembers
+the changesets it stopped (64 per process, the oldest forgotten first, and
+each forgotten once it lands). A call with the same changes, message,
+parents and metadata (`request_id` included) for the same ref reuses the
+stopped changeset instead of making another; so does a call naming it
+with `changeset` (which, without `target_ref`, lands it on the ref the
+stopped call named, keeping its `request_id`'s land id). With `force:
+true` such a call lands it; without, it is stopped again: the tool asks the
+server for anything new (`GET /v1/notices`) and lists those notices with
+the earlier ones, saying how many are new. So an agent that retries
+blindly is never landed by it.
+
+**Different changes are stopped only by what is new.** The server says
+each notice once per session (30 minutes), so a commit with changed work
+is stopped only by a notice the agent has not been shown: changing the
+work after a stop lands it unless something new turned up. A notice is
+said again, and stops, when it comes to stop a land of a file it did not
+stop before: another session first heard of through a directory, or a
+land that changed other files, stops a later commit of a file it does
+touch. Every notice that stops comes in the one answer, past the cap of
+three. A call with nothing that stops it is the same one create and one
+land as before: the check costs no request.
+
+**Limits.** The check reads what the server said; when the notices of a
+create were left out (each part has 150 ms, ADR 0096) or a `GET
+/v1/notices` answer is lost, nothing stops, and the notices come on a
+later answer. Several MCP servers on one `LEEP_AGENT_SESSION` share the
+server's said-once memory but not their stopped changesets: a notice one
+of them was stopped by does not stop the other. After an MCP server
+restart the remembered changesets are gone: the same call makes a new
+changeset, which lands since its notices were said; a call that omits
 `base` after the ref moved has another parent, so it makes a new
-changeset; the stopped one is left unlanded (changeset GC reclaims it).
-`leep_resolve_and_land` stops the same way; the conflict stays
+changeset too, and the stopped one is left unlanded (changeset GC reclaims
+it). `leep_resolve_and_land` stops the same way; the conflict stays
 remembered, and the same call with `force: true` lands the resolution it
 made. The CLI needs no such check: `leep commit` and `leep land` are
 separate commands, and `leep commit` prints its notices before the agent

@@ -27,7 +27,7 @@ leep_commit_and_land sends complete file contents, creates one changeset and lan
 reports conflicts, nothing landed; call leep_resolve_and_land with the report's conflict_id and \
 resolved content for the conflicting paths only. If it reports `stopped`, nothing landed either: \
 another agent's work meets your change; read the notices, then land the named changeset with \
-force:true or change your work.";
+force:true or change your work. Without force, the same call stops again.";
 
 pub struct Server {
     pub(crate) client: Client,

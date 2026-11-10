@@ -2532,15 +2532,29 @@ fn review_request_and_inbox() {
     assert!(text(&r).contains("token"), "{}", text(&r));
 }
 
-/// A server for the pre-flight tests: three principals, and counts of the
-/// changesets created and the lands sent.
-fn counted_server() -> (
-    String,
-    std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    std::sync::Arc<std::sync::atomic::AtomicUsize>,
-) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+/// What a pre-flight test server counted.
+#[derive(Clone, Default)]
+struct Counts {
+    creates: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    lands: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    notices: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Counts {
+    fn get(&self) -> (usize, usize, usize) {
+        use std::sync::atomic::Ordering::SeqCst;
+        (
+            self.creates.load(SeqCst),
+            self.lands.load(SeqCst),
+            self.notices.load(SeqCst),
+        )
+    }
+}
+
+/// A server for the pre-flight tests: three principals, counting the
+/// changesets created, the lands sent and the notice reads.
+fn counted_server() -> (String, Counts) {
+    use std::sync::atomic::Ordering;
 
     use axum::extract::Request;
     use axum::http::Method;
@@ -2550,25 +2564,26 @@ fn counted_server() -> (
         .iter()
         .map(|n| json!({ "name": n, "role": "write", "hash": auth::hash_token(&format!("{n}-t")) }))
         .collect();
-    let creates = Arc::new(AtomicUsize::new(0));
-    let lands = Arc::new(AtomicUsize::new(0));
-    let (c, l) = (creates.clone(), lands.clone());
+    let counts = Counts::default();
+    let c = counts.clone();
     let app = leep_server::router_with_auth(
         common::repo(),
         leep_server::DEFAULT_MAX_BODY_BYTES,
         Some(Auth::parse(&json!({ "tokens": list }).to_string()).unwrap()),
     )
     .layer(middleware::from_fn(move |req: Request, next: Next| {
-        if req.method() == Method::POST {
-            match req.uri().path() {
-                "/v1/changesets" => drop(c.fetch_add(1, Ordering::SeqCst)),
-                "/v1/land" => drop(l.fetch_add(1, Ordering::SeqCst)),
-                _ => {}
-            }
+        let counter = match (req.method(), req.uri().path()) {
+            (&Method::POST, "/v1/changesets") => Some(&c.creates),
+            (&Method::POST, "/v1/land") => Some(&c.lands),
+            (&Method::GET, "/v1/notices") => Some(&c.notices),
+            _ => None,
+        };
+        if let Some(n) = counter {
+            n.fetch_add(1, Ordering::SeqCst);
         }
         next.run(req)
     }));
-    (serve(app), creates, lands)
+    (serve(app), counts)
 }
 
 fn agent_on(url: &str, name: &str, key: &str) -> Server {
@@ -2578,30 +2593,57 @@ fn agent_on(url: &str, name: &str, key: &str) -> Server {
     Server::new(c)
 }
 
-fn main_of(s: &Server) -> Value {
-    data(&call(s, "leep_refs", json!({})))["refs"]["main"].clone()
+fn ref_of(s: &Server, name: &str) -> Value {
+    data(&call(s, "leep_refs", json!({})))["refs"][name].clone()
 }
 
-/// The pre-flight check (ADR 0096 amendment): with nothing overlapping a
-/// commit lands in one call; a commit to a file another agent works on is
-/// stopped before it lands, naming the changeset it made and the notice;
-/// changing the work and calling again lands, since that notice was said.
+fn main_of(s: &Server) -> Value {
+    ref_of(s, "main")
+}
+
+/// Seed `files` on `main` as `s` (an empty repository's first land is sent
+/// twice: without `create`, then with it).
+fn seed(s: &Server, files: &[&str]) {
+    let changes: Vec<Value> = files
+        .iter()
+        .map(|f| json!({ "path": f, "content": "seed\n" }))
+        .collect();
+    let r = commit(s, json!({ "message": "seed", "changes": changes }));
+    assert_eq!(r["isError"], false, "{r}");
+}
+
+/// A stopped result: not an error, nothing landed; answers the changeset.
+fn stopped(r: &Value) -> String {
+    assert_eq!(r["isError"], false, "a stop is not an error: {r}");
+    let st = &r["structuredContent"];
+    assert_eq!(st["status"], "stopped", "{r}");
+    assert_eq!(st["landed"], false);
+    assert!(text(r).starts_with("NOT LANDED"), "{}", text(r));
+    st["changeset"].as_str().unwrap().to_string()
+}
+
+/// The pre-flight check (ADR 0096 amendment): (1) with nothing
+/// overlapping, a commit is one create and one land; (2) a commit to a file
+/// another agent works on is stopped before it lands, naming the changeset
+/// and the notice, the ref unmoved; (3) the same call again is stopped
+/// again, reusing the changeset; (4) changed work lands in one call, since
+/// that notice was said.
 #[test]
 fn preflight_stops_a_land_on_another_agents_file_once() {
-    use std::sync::atomic::Ordering;
-
-    let (url, creates, lands) = counted_server();
+    let (url, counts) = counted_server();
     let a = agent_on(&url, "ana", "pf-a");
     let b = agent_on(&url, "ben", "pf-b");
+    seed(&a, &["README"]);
 
-    // (1) Nothing overlaps: one call creates once and lands once.
-    let seed = data(&commit(
+    // (1) One create, one land.
+    let before = counts.get();
+    let r = data(&commit(
         &a,
-        json!({ "message": "seed", "changes": [{ "path": "src/x/a.rs", "content": "a\n" }] }),
+        json!({ "message": "start", "changes": [{ "path": "src/x/a.rs", "content": "a\n" }] }),
     ));
-    assert_eq!(seed["status"], "landed", "{seed}");
-    assert_eq!(creates.load(Ordering::SeqCst), 1);
-    assert!(lands.load(Ordering::SeqCst) >= 1);
+    assert_eq!(r["status"], "landed", "{r}");
+    let after = counts.get();
+    assert_eq!((after.0 - before.0, after.1 - before.1), (1, 1));
     let head = main_of(&a);
 
     // ben says it works on the file; its title is another agent's words.
@@ -2613,27 +2655,22 @@ fn preflight_stops_a_land_on_another_agents_file_once() {
     assert_eq!(started["isError"], false, "{started}");
 
     // (2) Stopped: created, not landed; the ref has not moved.
-    let lands_before = lands.load(Ordering::SeqCst);
-    let r = commit(
-        &a,
-        json!({ "message": "parser: fix", "changes": [{ "path": "src/x/a.rs", "content": "b\n" }] }),
-    );
-    assert_eq!(r["isError"], true, "{r}");
-    let st = &r["structuredContent"];
-    assert_eq!(st["status"], "stopped", "{r}");
-    assert_eq!(st["landed"], false);
-    let stopped = st["changeset"].as_str().unwrap().to_string();
-    assert_eq!(st["stopped_by"][0]["level"], "same_file", "{r}");
+    let args = json!({ "message": "parser: fix", "changes": [{ "path": "src/x/a.rs", "content": "b\n" }] });
+    let before = counts.get();
+    let r = commit(&a, args.clone());
+    let id = stopped(&r);
     assert_eq!(
-        lands.load(Ordering::SeqCst),
-        lands_before,
-        "nothing was sent to land"
+        r["structuredContent"]["stopped_by"][0]["level"], "same_file",
+        "{r}"
     );
+    let after = counts.get();
+    assert_eq!((after.0 - before.0, after.1 - before.1), (1, 0));
     assert_eq!(main_of(&a), head, "the ref did not move");
     let t = text(&r);
-    assert!(t.starts_with("NOT LANDED"), "{t}");
     assert!(
-        t.contains(&format!("changeset: \"{stopped}\" and force: true")),
+        t.contains(&format!(
+            "changeset: \"{id}\", target_ref: \"main\" and force: true"
+        )),
         "{t}"
     );
     let (outside, fenced) = t.split_once(leep_mcp::tools::UNTRUSTED_NOTE).unwrap();
@@ -2643,9 +2680,19 @@ fn preflight_stops_a_land_on_another_agents_file_once() {
     );
     assert!(!outside.contains("SYSTEM"), "{t}");
     assert!(fenced.contains("SYSTEM"), "{t}");
-    // The changeset exists, unlanded.
-    let shown = call(&a, "leep_show", json!({ "rev": stopped }));
+    let shown = call(&a, "leep_show", json!({ "rev": id }));
     assert_eq!(shown["isError"], false, "{shown}");
+
+    // (3) The same call again: the same changeset, stopped again, after
+    // asking the server what is new; nothing created or landed.
+    let before = counts.get();
+    let r = commit(&a, args);
+    assert_eq!(stopped(&r), id);
+    let after = counts.get();
+    assert_eq!((after.0 - before.0, after.1 - before.1), (0, 0));
+    assert!(after.2 > before.2, "asked GET /v1/notices");
+    assert!(text(&r).contains("stopped before"), "{}", text(&r));
+    assert_eq!(main_of(&a), head);
 
     // (4) The agent read the notice and changed its work: the notice was
     // said, so the new commit lands in one call.
@@ -2654,26 +2701,18 @@ fn preflight_stops_a_land_on_another_agents_file_once() {
         json!({ "message": "parser: fix, keeping ben's lines", "changes": [{ "path": "src/x/a.rs", "content": "c\n" }] }),
     ));
     assert_eq!(again["status"], "landed", "{again}");
-    assert_ne!(again["changeset"], stopped.as_str());
+    assert_ne!(again["changeset"], id.as_str());
 }
 
 /// Landing a stopped changeset with `force` makes no second changeset,
-/// whether the call names it or repeats its arguments; and a retry without
-/// `force` lands too once nothing new overlaps (no loop).
+/// whether the call names it or repeats its arguments.
 #[test]
 fn preflight_force_lands_the_stopped_changeset() {
-    use std::sync::atomic::Ordering;
-
-    let (url, creates, _) = counted_server();
+    let (url, counts) = counted_server();
     let a = agent_on(&url, "ana", "pf2-a");
     let b = agent_on(&url, "ben", "pf2-b");
     let c = agent_on(&url, "cyd", "pf2-c");
-    let seed = commit(
-        &a,
-        json!({ "message": "seed", "changes": [
-            { "path": "src/x/a.rs", "content": "a\n" }, { "path": "src/x/b.rs", "content": "b\n" }] }),
-    );
-    assert_eq!(seed["isError"], false, "{seed}");
+    seed(&a, &["src/x/a.rs", "src/x/b.rs"]);
     for (s, file) in [(&b, "src/x/a.rs"), (&c, "src/x/b.rs")] {
         let r = call(
             s,
@@ -2687,79 +2726,215 @@ fn preflight_force_lands_the_stopped_changeset() {
     let args =
         json!({ "message": "a: edit", "changes": [{ "path": "src/x/a.rs", "content": "a2\n" }] });
     let r = commit(&a, args.clone());
-    assert_eq!(r["structuredContent"]["status"], "stopped", "{r}");
+    let id = stopped(&r);
     assert_eq!(
         r["structuredContent"]["stopped_by"][0]["level"], "claimed",
         "{r}"
     );
-    let stopped = r["structuredContent"]["changeset"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let made = creates.load(Ordering::SeqCst);
-    let mut forced = args.clone();
+    let made = counts.get().0;
+    let mut forced = args;
     forced["force"] = json!(true);
     let landed = data(&commit(&a, forced));
     assert_eq!(landed["status"], "landed", "{landed}");
     assert_eq!(
         landed["changeset"],
-        stopped.as_str(),
+        id.as_str(),
         "the stopped changeset landed"
     );
-    assert_eq!(creates.load(Ordering::SeqCst), made, "no second changeset");
+    assert_eq!(counts.get().0, made, "no second changeset");
 
     // Naming the changeset with force does the same.
     let r = commit(
         &a,
         json!({ "message": "b: edit", "changes": [{ "path": "src/x/b.rs", "content": "b2\n" }] }),
     );
-    assert_eq!(r["structuredContent"]["status"], "stopped", "{r}");
-    let stopped = r["structuredContent"]["changeset"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let made = creates.load(Ordering::SeqCst);
-    let landed = data(&commit(&a, json!({ "changeset": stopped, "force": true })));
+    let id = stopped(&r);
+    let made = counts.get().0;
+    let landed = data(&commit(&a, json!({ "changeset": id, "force": true })));
     assert_eq!(landed["status"], "landed", "{landed}");
-    assert_eq!(landed["changeset"], stopped.as_str());
-    assert_eq!(creates.load(Ordering::SeqCst), made);
+    assert_eq!(landed["changeset"], id.as_str());
+    assert_eq!(counts.get().0, made);
     assert_eq!(main_of(&a), landed["landed"]);
 }
 
-/// A stopped call repeated without `force` reuses its changeset and lands
-/// it when the server has nothing new to say: a notice stops one call, not
-/// every retry.
+/// A retry without `force` is stopped again, and hears what is new since:
+/// ana works under a directory (her scope), so the server's notice read,
+/// which knows no request, pairs a new claim with her directory; the claim
+/// on her file still stops the retry, named among the notices.
 #[test]
-fn preflight_retry_without_force_lands_when_nothing_is_new() {
-    use std::sync::atomic::Ordering;
-
-    let (url, creates, _) = counted_server();
+fn preflight_retry_is_stopped_again_with_what_is_new() {
+    let (url, counts) = counted_server();
     let a = agent_on(&url, "ana", "pf3-a");
     let b = agent_on(&url, "ben", "pf3-b");
-    let seed = commit(
+    let c = agent_on(&url, "cyd", "pf3-c");
+    seed(&a, &["src/x/a.rs"]);
+    let r = call(
         &a,
-        json!({ "message": "seed", "changes": [{ "path": "src/x/a.rs", "content": "a\n" }] }),
+        "leep_session_start",
+        json!({ "title": "x work", "scope": ["src/x"], "base": "main" }),
     );
-    assert_eq!(seed["isError"], false, "{seed}");
+    assert_eq!(r["isError"], false, "{r}");
     let r = call(
         &b,
-        "leep_task_start",
-        json!({ "task": "Fix the parser", "task_key": "T-3", "paths": ["src/x/a.rs"] }),
+        "leep_session_start",
+        json!({ "title": "a work", "scope": ["src/x/a.rs"], "base": "main" }),
     );
     assert_eq!(r["isError"], false, "{r}");
     let args =
         json!({ "message": "parser", "changes": [{ "path": "src/x/a.rs", "content": "x\n" }] });
-    let r = commit(&a, args.clone());
-    assert_eq!(r["structuredContent"]["status"], "stopped", "{r}");
-    let stopped = r["structuredContent"]["changeset"]
-        .as_str()
+    let id = stopped(&commit(&a, args.clone()));
+
+    let r = call(
+        &c,
+        "leep_session_start",
+        json!({ "title": "own a", "claims": ["src/x/a.rs"], "base": "main" }),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let asked = counts.get().2;
+    let r = commit(&a, args);
+    assert_eq!(stopped(&r), id);
+    assert!(counts.get().2 > asked, "asked GET /v1/notices");
+    let by: Vec<(String, String)> = r["structuredContent"]["stopped_by"]
+        .as_array()
         .unwrap()
-        .to_string();
-    let made = creates.load(Ordering::SeqCst);
-    let landed = data(&commit(&a, args));
+        .iter()
+        .map(|n| {
+            (
+                n["level"].as_str().unwrap().to_string(),
+                n["principal"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        by,
+        [
+            ("claimed".to_string(), "cyd".to_string()),
+            ("same_file".to_string(), "ben".to_string())
+        ],
+        "{r}"
+    );
+    assert!(text(&r).contains("(1 new since)"), "{}", text(&r));
+}
+
+/// A stop on another ref says which, and landing the changeset by id
+/// without naming the ref lands it there, not on `main`.
+#[test]
+fn preflight_lands_a_stopped_changeset_on_its_own_ref() {
+    let (url, _) = counted_server();
+    let a = agent_on(&url, "ana", "pf5-a");
+    let b = agent_on(&url, "ben", "pf5-b");
+    seed(&a, &["README"]);
+    let main = main_of(&a);
+    let r = commit(
+        &a,
+        json!({ "message": "branch", "changes": [{ "path": "f.rs", "content": "f\n" }],
+                "target_ref": "feature", "create_ref": true }),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let r = call(
+        &b,
+        "leep_session_start",
+        json!({ "title": "f work", "scope": ["f.rs"], "target_ref": "feature", "base": "feature" }),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let feature = ref_of(&a, "feature");
+    let r = commit(
+        &a,
+        json!({ "message": "f: edit", "changes": [{ "path": "f.rs", "content": "g\n" }],
+                "target_ref": "feature" }),
+    );
+    let id = stopped(&r);
+    assert_eq!(r["structuredContent"]["target_ref"], "feature");
+    assert!(
+        text(&r).contains(&format!(
+            "changeset: \"{id}\", target_ref: \"feature\" and force: true"
+        )),
+        "{}",
+        text(&r)
+    );
+    assert_eq!(ref_of(&a, "feature"), feature);
+    // Followed without the ref, as an agent might.
+    let landed = data(&commit(&a, json!({ "changeset": id, "force": true })));
+    assert_eq!(landed["target_ref"], "feature", "{landed}");
+    assert_eq!(landed["changeset"], id.as_str());
+    assert_eq!(ref_of(&a, "feature"), landed["landed"]);
+    assert_eq!(main_of(&a), main, "main did not move");
+}
+
+/// A forced land that fails keeps the stopped changeset's request: the call
+/// that finishes it by id sends the same land id, so it lands at most once.
+#[test]
+fn a_failed_forced_land_keeps_its_request() {
+    use std::sync::{Arc, Mutex};
+
+    use axum::body::Body;
+    use axum::extract::Request;
+    use axum::http::{header, HeaderValue, Method, StatusCode};
+    use axum::middleware::{self, Next};
+    use axum::response::{IntoResponse, Response};
+
+    let list: Vec<Value> = ["ana", "ben"]
+        .iter()
+        .map(|n| json!({ "name": n, "role": "write", "hash": auth::hash_token(&format!("{n}-t")) }))
+        .collect();
+    // After `refuse` is set, the next land is refused unadmitted (nothing
+    // done); every land's body is kept.
+    let refuse = Arc::new(Mutex::new(false));
+    let lands: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let (r2, seen) = (refuse.clone(), lands.clone());
+    let app = leep_server::router_with_auth(
+        common::repo(),
+        leep_server::DEFAULT_MAX_BODY_BYTES,
+        Some(Auth::parse(&json!({ "tokens": list }).to_string()).unwrap()),
+    )
+    .layer(middleware::from_fn(move |req: Request, next: Next| {
+        let (refuse, seen) = (r2.clone(), seen.clone());
+        async move {
+            if req.method() != Method::POST || req.uri().path() != "/v1/land" {
+                return next.run(req).await;
+            }
+            let (parts, body) = req.into_parts();
+            let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+            seen.lock().unwrap().push(serde_json::from_slice(&bytes).unwrap());
+            if std::mem::take(&mut *refuse.lock().unwrap()) {
+                let body = json!({ "error": "land not admitted; nothing was done", "code": "unavailable" });
+                let mut resp: Response =
+                    (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+                let h = resp.headers_mut();
+                h.insert(header::RETRY_AFTER, HeaderValue::from_static("0"));
+                h.insert("leep-refused", HeaderValue::from_static("admission"));
+                return resp;
+            }
+            next.run(Request::from_parts(parts, Body::from(bytes))).await
+        }
+    }));
+    let url = serve(app);
+    let a = agent_on(&url, "ana", "pf6-a");
+    let b = agent_on(&url, "ben", "pf6-b");
+    seed(&a, &["src/a.rs"]);
+    let r = call(
+        &b,
+        "leep_session_start",
+        json!({ "title": "a work", "scope": ["src/a.rs"], "base": "main" }),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let args = json!({ "message": "a", "changes": [{ "path": "src/a.rs", "content": "x\n" }],
+                       "request_id": "req-6" });
+    let id = stopped(&commit(&a, args.clone()));
+    lands.lock().unwrap().clear();
+    *refuse.lock().unwrap() = true;
+    let mut forced = args;
+    forced["force"] = json!(true);
+    let r = commit(&a, forced);
+    assert_eq!(r["isError"], true, "refused: {r}");
+    let landed = data(&commit(&a, json!({ "changeset": id, "force": true })));
     assert_eq!(landed["status"], "landed", "{landed}");
-    assert_eq!(landed["changeset"], stopped.as_str());
-    assert_eq!(creates.load(Ordering::SeqCst), made);
+    let lands = lands.lock().unwrap();
+    assert_eq!(lands.len(), 2, "{lands:?}");
+    assert_eq!(
+        lands[0]["land_id"], lands[1]["land_id"],
+        "the request's land id both times"
+    );
 }
 
 /// Notices below the stopping levels, or met only through a directory
@@ -2820,7 +2995,7 @@ fn preflight_lets_near_scope_and_related_notices_through() {
 }
 
 /// A context pack the server shed (ADR 0060) is asked for once more after
-/// its short `Retry-After`, so the task's first call carries its context;
+/// its short `Retry-After` (0 here, so the test does not wait), so the task's first call carries its context;
 /// a long pause is reported instead of waited out, and nothing is asked
 /// more than twice.
 #[test]
@@ -2868,7 +3043,7 @@ fn task_start_asks_once_more_for_a_shed_pack() {
     let task = json!({ "task": "Fix the parser", "paths": ["src/x/a.rs"] });
 
     // Shed once with a short pause: asked again, and the pack comes.
-    let (s, asked) = shed("1", 1);
+    let (s, asked) = shed("0", 1);
     let r = call(&s, "leep_task_start", task.clone());
     let t = text(&r);
     assert!(!t.contains("Context unavailable"), "{t}");
@@ -2877,7 +3052,7 @@ fn task_start_asks_once_more_for_a_shed_pack() {
     assert_eq!(asked.load(Ordering::SeqCst), 2);
 
     // Shed every time: asked twice, then reported.
-    let (s, asked) = shed("1", usize::MAX);
+    let (s, asked) = shed("0", usize::MAX);
     let t = text(&call(&s, "leep_task_start", task.clone()));
     assert!(t.contains("Context unavailable"), "{t}");
     assert_eq!(asked.load(Ordering::SeqCst), 2);
@@ -2895,17 +3070,15 @@ fn task_start_asks_once_more_for_a_shed_pack() {
 /// stopped too, and the same call with force lands the changeset it made.
 #[test]
 fn preflight_stops_a_resolution_too() {
-    use std::sync::atomic::Ordering;
-
-    let (url, creates, _) = counted_server();
+    let (url, counts) = counted_server();
     let a = agent_on(&url, "ana", "pf4-a");
     let b = agent_on(&url, "ben", "pf4-b");
     let c = agent_on(&url, "cyd", "pf4-c");
-    let seed = commit(
+    let first = commit(
         &a,
         json!({ "message": "seed", "changes": [{ "path": "a.txt", "content": "one\n" }] }),
     );
-    assert_eq!(seed["isError"], false, "{seed}");
+    assert_eq!(first["isError"], false, "{first}");
     let base = main_of(&a);
     // ana starts from the seed; ben lands on the same line.
     let r = call(
@@ -2949,13 +3122,13 @@ fn preflight_stops_a_resolution_too() {
         text(&r).contains("leep_resolve_and_land again with the same arguments and force: true")
     );
     let stopped = r["structuredContent"]["changeset"].clone();
-    let made = creates.load(Ordering::SeqCst);
+    let made = counts.get().0;
     let mut forced = resolve;
     forced["force"] = json!(true);
     let landed = data(&call(&a, "leep_resolve_and_land", forced));
     assert_eq!(landed["status"], "landed", "{landed}");
     assert_eq!(landed["changeset"], stopped);
-    assert_eq!(creates.load(Ordering::SeqCst), made, "no second changeset");
+    assert_eq!(counts.get().0, made, "no second changeset");
     assert_eq!(
         text(&call(&a, "leep_read_file", json!({ "path": "a.txt" }))),
         "uno eins\n"

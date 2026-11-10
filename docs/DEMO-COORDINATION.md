@@ -88,8 +88,9 @@ The demo is also a check on how the notices read. Things to look at:
   and telling eli its duplicate landed the task.
 - The pre-flight check (ADR 0096 amendment) stops dee's commit before it
   lands, so dee hears of eli first; it reads the warning and lands with
-  `force`. Only notices dee had not been shown stop it, so the check never
-  loops, and the solo agents' commits, which meet nothing louder than
+  `force`. Only notices dee had not been shown stop it; the stopped
+  changeset lands only with `force`, so a blind retry is stopped again,
+  never landed. The solo agents' commits, which meet nothing louder than
   `near`, land in one call as before.
 - Known limit, left to the maintainer: `leep-mcp` asks for notices at most
   every 30 s when a tool's answers carry none, so a `landed` notice can
