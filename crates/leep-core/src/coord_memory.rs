@@ -57,10 +57,10 @@ pub(crate) fn changed_note(n: &Note, change: &NoteChange, at: i64) -> Option<Not
             n.reported_at = Some(at);
         }
         NoteChange::Revoke => close(&mut n, NoteState::Retracted),
-        NoteChange::Endorse { by } if n.endorsed_by.is_none() => {
+        NoteChange::Endorse { by } => {
             n.endorsed_by = Some(by.clone());
             n.endorsed_at = Some(at);
-            n.expires = None;
+            n.expires = Some(at + crate::coord::ENDORSED_NOTE_TTL_SECS);
         }
         _ => return None,
     }
@@ -355,21 +355,22 @@ impl CoordStore for MemoryCoordStore {
 
     async fn notes_at(&self, anchors: &[String], cap: usize) -> Result<Vec<Note>> {
         crate::coord::check_anchor_probe(anchors)?;
-        Ok(self
+        let mut found: Vec<Note> = self
             .rows
             .lock()
             .unwrap()
             .notes
             .values()
-            .rev()
             .filter(|n| {
                 n.state == NoteState::Open
                     && n.anchor_type == crate::coord::AnchorType::Path
                     && anchors.contains(&n.anchor)
             })
-            .take(cap)
             .cloned()
-            .collect())
+            .collect();
+        found.sort_by_key(crate::coord::note_tier_key);
+        found.truncate(cap);
+        Ok(found)
     }
 
     async fn change_note(&self, id: u64, change: &NoteChange, at: i64) -> Result<bool> {
@@ -428,10 +429,36 @@ impl CoordStore for MemoryCoordStore {
                 n.reported_by = None;
                 n.reported_at = None;
                 n.expires = match (&n.endorsed_by, n.trust) {
-                    (Some(_), _) => None,
+                    (Some(_), _) => n
+                        .endorsed_at
+                        .map(|t| t + crate::coord::ENDORSED_NOTE_TTL_SECS),
                     (None, NoteTrust::Human) => Some(n.created + crate::coord::HUMAN_NOTE_TTL_SECS),
                     (None, NoteTrust::Agent) => Some(n.created + crate::coord::AGENT_NOTE_TTL_SECS),
                 };
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn unendorse_notes(&self, id: Option<u64>, endorser: Option<&str>) -> Result<u64> {
+        let mut rows = self.rows.lock().unwrap();
+        let mut count = 0;
+        for n in rows.notes.values_mut() {
+            let picked = id.is_some_and(|i| i == n.id)
+                || endorser.is_some_and(|e| n.endorsed_by.as_deref() == Some(e));
+            if picked && n.endorsed_by.is_some() {
+                n.endorsed_by = None;
+                n.endorsed_at = None;
+                if n.state == NoteState::Open {
+                    n.expires = Some(
+                        n.created
+                            + match n.trust {
+                                NoteTrust::Human => crate::coord::HUMAN_NOTE_TTL_SECS,
+                                NoteTrust::Agent => crate::coord::AGENT_NOTE_TTL_SECS,
+                            },
+                    );
+                }
                 count += 1;
             }
         }
@@ -1158,7 +1185,8 @@ pub async fn check_notes_contract(store: &dyn CoordStore) {
     assert_eq!(list(all.clone()).await.len(), before, "nothing stored");
     assert_eq!(
         ids(store.notes_at(&anchors, 10).await.unwrap()),
-        [a2.id, dir.id]
+        [dir.id, a2.id],
+        "the human note first"
     );
     let open = NoteFilter {
         states: vec![NoteState::Open],
@@ -1323,20 +1351,27 @@ pub async fn check_notes_contract(store: &dyn CoordStore) {
         store.get_note(dying.id).await.unwrap().unwrap().expires,
         Some(at1 - 1)
     );
-    // Endorsement: once, and the note no longer expires; a report then
-    // only counts.
+    // Endorsement: the note lives a year from its newest endorsement (an
+    // owner renews it by endorsing again); a report then only counts.
     let endorse = NoteChange::Endorse { by: "hugo".into() };
+    assert!(store
+        .change_note(below.id, &endorse, at1 - 5)
+        .await
+        .unwrap());
     assert!(store.change_note(below.id, &endorse, at1).await.unwrap());
-    assert!(!store.change_note(below.id, &endorse, at1).await.unwrap());
     let e = store.get_note(below.id).await.unwrap().unwrap();
     assert_eq!(
         (e.endorsed_by.as_deref(), e.endorsed_at, e.expires),
-        (Some("hugo"), Some(at1), None)
+        (
+            Some("hugo"),
+            Some(at1),
+            Some(at1 + crate::coord::ENDORSED_NOTE_TTL_SECS)
+        )
     );
     assert!(!store.change_note(below.id, &other, at1).await.unwrap());
     // An owner's report (the caller checked ownership) hides an endorsed
-    // note and a human one; the undo gives each back the life it had:
-    // none once endorsed, a human note's from its creation.
+    // note and a human one; the undo gives each back the life it had: a
+    // year from its endorsement, a human note's from its creation.
     let by_owner = NoteChange::Report {
         by: "olga".into(),
         max_per_hour: 5,
@@ -1354,7 +1389,11 @@ pub async fn check_notes_contract(store: &dyn CoordStore) {
     let e = store.get_note(below.id).await.unwrap().unwrap();
     assert_eq!(
         (e.state, e.endorsed_by.as_deref(), e.expires),
-        (NoteState::Open, Some("hugo"), None)
+        (
+            NoteState::Open,
+            Some("hugo"),
+            Some(at1 + crate::coord::ENDORSED_NOTE_TTL_SECS)
+        )
     );
     let h = store.get_note(dir.id).await.unwrap().unwrap();
     assert_eq!(
@@ -1399,7 +1438,7 @@ pub async fn check_notes_contract(store: &dyn CoordStore) {
         }
     }
     assert!(swept.closed >= 4 && swept.expired >= 4, "{swept:?}");
-    // Left: the human note and the endorsed one, which never expire.
+    // Left: the human note and the endorsed one, which live a year.
     assert_eq!(list(all.clone()).await, [below.id, dir.id]);
     for id in [below.id, dir.id] {
         assert!(store
@@ -1408,6 +1447,66 @@ pub async fn check_notes_contract(store: &dyn CoordStore) {
             .unwrap());
     }
     let after = end + CLOSED_NOTE_RETENTION_SECS + 1;
+    while store.sweep_notes(after, 1000).await.unwrap() != NoteSweep::default() {}
+    assert!(list(all.clone()).await.is_empty());
+
+    // Crowding: 300 newer agent notes on a file and its directory never
+    // push an older endorsed or human note out of a capped probe; the
+    // probe answers endorsed, then human, then agent, each newest first.
+    let mut old = note("ada", "crowd/a.rs", "endorsed, oldest");
+    old.expires = None;
+    let endorsed = store.add_note(&old).await.unwrap();
+    assert!(store
+        .change_note(endorsed.id, &NoteChange::Endorse { by: "hugo".into() }, t0)
+        .await
+        .unwrap());
+    let mut h = note("hana", "crowd", "human, old");
+    h.trust = NoteTrust::Human;
+    h.expires = None;
+    let human = store.add_note(&h).await.unwrap();
+    let mut agents = Vec::new();
+    for i in 0..300 {
+        let mut n = note(
+            &format!("crowd-{}", i % 10),
+            if i % 2 == 0 { "crowd/a.rs" } else { "crowd" },
+            &format!("agent {i}"),
+        );
+        n.expires = None;
+        agents.push(store.add_note(&n).await.unwrap().id);
+    }
+    let probe = ["crowd/a.rs".to_string(), "crowd".to_string()];
+    let got = ids(store.notes_at(&probe, 256).await.unwrap());
+    assert_eq!(got.len(), 256);
+    assert_eq!(&got[..2], &[endorsed.id, human.id], "privileged first");
+    let newest: Vec<u64> = agents.iter().rev().take(254).copied().collect();
+    assert_eq!(&got[2..], &newest[..], "then agents, newest first");
+    // An operator's undo of endorsements: by note, or by endorser; an open
+    // note gets its unendorsed life back.
+    assert_eq!(store.unendorse_notes(None, Some("hugo")).await.unwrap(), 1);
+    let back = store.get_note(endorsed.id).await.unwrap().unwrap();
+    assert_eq!(
+        (back.endorsed_by, back.endorsed_at, back.expires),
+        (None, None, Some(t0 + AGENT_NOTE_TTL_SECS))
+    );
+    assert_eq!(store.unendorse_notes(None, Some("hugo")).await.unwrap(), 0);
+    assert_eq!(
+        store
+            .unendorse_notes(Some(endorsed.id), None)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        ids(store.notes_at(&probe, 1).await.unwrap()),
+        [human.id],
+        "no longer endorsed: the human note leads"
+    );
+    for id in agents.iter().chain([&endorsed.id, &human.id]) {
+        store
+            .change_note(*id, &NoteChange::Revoke, end)
+            .await
+            .unwrap();
+    }
     while store.sweep_notes(after, 1000).await.unwrap() != NoteSweep::default() {}
     assert!(list(all).await.is_empty());
 }
