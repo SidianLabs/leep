@@ -422,6 +422,11 @@ pub fn notice_lines(notices: &[leep_core::api::Notice]) -> Vec<String> {
             if let Some(p) = &t.other_path {
                 line.push_str(&format!(" at {p:?}"));
             }
+            match n.via.as_deref() {
+                None | Some("related") => {}
+                // A `via` this client does not know, shown as it is.
+                Some(v) => line.push_str(&format!(" via {}", word(v))),
+            }
             if let Some(p) = &t.path {
                 if n.via.as_deref() == Some("related") {
                     // A file the task turned up, not one of mine.
@@ -673,8 +678,14 @@ mod tests {
                 task_key: None,
             },
         };
-        let l = &notice_lines(&[n])[0];
+        let l = &notice_lines(&[n.clone()])[0];
         assert!(!l.contains("(your "), "{l}");
+        let odd = Notice {
+            via: Some("mirror\nX".into()),
+            ..n.clone()
+        };
+        let l2 = &notice_lines(&[odd])[0];
+        assert!(l2.contains(r#" via "mirror\nX""#), "{l2}");
         assert!(
             l.ends_with(r#"(a file related to your task: "src/auth/keys.rs")"#),
             "{l}"

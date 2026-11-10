@@ -1031,7 +1031,8 @@ Added:
 - `Notice.via?` (omitted when absent, default absent): `related` on a
   context pack's `in_flight` item met only on a file related to the task,
   never on one of the agent's own paths; `untrusted.path` then names that
-  file. A client shows a `via` it does not know as it is.
+  file. A client shows a `via` it does not know as it is (the CLI quoted
+  and escaped, the MCP tools as `?` unless it is a plain word).
 - `possible_duplicate` by `task_key` may now come on any answer carrying
   notices (creates, lands, `GET /v1/notices`, listings), not only on
   declarations. No shape changed.

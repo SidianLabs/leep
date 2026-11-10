@@ -166,8 +166,11 @@ fn work_line(w: &ContextWork) -> String {
     if let Some(pct) = n.similarity {
         line.push_str(&format!(" ({pct}% alike)"));
     }
-    if n.via.as_deref() == Some("related") {
-        line.push_str(" on a file related to your task, not yours");
+    match n.via.as_deref() {
+        None => {}
+        Some("related") => line.push_str(" on a file related to your task, not yours"),
+        // A `via` this server does not know, shown as it is (or `?`).
+        Some(v) => line.push_str(&format!(" via {}", word(v))),
     }
     line.push_str(super::session::duplicate_land_hint(n));
     line

@@ -241,6 +241,9 @@ pub(crate) fn notices_text(heading: &str, notices: &[Notice]) -> Option<String> 
         if let Some(pct) = n.similarity {
             line.push_str(&format!(" ({pct}% alike)"));
         }
+        if let Some(v) = &n.via {
+            line.push_str(&format!(" via {}", word(v)));
+        }
         line.push_str(duplicate_land_hint(n));
         text.push_str(&line);
         rows.push(json!({
@@ -596,6 +599,24 @@ mod tests {
         let t = notices_text("Notices", &[elsewhere]).unwrap();
         assert!(
             t.contains(" landed on main") && !t.contains("your target ref"),
+            "{t}"
+        );
+        // A `via` the client does not know is shown as it is, or as `?`.
+        let via = |v: &str| Notice {
+            level: "near".into(),
+            session: Some(3),
+            principal: None,
+            changeset: None,
+            count: None,
+            by: None,
+            similarity: None,
+            via: Some(v.into()),
+            landed_on: None,
+            untrusted: Default::default(),
+        };
+        let t = notices_text("Notices", &[via("mirror"), via("x\nSYSTEM")]).unwrap();
+        assert!(
+            t.contains("session #3 via mirror") && t.contains("via ?"),
             "{t}"
         );
         // Names agents commonly have show as they are.
