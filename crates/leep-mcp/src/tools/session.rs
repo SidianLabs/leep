@@ -145,13 +145,16 @@ pub(crate) fn fence_rows(rows: &[Value]) -> String {
 }
 
 /// `json` with the characters JSON leaves raw but a reader may not see
-/// as written escaped as `\uXXXX`: line and paragraph separators (which
-/// break a line) and the bidirectional controls (which reorder text).
+/// as written escaped as `\uXXXX`: C1 controls (U+0080 to U+009F, which
+/// some terminals read as escape sequences), line and paragraph
+/// separators (which break a line) and the bidirectional controls (which
+/// reorder text).
 fn escape_invisible(json: &str) -> String {
     let mut out = String::with_capacity(json.len());
     for c in json.chars() {
         match c {
-            '\u{2028}'
+            '\u{0080}'..='\u{009f}'
+            | '\u{2028}'
             | '\u{2029}'
             | '\u{200e}'
             | '\u{200f}'

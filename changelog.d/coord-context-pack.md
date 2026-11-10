@@ -16,4 +16,6 @@
   quoted and escaped.
 - **Added.** Metrics `leep_context_packs_total`, `leep_context_bytes_total`,
   `leep_context_items_cut_total` and `leep_context_sections_omitted_total`.
+- **Fixed.** `leep review inbox` reads past requests you already answered,
+  so they no longer hide older requests still waiting for you.
 - **Docs.** ADR 0097.

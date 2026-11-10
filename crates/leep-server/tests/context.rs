@@ -109,25 +109,28 @@ impl Api {
         parent: Option<ChangesetId>,
         paths: &[&str],
     ) -> ChangesetId {
-        let body = format!("{who}: fn parse_token() {{}}\n");
-        let content = self
-            .repo
-            .put_blob(Bytes::from(body.clone().into_bytes()))
-            .await
-            .unwrap();
-        let changes: BTreeMap<RepoPath, FileChange> = paths
-            .iter()
-            .map(|p| {
-                (
-                    RepoPath::new(*p).unwrap(),
-                    FileChange::Modify {
-                        content,
-                        kind: FileKind::Regular,
-                        size: body.len() as u64,
-                    },
-                )
-            })
-            .collect();
+        let mut changes: BTreeMap<RepoPath, FileChange> = BTreeMap::new();
+        for p in paths {
+            // An OWNERS file names an owner; every other file is code.
+            let body = if p.ends_with("OWNERS") {
+                "rhea\n".to_string()
+            } else {
+                format!("{who}: fn parse_token() {{}}\n")
+            };
+            let content = self
+                .repo
+                .put_blob(Bytes::from(body.clone().into_bytes()))
+                .await
+                .unwrap();
+            changes.insert(
+                RepoPath::new(*p).unwrap(),
+                FileChange::Modify {
+                    content,
+                    kind: FileKind::Regular,
+                    size: body.len() as u64,
+                },
+            );
+        }
         let cs = Changeset {
             parents: parent.into_iter().collect(),
             author: who.into(),
@@ -226,8 +229,7 @@ async fn a_read_token_gets_live_work_and_history() {
     let h = &p.history[0];
     assert_eq!(h.created_by.as_deref(), Some("alice"));
     assert_eq!(h.untrusted.agent_model.as_deref(), Some("alice-model"));
-    // The OWNERS file names whoever wrote it: "alice: fn ..." is one line.
-    assert_eq!(p.owners[0].untrusted.owners, ["alice: fn parse_token() {}"]);
+    assert_eq!(p.owners[0].untrusted.owners, ["rhea"]);
     assert!(p.ref_health.is_some() && p.omitted.is_empty());
 }
 

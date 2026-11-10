@@ -117,7 +117,7 @@ server vouches for (level, session id, principal, landed changeset id,
 count, `by` and similarity); a level or name that is not a word of
 letters, digits, `_`, `-` and `.` shows as `?`. Titles, paths and task
 keys follow in a fenced `untrusted` block, one row per notice, under the
-same fixed line, with line separators and bidirectional controls
+same fixed line, with C1 controls, line separators and bidirectional controls
 escaped. Structured results also get a `notices` list. Each MCP server
 asks with a 3 s timeout, and a notice it was given is not given again. Notices are advisory: they never change what a
 tool did. Duplicates are found by task key or by similar wording only.
