@@ -76,12 +76,12 @@ printf '%s\n' \
 | `leep_resolve` | `rev` | `{rev, id, via}`: the full id and whether it came from a ref (or tag), a full `id`, a `prefix`, or a revision with `~N` / `^N` steps (`suffix`, ADR 0064); an ambiguous prefix is an error listing the candidates |
 | `leep_merge_base` | `a`, `b` | `base` (the newest common ancestor, null if unrelated) and `a_is_ancestor_of_b` / `b_is_ancestor_of_a` |
 | `leep_provenance` | `rev?`, `path?`, `limit?` (changesets scanned, default 1000, max 10000), `top?` (rows per group, default 10, max 100) | per agent model and session, and per human author: changesets, distinct files touched, first and last timestamps; `agent_changesets` / `human_changesets` totals, `*_omitted` counts past `top`, `scanned` and `truncated` |
-| `leep_commit_and_land` | `message`, `changes[]`, `base?`, `target_ref?`, `create_ref?`, `prompt?`, `tests?`, `request_id?`; or `changeset` alone | landed id, or a conflict report |
-| `leep_resolve_and_land` | `conflict_id` (or `onto`), `resolutions[]` (`{path, content}` or `{path, delete: true}`, `executable?`), `message?` | finishes a conflict report sending only the conflicting files; same result shape as `leep_commit_and_land` |
+| `leep_commit_and_land` | `message`, `changes[]`, `base?`, `target_ref?`, `create_ref?`, `prompt?`, `tests?`, `request_id?`, `force?`; or `changeset` (with `force?`) alone | landed id, a conflict report, or `stopped` by the pre-flight check (below) |
+| `leep_resolve_and_land` | `conflict_id` (or `onto`), `resolutions[]` (`{path, content}` or `{path, delete: true}`, `executable?`), `message?`, `force?` | finishes a conflict report sending only the conflicting files; same result shape as `leep_commit_and_land`, pre-flight check included |
 | `leep_session_start` | `title`, `approach?`, `task_key?`, `scope?[]`, `claims?[]`, `target_ref?` (default `main`), `base?` | declares (or updates) this agent's session (ADR 0095): `session`, `created`, `agent_session` (the key; one is made when `LEEP_AGENT_SESSION` is unset, and later commits record it) and `others_nearby`, the other live sessions on or near the scope and claims |
 | `leep_who` | `path?`, `task_key?`, `principal?`, `all?`, `limit?` (default 20, max 200) | the sessions working on, above or below `path` (or of a task key or principal), newest first, each with principal, agent session, state (`active`, `idle`; with `all` also `landed`, `abandoned`, `expired`), scope, claims and touched paths |
 | `leep_overlaps` | – | everything overlapping this agent's session now, highest level first (ADR 0096): `{session, overlaps: [Notice]}`; an error before `leep_session_start` or a commit |
-| `leep_task_start` | `task`, `task_key?`, `paths?[]`, `ref?` (default `main`), `budget_bytes?` (default 32768, 1024 to 262144) | the first call of a task (ADR 0097): declares or resumes this agent's session (the task's first line its title, the rest its approach, `paths` its scope; a key is made when `LEEP_AGENT_SESSION` is unset; a session without a base takes the head the pack describes, so a later land on its files is a `landed` notice) and answers the context pack for it: `{session, created, agent_session, context: ContextPack}` |
+| `leep_task_start` | `task`, `task_key?`, `paths?[]`, `ref?` (default `main`), `budget_bytes?` (default 32768, 1024 to 262144) | the first call of a task (ADR 0097): declares or resumes this agent's session (the task's first line its title, the rest its approach, `paths` its scope; a key is made when `LEEP_AGENT_SESSION` is unset; a session without a base takes the head the pack describes, so a later land on its files is a `landed` notice) and answers the context pack for it: `{session, created, agent_session, context: ContextPack}`. A pack the server shed (`Leep-Refused`, ADR 0060) with a `Retry-After` of at most 2 s is asked once more after that pause; otherwise, or when shed again, the result says "Context unavailable" with `retry_after` |
 | `leep_context` | `task?` (default: the session's title), `task_key?`, `paths?[]`, `ref?`, `budget_bytes?` | the context pack alone (ADR 0097): `files`, `owners`, `history`, `in_flight`, `duplicates`, `ref_health`, with `cut` and `omitted` |
 | `leep_review_request` | `rev`, `reviewers?[]`, `message?`, `ref?` (default `main`) | opens a review request (ADR 0086), as `leep review request`: reviewers default to the owners still pending; an equal open request is answered (`existing: true`); needs authentication |
 | `leep_review_inbox` | `mine?`, `all?`, `limit?` (default 20, max 100) | open review requests naming this agent that it has not answered (or, with `mine`, the ones it made), as `leep review inbox`; `all` adds closed and answered ones; needs authentication |
@@ -123,8 +123,11 @@ letters, digits, `_`, `-` and `.` shows as `?`. Titles, paths and task
 keys follow in a fenced `untrusted` block, one row per notice, under the
 same fixed line, with C1 controls, line separators and bidirectional controls
 escaped. Structured results also get a `notices` list. Each MCP server
-asks with a 3 s timeout, and a notice it was given is not given again. Notices are advisory: they never change what a
-tool did. Duplicates are found by task key (on every answer, so the first
+asks with a 3 s timeout, and a notice it was given is not given again. Notices are advisory: they never change what the
+server does; the one thing they change on the client is the pre-flight
+check of `leep_commit_and_land` and `leep_resolve_and_land` (below), and
+an answer to a create carries, past the three, every notice that stops a
+land of its files. Duplicates are found by task key (on every answer, so the first
 of a pair hears of the second too) or by similar wording (when a session
 is declared) only.
 
@@ -178,6 +181,72 @@ revision the agent read the files from (default: head of `target_ref`, which
 defaults to `main`). The tool uploads missing blobs, creates one changeset
 with `agent.*` provenance, and lands it. If `main` moved and the edits do not
 overlap, the server rebases automatically (`rebased: true`).
+
+**Pre-flight check** ([ADR 0096](adr/0096-overlap-notices-and-duplicate-flags.md),
+amendment). The create's answer already carries the notices for the
+agent's session, so before landing the tool reads them, and lands only
+when none of them should be read first. One stops the land of the files
+the changeset changes when (`Notice::stops_land` in `leep-core`, the one
+place the rule lives; it reads the other side's path, `other_path`):
+
+| Level | Stops when |
+|---|---|
+| `possible_duplicate` | always |
+| `landed` | its changeset changed one of the files, or it is a duplicate's land (`by task_key`) |
+| `claimed` | the claim is on one of the files or a directory holding it |
+| `same_file` | the other session names one of the files itself, not only a directory holding it (a scope) |
+| `near`, a level the client does not know, anything `via` a related file | never |
+
+A stopped call has created the changeset but not landed it. Like a
+conflict report its result is not an error (`isError: false`; nothing
+failed), starts `NOT LANDED: stopped before landing`, and carries
+`{status: "stopped", landed: false, changeset, target_ref, files_changed,
+stopped_by: [Notice], guidance}`; the text lists every notice that stopped
+it under "Notices about other agents' work near yours that stopped this
+land", with other agents' words in the usual fence, and the other notices
+end the result as usual. The guidance says how to go on: land it as it
+is with `changeset` set to the id, the `target_ref` given (and
+`create_ref: true` when the call had it) and `force: true`, or change the
+work and call again.
+
+**A stopped changeset lands only with `force`.** The MCP server remembers
+the changesets it stopped (64 per process, the oldest forgotten first, and
+each forgotten once it lands). A call with the same changes, message,
+parents and metadata (`request_id` included) for the same ref reuses the
+stopped changeset instead of making another; so does a call naming it
+with `changeset` (which, without `target_ref`, lands it on the ref the
+stopped call named, keeping its `request_id`'s land id). With `force:
+true` such a call lands it; without, it is stopped again: the tool asks the
+server for anything new (`GET /v1/notices`) and lists those notices with
+the earlier ones, saying how many are new. So an agent that retries
+blindly is never landed by it.
+
+**Different changes are stopped only by what is new.** The server says
+each notice once per session (30 minutes), so a commit with changed work
+is stopped only by a notice the agent has not been shown: changing the
+work after a stop lands it unless something new turned up. A notice is
+said again, and stops, when it comes to stop a land of a file it did not
+stop before: another session first heard of through a directory, or a
+land that changed other files, stops a later commit of a file it does
+touch. Every notice that stops comes in the one answer, past the cap of
+three. A call with nothing that stops it is the same one create and one
+land as before: the check costs no request.
+
+**Limits.** The check reads what the server said; when the notices of a
+create were left out (each part has 150 ms, ADR 0096) or a `GET
+/v1/notices` answer is lost, nothing stops, and the notices come on a
+later answer. Several MCP servers on one `LEEP_AGENT_SESSION` share the
+server's said-once memory but not their stopped changesets: a notice one
+of them was stopped by does not stop the other. After an MCP server
+restart the remembered changesets are gone: the same call makes a new
+changeset, which lands since its notices were said; a call that omits
+`base` after the ref moved has another parent, so it makes a new
+changeset too, and the stopped one is left unlanded (changeset GC reclaims
+it). `leep_resolve_and_land` stops the same way; the conflict stays
+remembered, and the same call with `force: true` lands the resolution it
+made. The CLI needs no such check: `leep commit` and `leep land` are
+separate commands, and `leep commit` prints its notices before the agent
+lands.
 
 **Retrying.** The server's request timeout (408) can cancel a land after it
 moved the ref, so a failed call does not mean nothing landed. When the land

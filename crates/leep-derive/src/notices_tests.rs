@@ -299,7 +299,9 @@ async fn at_most_three_ranked_and_the_rest_later() {
         if i == 0 {
             d.claims = Some(vec!["lib/x.rs".into()]);
         } else {
-            d.scope = Some(vec!["lib/x.rs".into()]);
+            // Through a directory: these stop no land, so the cap holds
+            // (every notice that stops one comes at once).
+            d.scope = Some(vec!["lib".into()]);
         }
         r.declare_session(who, d).await.unwrap();
     }
@@ -893,4 +895,194 @@ async fn a_session_without_a_target_hears_of_the_default_ref() {
     let l: Vec<_> = n.iter().filter(|n| n.level == "landed").collect();
     assert_eq!(l.len(), 1, "{n:?}");
     assert!(l[0].landed_on.is_none());
+}
+
+/// A session met both through a directory it scoped and on the file
+/// itself is named on the file (the pre-flight check reads it), and one
+/// met only through its directory is named on the directory.
+#[tokio::test]
+async fn a_notice_names_the_shared_file_over_a_directory() {
+    let r = repo();
+    let mut a = declare("a-1", "auth work");
+    a.scope = Some(vec!["src/auth".into()]);
+    r.declare_session("ada", a).await.unwrap();
+    // ada touches token.rs too; bo then edits it.
+    commit(&r, "ada", "a-1", &[], &["src/auth/token.rs"]).await;
+    let (_, n) = commit(&r, "bo", "b-1", &[], &["src/auth/token.rs"]).await;
+    assert_eq!(levels(&n), ["same_file"]);
+    assert_eq!(n[0].untrusted.path.as_deref(), Some("src/auth/token.rs"));
+    assert_eq!(
+        n[0].untrusted.other_path.as_deref(),
+        Some("src/auth/token.rs")
+    );
+    assert!(n[0].stops_land(&["src/auth/token.rs"]));
+    // cy edits another file of ada's directory: only the scope meets it.
+    let (_, n) = commit(&r, "cy", "c-1", &[], &["src/auth/keys.rs"]).await;
+    assert_eq!(levels(&n), ["same_file"]);
+    assert_eq!(n[0].untrusted.other_path.as_deref(), Some("src/auth"));
+    assert!(!n[0].stops_land(&["src/auth/keys.rs"]));
+}
+
+/// A `landed` notice names a file of mine the land changed itself, ahead
+/// of a directory of mine holding another file it changed.
+#[tokio::test]
+async fn a_landed_notice_names_my_file_over_my_directory() {
+    let r = repo();
+    let (seed, _) = commit(&r, "root", "r-0", &[], &["README"]).await;
+    let LandResponse::Landed { landed: base, .. } =
+        r.land_as(seed, "main", Some("root")).await.unwrap()
+    else {
+        panic!()
+    };
+    let mut a = declare("a-1", "tokens");
+    a.base = Some(base);
+    a.scope = Some(vec!["src/auth".into()]);
+    r.declare_session("ada", a).await.unwrap();
+    commit(&r, "ada", "a-1", &[base], &["src/auth/token.rs"]).await;
+    let (theirs, _) = commit(
+        &r,
+        "bo",
+        "b-1",
+        &[base],
+        &["src/auth/keys.rs", "src/auth/token.rs"],
+    )
+    .await;
+    let LandResponse::Landed { landed, .. } = r.land_as(theirs, "main", Some("bo")).await.unwrap()
+    else {
+        panic!()
+    };
+    r.note_landed(theirs, landed, Some("bo")).await.unwrap();
+    let n = r.notices_for("ada", "a-1", &NoticeAsk::default()).await;
+    let land = n.iter().find(|n| n.level == "landed").expect("{n:?}");
+    assert_eq!(land.untrusted.path.as_deref(), Some("src/auth/token.rs"));
+    assert_eq!(
+        land.untrusted.other_path.as_deref(),
+        Some("src/auth/token.rs")
+    );
+    assert!(land.stops_land(&["src/auth/token.rs"]));
+    assert!(!land.stops_land(&["src/auth/mod.rs"]));
+}
+
+/// A session said once at a level is said again when it comes to stop a
+/// land of a file it did not stop before (the pre-flight check, ADR 0096
+/// amendment): ada, scoped to `src`, hears of bo on `src/b.rs`, which
+/// stops nothing of hers; bo then edits `src/a.rs`, and ada's commit of
+/// it hears of bo again, as a notice that stops it. Once.
+#[tokio::test]
+async fn a_same_file_notice_is_said_again_when_it_comes_to_stop() {
+    let r = repo();
+    let mut a = declare("a-1", "src work");
+    a.scope = Some(vec!["src".into()]);
+    r.declare_session("ada", a).await.unwrap();
+    commit(&r, "bo", "b-1", &[], &["src/b.rs"]).await;
+    let n = r.notices_for("ada", "a-1", &NoticeAsk::default()).await;
+    assert_eq!(levels(&n), ["same_file"]);
+    assert!(!n[0].stops_land(&["src/a.rs"]), "{n:?}");
+    commit(&r, "bo", "b-1", &[], &["src/a.rs"]).await;
+    let (_, n) = commit(&r, "ada", "a-1", &[], &["src/a.rs"]).await;
+    assert_eq!(levels(&n), ["same_file"], "said again: {n:?}");
+    assert_eq!(n[0].untrusted.other_path.as_deref(), Some("src/a.rs"));
+    assert!(n[0].stops_land(&["src/a.rs"]));
+    let (_, n) = commit(&r, "ada", "a-1", &[], &["src/a.rs"]).await;
+    assert!(n.is_empty(), "once: {n:?}");
+}
+
+/// The same for a claim: bo's claim on `src/b.rs` reaches ada through her
+/// scope and stops nothing; bo then claims `src/a.rs` too, and ada's commit
+/// of it is told again.
+#[tokio::test]
+async fn a_claim_is_said_again_when_it_comes_to_stop() {
+    let r = repo();
+    let mut a = declare("a-1", "src work");
+    a.scope = Some(vec!["src".into()]);
+    r.declare_session("ada", a).await.unwrap();
+    let mut b = declare("b-1", "own b");
+    b.claims = Some(vec!["src/b.rs".into()]);
+    r.declare_session("bo", b.clone()).await.unwrap();
+    let n = r.notices_for("ada", "a-1", &NoticeAsk::default()).await;
+    assert_eq!(levels(&n), ["claimed"]);
+    assert!(!n[0].stops_land(&["src/a.rs"]), "{n:?}");
+    b.claims = Some(vec!["src/b.rs".into(), "src/a.rs".into()]);
+    r.declare_session("bo", b).await.unwrap();
+    let (_, n) = commit(&r, "ada", "a-1", &[], &["src/a.rs"]).await;
+    assert_eq!(levels(&n), ["claimed"], "said again: {n:?}");
+    assert!(n[0].stops_land(&["src/a.rs"]), "{n:?}");
+}
+
+/// The same for a land: ada hears of bo's land on `src/a.rs` and
+/// `src/b.rs` while her files are only her scope, so it stops nothing;
+/// her commit of `src/a.rs` hears of it again, naming that file.
+#[tokio::test]
+async fn a_land_is_said_again_when_it_comes_to_stop() {
+    let r = repo();
+    let (seed, _) = commit(&r, "root", "r-0", &[], &["README"]).await;
+    let LandResponse::Landed { landed: base, .. } =
+        r.land_as(seed, "main", Some("root")).await.unwrap()
+    else {
+        panic!()
+    };
+    let mut a = declare("a-1", "src work");
+    a.base = Some(base);
+    a.scope = Some(vec!["src".into()]);
+    r.declare_session("ada", a).await.unwrap();
+    let (theirs, _) = commit(&r, "bo", "b-1", &[base], &["src/a.rs", "src/b.rs"]).await;
+    let LandResponse::Landed { landed, .. } = r.land_as(theirs, "main", Some("bo")).await.unwrap()
+    else {
+        panic!()
+    };
+    r.note_landed(theirs, landed, Some("bo")).await.unwrap();
+    let n = r.notices_for("ada", "a-1", &NoticeAsk::default()).await;
+    assert_eq!(levels(&n), ["landed"]);
+    let (_, n) = commit(&r, "ada", "a-1", &[base], &["src/a.rs"]).await;
+    let land = n.iter().find(|n| n.level == "landed").expect("said again");
+    assert_eq!(land.changeset, Some(landed));
+    assert_eq!(land.untrusted.other_path.as_deref(), Some("src/a.rs"));
+    assert!(land.stops_land(&["src/a.rs"]));
+}
+
+/// A `landed` notice names the file the request changes, not the first
+/// of the session's files the land changed: ada touched `a.rs` earlier and
+/// now commits `b.rs`; bo's land changed both.
+#[tokio::test]
+async fn a_landed_notice_names_the_requests_file() {
+    let r = repo();
+    let (seed, _) = commit(&r, "root", "r-0", &[], &["README"]).await;
+    let LandResponse::Landed { landed: base, .. } =
+        r.land_as(seed, "main", Some("root")).await.unwrap()
+    else {
+        panic!()
+    };
+    let mut a = declare("a-1", "src work");
+    a.base = Some(base);
+    r.declare_session("ada", a).await.unwrap();
+    commit(&r, "ada", "a-1", &[base], &["src/a.rs"]).await;
+    let (theirs, _) = commit(&r, "bo", "b-1", &[base], &["src/a.rs", "src/b.rs"]).await;
+    let LandResponse::Landed { landed, .. } = r.land_as(theirs, "main", Some("bo")).await.unwrap()
+    else {
+        panic!()
+    };
+    r.note_landed(theirs, landed, Some("bo")).await.unwrap();
+    let (_, n) = commit(&r, "ada", "a-1", &[base], &["src/b.rs"]).await;
+    let land = n.iter().find(|n| n.level == "landed").expect("{n:?}");
+    assert_eq!(land.untrusted.other_path.as_deref(), Some("src/b.rs"));
+    assert!(land.stops_land(&["src/b.rs"]));
+}
+
+/// Every notice that stops a land of the request's files comes in the one
+/// answer, past the cap of three: five agents claim ada's file.
+#[tokio::test]
+async fn every_notice_that_stops_comes_in_one_answer() {
+    let r = repo();
+    for i in 0..5 {
+        let mut b = declare(&format!("b-{i}"), "own a");
+        b.claims = Some(vec!["src/a.rs".into()]);
+        r.declare_session(&format!("bo{i}"), b).await.unwrap();
+    }
+    // A near one is still capped out.
+    commit(&r, "cy", "c-1", &[], &["src/c.rs"]).await;
+    let (_, n) = commit(&r, "ada", "a-1", &[], &["src/a.rs"]).await;
+    assert_eq!(levels(&n), ["claimed"; 5], "{n:?}");
+    assert!(n.len() > MAX_NOTICES);
+    let (_, n) = commit(&r, "ada", "a-1", &[], &["src/a.rs"]).await;
+    assert!(n.is_empty(), "once: {n:?}");
 }

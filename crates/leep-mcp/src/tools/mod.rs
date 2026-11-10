@@ -10,6 +10,7 @@ mod session;
 mod work;
 
 pub use commit::request_land_id;
+pub(crate) use commit::StoppedLands;
 pub(crate) use resolve::Conflicts;
 pub use session::UNTRUSTED_NOTE;
 
@@ -579,7 +580,17 @@ pub fn definitions() -> Vec<Value> {
              finish it with leep_resolve_and_land, sending only the conflicting files. Landing onto a ref that does not exist needs create_ref:true. Text \
              files only. If a call fails without an answer (timeout, lost connection), it may \
              have landed: call again with `changeset` set to the id the error names, or with \
-             the same `request_id`; that never lands the change twice.",
+             the same `request_id`; that never lands the change twice. PRE-FLIGHT: before \
+             landing, the tool checks the notices its commit got; when one you have not been \
+             shown says another agent claimed or edits one of the files you change, may have \
+             your task, or landed a change to one of them since your base, it stops: the result \
+             has status `stopped`, NOTHING is landed, and it names the changeset it made, its \
+             target_ref and every notice that stopped it. That changeset lands only with \
+             force:true: call with `changeset` set to its id, the `target_ref` given, and \
+             force:true (repeating the call with force:true also lands it, without making \
+             another). Calling again without force stops again. Different changes are stopped \
+             only by notices you have not been shown. Notices about nearby files (`near`), a \
+             directory someone scoped, or a file only related to your task never stop.",
             json!({
                 "type": "object",
                 "properties": {
@@ -605,7 +616,8 @@ pub fn definitions() -> Vec<Value> {
                     "create_ref": { "type": "boolean", "description": "Create target_ref if it does not exist (default false, so a mistyped ref is an error). The first land onto `main` of an empty repository creates it without this." },
                     "prompt": { "type": "string", "description": "The request that led to this change, recorded as provenance." },
                     "tests": { "type": "string", "description": "Tests run and their results, recorded as provenance." },
-                    "changeset": { "type": "string", "description": "Land this existing changeset (id or unique prefix) instead of creating one, e.g. to finish a call that timed out. Give no changes with it." },
+                    "changeset": { "type": "string", "description": "Land this existing changeset (id or unique prefix) instead of creating one, e.g. to finish a call that timed out or one the pre-flight check stopped (with force:true; without target_ref it lands where the stopped call meant to). Give no changes with it." },
+                    "force": { "type": "boolean", "description": "Land without the pre-flight check (default false): set it after reading the notices of a `stopped` result, to land anyway." },
                     "request_id": { "type": "string", "description": "Your own id for this request, unique per change (among your own requests; another agent may use the same id). A retry with the same id and target_ref lands at most once, at any age and even from a restarted MCP server: if the first call landed, the result is that land (`from_record: true`). Keep it when you retry after a conflict." }
                 },
                 // `message` and `changes` are required unless `changeset` is
@@ -627,7 +639,10 @@ pub fn definitions() -> Vec<Value> {
              The result is like leep_commit_and_land's: landed, or a new conflict report with a \
              new conflict_id if the ref moved again. If the conflict is not remembered (the MCP \
              server restarted), call leep_commit_and_land again with base set to `onto` and ALL \
-             files you meant to change.",
+             files you meant to change. Like leep_commit_and_land it may stop before landing \
+             (status `stopped`) for notices you have not been shown; call it again with the same \
+             arguments and force:true to land the changeset it made (without force it stops \
+             again).",
             json!({
                 "type": "object",
                 "properties": {
@@ -649,7 +664,8 @@ pub fn definitions() -> Vec<Value> {
                             "additionalProperties": false
                         }
                     },
-                    "message": { "type": "string", "description": "Commit message; default: the conflicted change's message." }
+                    "message": { "type": "string", "description": "Commit message; default: the conflicted change's message." },
+                    "force": { "type": "boolean", "description": "Land without the pre-flight check (default false), after reading a `stopped` result's notices." }
                 },
                 "required": ["resolutions"],
                 "additionalProperties": false

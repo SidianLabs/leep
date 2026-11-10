@@ -11,7 +11,7 @@ use leep_core::{Changeset, ChangesetId, FileChange, FileKind, Hash, RepoPath};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::commit::{non_empty, Edit};
+use super::commit::{non_empty, Edit, Lander};
 use super::{parse_args, ToolError, ToolResult};
 use crate::Server;
 
@@ -88,6 +88,9 @@ struct Args {
     #[serde(default)]
     resolutions: Vec<Edit>,
     message: Option<String>,
+    /// Land without the pre-flight check (ADR 0096 amendment).
+    #[serde(default)]
+    force: bool,
 }
 
 impl Server {
@@ -317,13 +320,26 @@ impl Server {
             changes,
             extra,
         };
-        let created = self.client.create_changeset(&cs)?;
+        let (created, made) = self.create_or_reuse(&cs, &pending.target_ref, false)?;
         let request = pending.request_id.as_str();
         if !request.starts_with("conflict:") {
             self.requests
                 .lock()
                 .unwrap()
                 .insert(request.to_string(), (created, pending.target_ref.clone()));
+        }
+        // Stopped, the conflict stays remembered: the same call with
+        // `force` lands the changeset just made.
+        if let Some(stop) = self.preflight(
+            created,
+            &pending.target_ref,
+            made.then_some(&cs),
+            a.force,
+            Some(request),
+            pending.create,
+            Lander::Resolve,
+        )? {
+            return Ok(stop);
         }
         let out = self.land_and_report(
             created,
