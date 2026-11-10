@@ -412,16 +412,30 @@ impl Server {
             scope: (!a.paths.is_empty()).then(|| a.paths.clone()),
             claims: None,
         };
-        let declared = self
+        let mut declared = self
             .client
             .declare_session(&declare)
             .map_err(sessions_off)?;
-        let s = &declared.session;
         let req = self.context_request(a.task, a.task_key, a.paths, Some(target), a.budget_bytes);
         // The session is declared: a pack the server cannot give now (shed,
         // rate limited, failing) is reported beside it, never as a failure
         // of the call, so the agent does not declare again.
         let pack = self.client.context(&req);
+        // An agent without a working copy reads the ref as the pack
+        // describes it: that head is the session's base, so a later land
+        // on its files is a `landed` notice (ADR 0096). A resumed session
+        // keeps the base it has; failing to record one fails nothing.
+        if let (None, Ok(p)) = (declared.session.base, &pack) {
+            let based = DeclareSessionRequest {
+                session: key.clone(),
+                base: Some(p.head),
+                ..Default::default()
+            };
+            if let Ok(d) = self.client.declare_session(&based) {
+                declared.session = d.session;
+            }
+        }
+        let s = &declared.session;
         let mut text = format!(
             "Session {} {} as {} (agent.session={key}). Your commits through \
              leep_commit_and_land record this key, and the session ends by itself when its \
