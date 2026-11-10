@@ -3154,6 +3154,37 @@ mod tests {
                 .unwrap(),
                 plain
             );
+            // A conflicts answer, with its clean changes, round-trips the
+            // same: the flattened envelope keeps every field of the answer.
+            let content = Hash::of_blob(b"c");
+            let conflicts = LandAnswer {
+                answer: LandResponse::Conflicts {
+                    onto: id,
+                    conflicts: vec![Conflict {
+                        path: RepoPath::new("src/a.rs").unwrap(),
+                        base: None,
+                        ours: None,
+                        theirs: None,
+                        merged_with_markers: Some("<<<<<<<\n=======\n>>>>>>>\n".into()),
+                    }],
+                    clean: [(
+                        RepoPath::new("src/b.rs").unwrap(),
+                        FileChange::Modify {
+                            content,
+                            kind: FileKind::Regular,
+                            size: 1,
+                        },
+                    )]
+                    .into(),
+                },
+                notices: vec![n.clone()],
+            };
+            let cv = serde_json::to_value(&conflicts).unwrap();
+            assert_eq!(cv["status"], "conflicts");
+            let old: LandResponse = serde_json::from_value(cv.clone()).unwrap();
+            assert_eq!(old, conflicts.answer);
+            let back: LandAnswer = serde_json::from_value(cv).unwrap();
+            assert_eq!(back, conflicts);
             let r: SessionsResponse = serde_json::from_value(json!({ "sessions": [] })).unwrap();
             assert!(r.notices.is_empty());
             let o: OverlapsResponse =
