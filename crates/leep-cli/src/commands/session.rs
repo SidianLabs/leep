@@ -678,7 +678,7 @@ mod tests {
                 task_key: None,
             },
         };
-        let l = &notice_lines(&[n.clone()])[0];
+        let l = &notice_lines(std::slice::from_ref(&n))[0];
         assert!(!l.contains("(your "), "{l}");
         let odd = Notice {
             via: Some("mirror\nX".into()),
