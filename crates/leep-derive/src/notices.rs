@@ -69,6 +69,8 @@ pub const NOTICE_TITLE_BYTES: usize = 80;
 /// Sessions whose said notices are remembered, and notices per session.
 const MAX_SEEN_SESSIONS: usize = 100_000;
 const MAX_SEEN_PER_SESSION: usize = 64;
+/// A full memory is purged of expired entries at most this often.
+const PURGE_EVERY_SECS: i64 = 60;
 /// Sessions whose `landed` answer is kept until the ref or head moves.
 const MAX_LANDED_CACHE: usize = 10_000;
 
@@ -132,6 +134,8 @@ struct Seen {
 #[derive(Default)]
 pub struct NoticeState {
     seen: Mutex<HashMap<u64, Vec<Seen>>>,
+    /// When the full memory was last purged of expired entries.
+    purged: Mutex<i64>,
     /// Session id to (target head, session head, `landed` found).
     landed: Mutex<HashMap<u64, LandedAt>>,
 }
@@ -141,20 +145,9 @@ impl NoticeState {
     /// marked said at `now`.
     fn pick(&self, session: u64, found: Vec<Found>, max: usize, now: i64) -> Vec<Found> {
         let mut all = self.seen.lock().unwrap();
-        if !all.contains_key(&session) && all.len() >= MAX_SEEN_SESSIONS {
-            // Full: forget what expired; if still full, say nothing rather
-            // than repeat on every call.
-            all.retain(|_, v| {
-                v.retain(|s| now - s.at < SEEN_TTL_SECS);
-                !v.is_empty()
-            });
-            if all.len() >= MAX_SEEN_SESSIONS {
-                metrics::counter!("leep_notices_omitted_total", "reason" => "full").increment(1);
-                return Vec::new();
-            }
-        }
-        let seen = all.entry(session).or_default();
-        seen.retain(|s| now - s.at < SEEN_TTL_SECS);
+        let fresh = |s: &Seen| now - s.at < SEEN_TTL_SECS;
+        let mut seen = all.remove(&session).unwrap_or_default();
+        seen.retain(fresh);
         let mut out = Vec::new();
         // Only the best-ranked overlaps are ever considered, and an
         // unexpired entry is never dropped: a session with more overlaps
@@ -175,6 +168,28 @@ impl NoticeState {
             });
             out.push(f);
         }
+        if seen.is_empty() {
+            // Nothing to remember: no entry, so quiet sessions cost nothing.
+            return out;
+        }
+        if all.len() >= MAX_SEEN_SESSIONS {
+            // Full: forget what expired, at most once a minute (a purge
+            // walks every entry under the lock); if still full, say
+            // nothing new rather than repeat on every call.
+            let mut last = self.purged.lock().unwrap();
+            if now - *last >= PURGE_EVERY_SECS {
+                *last = now;
+                all.retain(|_, v| {
+                    v.retain(fresh);
+                    !v.is_empty()
+                });
+            }
+            if all.len() >= MAX_SEEN_SESSIONS {
+                metrics::counter!("leep_notices_omitted_total", "reason" => "full").increment(1);
+                return Vec::new();
+            }
+        }
+        all.insert(session, seen);
         out
     }
 
@@ -797,6 +812,24 @@ mod tests {
         }
         assert!(said.values().all(|n| *n == 1), "{said:?}");
         assert!(said.contains_key("s0") && said.len() <= MAX_SEEN_PER_SESSION);
+    }
+
+    /// Answers that say nothing leave nothing behind, so sessions without
+    /// overlaps never fill the memory.
+    #[test]
+    fn saying_nothing_keeps_nothing() {
+        let st = NoticeState::default();
+        for id in 0..100 {
+            assert!(st.pick(id, Vec::new(), 3, 1000).is_empty());
+        }
+        st.pick(7, vec![found(NoticeLevel::SameFile, "s")], 3, 1000);
+        assert!(st
+            .pick(7, vec![found(NoticeLevel::SameFile, "s")], 3, 1001)
+            .is_empty());
+        assert_eq!(st.seen.lock().unwrap().len(), 1);
+        // Once its notices expire, the session's entry goes too.
+        st.pick(7, Vec::new(), 3, 1000 + SEEN_TTL_SECS);
+        assert!(st.seen.lock().unwrap().is_empty());
     }
 
     #[test]
