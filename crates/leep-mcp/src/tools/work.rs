@@ -416,7 +416,13 @@ impl Server {
             .client
             .declare_session(&declare)
             .map_err(sessions_off)?;
-        let req = self.context_request(a.task, a.task_key, a.paths, Some(target), a.budget_bytes);
+        let req = self.context_request(
+            a.task,
+            a.task_key,
+            a.paths,
+            Some(target.clone()),
+            a.budget_bytes,
+        );
         // The session is declared: a pack the server cannot give now (shed,
         // rate limited, failing) is reported beside it, never as a failure
         // of the call, so the agent does not declare again.
@@ -424,15 +430,23 @@ impl Server {
         // An agent without a working copy reads the ref as the pack
         // describes it: that head is the session's base, so a later land
         // on its files is a `landed` notice (ADR 0096). A resumed session
-        // keeps the base it has; failing to record one fails nothing.
-        if let (None, Ok(p)) = (declared.session.base, &pack) {
-            let based = DeclareSessionRequest {
-                session: key.clone(),
-                base: Some(p.head),
-                ..Default::default()
+        // keeps the base it has; failing to record one fails nothing. A
+        // pack the server shed still leaves a base: the ref's head, read
+        // directly, so the session hears of later lands either way.
+        if declared.session.base.is_none() {
+            let head = match &pack {
+                Ok(p) => Some(p.head),
+                Err(_) => self.client.get_ref(&target).ok().and_then(|r| r.target),
             };
-            if let Ok(d) = self.client.declare_session(&based) {
-                declared.session = d.session;
+            if let Some(head) = head {
+                let based = DeclareSessionRequest {
+                    session: key.clone(),
+                    base: Some(head),
+                    ..Default::default()
+                };
+                if let Ok(d) = self.client.declare_session(&based) {
+                    declared.session = d.session;
+                }
             }
         }
         let s = &declared.session;
