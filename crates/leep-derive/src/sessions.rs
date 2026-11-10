@@ -404,6 +404,7 @@ impl Repo {
             states: stored,
             before: q.before,
             limit,
+            skip_paths: false,
         };
         let rows = coord.list_sessions(&filter).await?;
         let next = (rows.len() == limit)

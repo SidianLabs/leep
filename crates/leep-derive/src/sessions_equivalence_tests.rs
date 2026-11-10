@@ -52,6 +52,12 @@ impl CoordStore for Dropped {
     async fn count_sessions(&self, _: leep_core::coord::SessionState, _: usize) -> Result<u64> {
         Err(gone())
     }
+    async fn near_paths(
+        &self,
+        _: &leep_core::coord::NearQuery,
+    ) -> Result<Vec<leep_core::coord::NearRow>> {
+        Err(gone())
+    }
 }
 
 fn repo() -> Repo {

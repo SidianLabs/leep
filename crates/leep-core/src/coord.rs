@@ -620,6 +620,10 @@ pub struct SessionFilter {
     pub before: Option<u64>,
     /// At most this many; 0 means none.
     pub limit: usize,
+    /// Leave the scope, claims and touched lists empty: one statement,
+    /// for callers that read only the sessions' own fields (duplicate
+    /// detection reads titles; ADR 0096).
+    pub skip_paths: bool,
 }
 
 impl SessionFilter {
@@ -640,6 +644,130 @@ impl SessionFilter {
             && (self.states.is_empty() || self.states.contains(&s.state))
             && self.before.is_none_or(|b| s.id < b)
     }
+}
+
+/// How much an overlap notice matters (ADR 0096), lowest first. Stored
+/// nowhere; on the wire as [`NoticeLevel::as_str`], and a client shows a
+/// level it does not know as it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum NoticeLevel {
+    /// Two sessions work in the same directory on different paths.
+    Near,
+    /// Two sessions name the same path, or one names a directory holding
+    /// the other's path.
+    SameFile,
+    /// The other session claimed a path that is, holds or lies in mine.
+    Claimed,
+    /// The other session looks like the same task: the same task key, or
+    /// a title and approach much like mine.
+    PossibleDuplicate,
+    /// A changeset touching my paths landed on my target ref since my base.
+    Landed,
+}
+
+impl NoticeLevel {
+    pub const ALL: [NoticeLevel; 5] = [
+        NoticeLevel::Near,
+        NoticeLevel::SameFile,
+        NoticeLevel::Claimed,
+        NoticeLevel::PossibleDuplicate,
+        NoticeLevel::Landed,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NoticeLevel::Near => "near",
+            NoticeLevel::SameFile => "same_file",
+            NoticeLevel::Claimed => "claimed",
+            NoticeLevel::PossibleDuplicate => "possible_duplicate",
+            NoticeLevel::Landed => "landed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|v| v.as_str() == s)
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "unknown notice level {s:?} (expected near, same_file, claimed, \
+                     possible_duplicate or landed)"
+                ))
+            })
+    }
+}
+
+/// The parent directory of `p`, if it has one.
+pub fn parent_dir(p: &str) -> Option<&str> {
+    parent(p)
+}
+
+/// What [`CoordStore::near_paths`] looks for: the path rows of other
+/// active sessions that overlap `paths` (equal, a directory above, or below
+/// one of them) and, with `siblings`, that share a directory with one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NearQuery {
+    pub paths: Vec<String>,
+    pub siblings: bool,
+    /// Leave this session's rows out.
+    pub exclude: Option<u64>,
+    /// At most this many rows from each range scan, so one crowded
+    /// directory cannot fill the answer.
+    pub per_range: usize,
+    /// At most this many rows in all.
+    pub limit: usize,
+}
+
+impl NearQuery {
+    /// The exact paths to probe (each path and every directory above it)
+    /// and the half-open ranges `(lo, hi)` to scan, `lo < path < hi`: below
+    /// each path and, with `siblings`, below each path's directory. Every
+    /// store answers the same rows from these.
+    pub fn probes(&self) -> (Vec<String>, Vec<(String, String)>) {
+        let mut exact: BTreeSet<String> = BTreeSet::new();
+        let mut ranges: BTreeSet<String> = BTreeSet::new();
+        for p in &self.paths {
+            exact.insert(p.clone());
+            for a in ancestors(p) {
+                exact.insert(a.to_string());
+            }
+            ranges.insert(p.clone());
+            if self.siblings {
+                if let Some(d) = parent(p) {
+                    ranges.insert(d.to_string());
+                }
+            }
+        }
+        // A range below a directory already scanned adds nothing.
+        let covered: Vec<String> = ranges
+            .iter()
+            .filter(|r| !ancestors(r).iter().any(|a| ranges.contains(*a)))
+            .cloned()
+            .collect();
+        let ranges = covered
+            .into_iter()
+            .map(|d| (format!("{d}/"), format!("{d}0")))
+            .collect();
+        (exact.into_iter().collect(), ranges)
+    }
+
+    /// Whether `path` is one this query finds, for stores that filter in
+    /// memory.
+    pub fn matches(&self, path: &str) -> bool {
+        self.paths.iter().any(|p| {
+            paths_overlap(p, path)
+                || (self.siblings && parent(p).is_some_and(|d| paths_overlap(d, path) && path != d))
+        })
+    }
+}
+
+/// One answer of [`CoordStore::near_paths`]: a path row and its session,
+/// whose own path lists are left empty.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NearRow {
+    pub session: Session,
+    pub kind: PathKind,
+    pub path: String,
 }
 
 /// A heartbeat: the session of (principal, agent_session) was heard from
@@ -712,6 +840,11 @@ pub trait CoordStore: Send + Sync {
     /// How many sessions are in stored `state`, counting at most `cap`, so
     /// the answer costs a bounded index scan.
     async fn count_sessions(&self, state: SessionState, cap: usize) -> Result<u64>;
+
+    /// Path rows of active sessions near `q.paths` ([`NearQuery`]), with
+    /// their sessions: one probe of the exact paths and one bounded range
+    /// scan per range, all on the `(repo_id, path)` index (ADR 0096).
+    async fn near_paths(&self, q: &NearQuery) -> Result<Vec<NearRow>>;
 }
 
 #[cfg(test)]
