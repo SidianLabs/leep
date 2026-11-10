@@ -18,6 +18,7 @@ Status: early development (v0.1).
 - [Runbooks: what to do when an alert fires](docs/RUNBOOKS.md)
 - [The `leep` command line: exit codes and the agent contract](docs/CLI.md)
 - [Using Leep from AI agents (MCP)](docs/MCP.md)
+- [The coordination demo: twenty agents on one repository](docs/DEMO-COORDINATION.md)
 - [Contributing](CONTRIBUTING.md) and the [agent guide](CLAUDE.md)
 
 ## Layout
