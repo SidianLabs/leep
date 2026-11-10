@@ -710,6 +710,15 @@ async fn check_near_contract(store: &dyn CoordStore, t0: i64) {
     for s in [me, same, above, beside].into_iter().chain(crowd) {
         assert!(store.end_session(s.id, &end).await.unwrap());
     }
+    // Leave the store as the rest of the contract does: empty, so callers
+    // that check a fresh store after it (the migration tests) see none.
+    let gone = t0 + SESSION_RETENTION_SECS + PATHS_RETENTION_SECS + 1;
+    while store.sweep_sessions(gone, 1000).await.unwrap() != SweepReport::default() {}
+    let every = SessionFilter {
+        limit: 100,
+        ..Default::default()
+    };
+    assert!(store.list_sessions(&every).await.unwrap().is_empty());
 }
 
 #[cfg(test)]
