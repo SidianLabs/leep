@@ -93,8 +93,17 @@ lookup 250 ms, and the whole call 2 s (`CONTEXT_BOUND`). A section that
 fails or runs out of time is listed in `omitted {section, reason}`
 (`timeout`, `error`, or `off` when the server keeps no sessions) and the
 rest still comes. Only a bad request or a missing ref fails the call. The
-route takes a `search` read-class permit (ADR 0060), since it runs a code
-search, and the per-token limits of ADR 0020 apply. Tests on a paused clock
+route takes one `search` read-class permit (ADR 0060), since it runs a code
+search, and the per-token limits of ADR 0020 apply. That one permit covers
+the whole pack: its path-history pages, last-change reads, ref checks and
+culprits take no `log_filtered` permit of their own, so a server with
+`log_filtered=1` can run as many of those as it has `search` permits for
+packs. The cost under the permit is bounded: at most 128 MiB of blobs
+scanned (four searches of 32 MiB, against a plain search's 256 MiB) and 2 s.
+With `search=off` only the per-token rates bound packs. A full class sheds
+a pack with 503 and `Leep-Refused: read-class`; the CLI sends it again as
+it does a search, and the MCP tools report it as a retryable error (a
+router test checks the shed). Tests on a paused clock
 check the bound with a coordination store that never answers.
 
 ### 7. Untrusted text
