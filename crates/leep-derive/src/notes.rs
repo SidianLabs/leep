@@ -106,11 +106,13 @@ impl Repo {
         session_key: Option<&str>,
         req: AddNoteRequest,
     ) -> Result<NoteEntry> {
+        let supersedes = req.supersedes;
         let r = self
             .add_note_inner(principal, trust, session_key, req)
             .await;
         match &r {
             Ok(e) => {
+                self.note_added_events(e, supersedes);
                 metrics::counter!("leep_notes_added_total", "trust" => e.trust.clone(), "kind" => e.kind.clone())
                     .increment(1);
             }

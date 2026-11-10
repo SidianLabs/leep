@@ -13,6 +13,7 @@ pub mod conn;
 mod context;
 pub mod coord;
 pub mod errors;
+pub mod events;
 pub mod fingerprint;
 pub mod guard;
 pub mod limits;
@@ -336,6 +337,7 @@ pub fn router_with_read_classes(
         )
         .route("/v1/sessions/{id}/overlaps", get(sessions::overlaps))
         .route("/v1/notices", get(sessions::notices))
+        .route(events::PATH, get(events::get))
         .route("/v1/notes", get(notes::list).post(notes::add))
         .route("/v1/notes/{id}", get(notes::get_one).delete(notes::retract))
         .route("/v1/notes/{id}/report", post(notes::report))

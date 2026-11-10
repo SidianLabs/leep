@@ -196,6 +196,9 @@ pub struct Repo {
     pub(crate) coord: Option<Arc<dyn leep_core::coord::CoordStore>>,
     /// Heartbeats held until the next flush, shared by clones.
     pub(crate) beats: Arc<crate::sessions::BeatBuffer>,
+    /// Events held until the next flush, and their readers (ADR 0099),
+    /// shared by clones.
+    pub(crate) events: Arc<crate::events::Events>,
     /// Notices already said and recent overlap answers (ADR 0096), shared
     /// by clones.
     pub(crate) notices: Arc<crate::notices::NoticeState>,
@@ -701,6 +704,7 @@ impl Repo {
             blame_tracker: Arc::default(),
             coord,
             beats: Arc::default(),
+            events: Arc::default(),
             notices: Arc::default(),
             notices_on: true,
             default_ref: Arc::from(crate::notices::DEFAULT_TARGET_REF),

@@ -1491,7 +1491,11 @@ async fn upgrade_from_v10_adds_events() {
             limit: 10,
             ..Default::default()
         };
-        assert_eq!(coord.list_notes(&all).await.unwrap(), [n.clone()], "{kind}");
+        assert_eq!(
+            coord.list_notes(&all).await.unwrap(),
+            std::slice::from_ref(&n),
+            "{kind}"
+        );
         assert_eq!(
             coord.events_bounds().await.unwrap(),
             EventBounds::default(),

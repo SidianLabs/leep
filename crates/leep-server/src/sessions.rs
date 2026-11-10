@@ -406,8 +406,37 @@ async fn sweep_notes(repo: &Repo) {
         .increment(1);
 }
 
+/// One bounded step of the event sweep (ADR 0099), as for notes.
+async fn sweep_events(repo: &Repo) {
+    let reason = match tokio::time::timeout(HOOK_TIMEOUT, repo.sweep_events(16)).await {
+        Ok(Ok(_)) => return,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "sweeping events failed");
+            "error"
+        }
+        Err(_) => {
+            tracing::warn!("sweeping events timed out");
+            "timeout"
+        }
+    };
+    metrics::counter!("leep_session_hook_errors_total", "hook" => "events_sweep", "reason" => reason)
+        .increment(1);
+}
+
+/// At shutdown: wake every events waiter (long-polls answer, streams end)
+/// and append the events still held, within [`HOOK_TIMEOUT`].
+pub async fn stop_events(repo: &Repo) {
+    repo.events_shutdown();
+    match tokio::time::timeout(HOOK_TIMEOUT, repo.flush_events()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "appending events at shutdown failed"),
+        Err(_) => tracing::warn!("appending events at shutdown timed out"),
+    }
+}
+
 /// Write held heartbeats every [`FLUSH_EVERY`], and sweep expired and
-/// long-ended sessions, expired and long-closed notes (ADR 0098), and
+/// long-ended sessions, expired and long-closed notes (ADR 0098), events
+/// past their retention (ADR 0099), and
 /// refresh `leep_sessions_active` every [`SWEEP_EVERY`], until the process
 /// ends. Every server runs it; the
 /// statements are conditional, so several servers sweeping at once agree.
@@ -436,6 +465,7 @@ pub fn spawn_session_tasks(repo: Repo) {
                 tracing::warn!(error = %e, "sweeping sessions failed");
             }
             sweep_notes(&repo).await;
+            sweep_events(&repo).await;
             match repo.count_active_sessions(GAUGE_CAP).await {
                 Ok(n) => metrics::gauge!("leep_sessions_active").set(n as f64),
                 Err(e) => tracing::debug!(error = %e, "counting active sessions failed"),

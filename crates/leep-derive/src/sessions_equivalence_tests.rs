@@ -3,8 +3,9 @@
 //! repositories, one with no coordination store (its tables dropped), one
 //! whose sessions are declared, inferred, beaten, ended and swept at every
 //! step, with overlap notices and duplicate flags computed on every create,
-//! declaration and land (ADR 0096), and one whose coordination store fails
-//! every call. Every land answer, the refs and the ref log must be the same
+//! declaration and land (ADR 0096) and events flushed, read and swept
+//! between lands (ADR 0099), and one whose coordination store fails every
+//! call, `append_events` included. Every land answer, the refs and the ref log must be the same
 //! on all three.
 
 use std::collections::BTreeMap;
@@ -85,6 +86,18 @@ impl CoordStore for Dropped {
         Err(gone())
     }
     async fn unreport_notes(&self, _: Option<u64>, _: Option<&str>) -> Result<u64> {
+        Err(gone())
+    }
+    async fn append_events(&self, _: &[leep_core::coord::NewEvent]) -> Result<u64> {
+        Err(gone())
+    }
+    async fn events_after(&self, _: u64, _: usize) -> Result<Vec<leep_core::coord::Event>> {
+        Err(gone())
+    }
+    async fn events_bounds(&self) -> Result<leep_core::coord::EventBounds> {
+        Err(gone())
+    }
+    async fn sweep_events(&self, _: i64, _: usize) -> Result<u64> {
         Err(gone())
     }
 }
@@ -202,7 +215,28 @@ async fn chatter(r: &Repo, rng: &mut Rng, agent: usize) {
         let _ = r.sweep_sessions(4).await;
     }
     notes_chatter(r, rng, agent).await;
+    events_chatter(r, rng).await;
 }
+
+/// Events between lands (ADR 0099): flushed, read from the start and
+/// swept. Errors (the failing store) are counted by the server, never
+/// returned to an answer.
+async fn events_chatter(r: &Repo, rng: &mut Rng) {
+    if let Ok(n) = r.flush_events().await {
+        FLUSHED.fetch_add(n as usize, std::sync::atomic::Ordering::Relaxed);
+    }
+    if rng.below(3) == 0 {
+        let _ = r
+            .events_read(0, &crate::events::EventFilter::default())
+            .await;
+    }
+    if rng.below(5) == 0 {
+        let _ = r.sweep_events(2).await;
+    }
+}
+
+/// Events the populated repository appended during the runs.
+static FLUSHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Notes between lands (ADR 0098): written on the agent's directory, a
 /// file in it and the main ref's head, superseded, listed, reported,
@@ -350,8 +384,10 @@ async fn run(seed: u64) -> [usize; 3] {
                 .await;
             NOTICED.fetch_add(n.len(), std::sync::atomic::Ordering::Relaxed);
             if let Ok(LandResponse::Landed { landed, .. }) = &resp {
-                // What the server does after a land answered.
+                // What the server does after a land answered: the session
+                // ends as landed, an event that the next land never reads.
                 let _ = r.note_landed(id, *landed, Some(AGENTS[agent].0)).await;
+                let _ = r.flush_events().await;
             }
             answers.push(outcome(&resp));
         }
@@ -422,6 +458,10 @@ async fn coordination_state_never_changes_a_land_answer() {
     assert!(
         WROTE_NOTES.load(std::sync::atomic::Ordering::Relaxed) > 0,
         "notes were written during the runs"
+    );
+    assert!(
+        FLUSHED.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "events were appended during the runs"
     );
     // The sequences cover clean lands, rebases and conflicts.
     assert!(

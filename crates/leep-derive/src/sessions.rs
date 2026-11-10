@@ -379,6 +379,7 @@ impl Repo {
         if created {
             metrics::counter!("leep_sessions_started_total", "origin" => "declared").increment(1);
         }
+        self.session_written(&s, created);
         let declared: Vec<String> = s.scope.iter().chain(&s.claims).cloned().collect();
         if u.scope.is_some() || u.claims.is_some() {
             self.note_scope_change(s.id, Some(&declared));
@@ -498,6 +499,7 @@ impl Repo {
         };
         if coord.end_session(id, &end).await? {
             self.note_scope_change(id, None);
+            self.session_ended(&s, SessionState::Abandoned, None);
         }
         self.session(id).await
     }
@@ -557,6 +559,7 @@ impl Repo {
                     metrics::counter!("leep_sessions_started_total", "origin" => "inferred")
                         .increment(1);
                 }
+                self.session_written(&s, created);
                 Ok(Some(s))
             }
             Err(e) if too_many(&e) => {
@@ -609,6 +612,8 @@ impl Repo {
         let ended = coord.end_session(s.id, &end).await?;
         if ended {
             metrics::counter!("leep_sessions_ended_total", "state" => "landed").increment(1);
+            // The post-land hook is where lands become events (ADR 0099).
+            self.session_ended(&s, SessionState::Landed, Some(landed));
         }
         Ok(ended)
     }
