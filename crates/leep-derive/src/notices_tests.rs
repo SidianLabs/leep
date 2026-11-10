@@ -894,3 +894,69 @@ async fn a_session_without_a_target_hears_of_the_default_ref() {
     assert_eq!(l.len(), 1, "{n:?}");
     assert!(l[0].landed_on.is_none());
 }
+
+/// A session met both through a directory it scoped and on the file
+/// itself is named on the file (the pre-flight check reads it), and one
+/// met only through its directory is named on the directory.
+#[tokio::test]
+async fn a_notice_names_the_shared_file_over_a_directory() {
+    let r = repo();
+    let mut a = declare("a-1", "auth work");
+    a.scope = Some(vec!["src/auth".into()]);
+    r.declare_session("ada", a).await.unwrap();
+    // ada touches token.rs too; bo then edits it.
+    commit(&r, "ada", "a-1", &[], &["src/auth/token.rs"]).await;
+    let (_, n) = commit(&r, "bo", "b-1", &[], &["src/auth/token.rs"]).await;
+    assert_eq!(levels(&n), ["same_file"]);
+    assert_eq!(n[0].untrusted.path.as_deref(), Some("src/auth/token.rs"));
+    assert_eq!(
+        n[0].untrusted.other_path.as_deref(),
+        Some("src/auth/token.rs")
+    );
+    assert!(n[0].stops_land(|p| p == "src/auth/token.rs"));
+    // cy edits another file of ada's directory: only the scope meets it.
+    let (_, n) = commit(&r, "cy", "c-1", &[], &["src/auth/keys.rs"]).await;
+    assert_eq!(levels(&n), ["same_file"]);
+    assert_eq!(n[0].untrusted.other_path.as_deref(), Some("src/auth"));
+    assert!(!n[0].stops_land(|p| p == "src/auth/keys.rs"));
+}
+
+/// A `landed` notice names a file of mine the land changed itself, ahead
+/// of a directory of mine holding another file it changed.
+#[tokio::test]
+async fn a_landed_notice_names_my_file_over_my_directory() {
+    let r = repo();
+    let (seed, _) = commit(&r, "root", "r-0", &[], &["README"]).await;
+    let LandResponse::Landed { landed: base, .. } =
+        r.land_as(seed, "main", Some("root")).await.unwrap()
+    else {
+        panic!()
+    };
+    let mut a = declare("a-1", "tokens");
+    a.base = Some(base);
+    a.scope = Some(vec!["src/auth".into()]);
+    r.declare_session("ada", a).await.unwrap();
+    commit(&r, "ada", "a-1", &[base], &["src/auth/token.rs"]).await;
+    let (theirs, _) = commit(
+        &r,
+        "bo",
+        "b-1",
+        &[base],
+        &["src/auth/keys.rs", "src/auth/token.rs"],
+    )
+    .await;
+    let LandResponse::Landed { landed, .. } = r.land_as(theirs, "main", Some("bo")).await.unwrap()
+    else {
+        panic!()
+    };
+    r.note_landed(theirs, landed, Some("bo")).await.unwrap();
+    let n = r.notices_for("ada", "a-1", &NoticeAsk::default()).await;
+    let land = n.iter().find(|n| n.level == "landed").expect("{n:?}");
+    assert_eq!(land.untrusted.path.as_deref(), Some("src/auth/token.rs"));
+    assert_eq!(
+        land.untrusted.other_path.as_deref(),
+        Some("src/auth/token.rs")
+    );
+    assert!(land.stops_land(|p| p == "src/auth/token.rs"));
+    assert!(!land.stops_land(|p| p == "src/auth/mod.rs"));
+}

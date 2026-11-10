@@ -766,13 +766,23 @@ impl Repo {
         // out its rows on crowded paths (their count) unless they claim:
         // a session that also meets me on an uncrowded path is named there.
         // A row on one of my paths beats any on a related file.
-        type Best = ((bool, NoticeLevel), usize, String);
+        // At one level, a row naming my path itself beats one naming a
+        // directory holding it, then my earlier path (the request's own
+        // first): the notice names the file both work on, which is what
+        // the pre-flight check reads (`Notice::stops_land`).
+        type Rank = (bool, NoticeLevel, bool, std::cmp::Reverse<usize>);
+        type Best = (Rank, usize, String);
         let mut best: BTreeMap<u64, (&Session, Best)> = BTreeMap::new();
         for (r, level, i) in met {
             if hot.contains(r.path.as_str()) && level < NoticeLevel::Claimed {
                 continue;
             }
-            let at = (!mine[i].related, level);
+            let at = (
+                !mine[i].related,
+                level,
+                r.path == mine[i].path,
+                std::cmp::Reverse(i),
+            );
             let e = best
                 .entry(r.session.id)
                 .or_insert_with(|| (&r.session, (at, i, r.path.clone())));
@@ -780,7 +790,7 @@ impl Repo {
                 e.1 = (at, i, r.path.clone());
             }
         }
-        for (id, (o, ((_, level), i, theirs))) in best.into_iter().rev() {
+        for (id, (o, ((_, level, _, _), i, theirs))) in best.into_iter().rev() {
             let p = &mine[i];
             let mut n = notice(level, Some(o));
             n.untrusted.path = Some(p.path.clone());
@@ -851,9 +861,18 @@ impl Repo {
             w.walked += 1;
             w.at = cs.parents.first().copied();
             if !self.is_own(s, id, &cs).await? {
-                let hit = mine.iter().find_map(|p| {
-                    changed_near(&cs, &p.path).map(|c| (&p.path, p.declared, c.to_string()))
-                });
+                // A path of mine it changed itself first, so the notice
+                // names the file rather than a directory holding it.
+                let exact = |p: &&Probe| changed_near(&cs, &p.path) == Some(p.path.as_str());
+                let hit = mine
+                    .iter()
+                    .find(exact)
+                    .map(|p| (&p.path, p.declared, p.path.clone()))
+                    .or_else(|| {
+                        mine.iter().find_map(|p| {
+                            changed_near(&cs, &p.path).map(|c| (&p.path, p.declared, c.to_string()))
+                        })
+                    });
                 if let Some((p, declared, theirs)) = hit {
                     // Who landed it, to tell a duplicate's land (read only
                     // for a hit; kept with the walk).

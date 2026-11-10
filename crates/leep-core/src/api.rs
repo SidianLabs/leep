@@ -1257,6 +1257,38 @@ pub struct Notice {
     pub untrusted: NoticeText,
 }
 
+impl Notice {
+    /// Whether this notice stops an agent's land before it happens (the
+    /// pre-flight check, ADR 0096 amendment), for a change whose changed
+    /// files `changes` answers. The one place the rule lives:
+    /// - `possible_duplicate`, and a duplicate's land (`landed` by
+    ///   `task_key`), always stop;
+    /// - `landed` stops when the landed changeset changed one of these files;
+    /// - `claimed` stops when the claim is on one of these files or on a
+    ///   directory holding it;
+    /// - `same_file` stops when the other session names one of these files
+    ///   itself, not only a directory holding it (a scope);
+    /// - `near`, a level this client does not know, and anything met only
+    ///   through a related file (`via`) never stop.
+    ///
+    /// The paths compared are agent-written (`untrusted`): they decide only
+    /// whether to stop, never what is shown outside the fence.
+    pub fn stops_land(&self, changes: impl Fn(&str) -> bool) -> bool {
+        if self.via.is_some() {
+            return false;
+        }
+        let mine = self.untrusted.path.as_deref();
+        let theirs = self.untrusted.other_path.as_deref();
+        match self.level.as_str() {
+            "possible_duplicate" => true,
+            "landed" => self.by.as_deref() == Some("task_key") || theirs.is_some_and(&changes),
+            "claimed" => mine.is_some_and(&changes),
+            "same_file" => mine.is_some_and(&changes) && theirs == mine,
+            _ => false,
+        }
+    }
+}
+
 /// `GET /v1/notices`: the notices for the caller's session named by
 /// `Leep-Session`, each said once (ADR 0096).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2154,6 +2186,46 @@ pub struct SearchResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn which_notices_stop_a_land() {
+        let n = |level: &str, mine: &str, theirs: &str| Notice {
+            level: level.into(),
+            session: Some(1),
+            principal: None,
+            changeset: None,
+            count: None,
+            by: None,
+            similarity: None,
+            via: None,
+            landed_on: None,
+            untrusted: NoticeText {
+                path: Some(mine.into()),
+                other_path: Some(theirs.into()),
+                ..Default::default()
+            },
+        };
+        let changes = |p: &str| p == "src/a.rs";
+        // Their own file is mine; a scope above it is not enough.
+        assert!(n("same_file", "src/a.rs", "src/a.rs").stops_land(changes));
+        assert!(!n("same_file", "src/a.rs", "src").stops_land(changes));
+        assert!(!n("same_file", "src", "src/b.rs").stops_land(changes));
+        // A claim on my file or a directory above it.
+        assert!(n("claimed", "src/a.rs", "src").stops_land(changes));
+        assert!(!n("claimed", "src", "src/b.rs").stops_land(changes));
+        assert!(n("possible_duplicate", "src", "src").stops_land(changes));
+        assert!(n("landed", "src/a.rs", "src/a.rs").stops_land(changes));
+        assert!(!n("landed", "src", "src/b.rs").stops_land(changes));
+        let mut dup_land = n("landed", "src", "src/b.rs");
+        dup_land.by = Some("task_key".into());
+        assert!(dup_land.stops_land(changes));
+        // Never: near, an unknown level, a related file.
+        assert!(!n("near", "src/a.rs", "src/b.rs").stops_land(changes));
+        assert!(!n("conflict", "src/a.rs", "src/a.rs").stops_land(changes));
+        let mut related = n("claimed", "src/a.rs", "src/a.rs");
+        related.via = Some("related".into());
+        assert!(!related.stops_land(changes));
+    }
 
     #[test]
     fn rebase_onto_shapes_are_stable() {
