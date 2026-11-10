@@ -20,6 +20,7 @@ pub mod changeset_reach;
 pub mod changeset_sweep;
 pub mod checks;
 mod comments;
+pub mod context;
 mod cursor;
 pub mod derived;
 mod filter_log;
@@ -60,6 +61,8 @@ mod blame_tests;
 mod bounded_tests;
 #[cfg(test)]
 mod budget_tests;
+#[cfg(test)]
+mod context_tests;
 #[cfg(test)]
 mod criss_cross_tests;
 #[cfg(test)]

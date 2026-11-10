@@ -807,3 +807,30 @@ fn bad_read_limit_settings_fail_startup_with_a_clear_error() {
         assert!(err.contains(want), "{args:?}: {err}");
     }
 }
+
+/// A context pack (ADR 0097) runs a code search, so it takes a `search`
+/// permit: a full class sheds it at once, as it sheds a search, and it is
+/// admitted again once the permit is free.
+#[tokio::test]
+async fn a_full_search_class_sheds_a_context_pack() {
+    let r = rig(ClassLimit::Permits(1)).await;
+    let context = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/context")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"task":"find the needle"}"#))
+            .unwrap()
+    };
+    let held = start(&r.app, SEARCH).await;
+    assert_eq!(held.status(), StatusCode::OK);
+    assert_refused(&send(&r.app, context()).await);
+    assert_eq!(read(held).await.status, StatusCode::OK);
+    let ok = send(&r.app, context()).await;
+    assert_eq!(
+        ok.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&ok.body)
+    );
+}

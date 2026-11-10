@@ -505,12 +505,12 @@ impl Auth {
     }
 }
 
-/// Mutating requests need `write`. `POST /v1/blobs/missing` is a query, so a
-/// read token may call it.
+/// Mutating requests need `write`. `POST /v1/blobs/missing` and `POST
+/// /v1/context` (ADR 0097) are queries, so a read token may call them.
 pub(crate) fn needs_write(method: &Method, path: &str) -> bool {
     match *method {
         Method::GET | Method::HEAD => false,
-        Method::POST => path != "/v1/blobs/missing",
+        Method::POST => path != "/v1/blobs/missing" && path != "/v1/context",
         _ => true,
     }
 }
@@ -731,6 +731,7 @@ mod tests {
         assert!(!needs_write(&Method::GET, "/v1/refs"));
         assert!(!needs_write(&Method::GET, "/v1/search/main"));
         assert!(!needs_write(&Method::POST, "/v1/blobs/missing"));
+        assert!(!needs_write(&Method::POST, "/v1/context"));
         assert!(needs_write(&Method::POST, "/v1/land"));
         assert!(needs_write(&Method::POST, "/v1/changesets/abc/signatures"));
         assert!(needs_write(&Method::POST, "/v1/changesets/abc/reviews"));

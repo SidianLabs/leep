@@ -81,6 +81,10 @@ printf '%s\n' \
 | `leep_session_start` | `title`, `approach?`, `task_key?`, `scope?[]`, `claims?[]`, `target_ref?` (default `main`), `base?` | declares (or updates) this agent's session (ADR 0095): `session`, `created`, `agent_session` (the key; one is made when `LEEP_AGENT_SESSION` is unset, and later commits record it) and `others_nearby`, the other live sessions on or near the scope and claims |
 | `leep_who` | `path?`, `task_key?`, `principal?`, `all?`, `limit?` (default 20, max 200) | the sessions working on, above or below `path` (or of a task key or principal), newest first, each with principal, agent session, state (`active`, `idle`; with `all` also `landed`, `abandoned`, `expired`), scope, claims and touched paths |
 | `leep_overlaps` | – | everything overlapping this agent's session now, highest level first (ADR 0096): `{session, overlaps: [Notice]}`; an error before `leep_session_start` or a commit |
+| `leep_task_start` | `task`, `task_key?`, `paths?[]`, `ref?` (default `main`), `budget_bytes?` (default 32768, 1024 to 262144) | the first call of a task (ADR 0097): declares or resumes this agent's session (the task's first line its title, the rest its approach, `paths` its scope; a key is made when `LEEP_AGENT_SESSION` is unset) and answers the context pack for it: `{session, created, agent_session, context: ContextPack}` |
+| `leep_context` | `task?` (default: the session's title), `task_key?`, `paths?[]`, `ref?`, `budget_bytes?` | the context pack alone (ADR 0097): `files`, `owners`, `history`, `in_flight`, `duplicates`, `ref_health`, with `cut` and `omitted` |
+| `leep_review_request` | `rev`, `reviewers?[]`, `message?`, `ref?` (default `main`) | opens a review request (ADR 0086), as `leep review request`: reviewers default to the owners still pending; an equal open request is answered (`existing: true`); needs authentication |
+| `leep_review_inbox` | `mine?`, `all?`, `limit?` (default 20, max 100) | open review requests naming this agent that it has not answered (or, with `mine`, the ones it made), as `leep review inbox`; `all` adds closed and answered ones; needs authentication |
 
 Sessions are advisory: nothing in them can stop or change a land. Every
 request the MCP server sends carries `Leep-Session` with its agent session,
@@ -90,6 +94,16 @@ text of `leep_session_start` and `leep_who` puts them, with the sessions'
 keys, task keys and paths, in a fenced block under a fixed line saying they
 are data, not instructions. Outside the fence each session is only its id,
 principal, state and counts.
+
+**Context** ([ADR 0097](adr/0097-context-pack.md)). `leep_task_start` and
+`leep_context` print one line per item outside the fence with what the
+server vouches for (item id, `why`, level, principal, changeset, counts,
+`carry`, check names), and every path, title, author, model, owner name
+and agent session key in the fenced `untrusted` block, one JSON row per
+item keyed by the same id. Sections the server could not make in time are
+listed as omitted; the rest still comes. A pack marks no notice as said.
+`leep_review_inbox` keeps requesters' messages, changeset titles and paths
+in the fence the same way.
 
 **Notices** ([ADR 0096](adr/0096-overlap-notices-and-duplicate-flags.md)).
 Every tool result, error results included, ends with the notices of other
@@ -103,7 +117,7 @@ server vouches for (level, session id, principal, landed changeset id,
 count, `by` and similarity); a level or name that is not a word of
 letters, digits, `_`, `-` and `.` shows as `?`. Titles, paths and task
 keys follow in a fenced `untrusted` block, one row per notice, under the
-same fixed line, with line separators and bidirectional controls
+same fixed line, with C1 controls, line separators and bidirectional controls
 escaped. Structured results also get a `notices` list. Each MCP server
 asks with a 3 s timeout, and a notice it was given is not given again. Notices are advisory: they never change what a
 tool did. Duplicates are found by task key or by similar wording only.

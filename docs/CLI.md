@@ -15,7 +15,7 @@ command's options with examples for the common ones.
 | Branches | `branch`, `switch`, `tag`, `merge`, `rebase`, `cherry-pick`, `revert` |
 | History | `log`, `show`, `bisect`, `cat`, `blame`, `last-change`, `search`, `provenance`, `refs`, `reflog` |
 | Review | `review` (`approve`, `reject`, `withdraw`, `status`, `list`, `request`, `inbox`, `cancel`, `show`), `reviews`, `checks` (`post`, `status`, `ref`, `culprits`) |
-| Coordinate | `session` (`start`, `update`, `end`, `show`), `who` |
+| Coordinate | `work` (`start`), `session` (`start`, `update`, `end`, `show`), `who`, `context` |
 | Admin | `undo`, `keygen`, `config` |
 
 Global options, accepted by every command and listed only in `leep --help`:
@@ -240,6 +240,21 @@ carries them where the answer does. Titles, paths and names are quoted and
 escaped. `LEEP_NOTICE_LEVEL=near|same_file|claimed|possible_duplicate|landed|off`
 sets the lowest level shown (default `same_file`). Notices never change
 what a command does or its exit code.
+
+### Context
+
+`leep context` shows what the server already knows that bears on a task
+([ADR 0097](adr/0097-context-pack.md)), before you change anything:
+
+| Command | Effect |
+|---|---|
+| `leep context [-t TEXT] [PATHS...] [--task-key KEY] [--ref REF] [--budget BYTES]` | The context pack for the task `TEXT` (default: your session's title and approach) starting from `PATHS`: `files:` (each `[seed, search, co_change]` with its matching lines and how often it changed with your paths), `owners:` (names, the `carry` rule and the `OWNERS` file stating it), `last changes:` (changeset, creator, author, model, title), `work in flight:` and `possible duplicates:` (as notices are shown, without marking them said), `ref:` (head, `green/<ref>`, how far behind, red and the suspects touching these files), then what the budget `cut:` and which parts were `omitted:` (timeout, error, or `off` without sessions). `--budget` defaults to 32768 bytes, at most 262144. `--json` prints `ContextPack`. |
+| `leep work start [-t TITLE] [--approach TEXT] [--task KEY] [--scope PATH]... [--claim PATH]... [--ref REF] [--budget BYTES]` | `leep session start`, then `leep context` for the declared title, approach, scope and claims: one command to begin a task. `--json` prints `{session, context}`. |
+
+Identifiers in the task (words in backticks, `snake_case`, `camelCase`)
+are searched for. Every path, title, author, model and owner name is
+printed quoted and escaped. The pack is advisory, and the same request
+gives the same answer until something changes.
 
 ## CI checks
 

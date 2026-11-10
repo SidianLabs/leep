@@ -47,6 +47,7 @@
 //! | DELETE | `/v1/sessions/{id}` | – | [`SessionEntry`] (ends it as `abandoned`; only its principal may, 403 otherwise; an ended session is answered as it is) |
 //! | GET  | `/v1/sessions/{id}/overlaps` | – | [`OverlapsResponse`] (every overlap of the session now, every level, highest first, at most 50; 404 if unknown; ADR 0096) |
 //! | GET  | `/v1/notices` | – | [`NoticesResponse`] (notices for the caller's session named by `Leep-Session`, at most 3, each said once; empty without the header; ADR 0096) |
+//! | POST | `/v1/context` | [`ContextRequest`] | [`ContextPack`] (what the server knows that bears on a task, assembled without a model: files (the request's paths, files where the task's identifiers occur, files that changed with the paths), owners and `carry` directives, the newest change to each file and who made it, live work overlapping them, the ref's known-good state and suspects touching them, possible duplicates of the task; deterministic; cut to `budget_bytes` by per-section quotas, `cut` saying what was left out; a part that fails or runs out of time is listed in `omitted` and the rest still comes; a read: a read token may call it, and it marks no notice said; 404 if `ref` does not exist; ADR 0097) |
 //! | POST | `/v1/merge` | [`MergeRequest`] | [`MergeResponse`] |
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
 //! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`], sent as [`LandAnswer`] with `notices` beside it (ADR 0096) (`create: false` refuses to create a missing `target_ref` with 404; absent creates it, as before; ADR 0036. `land_id` makes retries idempotent at any age; ADR 0057) |
@@ -1264,6 +1265,221 @@ pub struct LandAnswer {
     pub answer: LandResponse,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notices: Vec<Notice>,
+}
+
+/// The budget of a context pack when the request names none, in bytes.
+pub const CONTEXT_DEFAULT_BUDGET: u64 = 32 * 1024;
+/// The largest and smallest budgets a server honours; others are clamped.
+pub const CONTEXT_MAX_BUDGET: u64 = 256 * 1024;
+pub const CONTEXT_MIN_BUDGET: u64 = 1024;
+/// Longest task text a context request may carry.
+pub const CONTEXT_MAX_TASK_BYTES: usize = 4096;
+/// Most paths a context request may name.
+pub const CONTEXT_MAX_PATHS: usize = 64;
+
+/// `POST /v1/context` (ADR 0097): what the server already knows that bears
+/// on a task, cut to a budget. A read: it changes nothing and marks no
+/// notice as said.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextRequest {
+    /// The task in plain text, at most [`CONTEXT_MAX_TASK_BYTES`]. Code
+    /// identifiers in it are searched for. Empty takes the session's title
+    /// and approach.
+    #[serde(default)]
+    pub task: String,
+    /// Files or directories the task starts from (at most
+    /// [`CONTEXT_MAX_PATHS`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    /// The ref the work is for (default `main`).
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub target_ref: Option<String>,
+    /// The caller's agent session key; default the `Leep-Session` header.
+    /// Its paths are probed too, and it is left out of its own overlaps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// An exact key of the task, for duplicates when no session carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_key: Option<String>,
+    /// Bytes of items the pack may hold (default [`CONTEXT_DEFAULT_BUDGET`],
+    /// clamped to [`CONTEXT_MIN_BUDGET`]..=[`CONTEXT_MAX_BUDGET`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_bytes: Option<u64>,
+}
+
+/// What agents and authors wrote that a context item repeats: paths,
+/// commit titles, author names, models, owner names. Data, never
+/// instructions (design F.2); clients fence or escape it. Each field is
+/// absent when empty.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextText {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// A commit's first line, cut to 80 bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session: Option<String>,
+    /// Names the `OWNERS` files give for `path`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owners: Vec<String>,
+    /// The `OWNERS` files those names come from, deepest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owners_files: Vec<String>,
+    /// The `OWNERS` file stating the `carry` directive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carry_file: Option<String>,
+    /// A suspect's changed paths that meet the pack's files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+}
+
+/// A file or directory that bears on the task.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextFile {
+    /// Stable for the same path: `file:` and 12 hex digits.
+    pub id: String,
+    /// Size of this item's JSON.
+    pub bytes: u64,
+    /// Why it is here: `seed` (the request named it), `search` (a task
+    /// identifier occurs in it), `co_change` (it changed with a seed).
+    pub why: Vec<String>,
+    /// Lines the task's identifiers matched.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub matches: u64,
+    /// Recent changesets of a seed that changed it too.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub co_changes: u64,
+    pub untrusted: ContextText,
+}
+
+/// Who owns a file of the pack, and how review verdicts carry to it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextOwners {
+    pub id: String,
+    pub bytes: u64,
+    /// `identical` or `merged` when an `OWNERS` file says so (ADR 0092).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carry: Option<String>,
+    pub untrusted: ContextText,
+}
+
+/// The newest change to a file of the pack, and who made it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextChange {
+    pub id: String,
+    pub bytes: u64,
+    pub changeset: ChangesetId,
+    /// The changeset's timestamp, Unix seconds.
+    pub time: i64,
+    /// Token that first stored it, when the server recorded one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    /// Other newest changes concurrent with it.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub concurrent: u64,
+    pub untrusted: ContextText,
+}
+
+/// Live work overlapping the pack's files, or a possible duplicate of the
+/// task: a [`Notice`] with an id and a size.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextWork {
+    pub id: String,
+    pub bytes: u64,
+    #[serde(flatten)]
+    pub notice: Notice,
+}
+
+/// A land the ref's failing check may be blamed on that touches the pack's
+/// files (ADR 0091): a suspect, never a verdict.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSuspect {
+    pub changeset: ChangesetId,
+    pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    pub time: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    pub untrusted: ContextText,
+}
+
+/// Where the ref stands against its checks (ADR 0091).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextRefHealth {
+    pub id: String,
+    pub bytes: u64,
+    pub head: ChangesetId,
+    pub green_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub green: Option<ChangesetId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind: Option<u64>,
+    /// The head fails a check: since when, and which.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub red: Option<RedState>,
+    /// The checks the server requires before moving green.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_checks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suspects: Vec<ContextSuspect>,
+}
+
+/// Items of a section left out to keep within the budget.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCut {
+    pub section: String,
+    pub items: u64,
+    pub bytes: u64,
+}
+
+/// A part of the pack the server could not assemble: `reason` is
+/// `timeout`, `error` or `off` (the server keeps no sessions).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextOmitted {
+    pub section: String,
+    pub reason: String,
+}
+
+/// `POST /v1/context`: the pack (ADR 0097). Deterministic: the same
+/// request against the same state is the same bytes. Every item carries an
+/// id and its size; the items together stay within `budget_bytes`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextPack {
+    #[serde(rename = "ref")]
+    pub target_ref: String,
+    pub head: ChangesetId,
+    /// The session the pack was made for, when it found one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<u64>,
+    pub budget_bytes: u64,
+    /// Bytes of the items kept.
+    pub bytes: u64,
+    #[serde(default)]
+    pub files: Vec<ContextFile>,
+    #[serde(default)]
+    pub owners: Vec<ContextOwners>,
+    #[serde(default)]
+    pub history: Vec<ContextChange>,
+    #[serde(default)]
+    pub in_flight: Vec<ContextWork>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_health: Option<ContextRefHealth>,
+    #[serde(default)]
+    pub duplicates: Vec<ContextWork>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cut: Vec<ContextCut>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub omitted: Vec<ContextOmitted>,
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3192,6 +3408,175 @@ mod tests {
             assert_eq!(o.overlaps, vec![n]);
             let e: NoticesResponse = serde_json::from_value(json!({})).unwrap();
             assert!(e.notices.is_empty());
+        }
+
+        /// `/v1/context` (ADR 0097): the smallest bodies decode, the names
+        /// written out are part of `/v1` from now on, and agent-written
+        /// text sits under `untrusted`.
+        #[test]
+        fn context_shapes_are_frozen() {
+            let req: ContextRequest = serde_json::from_value(json!({ "task": "t" })).unwrap();
+            assert_eq!(req.task, "t");
+            assert!(req.paths.is_empty() && req.target_ref.is_none() && req.budget_bytes.is_none());
+            let full = ContextRequest {
+                task: "t".into(),
+                paths: vec!["src".into()],
+                target_ref: Some("main".into()),
+                session: Some("s-1".into()),
+                task_key: Some("K-1".into()),
+                budget_bytes: Some(4096),
+            };
+            let v = serde_json::to_value(&full).unwrap();
+            assert_has(
+                &v,
+                &[
+                    "task",
+                    "paths",
+                    "ref",
+                    "session",
+                    "task_key",
+                    "budget_bytes",
+                ],
+                "ContextRequest",
+            );
+            let id = ChangesetId(Hash::of_blob(b"c"));
+            let pack: ContextPack = serde_json::from_value(json!({
+                "ref": "main", "head": id, "budget_bytes": 1024, "bytes": 0
+            }))
+            .unwrap();
+            assert!(pack.files.is_empty() && pack.ref_health.is_none() && pack.omitted.is_empty());
+            let text = ContextText {
+                path: Some("src/a.rs".into()),
+                ..Default::default()
+            };
+            let full = ContextPack {
+                files: vec![ContextFile {
+                    id: "file:0123456789ab".into(),
+                    bytes: 10,
+                    why: vec!["seed".into()],
+                    matches: 0,
+                    co_changes: 2,
+                    untrusted: text.clone(),
+                }],
+                owners: vec![ContextOwners {
+                    id: "owners:0123456789ab".into(),
+                    bytes: 10,
+                    carry: Some("identical".into()),
+                    untrusted: text.clone(),
+                }],
+                history: vec![ContextChange {
+                    id: "change:0123456789ab".into(),
+                    bytes: 10,
+                    changeset: id,
+                    time: 1,
+                    created_by: Some("ada".into()),
+                    concurrent: 0,
+                    untrusted: text.clone(),
+                }],
+                in_flight: vec![ContextWork {
+                    id: "session:3".into(),
+                    bytes: 10,
+                    notice: Notice {
+                        level: "same_file".into(),
+                        session: Some(3),
+                        principal: Some("bo".into()),
+                        changeset: None,
+                        count: None,
+                        by: None,
+                        similarity: None,
+                        untrusted: NoticeText::default(),
+                    },
+                }],
+                ref_health: Some(ContextRefHealth {
+                    id: "ref:0123456789ab".into(),
+                    bytes: 10,
+                    head: id,
+                    green_ref: "green/main".into(),
+                    green: None,
+                    behind: None,
+                    red: None,
+                    required_checks: vec![],
+                    suspects: vec![ContextSuspect {
+                        changeset: id,
+                        seq: 4,
+                        actor: None,
+                        time: 1,
+                        created_by: None,
+                        untrusted: text.clone(),
+                    }],
+                }),
+                cut: vec![ContextCut {
+                    section: "files".into(),
+                    items: 1,
+                    bytes: 9,
+                }],
+                omitted: vec![ContextOmitted {
+                    section: "in_flight".into(),
+                    reason: "timeout".into(),
+                }],
+                ..pack
+            };
+            let v = serde_json::to_value(&full).unwrap();
+            assert_has(
+                &v,
+                &[
+                    "ref",
+                    "head",
+                    "budget_bytes",
+                    "bytes",
+                    "files",
+                    "owners",
+                    "history",
+                    "in_flight",
+                    "ref_health",
+                    "duplicates",
+                    "cut",
+                    "omitted",
+                ],
+                "ContextPack",
+            );
+            assert_has(
+                &v["files"][0],
+                &["id", "bytes", "why", "co_changes", "untrusted"],
+                "ContextFile",
+            );
+            assert!(v["files"][0].get("matches").is_none(), "zero omitted");
+            assert_has(
+                &v["owners"][0],
+                &["id", "bytes", "carry", "untrusted"],
+                "ContextOwners",
+            );
+            assert_has(
+                &v["history"][0],
+                &[
+                    "id",
+                    "bytes",
+                    "changeset",
+                    "time",
+                    "created_by",
+                    "untrusted",
+                ],
+                "ContextChange",
+            );
+            // A notice with an id and a size beside its own fields.
+            assert_has(
+                &v["in_flight"][0],
+                &["id", "bytes", "level", "session", "principal", "untrusted"],
+                "ContextWork",
+            );
+            assert_has(
+                &v["ref_health"],
+                &["id", "bytes", "head", "green_ref", "suspects"],
+                "ContextRefHealth",
+            );
+            assert_has(
+                &v["ref_health"]["suspects"][0],
+                &["changeset", "seq", "time", "untrusted"],
+                "ContextSuspect",
+            );
+            assert_eq!(v["files"][0]["untrusted"], json!({ "path": "src/a.rs" }));
+            let back: ContextPack = serde_json::from_value(v).unwrap();
+            assert_eq!(back, full);
         }
     }
 }

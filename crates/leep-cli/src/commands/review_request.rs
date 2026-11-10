@@ -171,31 +171,85 @@ pub fn inbox(r: &Remote, args: &InboxArgs) -> Result<i32> {
             plural(hidden, "request")
         );
     }
+    if resp.next.is_some() {
+        outln!("(more requests follow; run again with -n larger)");
+    }
     Ok(code)
 }
 
 /// One page of the inbox, without the requests `me` already answered
 /// (unless `--mine` or `--all`), and how many those were.
 fn inbox_page(r: &Remote, args: &InboxArgs, me: &str) -> Result<(ReviewRequestsResponse, usize)> {
-    let mut query = vec![(
-        if args.mine { "requester" } else { "reviewer" },
-        me.to_string(),
-    )];
-    if !args.all {
-        query.push(("open", "true".into()));
+    waiting_requests(
+        r.client,
+        me,
+        args.mine,
+        args.all,
+        args.limit.unwrap_or(DEFAULT_INBOX),
+    )
+    .map_err(unsupported)
+}
+
+/// Requests listed per inbox when no limit is given.
+pub const DEFAULT_INBOX: usize = 50;
+/// Pages an inbox reads looking for requests not yet answered.
+const INBOX_PAGES: usize = 10;
+
+/// Up to `limit` review requests for `me`: open ones naming it (`mine`:
+/// that it made; `all`: closed ones too), newest first. Unless `mine` or
+/// `all`, the requests `me` already answered are left out, and further
+/// pages are read (at most [`INBOX_PAGES`]) so that answered ones do not
+/// hide older unanswered ones. `next` is set when more may follow. Answers
+/// the list and how many answered requests were left out.
+pub fn waiting_requests(
+    client: &crate::client::Client,
+    me: &str,
+    mine: bool,
+    all: bool,
+    limit: usize,
+) -> Result<(ReviewRequestsResponse, usize)> {
+    let limit = limit.max(1);
+    let mut base = vec![(if mine { "requester" } else { "reviewer" }, me.to_string())];
+    if !all {
+        base.push(("open", "true".into()));
     }
-    if let Some(n) = args.limit {
-        query.push(("limit", n.to_string()));
+    base.push(("limit", limit.to_string()));
+    let filter = !mine && !all;
+    let mut out = ReviewRequestsResponse {
+        requests: Vec::new(),
+        next: None,
+    };
+    let mut hidden = 0;
+    let mut before: Option<u64> = None;
+    for _ in 0..INBOX_PAGES {
+        let mut query = base.clone();
+        if let Some(b) = before {
+            query.push(("before", b.to_string()));
+        }
+        let page = client.review_requests(&query)?;
+        for e in page.requests {
+            // What waits for you is what you have not answered yet. A
+            // withdrawn verdict is no answer, so the request comes back.
+            if filter && answered_by(&e, me) {
+                hidden += 1;
+            } else if out.requests.len() < limit {
+                out.requests.push(e);
+            } else {
+                // A whole page was not needed: more may follow from here.
+                out.next = out.requests.last().map(|e| e.request.id);
+                return Ok((out, hidden));
+            }
+        }
+        out.next = page.next;
+        if out.requests.len() >= limit || !filter {
+            break;
+        }
+        match page.next {
+            Some(n) => before = Some(n),
+            None => break,
+        }
     }
-    let mut resp = r.client.review_requests(&query).map_err(unsupported)?;
-    // What waits for you is what you have not answered yet. A withdrawn
-    // verdict is no answer, so the request comes back.
-    let before = resp.requests.len();
-    if !args.mine && !args.all {
-        resp.requests.retain(|e| !answered_by(e, me));
-    }
-    let hidden = before - resp.requests.len();
-    Ok((resp, hidden))
+    Ok((out, hidden))
 }
 
 /// `--wait`: ask until a page lists something (exit 0) or the limit passes

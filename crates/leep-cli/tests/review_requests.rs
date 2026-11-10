@@ -274,8 +274,13 @@ fn request_inbox_and_cancel() {
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect()
         };
-        assert_eq!(pairs(0), [("reviewer", "ada"), ("open", "true")]);
-        assert_eq!(pairs(1), [("requester", "ada")]);
+        // The inbox asks for its limit, so it knows when to read on past
+        // requests the caller already answered.
+        assert_eq!(
+            pairs(0),
+            [("reviewer", "ada"), ("open", "true"), ("limit", "50")]
+        );
+        assert_eq!(pairs(1), [("requester", "ada"), ("limit", "50")]);
     }
 
     assert_eq!(

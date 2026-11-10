@@ -284,7 +284,7 @@ impl NoticeState {
 /// Each other session once, at its highest level (`found` is ranked),
 /// taking the paths a lower level of it named when the highest has none:
 /// a duplicate that also claims my file is one notice, not two.
-fn one_per_session(found: Vec<Found>) -> Vec<Found> {
+pub(crate) fn one_per_session(found: Vec<Found>) -> Vec<Found> {
     let mut at: HashMap<u64, usize> = HashMap::new();
     let mut out: Vec<Found> = Vec::with_capacity(found.len());
     for f in found {
@@ -330,7 +330,7 @@ async fn part(
     }
 }
 
-fn cut(s: &str, max: usize) -> String {
+pub(crate) fn cut(s: &str, max: usize) -> String {
     let mut end = s.len().min(max);
     while !s.is_char_boundary(end) {
         end -= 1;
@@ -461,6 +461,14 @@ pub fn alike(a: &Intent, b: &Intent) -> u32 {
 /// itself.
 fn same_agent_and_task(s: &Session, o: &Session) -> bool {
     s.task_key.is_some() && o.task_key == s.task_key && o.principal == s.principal
+        || same_session(s, o)
+}
+
+/// `o` is `s` itself, by key rather than id: a context pack whose lookup of
+/// the caller's session gave up stands one in (id 0) under the same
+/// principal and key, and must not find the caller as its own overlap.
+fn same_session(s: &Session, o: &Session) -> bool {
+    !s.agent_session.is_empty() && o.agent_session == s.agent_session && o.principal == s.principal
 }
 
 /// Jaccard similarity of two sorted trigram sets, in percent.
@@ -547,7 +555,7 @@ impl Repo {
         one_per_session(found)
     }
 
-    async fn path_overlaps(&self, s: &Session, focus: &[String]) -> Result<Vec<Found>> {
+    pub(crate) async fn path_overlaps(&self, s: &Session, focus: &[String]) -> Result<Vec<Found>> {
         let Some(coord) = self.coord.as_ref() else {
             return Ok(Vec::new());
         };
@@ -644,7 +652,7 @@ impl Repo {
     /// (ADR 0030). Progress is kept per session as it goes, so a walk cut
     /// short by the notice bound resumes on the next answer; it is redone
     /// when the ref or the session's head moves.
-    async fn landed_overlaps(&self, s: &Session) -> Result<Vec<Found>> {
+    pub(crate) async fn landed_overlaps(&self, s: &Session) -> Result<Vec<Found>> {
         let Some(target) = s.target_ref.as_deref() else {
             return Ok(Vec::new());
         };
@@ -783,7 +791,7 @@ impl Repo {
     /// intent (title and approach) at least [`SIMILAR_PERCENT`] alike by
     /// trigrams among the [`DUPLICATE_CANDIDATES`] newest active sessions
     /// (declared ones only, on both sides).
-    async fn duplicates(&self, s: &Session) -> Result<Vec<Found>> {
+    pub(crate) async fn duplicates(&self, s: &Session) -> Result<Vec<Found>> {
         let Some(coord) = self.coord.as_ref() else {
             return Ok(Vec::new());
         };

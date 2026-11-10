@@ -7,6 +7,7 @@ pub mod checkout;
 pub mod checks;
 pub mod commit;
 pub mod config;
+pub mod context;
 pub mod diff;
 pub mod history;
 pub mod init;

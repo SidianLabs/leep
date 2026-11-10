@@ -207,7 +207,7 @@ async fn warn_stranded(repo: &Repo, name: &str) -> leep_core::Result<()> {
 
 /// Every check name a result can have: the policy's required ones and every
 /// token's allow-list. Results are looked up by name, one row each.
-fn known_names(config: &crate::reload::RuntimeConfig) -> Vec<String> {
+pub(crate) fn known_names(config: &crate::reload::RuntimeConfig) -> Vec<String> {
     let mut all: BTreeSet<String> = BTreeSet::new();
     if let Some(p) = &config.checks {
         all.extend(p.check_names());
