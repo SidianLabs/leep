@@ -100,6 +100,51 @@ async fn a_schema_before_events_keeps_no_events() {
     assert_eq!(c.sweep_events(i64::MAX, 10).await.unwrap(), 0);
 }
 
+/// A stuck appender holding the events lock costs the others an error
+/// within the lock timeout (ADR 0099), never a data-pool connection held
+/// until the statement timeout: bounds reads fail, appends fail (the
+/// server counts them as dropped), and both work once it lets go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stuck_event_appender_does_not_hold_others_for_long() {
+    use leep_core::coord::NewEvent;
+    let Some((s, _schema)) = crate::tests::pg_store("coordeventlock").await else {
+        return;
+    };
+    let c = s.coord_store().unwrap();
+    let mut held = s.pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1, 1)")
+        .bind(crate::coord::EVENTS_LOCK)
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let e = NewEvent {
+        kind: "note.added".into(),
+        session_id: None,
+        principal: "ada".into(),
+        subject: "note:1".into(),
+        paths: Vec::new(),
+        payload: "{}".into(),
+        created: T0,
+    };
+    let bound = std::time::Duration::from_secs(10);
+    let r = tokio::time::timeout(bound, c.events_bounds())
+        .await
+        .expect("a bounds read fails within its lock timeout, not hung");
+    assert!(r.is_err(), "{r:?}");
+    let r = tokio::time::timeout(bound, c.append_events(std::slice::from_ref(&e)))
+        .await
+        .expect("an append fails within its lock timeout, not hung");
+    assert!(r.is_err(), "{r:?}");
+    assert!(c.events_after(0, 10).await.unwrap().is_empty());
+    sqlx::query("SELECT pg_advisory_unlock($1, 1)")
+        .bind(crate::coord::EVENTS_LOCK)
+        .execute(&mut *held)
+        .await
+        .unwrap();
+    let top = c.append_events(&[e]).await.unwrap();
+    assert_eq!(c.events_bounds().await.unwrap().newest, top);
+}
+
 /// Paths compare bytewise on Postgres too: a directory's range scan holds
 /// what is below it and nothing beside it, whatever the database's
 /// collation would say about `/`, `-` and `.`.

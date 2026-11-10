@@ -293,6 +293,10 @@ pub fn router_with_read_classes(
 ) -> Router {
     register_ready_metrics();
     let budget = limits::BodyBudget::new(body_limits);
+    // A long-poll answers before the request timeout cuts it (ADR 0099).
+    if !request_timeout.is_zero() {
+        repo.set_events_max_wait(request_timeout - request_timeout / 10);
+    }
     let repo = Arc::new(repo);
     let ready_state = Arc::new(ReadyProbe {
         repo: repo.clone(),
@@ -1836,7 +1840,7 @@ async fn land(
             .await?;
         // Notices first: the hook below ends the landing session.
         let answer = sessions::land_answer(&repo, req.changeset, actor, &headers, resp).await;
-        sessions::after_land(&repo, req.changeset, actor, &answer.answer);
+        sessions::after_land(&repo, req.changeset, &req.target_ref, actor, &answer.answer);
         review_requests::after_land(
             repo.clone(),
             &config,
@@ -1867,7 +1871,7 @@ async fn land(
             Coordinated::Landed(r) => {
                 // Notices first: the hook below ends the landing session.
                 let answer = sessions::land_answer(&repo, req.changeset, actor, &headers, r).await;
-                sessions::after_land(&repo, req.changeset, actor, &answer.answer);
+                sessions::after_land(&repo, req.changeset, &req.target_ref, actor, &answer.answer);
                 review_requests::after_land(
                     repo.clone(),
                     &config,

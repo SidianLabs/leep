@@ -95,7 +95,14 @@ fn run_two_servers(stores: &Stores, root: &std::path::Path) {
     );
     let seqs: Vec<u64> = cursors
         .iter()
-        .map(|c| c.trim_start_matches('e').parse().unwrap())
+        .map(|c| {
+            c.rsplit('.')
+                .next()
+                .unwrap()
+                .trim_start_matches('e')
+                .parse()
+                .unwrap()
+        })
         .collect();
     assert!(seqs.windows(2).all(|w| w[0] < w[1]), "in order");
     assert!(turns >= 2, "both servers answered");

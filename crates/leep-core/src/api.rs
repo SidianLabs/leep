@@ -53,7 +53,7 @@
 //! | GET  | `/v1/notes/{id}` | – | [`NoteEntry`] (404 if unknown) |
 //! | DELETE | `/v1/notes/{id}` | – | [`NoteEntry`] (retracts it; only its principal may, 403 otherwise; a closed note is answered as it is) |
 //! | POST | `/v1/notes/{id}/report` | `{}` | [`ReportNoteResponse`] (an open agent note nobody endorsed is hidden at once; any other is only counted) |
-//! | GET  | `/v1/events?after=cursor&session=k&paths=p&kinds=k&wait=s` | – | [`EventsResponse`] (coordination events after `after`, oldest first: ids, states and paths, never agent-written text, paths under `untrusted`; without `after` the current tail and no events; `kinds` (repeated or comma-separated) and `paths` (repeated, at most 16) filter; `session` names the caller's own session and keeps the events of other sessions on its paths or task; `wait` (0 to 30 seconds) holds the answer until something matches; at most 500 events or 256 KiB, `more` when there is more now; with `Accept: text/event-stream` the same events as a stream, `id:` the cursor, resumed by `Last-Event-ID`, a comment every 15 s, closed after 10 minutes or with `event: reset` when the reader falls behind; 410 [`CursorExpiredResponse`] for a cursor older than the 24 h kept; 503 `Leep-Refused: events` past 10,000 waiting per server or 64 per principal; 404 if events are off; ADR 0099) |
+//! | GET  | `/v1/events?after=cursor&session=k&paths=p&kinds=k&wait=s` | – | [`EventsResponse`] (coordination events after `after` (`ref.landed` for every land), oldest first: ids, states and paths, never agent-written text, paths under `untrusted`; without `after` the current tail and no events; `kinds` (repeated or comma-separated) and `paths` (repeated, at most 16) filter; `session` names the caller's own session and keeps the events of other sessions on its paths or task; `wait` (0 to 30 seconds) holds the answer until something matches; at most 500 events or 256 KiB, `more` when there is more now; with `Accept: text/event-stream` the same events as a stream, `id:` the cursor, resumed by `Last-Event-ID`, a comment every 15 s, closed after 10 minutes or with `event: reset` when the reader falls behind; 410 [`CursorExpiredResponse`] for a cursor older than the 24 h kept; 503 `Leep-Refused: events` past 10,000 waiting per server or 64 per principal; 404 if events are off; ADR 0099) |
 //! | POST | `/v1/merge` | [`MergeRequest`] | [`MergeResponse`] |
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
 //! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`], sent as [`LandAnswer`] with `notices` beside it (ADR 0096) (`create: false` refuses to create a missing `target_ref` with 404; absent creates it, as before; ADR 0036. `land_id` makes retries idempotent at any age; ADR 0057) |
@@ -392,6 +392,7 @@ pub mod error_code {
         INVALID_NAME,
         AMBIGUOUS_PREFIX,
         CURSOR_UNREPRESENTABLE,
+        CURSOR_EXPIRED,
         TOO_MANY_REVIEW_REQUESTS,
         INVALID,
         UNAUTHORIZED,
@@ -1470,8 +1471,8 @@ pub struct EventEntry {
     /// Opaque: pass as `after` (or `Last-Event-ID`) to read on from here.
     pub cursor: String,
     /// `session.started`, `session.paths`, `session.ended`, `note.added`,
-    /// `note.endorsed`, `note.superseded` or `conflict.predicted`; a
-    /// client shows one it does not know as it is.
+    /// `note.endorsed`, `note.superseded`, `ref.landed` or
+    /// `conflict.predicted`; a client shows one it does not know as it is.
     pub kind: String,
     /// `session:N`, `note:N` or a changeset id.
     pub subject: String,
@@ -1492,10 +1493,11 @@ pub struct EventEntry {
 /// come. Ids, states and enum names only.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventFacts {
-    /// `session.ended`: `landed`, `abandoned` or `expired`.
+    /// `session.ended`: `landed` or `abandoned`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
-    /// `session.ended` as landed: the changeset the ref moved to.
+    /// `session.ended` as landed, and `ref.landed`: the changeset the ref
+    /// moved to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landed_as: Option<ChangesetId>,
     /// `session.started`: `declared` or `inferred`.
@@ -1528,6 +1530,9 @@ pub struct EventFacts {
 pub struct EventText {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
+    /// `ref.landed`: the ref the land moved.
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub ref_name: Option<String>,
 }
 
 /// `GET /v1/events`.
@@ -1552,19 +1557,39 @@ pub struct CursorExpiredResponse {
     pub oldest: String,
 }
 
-/// An events cursor as sent: `e` and the sequence number. Opaque to
-/// clients, so its shape can change.
-pub fn event_cursor(seq: u64) -> String {
-    format!("e{seq}")
+/// An events cursor as sent: `e`, the store's events epoch, `.` and the
+/// sequence number. Opaque to clients, so its shape can change.
+pub fn event_cursor(epoch: &str, seq: u64) -> String {
+    format!("e{epoch}.{seq}")
 }
 
-/// The sequence number of an events cursor; `None` if it is not one.
-pub fn parse_event_cursor(c: &str) -> Option<u64> {
-    let n = c.trim().strip_prefix('e')?;
-    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+/// An events cursor read: the epoch it was made in (`None` for the
+/// epochless `e<seq>` form) and the sequence number.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventCursor {
+    pub epoch: Option<String>,
+    pub seq: u64,
+}
+
+/// An events cursor as read; `None` if it is not one.
+pub fn parse_event_cursor(c: &str) -> Option<EventCursor> {
+    let body = c.trim().strip_prefix('e')?;
+    let (epoch, n) = match body.split_once('.') {
+        Some((e, n)) => {
+            if e.is_empty() || e.len() > 64 || !e.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                return None;
+            }
+            (Some(e.to_string()), n)
+        }
+        None => (None, body),
+    };
+    if n.is_empty() || n.len() > 20 || !n.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    n.parse().ok()
+    Some(EventCursor {
+        epoch,
+        seq: n.parse().ok()?,
+    })
 }
 
 /// `GET /v1/sessions/{id}/overlaps`: everything overlapping a session now,
@@ -2455,6 +2480,38 @@ pub struct SearchResponse {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn event_cursors_carry_their_epoch() {
+        let c = event_cursor("ab12", 7);
+        assert_eq!(c, "eab12.7");
+        assert_eq!(
+            parse_event_cursor(&c),
+            Some(EventCursor {
+                epoch: Some("ab12".into()),
+                seq: 7
+            })
+        );
+        assert_eq!(
+            parse_event_cursor("e7"),
+            Some(EventCursor {
+                epoch: None,
+                seq: 7
+            })
+        );
+        for bad in [
+            "7",
+            "e",
+            "e.7",
+            "eab.",
+            "e-1",
+            "eab.x",
+            "ea b.1",
+            "eab.99999999999999999999999",
+        ] {
+            assert_eq!(parse_event_cursor(bad), None, "{bad}");
+        }
+    }
     use super::*;
 
     #[test]

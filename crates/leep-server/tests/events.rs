@@ -122,6 +122,14 @@ impl Api {
     }
 }
 
+fn seq(cursor: &str) -> u64 {
+    parse_event_cursor(cursor).unwrap().seq
+}
+
+async fn epoch(api: &Api) -> String {
+    api.repo.events_tail().await.unwrap().epoch.unwrap()
+}
+
 fn ev(paths: &[&str]) -> NewEvent {
     NewEvent {
         kind: "note.added".into(),
@@ -147,7 +155,8 @@ async fn a_reader_starts_at_the_tail_and_filters() {
     let tail = api.events("", VIEWER).await;
     assert!(tail.events.is_empty());
     assert_eq!(
-        tail.next, "e1",
+        seq(&tail.next),
+        1,
         "the declaration before it is behind the tail"
     );
     api.declare(
@@ -242,16 +251,24 @@ async fn an_expired_cursor_is_410() {
         > 0
     {}
     coord.append_events(&[ev(&["c"])]).await.unwrap();
-    for q in ["?after=e0", "?after=e1", "?after=e99"] {
+    let epoch = epoch(&api).await;
+    let mine = format!("?after=e{epoch}.0");
+    for q in [
+        "?after=e0",
+        "?after=e1",
+        "?after=e99",
+        "?after=e0123456789abcdef.2",
+        &mine,
+    ] {
         let r = api.get(&format!("/v1/events{q}"), VIEWER).await;
         assert_eq!(r.status, StatusCode::GONE, "{q}");
         let e: CursorExpiredResponse = serde_json::from_slice(&r.body).unwrap();
         assert_eq!(e.error.code.as_deref(), Some(error_code::CURSOR_EXPIRED));
-        assert_eq!(e.oldest, "e2");
+        assert_eq!(e.oldest, format!("e{epoch}.2"), "{q}");
     }
-    let on = api.events("?after=e2", VIEWER).await;
+    let on = api.events(&format!("?after=e{epoch}.2"), VIEWER).await;
     assert_eq!(on.events.len(), 1);
-    assert_eq!(on.next, "e3");
+    assert_eq!(on.next, format!("e{epoch}.3"));
 }
 
 /// A long-poll with nothing new answers after its wait, clamped to 30 s,
@@ -373,21 +390,20 @@ async fn a_stream_sends_events_and_resumes() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.headers()[header::CONTENT_TYPE], "text/event-stream");
-    let text = frames(resp.into_body(), |t| t.contains("id: e2")).await;
+    let ep = epoch(&api).await;
+    let id = |n: u64| format!("id: e{ep}.{n}");
+    let text = frames(resp.into_body(), |t| t.contains(&id(2))).await;
     assert!(text.contains("event: note.added"), "{text}");
-    assert!(text.contains("id: e1"), "{text}");
+    assert!(text.contains(&id(1)), "{text}");
     coord.append_events(&[ev(&["c"])]).await.unwrap();
     let resp = api
         .app
         .clone()
-        .oneshot(stream_req(&api, "", Some("e2")))
+        .oneshot(stream_req(&api, "", Some(&format!("e{ep}.2"))))
         .await
         .unwrap();
-    let text = frames(resp.into_body(), |t| t.contains("id: e3")).await;
-    assert!(
-        !text.contains("id: e1") && !text.contains("id: e2"),
-        "{text}"
-    );
+    let text = frames(resp.into_body(), |t| t.contains(&id(3))).await;
+    assert!(!text.contains(&id(1)) && !text.contains(&id(2)), "{text}");
     assert!(text.contains("\"untrusted\":{\"paths\":[\"c\"]}"), "{text}");
 }
 
@@ -430,4 +446,115 @@ async fn events_are_404_without_sessions() {
         api.get("/v1/events", VIEWER).await.status,
         StatusCode::NOT_FOUND
     );
+}
+
+/// A waiting read takes its waiter place before any store work: past the
+/// cap it is refused at once, though the store would never answer the
+/// tail read or the session lookup it would otherwise make first, and a
+/// `wait` without `after` is a waiter like any other.
+#[tokio::test(start_paused = true)]
+async fn admission_comes_before_any_store_work() {
+    let faults = Arc::new(leep_core::memory::CoordFaults::new(Arc::new(
+        leep_core::memory::MemoryCoordStore::new(),
+    )));
+    let api = Api::over(
+        repo()
+            .with_coord(Some(faults.clone()))
+            .with_event_waiter_caps(1, 1),
+    );
+    faults
+        .hang_reads
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // One waiter holds the only place (its read hangs on the store).
+    let app = api.app.clone();
+    let holder = api.request(Method::GET, "/v1/events?after=e0&wait=30", VIEWER, vec![]);
+    let held = tokio::spawn(async move { app.oneshot(holder).await });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!held.is_finished());
+    for q in [
+        "?wait=5",
+        "?after=e0&wait=5&session=k",
+        "?wait=0&wait=5&after=e0",
+    ] {
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            api.get(&format!("/v1/events{q}"), &token("bob")),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{q}: store work before admission"));
+        assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{q}");
+        assert_eq!(r.refused.as_deref(), Some(REFUSED_EVENTS), "{q}");
+    }
+    held.abort();
+}
+
+/// Every land is a `ref.landed` event, a human's without `agent.session`
+/// too, with the paths it changed; an agent's session on them matches it.
+#[tokio::test]
+async fn every_land_is_an_event_over_http() {
+    let api = Api::new();
+    api.declare(
+        "alice",
+        serde_json::json!({ "session": "k", "scope": ["src/a.rs"] }),
+    )
+    .await;
+    let tail = api.events("", VIEWER).await.next;
+    let content = api
+        .repo
+        .put_blob(bytes::Bytes::from_static(b"x\n"))
+        .await
+        .unwrap();
+    let cs = leep_core::Changeset {
+        parents: vec![],
+        author: "bob".into(),
+        timestamp: 1,
+        message: "by hand".into(),
+        changes: [(
+            leep_core::RepoPath::new("src/a.rs").unwrap(),
+            leep_core::FileChange::Modify {
+                content,
+                kind: leep_core::FileKind::Regular,
+                size: 2,
+            },
+        )]
+        .into(),
+        extra: Default::default(),
+    };
+    let r = api
+        .send(api.request(
+            Method::POST,
+            "/v1/changesets",
+            &token("bob"),
+            serde_json::to_vec(&cs).unwrap(),
+        ))
+        .await;
+    let made: CreateChangesetResponse = r.ok();
+    let land = LandRequest {
+        changeset: made.id,
+        target_ref: "main".into(),
+        create: None,
+        land_id: None,
+    };
+    let r = api
+        .send(api.request(
+            Method::POST,
+            "/v1/land",
+            &token("bob"),
+            serde_json::to_vec(&land).unwrap(),
+        ))
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let q = format!("?after={tail}&session=k&kinds=ref.landed");
+    let mut seen = Vec::new();
+    for _ in 0..200 {
+        seen = api.events(&q, &token("alice")).await.events;
+        if !seen.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(seen.len(), 1, "the land reached alice's session");
+    assert_eq!(seen[0].principal, "bob");
+    assert_eq!(seen[0].untrusted.paths, ["src/a.rs"]);
+    assert_eq!(seen[0].untrusted.ref_name.as_deref(), Some("main"));
 }

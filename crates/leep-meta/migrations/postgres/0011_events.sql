@@ -21,3 +21,17 @@ CREATE TABLE events (
     payload TEXT NOT NULL DEFAULT '{}',
     created BIGINT NOT NULL
 );
+-- One value at a time: with a cache, a connection could hand out a `seq`
+-- below one another connection already committed, and the append lock
+-- would no longer make commit order `seq` order.
+ALTER SEQUENCE events_seq_seq CACHE 1;
+
+-- The store's events epoch: random, made once here (and again when a
+-- restore clears the events), carried in every cursor so a cursor from
+-- another store, or from before a restore, is answered as expired instead
+-- of being read against sequence numbers that mean something else here.
+CREATE TABLE events_epoch (
+    id INT PRIMARY KEY CHECK (id = 1),
+    epoch TEXT NOT NULL
+);
+INSERT INTO events_epoch (id, epoch) VALUES (1, substr(md5(random()::text || clock_timestamp()::text), 1, 16));

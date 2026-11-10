@@ -16,17 +16,17 @@
 //! never text an agent wrote.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
-use leep_core::api::{EventEntry, EventFacts, EventText, NoteEntry};
+use leep_core::api::{EventCursor, EventEntry, EventFacts, EventText, NoteEntry};
 use leep_core::coord::{
     bound_paths, paths_overlap, CoordStore, Event, EventKind, NewEvent, Session,
     EVENT_RETENTION_SECS, MAX_EVENT_PATHS,
 };
 use leep_core::store::unix_now;
-use leep_core::{Error, Hash, Result};
+use leep_core::{ChangesetId, Error, Hash, Result};
 use tokio::sync::watch;
 
 use crate::Repo;
@@ -49,6 +49,13 @@ pub const MAX_WAIT: Duration = Duration::from_secs(30);
 /// principal on one server.
 pub const MAX_WAITERS: usize = 10_000;
 pub const MAX_WAITERS_PER_PRINCIPAL: usize = 64;
+/// Store pages one read scans for a match before it answers with `more`,
+/// so a reader far behind with a narrow filter costs a bounded amount.
+pub const MAX_SCAN_PAGES: usize = 8;
+/// Most changed paths a `ref.landed` event reads from the land's diff
+/// before folding them; past it the top-level names that changed stand
+/// for the rest.
+pub const LAND_DIFF_PATHS: usize = 1000;
 /// Most `paths` filters one read takes.
 pub const MAX_FILTER_PATHS: usize = 16;
 /// Events one sweep statement deletes.
@@ -70,6 +77,11 @@ pub struct Events {
     /// A digest of the paths last sent per session.
     paths_seen: Mutex<HashMap<u64, u64>>,
     retention_secs: AtomicI64,
+    /// The longest a waiter waits, in ms: [`MAX_WAIT`], or less under a
+    /// short request timeout.
+    max_wait_ms: AtomicU64,
+    /// The store's events epoch, as last read.
+    epoch: Mutex<Option<String>>,
     hub: Hub,
 }
 
@@ -82,6 +94,8 @@ impl Default for Events {
             flushing: tokio::sync::Mutex::new(()),
             paths_seen: Mutex::default(),
             retention_secs: AtomicI64::new(EVENT_RETENTION_SECS),
+            max_wait_ms: AtomicU64::new(MAX_WAIT.as_millis() as u64),
+            epoch: Mutex::default(),
             hub: Hub::default(),
         }
     }
@@ -118,33 +132,59 @@ struct HubState {
     tailing: bool,
 }
 
+/// An event as the ring keeps it: with its task digest read once.
+#[derive(Clone, Debug)]
+struct Ringed {
+    event: Arc<Event>,
+    task: Option<String>,
+}
+
+impl Ringed {
+    fn of(e: Event) -> Ringed {
+        Ringed {
+            task: task_of(&e),
+            event: Arc::new(e),
+        }
+    }
+}
+
+/// The task digest of a session event, read from its payload.
+fn task_of(e: &Event) -> Option<String> {
+    e.kind
+        .starts_with("session.")
+        .then(|| facts(e).task)
+        .flatten()
+}
+
 /// The ring holds every event with `floor < seq <= last` while `live`.
 #[derive(Default)]
 struct Ring {
     live: bool,
     floor: u64,
     last: u64,
-    events: VecDeque<Arc<Event>>,
+    events: VecDeque<Ringed>,
 }
 
 impl Ring {
     /// Events above `after`, at most [`READ_PAGE`]; `None` when the ring
-    /// does not hold everything above it.
-    fn after(&self, after: u64) -> Option<Vec<Arc<Event>>> {
-        if !self.live || after < self.floor {
+    /// does not hold everything above it, and for a cursor past what it
+    /// has read (from a lagging tailer, or another store), which the store
+    /// answers.
+    fn after(&self, after: u64) -> Option<Vec<Ringed>> {
+        if !self.live || after < self.floor || after > self.last {
             return None;
         }
-        let from = self.events.partition_point(|e| e.seq <= after);
+        let from = self.events.partition_point(|e| e.event.seq <= after);
         Some(self.events.range(from..).take(READ_PAGE).cloned().collect())
     }
 
     fn push(&mut self, page: Vec<Event>) {
         for e in page {
             self.last = self.last.max(e.seq);
-            self.events.push_back(Arc::new(e));
+            self.events.push_back(Ringed::of(e));
             if self.events.len() > RING {
                 if let Some(old) = self.events.pop_front() {
-                    self.floor = old.seq;
+                    self.floor = old.event.seq;
                 }
             }
         }
@@ -228,6 +268,12 @@ pub enum SessionScope {
 
 impl EventFilter {
     pub fn matches(&self, e: &Event) -> bool {
+        self.matches_with(e, || task_of(e))
+    }
+
+    /// [`EventFilter::matches`] with the event's task digest from `task`,
+    /// asked only when the filter needs it.
+    fn matches_with(&self, e: &Event, task_of_e: impl FnOnce() -> Option<String>) -> bool {
         if !self.kinds.is_empty() && !self.kinds.contains(&e.kind) {
             return false;
         }
@@ -247,31 +293,46 @@ impl EventFilter {
                     return false;
                 }
                 on(paths)
-                    || task.as_ref().is_some_and(|t| {
-                        e.kind.starts_with("session.")
-                            && facts(e).task.as_deref() == Some(t.as_str())
-                    })
+                    || task
+                        .as_ref()
+                        .is_some_and(|t| task_of_e().as_deref() == Some(t.as_str()))
             }
         }
     }
 }
 
-fn facts(e: &Event) -> EventFacts {
+/// What `payload` holds: the facts, and the ref of a `ref.landed`, which
+/// a client gets under `untrusted`.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Payload {
+    #[serde(flatten)]
+    facts: EventFacts,
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    ref_name: Option<String>,
+}
+
+fn payload(e: &Event) -> Payload {
     serde_json::from_str(&e.payload).unwrap_or_default()
 }
 
-/// The wire form of `e`.
-pub fn entry(e: &Event) -> EventEntry {
+fn facts(e: &Event) -> EventFacts {
+    payload(e).facts
+}
+
+/// The wire form of `e`, its cursor in `epoch`.
+pub fn entry(e: &Event, epoch: &str) -> EventEntry {
+    let p = payload(e);
     EventEntry {
-        cursor: leep_core::api::event_cursor(e.seq),
+        cursor: leep_core::api::event_cursor(epoch, e.seq),
         kind: e.kind.clone(),
         subject: e.subject.clone(),
         principal: e.principal.clone(),
         session: e.session_id,
         created: e.created,
-        facts: facts(e),
+        facts: p.facts,
         untrusted: EventText {
             paths: e.paths.clone(),
+            ref_name: p.ref_name,
         },
     }
 }
@@ -293,6 +354,8 @@ pub struct EventsPage {
     pub next: u64,
     /// Whether more were there when the answer was cut.
     pub more: bool,
+    /// The store's events epoch, for the cursors.
+    pub epoch: String,
 }
 
 /// The answer to a read.
@@ -303,6 +366,7 @@ pub enum EventsAnswer {
     /// store: resync, then read on from `oldest`.
     Expired {
         oldest: u64,
+        epoch: String,
     },
 }
 
@@ -364,16 +428,35 @@ impl Repo {
         paths: Vec<String>,
         facts: &EventFacts,
     ) {
+        self.emit_with_ref(kind, session_id, principal, subject, paths, facts, None)
+    }
+
+    /// [`Repo::emit`] with a ref name, kept under `untrusted`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_with_ref(
+        &self,
+        kind: EventKind,
+        session_id: Option<u64>,
+        principal: &str,
+        subject: String,
+        paths: Vec<String>,
+        facts: &EventFacts,
+        ref_name: Option<String>,
+    ) {
         if self.coord.is_none() || self.events.off.load(Ordering::Relaxed) {
             return;
         }
+        let payload = Payload {
+            facts: facts.clone(),
+            ref_name,
+        };
         let e = NewEvent {
             kind: kind.as_str().to_string(),
             session_id,
             principal: principal.to_string(),
             subject,
             paths: bound_paths(&paths, MAX_EVENT_PATHS),
-            payload: serde_json::to_string(facts).unwrap_or_else(|_| "{}".into()),
+            payload: serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into()),
             created: unix_now(),
         };
         {
@@ -423,22 +506,60 @@ impl Repo {
         }
     }
 
-    /// Delete events older than the retention, in at most `steps` bounded
-    /// steps.
-    pub async fn sweep_events(&self, steps: usize) -> Result<u64> {
+    /// Delete events older than the retention in bounded steps, until
+    /// none is left to delete, `budget` has passed, or `steps` were taken;
+    /// then set `leep_events_oldest_age_seconds`, which grows past the
+    /// retention when the sweep falls behind.
+    pub async fn sweep_events(&self, budget: Duration, steps: usize) -> Result<u64> {
         let Some(coord) = self.coord.as_ref() else {
             return Ok(0);
         };
-        let cutoff = unix_now() - self.events.retention_secs.load(Ordering::Relaxed);
+        let now = unix_now();
+        let cutoff = now - self.events.retention_secs.load(Ordering::Relaxed);
+        let started = tokio::time::Instant::now();
         let mut total = 0;
         for _ in 0..steps {
             let n = coord.sweep_events(cutoff, SWEEP_STEP).await?;
             total += n;
-            if n < SWEEP_STEP as u64 {
+            if n < SWEEP_STEP as u64 || started.elapsed() >= budget {
                 break;
             }
         }
+        let b = self.read_bounds(coord.as_ref()).await?;
+        let age = match b.oldest {
+            Some(o) => coord
+                .events_after(o - 1, 1)
+                .await?
+                .first()
+                .map_or(0, |e| (now - e.created).max(0)),
+            None => 0,
+        };
+        metrics::gauge!("leep_events_oldest_age_seconds").set(age as f64);
         Ok(total)
+    }
+
+    /// Wait at most `d` (and [`MAX_WAIT`]) for events: under a short
+    /// request timeout, so a long-poll answers before it is cut.
+    pub fn set_events_max_wait(&self, d: Duration) {
+        let d = d.min(MAX_WAIT).max(Duration::from_millis(1));
+        self.events
+            .max_wait_ms
+            .store(d.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// The bounds, remembering the epoch.
+    async fn read_bounds(&self, coord: &dyn CoordStore) -> Result<leep_core::coord::EventBounds> {
+        let b = coord.events_bounds().await?;
+        *self.events.epoch.lock().unwrap() = Some(b.epoch.clone());
+        Ok(b)
+    }
+
+    /// The store's events epoch, read once and then remembered.
+    async fn epoch(&self, coord: &dyn CoordStore) -> Result<String> {
+        if let Some(e) = self.events.epoch.lock().unwrap().clone() {
+            return Ok(e);
+        }
+        Ok(self.read_bounds(coord).await?.epoch)
     }
 
     /// Wake every waiter and stop the tailer: the server is shutting down.
@@ -446,11 +567,15 @@ impl Repo {
         self.events.hub.shutdown.send_replace(true);
     }
 
-    /// The cursor of the newest event: where a reader with no cursor
-    /// starts. 404 when the store keeps no events.
-    pub async fn events_tail(&self) -> Result<u64> {
+    /// The cursor of the newest event (its epoch and `seq`): where a
+    /// reader with no cursor starts. 404 when the store keeps no events.
+    pub async fn events_tail(&self) -> Result<EventCursor> {
         let coord = self.events_on()?;
-        Ok(coord.events_bounds().await?.newest)
+        let b = self.read_bounds(coord.as_ref()).await?;
+        Ok(EventCursor {
+            epoch: Some(b.epoch),
+            seq: b.newest,
+        })
     }
 
     fn events_on(&self) -> Result<&Arc<dyn CoordStore>> {
@@ -496,34 +621,62 @@ impl Repo {
     }
 
     /// The events after `after` that `filter` keeps, one bounded page,
-    /// from the ring when it holds them, else from the store.
-    pub async fn events_read(&self, after: u64, filter: &EventFilter) -> Result<EventsAnswer> {
+    /// from the ring when it holds them, else from the store. A cursor of
+    /// another epoch, or older than the events kept, is expired.
+    pub async fn events_read(
+        &self,
+        after: &EventCursor,
+        filter: &EventFilter,
+    ) -> Result<EventsAnswer> {
         let coord = self.events_on()?;
-        let ring = self.events.hub.ring.read().unwrap().after(after);
-        let scanned: Vec<Arc<Event>> = match ring {
+        let seq = after.seq;
+        let expired = |b: leep_core::coord::EventBounds| {
+            metrics::counter!("leep_events_cursor_expired_total").increment(1);
+            Ok(EventsAnswer::Expired {
+                oldest: b.oldest.map_or(b.newest, |o| o - 1),
+                epoch: b.epoch,
+            })
+        };
+        let mut epoch = self.epoch(coord.as_ref()).await?;
+        if let Some(theirs) = after.epoch.as_ref().filter(|e| **e != epoch) {
+            // Read it again: a restore beneath a running server changes it.
+            let b = self.read_bounds(coord.as_ref()).await?;
+            if b.epoch != *theirs {
+                return expired(b);
+            }
+            epoch = b.epoch;
+        }
+        let ring = self.events.hub.ring.read().unwrap().after(seq);
+        let scanned: Vec<Ringed> = match ring {
             Some(v) => v,
             None => {
-                let page = coord.events_after(after, READ_PAGE).await?;
-                if page.first().is_none_or(|e| e.seq > after.saturating_add(1)) {
-                    let b = coord.events_bounds().await?;
-                    if b.expired(after) {
-                        metrics::counter!("leep_events_cursor_expired_total").increment(1);
-                        let oldest = b.oldest.map_or(b.newest, |o| o - 1);
-                        return Ok(EventsAnswer::Expired { oldest });
+                let page = coord.events_after(seq, READ_PAGE).await?;
+                if page.first().is_none_or(|e| e.seq > seq.saturating_add(1)) {
+                    let b = self.read_bounds(coord.as_ref()).await?;
+                    if b.expired(seq) || b.epoch != epoch {
+                        return expired(b);
                     }
                 }
-                page.into_iter().map(Arc::new).collect()
+                page.into_iter()
+                    .map(|e| Ringed {
+                        event: Arc::new(e),
+                        task: None,
+                    })
+                    .collect()
             }
         };
         let full = scanned.len() >= READ_PAGE;
         let mut out = EventsPage {
             events: Vec::new(),
-            next: after,
+            next: seq,
             more: false,
+            epoch,
         };
         let mut bytes = 0;
-        for e in &scanned {
-            if filter.matches(e) {
+        for r in &scanned {
+            let e = &r.event;
+            let task = || r.task.clone().or_else(|| task_of(e));
+            if filter.matches_with(e, task) {
                 let n = size(e);
                 if out.events.len() >= MAX_PAGE_EVENTS
                     || (!out.events.is_empty() && bytes + n > MAX_PAGE_BYTES)
@@ -545,26 +698,31 @@ impl Repo {
     /// shutdown.
     pub async fn events_wait(
         &self,
-        after: u64,
+        after: &EventCursor,
         filter: &EventFilter,
         wait: Duration,
         waiter: Option<&mut Waiter>,
     ) -> Result<EventsAnswer> {
-        let deadline = tokio::time::Instant::now() + wait.min(MAX_WAIT);
+        let most = Duration::from_millis(self.events.max_wait_ms.load(Ordering::Relaxed));
+        let deadline = tokio::time::Instant::now() + wait.min(most);
         let mut waiter = waiter;
         if let Some(w) = waiter.as_deref_mut() {
             w.tail.borrow_and_update();
         }
-        let mut after = after;
+        let mut after = after.clone();
+        let mut scanned = 0;
         loop {
-            let page = match self.events_read(after, filter).await? {
+            let page = match self.events_read(&after, filter).await? {
                 EventsAnswer::Page(p) => p,
                 expired => return Ok(expired),
             };
             if !page.events.is_empty() {
                 return Ok(EventsAnswer::Page(page));
             }
-            after = page.next;
+            after = EventCursor {
+                epoch: Some(page.epoch.clone()),
+                seq: page.next,
+            };
             let Some(w) = waiter.as_deref_mut() else {
                 return Ok(EventsAnswer::Page(page));
             };
@@ -572,7 +730,12 @@ impl Repo {
                 return Ok(EventsAnswer::Page(page));
             }
             if page.more {
-                // Nothing matched in a full page: read on at once.
+                // Nothing matched in a full page: read on at once, for at
+                // most a few pages; the reader asks again for the rest.
+                scanned += 1;
+                if scanned >= MAX_SCAN_PAGES {
+                    return Ok(EventsAnswer::Page(page));
+                }
                 continue;
             }
             tokio::select! {
@@ -585,6 +748,62 @@ impl Repo {
                 _ = tokio::time::sleep_until(deadline) => {}
             }
         }
+    }
+
+    /// After a land onto `target_ref` answered `landed`: `ref.landed`,
+    /// for every land whatever its changesets carry, with the paths it
+    /// changed. They are the diff from the ref's head before the land (its
+    /// ref log entry; else `landed`'s first parent) to `landed`, at most
+    /// [`LAND_DIFF_PATHS`] read and folded; a larger land stands as the
+    /// top-level names it changed. The ref name goes under `untrusted`.
+    pub async fn note_land_event(
+        &self,
+        target_ref: &str,
+        landed: ChangesetId,
+        actor: Option<&str>,
+    ) -> Result<bool> {
+        if self.coord.is_none() {
+            return Ok(false);
+        }
+        let log = self.meta().ref_log(Some(target_ref), None, 64).await?;
+        let old = match log.iter().find(|e| e.new == Some(landed)) {
+            Some(e) => e.old,
+            None => self.get_changeset(landed).await?.parents.first().copied(),
+        };
+        let diff = self
+            .diff_page(old, landed, "", None, Some(LAND_DIFF_PATHS), None)
+            .await?;
+        let paths: Vec<String> = if diff.next.is_none() {
+            diff.entries.iter().map(|d| d.path.to_string()).collect()
+        } else {
+            let names = |id: Option<ChangesetId>| async move {
+                match id {
+                    Some(id) => self.list_dir(id, "").await.map(|t| t.entries),
+                    None => Ok(Default::default()),
+                }
+            };
+            let (before, after) = (names(old).await?, names(Some(landed)).await?);
+            before
+                .keys()
+                .chain(after.keys())
+                .filter(|k| before.get(*k) != after.get(*k))
+                .cloned()
+                .collect()
+        };
+        let facts = EventFacts {
+            landed_as: Some(landed),
+            ..Default::default()
+        };
+        self.emit_with_ref(
+            EventKind::RefLanded,
+            None,
+            actor.unwrap_or(crate::sessions::ANONYMOUS),
+            landed.to_string(),
+            paths,
+            &facts,
+            Some(target_ref.to_string()),
+        );
+        Ok(true)
     }
 
     /// A session was written (declared, inferred from a create): send
@@ -761,7 +980,10 @@ async fn tail(events: Arc<Events>, coord: Arc<dyn CoordStore>) {
             return;
         }
         match coord.events_bounds().await {
-            Ok(b) => break b.newest,
+            Ok(b) => {
+                *events.epoch.lock().unwrap() = Some(b.epoch);
+                break b.newest;
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "reading the events tail failed");
                 metrics::counter!("leep_session_hook_errors_total", "hook" => "events_tail", "reason" => "error")
@@ -895,8 +1117,12 @@ mod tests {
         assert!(r.after(14).is_none(), "evicted");
         let v = r.after(15).unwrap();
         assert_eq!(v.len(), READ_PAGE);
-        assert_eq!(v[0].seq, 16);
+        assert_eq!(v[0].event.seq, 16);
         assert!(r.after(r.last).unwrap().is_empty());
+        assert!(
+            r.after(r.last + 1).is_none(),
+            "past what it read: the store answers"
+        );
         r.live = false;
         assert!(r.after(20).is_none());
     }

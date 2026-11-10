@@ -193,13 +193,17 @@ pub struct NoticeWatch {
 
 impl Server {
     /// Whether to ask for the session's notices now: something bearing on
-    /// `key` happened since the last call (or the cursor expired), or this
-    /// is the first call. Moves the cursor on. Best effort: a failed read
-    /// says no, and the next call reads from the same cursor.
+    /// `key` happened since the last call (another session's work on its
+    /// paths or task, any land there), the cursor expired, this is the
+    /// first call, or nothing was asked for [`NOTICE_POLL_EVERY`]. The
+    /// last is a floor: events are lossy (an overflow, a failed append), and
+    /// a server whose events keep failing must not silence notices. Moves
+    /// the cursor on; a failed read keeps it.
     fn notices_due(&self, key: &str) -> bool {
         let mut w = self.notice_poll.lock().unwrap();
+        let floor = w.last.is_none_or(|t| t.elapsed() >= NOTICE_POLL_EVERY);
         if w.no_events {
-            return w.last.is_none_or(|t| t.elapsed() >= NOTICE_POLL_EVERY);
+            return floor;
         }
         let mut q = vec![("session", key.to_string())];
         if let Some(c) = &w.cursor {
@@ -209,7 +213,7 @@ impl Server {
         match self.client.events(&q, std::time::Duration::ZERO) {
             Ok(EventsRead::Page(p)) => {
                 w.cursor = Some(p.next);
-                first || !p.events.is_empty()
+                first || floor || !p.events.is_empty()
             }
             Ok(EventsRead::Expired(e)) => {
                 // Too far behind to know: ask, and read on from the oldest.
@@ -218,10 +222,18 @@ impl Server {
             }
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 w.no_events = true;
-                w.last.is_none_or(|t| t.elapsed() >= NOTICE_POLL_EVERY)
+                floor
             }
-            Err(_) => first,
+            Err(_) => first || floor,
         }
+    }
+
+    /// Make the last notices read `by` older, as if that much time had
+    /// passed: for tests of the [`NOTICE_POLL_EVERY`] floor.
+    #[doc(hidden)]
+    pub fn age_notice_poll(&self, by: std::time::Duration) {
+        let mut w = self.notice_poll.lock().unwrap();
+        w.last = w.last.and_then(|t| t.checked_sub(by));
     }
 
     /// `out` with the notices the call's answers carried, fenced (ADR

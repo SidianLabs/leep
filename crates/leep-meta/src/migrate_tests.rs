@@ -620,6 +620,7 @@ fn full_schema() -> BTreeSet<String> {
         "notes_reported",
         "notes_open",
         "events",
+        "events_epoch",
     ]
     .map(String::from)
     .into()
@@ -1432,8 +1433,8 @@ async fn upgrade_from_v9_adds_notes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn upgrade_from_v10_adds_events() {
     use leep_core::coord::{
-        AnchorType, EventBounds, NewEvent, NewNote, NoteFilter, NoteKind, NoteSweep, NoteTrust,
-        SessionEnd, SessionOrigin, SessionState, SessionUpdate, SweepReport,
+        AnchorType, NewEvent, NewNote, NoteFilter, NoteKind, NoteSweep, NoteTrust, SessionEnd,
+        SessionOrigin, SessionState, SessionUpdate, SweepReport,
     };
     for db in dbs("fromv10").await {
         let kind = db.kind();
@@ -1496,11 +1497,9 @@ async fn upgrade_from_v10_adds_events() {
             std::slice::from_ref(&n),
             "{kind}"
         );
-        assert_eq!(
-            coord.events_bounds().await.unwrap(),
-            EventBounds::default(),
-            "{kind}"
-        );
+        let b = coord.events_bounds().await.unwrap();
+        assert_eq!((b.oldest, b.newest), (None, 0), "{kind}");
+        assert_eq!(b.epoch.len(), 16, "{kind}");
         // The contract runs on an empty store: forget that session and note.
         let end = SessionEnd {
             state: SessionState::Abandoned,

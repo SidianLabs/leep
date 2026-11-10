@@ -558,6 +558,29 @@ async fn note_lock(tx: &mut sqlx::Transaction<'_, Postgres>, principal: &str) ->
     Ok(())
 }
 
+/// How long an events append or bounds read waits for the events lock.
+const EVENTS_LOCK_TIMEOUT: &str = "2s";
+
+/// Take the events lock (`func`: exclusive for an append, shared for a
+/// bounds read) for the rest of `tx`, waiting at most
+/// [`EVENTS_LOCK_TIMEOUT`]: a stuck appender then costs the others an
+/// error (an append is counted as dropped, a read answers 500), never a
+/// data-pool connection held behind it until the statement timeout.
+async fn events_lock(tx: &mut sqlx::Transaction<'_, Postgres>, func: &str) -> Result<()> {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL lock_timeout = '{EVENTS_LOCK_TIMEOUT}'"
+    )))
+    .execute(&mut **tx)
+    .await
+    .map_err(storage)?;
+    sqlx::query(sqlx::AssertSqlSafe(format!("SELECT {func}($1, 1)")))
+        .bind(EVENTS_LOCK)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage)?;
+    Ok(())
+}
+
 async fn pg_paths(conn: &mut sqlx::PgConnection, sessions: Vec<Session>) -> Result<Vec<Session>> {
     if sessions.is_empty() {
         return Ok(sessions);
@@ -1183,11 +1206,7 @@ impl CoordStore for PgCoordStore {
         // a time, in that order: a reader that has seen `seq` N has seen
         // every committed event below it, and none below it commits later.
         let mut tx = self.pool("events_append").begin().await.map_err(storage)?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1, 1)")
-            .bind(EVENTS_LOCK)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
+        events_lock(&mut tx, "pg_advisory_xact_lock").await?;
         let mut top = 0;
         for chunk in events.chunks(PG_EVENTS_PER_INSERT) {
             let seqs: Vec<i64> = insert_events!(Postgres, chunk)
@@ -1223,14 +1242,11 @@ impl CoordStore for PgCoordStore {
         // Shared, so it waits for an append in flight: the sequence's value
         // read after it is committed, never a `seq` still to commit.
         let mut tx = self.pool("events_bounds").begin().await.map_err(storage)?;
-        sqlx::query("SELECT pg_advisory_xact_lock_shared($1, 1)")
-            .bind(EVENTS_LOCK)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
-        let (oldest, newest): (Option<i64>, i64) = sqlx::query_as(
+        events_lock(&mut tx, "pg_advisory_xact_lock_shared").await?;
+        let (oldest, newest, epoch): (Option<i64>, i64, String) = sqlx::query_as(
             "SELECT (SELECT MIN(seq) FROM events), \
-             (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM events_seq_seq)",
+             (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM events_seq_seq), \
+             (SELECT epoch FROM events_epoch WHERE id = 1)",
         )
         .fetch_one(&mut *tx)
         .await
@@ -1239,6 +1255,7 @@ impl CoordStore for PgCoordStore {
         Ok(EventBounds {
             oldest: oldest.map(to_u64).transpose()?,
             newest: to_u64(newest)?,
+            epoch,
         })
     }
 
@@ -2038,9 +2055,10 @@ impl CoordStore for SqliteCoordStore {
         }
         // `sqlite_sequence` keeps the largest `seq` handed out even when
         // the sweep has emptied the table.
-        let (oldest, newest): (Option<i64>, Option<i64>) = sqlx::query_as(
+        let (oldest, newest, epoch): (Option<i64>, Option<i64>, String) = sqlx::query_as(
             "SELECT (SELECT MIN(seq) FROM events), \
-             (SELECT seq FROM sqlite_sequence WHERE name = 'events')",
+             (SELECT seq FROM sqlite_sequence WHERE name = 'events'), \
+             (SELECT epoch FROM events_epoch WHERE id = 1)",
         )
         .fetch_one(self.pool("events_bounds"))
         .await
@@ -2048,6 +2066,7 @@ impl CoordStore for SqliteCoordStore {
         Ok(EventBounds {
             oldest: oldest.map(to_u64).transpose()?,
             newest: to_u64(newest.unwrap_or(0))?,
+            epoch,
         })
     }
 

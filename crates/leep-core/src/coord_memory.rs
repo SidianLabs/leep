@@ -29,14 +29,31 @@ struct Rows {
 
 /// Sessions in memory, for tests and `mem://` servers. One lock over every
 /// row, so each call is atomic.
-#[derive(Default)]
 pub struct MemoryCoordStore {
     rows: Mutex<Rows>,
+    /// The events epoch: random per store.
+    epoch: String,
+}
+
+impl Default for MemoryCoordStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MemoryCoordStore {
     pub fn new() -> Self {
-        Self::default()
+        static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seed = format!(
+            "{:?} {} {n}",
+            std::time::SystemTime::now(),
+            std::process::id()
+        );
+        MemoryCoordStore {
+            rows: Mutex::default(),
+            epoch: Hash::of_blob(seed.as_bytes()).to_string()[..16].to_string(),
+        }
     }
 }
 
@@ -483,6 +500,7 @@ impl CoordStore for MemoryCoordStore {
         Ok(EventBounds {
             oldest: rows.events.keys().next().copied(),
             newest: rows.last_event,
+            epoch: self.epoch.clone(),
         })
     }
 
@@ -499,6 +517,108 @@ impl CoordStore for MemoryCoordStore {
             rows.events.remove(seq);
         }
         Ok(due.len() as u64)
+    }
+}
+
+/// A [`CoordStore`] that passes every call to `inner` except the ones a
+/// test makes fail or hang: for the land-equivalence test (appends that
+/// always fail on an otherwise working store) and for admission tests
+/// (reads that never answer).
+pub struct CoordFaults {
+    pub inner: std::sync::Arc<dyn CoordStore>,
+    /// `append_events` fails.
+    pub fail_appends: std::sync::atomic::AtomicBool,
+    /// `events_bounds` and `list_sessions` never answer.
+    pub hang_reads: std::sync::atomic::AtomicBool,
+    /// Appends asked for, failed or not.
+    pub appends: std::sync::atomic::AtomicUsize,
+}
+
+impl CoordFaults {
+    pub fn new(inner: std::sync::Arc<dyn CoordStore>) -> Self {
+        CoordFaults {
+            inner,
+            fail_appends: Default::default(),
+            hang_reads: Default::default(),
+            appends: Default::default(),
+        }
+    }
+
+    async fn hang(&self) {
+        if self.hang_reads.load(std::sync::atomic::Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[async_trait]
+impl CoordStore for CoordFaults {
+    async fn upsert_session(&self, u: &SessionUpdate) -> Result<(Session, bool)> {
+        self.inner.upsert_session(u).await
+    }
+    async fn get_session(&self, id: u64) -> Result<Option<Session>> {
+        self.inner.get_session(id).await
+    }
+    async fn list_sessions(&self, f: &SessionFilter) -> Result<Vec<Session>> {
+        self.hang().await;
+        self.inner.list_sessions(f).await
+    }
+    async fn end_session(&self, id: u64, end: &SessionEnd) -> Result<bool> {
+        self.inner.end_session(id, end).await
+    }
+    async fn beat_sessions(&self, beats: &[Beat]) -> Result<u64> {
+        self.inner.beat_sessions(beats).await
+    }
+    async fn sweep_sessions(&self, now: i64, limit: usize) -> Result<SweepReport> {
+        self.inner.sweep_sessions(now, limit).await
+    }
+    async fn count_sessions(&self, state: SessionState, cap: usize) -> Result<u64> {
+        self.inner.count_sessions(state, cap).await
+    }
+    async fn near_paths(&self, q: &NearQuery) -> Result<Vec<NearRow>> {
+        self.inner.near_paths(q).await
+    }
+    async fn add_note(&self, n: &NewNote) -> Result<Note> {
+        self.inner.add_note(n).await
+    }
+    async fn get_note(&self, id: u64) -> Result<Option<Note>> {
+        self.inner.get_note(id).await
+    }
+    async fn list_notes(&self, f: &NoteFilter) -> Result<Vec<Note>> {
+        self.inner.list_notes(f).await
+    }
+    async fn notes_at(&self, anchors: &[String], cap: usize) -> Result<Vec<Note>> {
+        self.inner.notes_at(anchors, cap).await
+    }
+    async fn change_note(&self, id: u64, change: &NoteChange, at: i64) -> Result<bool> {
+        self.inner.change_note(id, change, at).await
+    }
+    async fn revoke_notes(&self, principal: &str, at: i64) -> Result<u64> {
+        self.inner.revoke_notes(principal, at).await
+    }
+    async fn unreport_notes(&self, id: Option<u64>, reporter: Option<&str>) -> Result<u64> {
+        self.inner.unreport_notes(id, reporter).await
+    }
+    async fn sweep_notes(&self, now: i64, limit: usize) -> Result<NoteSweep> {
+        self.inner.sweep_notes(now, limit).await
+    }
+    async fn append_events(&self, events: &[NewEvent]) -> Result<u64> {
+        self.appends
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_appends.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Storage("appending events failed (injected)".into()));
+        }
+        self.inner.append_events(events).await
+    }
+    async fn events_after(&self, after: u64, limit: usize) -> Result<Vec<Event>> {
+        self.inner.events_after(after, limit).await
+    }
+    async fn events_bounds(&self) -> Result<EventBounds> {
+        self.hang().await;
+        self.inner.events_bounds().await
+    }
+    async fn sweep_events(&self, cutoff: i64, limit: usize) -> Result<u64> {
+        self.inner.sweep_events(cutoff, limit).await
     }
 }
 
@@ -1438,7 +1558,12 @@ pub async fn check_events_contract(store: &dyn CoordStore) {
         created: at,
     };
     let fresh = store.events_bounds().await.unwrap();
-    assert_eq!(fresh, EventBounds::default());
+    assert_eq!((fresh.oldest, fresh.newest), (None, 0));
+    let epoch = fresh.epoch.clone();
+    assert!(
+        (8..=64).contains(&epoch.len()) && epoch.bytes().all(|b| b.is_ascii_alphanumeric()),
+        "{epoch:?}"
+    );
     assert!(!fresh.expired(0));
     assert_eq!(store.append_events(&[]).await.unwrap(), 0);
     assert!(store.events_after(0, 10).await.unwrap().is_empty());
@@ -1529,6 +1654,7 @@ pub async fn check_events_contract(store: &dyn CoordStore) {
     assert_eq!(b.newest, old_again);
     assert!(b.expired(late));
     assert!(!b.expired(old_again));
+    assert_eq!(b.epoch, epoch, "the epoch is fixed");
     let next = store.append_events(&[ev(1, t0 + 2000)]).await.unwrap();
     assert!(next > old_again, "seq never goes back after a sweep");
     while store.sweep_events(t0 + 3000, 1000).await.unwrap() > 0 {}

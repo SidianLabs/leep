@@ -12,8 +12,7 @@
 //! `leep_derive::events`.
 
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::{Query, Request, State};
@@ -23,7 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use leep_core::api::{
     error_code, event_cursor, parse_event_cursor, CursorExpiredResponse, ErrorResponse,
-    EventsResponse, REFUSED_EVENTS,
+    EventCursor, EventsResponse, REFUSED_EVENTS,
 };
 use leep_core::coord::{normalize_path, EventKind};
 use leep_core::Error;
@@ -61,30 +60,36 @@ fn wants_stream(headers: &HeaderMap) -> bool {
 }
 
 /// Whether `req` is a waiting `GET /v1/events`: a stream, or a long-poll
-/// with a `wait` above 0. It is admitted by the events waiter class, not
-/// by the token's concurrency permit.
+/// with a `wait` above 0, decided by the one parse the handler makes too
+/// ([`Ask::waits`]). It is admitted by the events waiter class, which the
+/// handler takes before any other work, not by the token's concurrency
+/// permit. A request that does not parse is not one: it takes a permit
+/// and is answered 400.
 pub fn is_waiter(req: &Request) -> bool {
     if req.method() != axum::http::Method::GET || req.uri().path() != PATH {
         return false;
     }
-    if wants_stream(req.headers()) {
-        return true;
-    }
-    req.uri().query().is_some_and(|q| {
-        q.split('&').any(|kv| {
-            kv.strip_prefix("wait=")
-                .and_then(|w| w.parse::<f64>().ok())
-                .is_some_and(|w| w > 0.0)
-        })
-    })
+    let Ok(Query(q)) = Query::<Vec<(String, String)>>::try_from_uri(req.uri()) else {
+        return false;
+    };
+    parse(&q, req.headers()).is_ok_and(|a| a.waits())
 }
 
 /// What one request asks.
 struct Ask {
-    after: Option<u64>,
+    after: Option<EventCursor>,
     session: Option<String>,
     filter: EventFilter,
     wait: Duration,
+    stream: bool,
+}
+
+impl Ask {
+    /// Whether the request waits: then it takes a waiter place, and no
+    /// concurrency permit.
+    fn waits(&self) -> bool {
+        self.stream || !self.wait.is_zero()
+    }
 }
 
 fn parse(q: &[(String, String)], headers: &HeaderMap) -> ApiResult<Ask> {
@@ -93,6 +98,7 @@ fn parse(q: &[(String, String)], headers: &HeaderMap) -> ApiResult<Ask> {
         session: None,
         filter: EventFilter::default(),
         wait: Duration::ZERO,
+        stream: wants_stream(headers),
     };
     let cursor = |v: &str| {
         parse_event_cursor(v).ok_or_else(|| bad("bad after: expected a cursor from an answer"))
@@ -188,22 +194,23 @@ fn refused(why: leep_derive::events::Refused) -> crate::ApiError {
     .into()
 }
 
-fn expired(oldest: u64) -> Response {
+fn expired(oldest: u64, epoch: &str) -> Response {
     (
         StatusCode::GONE,
         Json(CursorExpiredResponse {
             error: ErrorResponse::new(
-                "this cursor is older than the events kept; resync (GET /v1/notices, \
-                 /v1/sessions/{id}/overlaps) and read on from `oldest`",
+                "this cursor is older than the events kept, or from another store; resync \
+                 (GET /v1/notices, /v1/sessions/{id}/overlaps) and read on from `oldest`",
             )
             .with_code(error_code::CURSOR_EXPIRED),
-            oldest: event_cursor(oldest),
+            oldest: event_cursor(epoch, oldest),
         }),
     )
         .into_response()
 }
 
-/// `GET /v1/events`.
+/// `GET /v1/events`. A waiting request takes its waiter place first, before
+/// any store read, so a request refused costs the store nothing.
 pub(crate) async fn get(
     State(repo): S,
     auth::MaybePrincipal(who): auth::MaybePrincipal,
@@ -212,15 +219,19 @@ pub(crate) async fn get(
 ) -> ApiResult<Response> {
     let ask = parse(&q, &headers)?;
     let me = principal(&who);
-    let stream = wants_stream(&headers);
-    let start = match ask.after {
+    let mut waiter = if ask.waits() {
+        Some(repo.event_waiter(&me).map_err(refused)?)
+    } else {
+        None
+    };
+    let start = match ask.after.clone() {
         Some(a) => a,
         None => {
             let tail = repo.events_tail().await?;
-            if !stream {
+            if !ask.stream {
                 return Ok(Json(EventsResponse {
                     events: Vec::new(),
-                    next: event_cursor(tail),
+                    next: event_cursor(tail.epoch.as_deref().unwrap_or(""), tail.seq),
                     more: false,
                 })
                 .into_response());
@@ -230,62 +241,76 @@ pub(crate) async fn get(
     };
     let mut filter = ask.filter;
     filter.session = scope(&repo, &me, ask.session.as_deref()).await?;
-    if stream {
-        let waiter = repo.event_waiter(&me).map_err(refused)?;
-        return Ok(sse(repo, waiter, start, filter).into_response());
+    if ask.stream {
+        if let Some(w) = waiter.take() {
+            let key = ask.session.map(|k| (me, k));
+            return Ok(sse(repo, w, start, filter, key).into_response());
+        }
     }
-    let mut waiter = if ask.wait.is_zero() {
-        None
-    } else {
-        Some(repo.event_waiter(&me).map_err(refused)?)
-    };
     match repo
-        .events_wait(start, &filter, ask.wait, waiter.as_mut())
+        .events_wait(&start, &filter, ask.wait, waiter.as_mut())
         .await?
     {
         EventsAnswer::Page(p) => Ok(Json(EventsResponse {
-            events: p.events.iter().map(entry).collect(),
-            next: event_cursor(p.next),
+            events: p.events.iter().map(|e| entry(e, &p.epoch)).collect(),
+            next: event_cursor(&p.epoch, p.next),
             more: p.more,
         })
         .into_response()),
-        EventsAnswer::Expired { oldest } => Ok(expired(oldest)),
+        EventsAnswer::Expired { oldest, epoch } => Ok(expired(oldest, &epoch)),
     }
 }
 
 /// The stream: a task reads pages as a long-poll would and hands each
 /// event to a channel of [`STREAM_BUFFER`]; the response body drains it. A
 /// reader that lets the channel fill gets `event: reset` after what it
-/// holds, and the stream ends: nothing is buffered without bound.
+/// holds, and the stream ends: nothing is buffered without bound. The
+/// last event (a reset) is kept aside, so a full channel never drops it.
+/// `key`, the caller's principal and session key, is resolved again every
+/// [`HEARTBEAT`], so the session's new paths count.
 fn sse(
     repo: Arc<Repo>,
     mut waiter: Waiter,
-    start: u64,
-    filter: EventFilter,
+    start: EventCursor,
+    mut filter: EventFilter,
+    key: Option<(String, String)>,
 ) -> Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<SseEvent>(STREAM_BUFFER);
-    let lagged = Arc::new(AtomicBool::new(false));
-    let lag = lagged.clone();
+    let last: Arc<Mutex<Option<SseEvent>>> = Arc::default();
+    let finish = last.clone();
     tokio::spawn(async move {
         let close_at = tokio::time::Instant::now() + STREAM_FOR;
+        let mut resolved = tokio::time::Instant::now();
         let mut after = start;
+        let reset = |data: String| {
+            *finish.lock().unwrap() = Some(SseEvent::default().event("reset").data(data));
+        };
         loop {
             let left = close_at.saturating_duration_since(tokio::time::Instant::now());
             if left.is_zero() || waiter.stopping() {
                 return;
             }
+            if let Some((me, k)) = &key {
+                if resolved.elapsed() >= HEARTBEAT {
+                    resolved = tokio::time::Instant::now();
+                    if let Ok(s) = scope(&repo, me, Some(k)).await {
+                        filter.session = s;
+                    }
+                }
+            }
+            let wait = left.min(MAX_WAIT).min(HEARTBEAT);
             let read = tokio::select! {
-                r = repo.events_wait(after, &filter, left.min(MAX_WAIT), Some(&mut waiter)) => r,
+                r = repo.events_wait(&after, &filter, wait, Some(&mut waiter)) => r,
                 _ = tx.closed() => return,
             };
             let page = match read {
                 Ok(EventsAnswer::Page(p)) => p,
-                Ok(EventsAnswer::Expired { oldest }) => {
+                Ok(EventsAnswer::Expired { oldest, epoch }) => {
                     let data = serde_json::json!({
                         "reason": error_code::CURSOR_EXPIRED,
-                        "oldest": event_cursor(oldest),
+                        "oldest": event_cursor(&epoch, oldest),
                     });
-                    let _ = tx.try_send(SseEvent::default().event("reset").data(data.to_string()));
+                    reset(data.to_string());
                     return;
                 }
                 Err(e) => {
@@ -293,50 +318,50 @@ fn sse(
                     return;
                 }
             };
+            let lagged = || {
+                metrics::counter!("leep_events_refused_total", "reason" => "lagged").increment(1);
+                reset(r#"{"reason":"lagged"}"#.to_string());
+            };
             for e in &page.events {
-                let data = serde_json::to_string(&entry(e)).unwrap_or_default();
+                let data = serde_json::to_string(&entry(e, &page.epoch)).unwrap_or_default();
                 let ev = SseEvent::default()
-                    .id(event_cursor(e.seq))
+                    .id(event_cursor(&page.epoch, e.seq))
                     .event(e.kind.clone())
                     .data(data);
                 if let Err(err) = tx.try_send(ev) {
                     if matches!(err, tokio::sync::mpsc::error::TrySendError::Full(_)) {
-                        metrics::counter!("leep_events_refused_total", "reason" => "lagged")
-                            .increment(1);
-                        lag.store(true, Ordering::Release);
+                        lagged();
                     }
                     return;
                 }
             }
-            if page.next > after && page.events.last().is_none_or(|e| e.seq < page.next) {
+            if page.next > after.seq && page.events.last().is_none_or(|e| e.seq < page.next) {
                 // Nothing to show past here: move the reader's
                 // Last-Event-ID on without an event (an `id:` alone is not
                 // dispatched), so a reconnect does not read it again.
-                if tx
-                    .try_send(SseEvent::default().id(event_cursor(page.next)))
-                    .is_err()
-                {
-                    lag.store(true, Ordering::Release);
+                let ev = SseEvent::default().id(event_cursor(&page.epoch, page.next));
+                if tx.try_send(ev).is_err() {
+                    lagged();
                     return;
                 }
             }
-            after = page.next;
+            after = EventCursor {
+                epoch: Some(page.epoch),
+                seq: page.next,
+            };
         }
     });
     let stream =
-        futures_util::stream::unfold((rx, lagged, false), |(mut rx, lagged, done)| async move {
+        futures_util::stream::unfold((rx, last, false), |(mut rx, last, done)| async move {
             if done {
                 return None;
             }
             match rx.recv().await {
-                Some(ev) => Some((Ok(ev), (rx, lagged, false))),
-                None if lagged.load(Ordering::Acquire) => {
-                    let reset = SseEvent::default()
-                        .event("reset")
-                        .data(r#"{"reason":"lagged"}"#);
-                    Some((Ok(reset), (rx, lagged, true)))
+                Some(ev) => Some((Ok(ev), (rx, last, false))),
+                None => {
+                    let end = last.lock().unwrap().take();
+                    end.map(|ev| (Ok(ev), (rx, last, true)))
                 }
-                None => None,
             }
         });
     Sse::new(stream).keep_alive(KeepAlive::new().interval(HEARTBEAT))
@@ -356,6 +381,12 @@ mod tests {
             b.body(axum::body::Body::empty()).unwrap()
         };
         assert!(is_waiter(&req("/v1/events?after=e1&wait=5", None)));
+        // One parse decides, as the handler's: the last `wait` wins, and a
+        // request that does not parse takes a permit.
+        assert!(!is_waiter(&req("/v1/events?after=e1&wait=1&wait=0", None)));
+        assert!(is_waiter(&req("/v1/events?after=e1&wait=0&wait=1", None)));
+        assert!(is_waiter(&req("/v1/events?wait=5", None)));
+        assert!(!is_waiter(&req("/v1/events?wait=5&after=bogus", None)));
         assert!(is_waiter(&req("/v1/events?wait=0.5", None)));
         assert!(!is_waiter(&req("/v1/events?after=e1&wait=0", None)));
         assert!(!is_waiter(&req("/v1/events?after=e1", None)));
@@ -384,7 +415,7 @@ mod tests {
             &h,
         )
         .unwrap();
-        assert_eq!(a.after, Some(12));
+        assert_eq!(a.after.map(|c| c.seq), Some(12));
         assert_eq!(a.filter.paths, ["src/a", "docs", "web"]);
         assert_eq!(a.filter.kinds, ["session.ended", "note.added"]);
         assert_eq!(a.wait, MAX_WAIT);
@@ -405,6 +436,12 @@ mod tests {
         assert!(parse(&many, &h).is_err());
         let mut h = HeaderMap::new();
         h.insert("last-event-id", "e40".parse().unwrap());
-        assert_eq!(parse(&q(&[("after", "e3")]), &h).unwrap().after, Some(40));
+        assert_eq!(
+            parse(&q(&[("after", "e3")]), &h)
+                .unwrap()
+                .after
+                .map(|c| c.seq),
+            Some(40)
+        );
     }
 }

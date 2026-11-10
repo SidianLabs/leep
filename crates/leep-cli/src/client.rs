@@ -91,6 +91,11 @@ pub const NOTICE_LEVEL_ENV: &str = "LEEP_NOTICE_LEVEL";
 /// slow server costs them, not the command.
 pub const NOTICE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// `wait` as `GET /v1/events` takes it: seconds, to the millisecond.
+pub fn wait_param(wait: Duration) -> String {
+    format!("{:.3}", wait.as_secs_f64())
+}
+
 /// The answer to [`Client::events`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EventsRead {
@@ -945,7 +950,7 @@ impl Client {
     pub fn events(&self, query: &[(&str, String)], wait: Duration) -> Result<EventsRead> {
         let mut query = query.to_vec();
         if !wait.is_zero() {
-            query.push(("wait", wait.as_secs().to_string()));
+            query.push(("wait", wait_param(wait)));
         }
         let req = self
             .named(self.http.get(self.url("/v1/events")).query(&query))
@@ -1735,6 +1740,12 @@ fn classify(resp: Response, has_token: bool) -> CliError {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn event_waits_keep_their_milliseconds() {
+        assert_eq!(wait_param(Duration::from_millis(250)), "0.250");
+        assert_eq!(wait_param(Duration::from_secs(30)), "30.000");
+    }
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;

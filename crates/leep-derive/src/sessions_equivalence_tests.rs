@@ -227,11 +227,17 @@ async fn events_chatter(r: &Repo, rng: &mut Rng) {
     }
     if rng.below(3) == 0 {
         let _ = r
-            .events_read(0, &crate::events::EventFilter::default())
+            .events_read(
+                &leep_core::api::EventCursor {
+                    epoch: None,
+                    seq: 0,
+                },
+                &crate::events::EventFilter::default(),
+            )
             .await;
     }
     if rng.below(5) == 0 {
-        let _ = r.sweep_events(2).await;
+        let _ = r.sweep_events(std::time::Duration::from_secs(1), 2).await;
     }
 }
 
@@ -337,8 +343,16 @@ async fn run(seed: u64) -> [usize; 3] {
     let without = repo().with_coord(None);
     let with = repo();
     let broken = repo().with_coord(Some(Arc::new(Dropped)));
+    // A store that works in every way but appending events.
+    let faults = Arc::new(leep_core::memory::CoordFaults::new(Arc::new(
+        leep_core::memory::MemoryCoordStore::new(),
+    )));
+    faults
+        .fail_appends
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let no_appends = repo().with_coord(Some(faults.clone()));
     assert!(with.coord().is_some());
-    let repos = [&without, &with, &broken];
+    let repos = [&without, &with, &broken, &no_appends];
     // Each agent's base, often stale so lands rebase and conflict.
     let mut bases: Vec<Option<ChangesetId>> = vec![None; AGENTS.len()];
     let mut landed = 0;
@@ -387,6 +401,9 @@ async fn run(seed: u64) -> [usize; 3] {
                 // What the server does after a land answered: the session
                 // ends as landed, an event that the next land never reads.
                 let _ = r.note_landed(id, *landed, Some(AGENTS[agent].0)).await;
+                let _ = r
+                    .note_land_event("main", *landed, Some(AGENTS[agent].0))
+                    .await;
                 let _ = r.flush_events().await;
             }
             answers.push(outcome(&resp));
@@ -394,6 +411,10 @@ async fn run(seed: u64) -> [usize; 3] {
         assert_eq!(
             answers[0], answers[1],
             "seed {seed} step {step}: with sessions"
+        );
+        assert_eq!(
+            answers[0], answers[3],
+            "seed {seed} step {step}: appends failing"
         );
         assert_eq!(
             answers[0], answers[2],
@@ -418,13 +439,33 @@ async fn run(seed: u64) -> [usize; 3] {
         .collect();
     assert_eq!(refs[0], refs[1], "seed {seed}");
     assert_eq!(refs[0], refs[2], "seed {seed}");
+    assert_eq!(refs[0], refs[3], "seed {seed}");
     let logs = [
         ref_log(without.meta().as_ref()).await,
         ref_log(with.meta().as_ref()).await,
         ref_log(broken.meta().as_ref()).await,
+        ref_log(no_appends.meta().as_ref()).await,
     ];
     assert_eq!(logs[0], logs[1], "seed {seed}");
     assert_eq!(logs[0], logs[2], "seed {seed}");
+    assert_eq!(logs[0], logs[3], "seed {seed}");
+    // Its sessions and notes were kept, and every flush tried and failed.
+    let tried = faults.appends.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(tried > 0, "seed {seed}: events were emitted and flushed");
+    assert!(
+        no_appends
+            .events_read(
+                &leep_core::api::EventCursor {
+                    epoch: None,
+                    seq: 0
+                },
+                &crate::events::EventFilter::default(),
+            )
+            .await
+            .map(|a| matches!(a, crate::events::EventsAnswer::Page(p) if p.events.is_empty()))
+            .unwrap_or(false),
+        "seed {seed}: nothing was appended"
+    );
     // The populated store really was populated.
     let all = with
         .sessions(&SessionQuery {

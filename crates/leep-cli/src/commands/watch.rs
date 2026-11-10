@@ -92,6 +92,9 @@ pub fn line(e: &EventEntry) -> String {
         l.push_str("  ");
         l.push_str(&f);
     }
+    if let Some(r) = &e.untrusted.ref_name {
+        l.push_str(&format!("  on {r:?}"));
+    }
     if !e.untrusted.paths.is_empty() {
         l.push_str(&format!("  {:?}", e.untrusted.paths));
     }
@@ -166,6 +169,7 @@ mod tests {
             },
             untrusted: leep_core::api::EventText {
                 paths: vec!["src/a\u{1b}[2J.rs".into()],
+                ref_name: None,
             },
         };
         let l = line(&e);

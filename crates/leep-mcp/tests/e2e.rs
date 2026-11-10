@@ -2039,22 +2039,24 @@ fn sessions_show_who_works_where() {
     );
 }
 
-/// Wait until the server has appended `n` `session.ended` events of
-/// `principal` (it appends every 250 ms, after the land's answer).
+/// Wait until the server has appended the events of `n` lands by
+/// `principal`, `ref.landed` and the `session.ended` of its session (it
+/// appends every 250 ms, after the land's answer).
 fn await_lands(url: &str, principal: &str, n: usize) {
     let reader = leep_cli::client::Client::with_token(url, Some("ben-t"));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    loop {
-        let q = [
-            ("kinds", "session.ended".to_string()),
-            ("after", "e0".to_string()),
-        ];
-        if let Ok(leep_cli::client::EventsRead::Page(p)) =
-            reader.events(&q, std::time::Duration::ZERO)
-        {
-            if p.events.iter().filter(|e| e.principal == principal).count() >= n {
-                return;
+    let count = |kind: &str| {
+        let q = [("kinds", kind.to_string()), ("after", "e0".to_string())];
+        match reader.events(&q, std::time::Duration::ZERO) {
+            Ok(leep_cli::client::EventsRead::Page(p)) => {
+                p.events.iter().filter(|e| e.principal == principal).count()
             }
+            _ => 0,
+        }
+    };
+    loop {
+        if count("session.ended") >= n && count("ref.landed") >= n {
+            return;
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -2181,6 +2183,7 @@ fn notices_ride_on_tool_results() {
 #[test]
 fn a_landed_notice_arrives_on_the_next_tool_call() {
     let (url, counts) = counted_server();
+    let bens = || counts.ben_notices.load(std::sync::atomic::Ordering::SeqCst);
     let a = agent_on(&url, "ana", "e-a");
     let b = agent_on(&url, "ben", "e-b");
     seed(&a, &["src/x/a.rs", "docs/b.md"]);
@@ -2193,10 +2196,10 @@ fn a_landed_notice_arrives_on_the_next_tool_call() {
     );
     assert_eq!(started["isError"], false, "{started}");
     // Nothing new: the next calls ask for no notices.
-    let before = counts.get().2;
+    let before = bens();
     call(&b, "leep_refs", json!({}));
     call(&b, "leep_refs", json!({}));
-    assert_eq!(counts.get().2, before, "no event, no notices read");
+    assert_eq!(bens(), before, "no event, no notices read");
     // ana's land elsewhere is no reason to ask either.
     let elsewhere = commit(
         &a,
@@ -2206,7 +2209,7 @@ fn a_landed_notice_arrives_on_the_next_tool_call() {
     await_lands(&url, "ana", 2);
     let quiet = text(&call(&b, "leep_refs", json!({})));
     assert!(!quiet.contains("[landed]"), "{quiet}");
-    assert_eq!(counts.get().2, before, "an unrelated land asks nothing");
+    assert_eq!(bens(), before, "an unrelated land asks nothing");
     // ana lands a change to b's file; b's very next call says so, a moment
     // after its last one.
     let landed = commit(
@@ -2220,12 +2223,66 @@ fn a_landed_notice_arrives_on_the_next_tool_call() {
     assert!(t.contains("[landed] changeset"), "{t}");
     let main = data(&next)["refs"]["main"].as_str().unwrap().to_string();
     assert!(t.contains(&main), "names the landed changeset: {t}");
-    assert!(counts.get().2 > before, "asked GET /v1/notices");
+    assert!(bens() > before, "asked GET /v1/notices");
     // Said once: the call after asks nothing and says nothing.
-    let asked = counts.get().2;
+    let asked = bens();
     let again = text(&call(&b, "leep_refs", json!({})));
     assert!(!again.contains("[landed]"), "{again}");
-    assert_eq!(counts.get().2, asked);
+    assert_eq!(bens(), asked);
+}
+
+/// The notices floor (ADR 0099): events are lossy, so a tool call asks for
+/// notices at least every 30 s even when no event matched, and when the
+/// events read keeps failing (a 5xx) notices are not silenced.
+#[test]
+fn notices_are_asked_at_least_every_30_s() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use axum::extract::Request;
+    use axum::http::{Method, StatusCode};
+    use axum::middleware::{self, Next};
+    use axum::response::IntoResponse;
+
+    let broken = std::sync::Arc::new(AtomicBool::new(false));
+    let asked = std::sync::Arc::new(AtomicUsize::new(0));
+    let (b2, a2) = (broken.clone(), asked.clone());
+    let app = leep_server::router(common::repo()).layer(middleware::from_fn(
+        move |req: Request, next: Next| {
+            let (broken, asked) = (b2.clone(), a2.clone());
+            async move {
+                let path = req.uri().path().to_string();
+                if req.method() == Method::GET && path == "/v1/notices" {
+                    asked.fetch_add(1, Ordering::SeqCst);
+                }
+                if path == "/v1/events" && broken.load(Ordering::SeqCst) {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+                next.run(req).await
+            }
+        },
+    ));
+    let url = serve(app);
+    let s = Server::new(config(&url));
+    call(&s, "leep_refs", json!({}));
+    let n = asked.load(Ordering::SeqCst);
+    assert_eq!(n, 1, "the first call asks");
+    call(&s, "leep_refs", json!({}));
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        n,
+        "nothing new, asked a moment ago"
+    );
+    // 30 s on with nothing matched: asked anyway.
+    s.age_notice_poll(std::time::Duration::from_secs(31));
+    call(&s, "leep_refs", json!({}));
+    assert_eq!(asked.load(Ordering::SeqCst), n + 1);
+    // Events failing: still asked every 30 s, never more often.
+    broken.store(true, Ordering::SeqCst);
+    call(&s, "leep_refs", json!({}));
+    assert_eq!(asked.load(Ordering::SeqCst), n + 1);
+    s.age_notice_poll(std::time::Duration::from_secs(31));
+    call(&s, "leep_refs", json!({}));
+    assert_eq!(asked.load(Ordering::SeqCst), n + 2);
 }
 
 /// `leep_task_start` (ADR 0097): one call declares the session and answers
@@ -2762,6 +2819,8 @@ struct Counts {
     creates: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     lands: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     notices: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Notice reads by ben's token alone.
+    ben_notices: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Counts {
@@ -2804,6 +2863,13 @@ fn counted_server() -> (String, Counts) {
         };
         if let Some(n) = counter {
             n.fetch_add(1, Ordering::SeqCst);
+        }
+        let ben = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .is_some_and(|v| v == "Bearer ben-t");
+        if ben && req.uri().path() == "/v1/notices" {
+            c.ben_notices.fetch_add(1, Ordering::SeqCst);
         }
         next.run(req)
     }));

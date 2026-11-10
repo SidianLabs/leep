@@ -850,6 +850,11 @@ impl Sink for SqliteSink {
                 .await
                 .map_err(storage)?;
         }
+        // A new epoch: cursors from before the restore are answered 410.
+        sqlx::query("UPDATE events_epoch SET epoch = lower(hex(randomblob(8))) WHERE id = 1")
+            .execute(&mut *self.0)
+            .await
+            .map_err(storage)?;
         Ok(())
     }
 
@@ -1236,6 +1241,11 @@ impl Sink for PgSink {
                 .await
                 .map_err(storage)?;
         }
+        // A new epoch: cursors from before the restore are answered 410.
+        sqlx::query("UPDATE events_epoch SET epoch = substr(md5(random()::text || clock_timestamp()::text), 1, 16) WHERE id = 1")
+            .execute(&mut *self.0)
+            .await
+            .map_err(storage)?;
         Ok(())
     }
 

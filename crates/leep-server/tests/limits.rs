@@ -539,6 +539,11 @@ async fn a_waiting_event_read_holds_no_concurrency_permit() {
     let now = format!("/v1/events?after={}", tail.next);
     let busy = send(&r.app, request(Method::GET, &now, A, Body::empty())).await;
     assert_eq!(busy.status, StatusCode::TOO_MANY_REQUESTS);
+    // The last `wait` decides, as in the handler: `wait=1&wait=0` does not
+    // wait, so it needs the permit.
+    let twice = format!("/v1/events?after={}&wait=1&wait=0", tail.next);
+    let busy = send(&r.app, request(Method::GET, &twice, A, Body::empty())).await;
+    assert_eq!(busy.status, StatusCode::TOO_MANY_REQUESTS);
     drop(tx);
     held.await.unwrap();
     assert_eq!(waiting.await.unwrap().status, StatusCode::OK);

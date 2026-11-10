@@ -21,3 +21,13 @@ CREATE TABLE events (
     payload TEXT NOT NULL DEFAULT '{}',
     created INTEGER NOT NULL
 );
+
+-- The store's events epoch: random, made once here (and again when a
+-- restore clears the events), carried in every cursor so a cursor from
+-- another store, or from before a restore, is answered as expired instead
+-- of being read against sequence numbers that mean something else here.
+CREATE TABLE events_epoch (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    epoch TEXT NOT NULL
+);
+INSERT INTO events_epoch (id, epoch) VALUES (1, lower(hex(randomblob(8))));

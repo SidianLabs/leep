@@ -1322,10 +1322,14 @@ pub enum EventKind {
     /// Reserved for the merge dry run (ADR 0096, part 2); nothing emits it
     /// yet.
     ConflictPredicted,
+    /// A land moved a ref, whatever its changesets carried: sent for every
+    /// land, so a reader hears of a land on its paths even when no session
+    /// ended with it.
+    RefLanded,
 }
 
 impl EventKind {
-    pub const ALL: [EventKind; 7] = [
+    pub const ALL: [EventKind; 8] = [
         EventKind::SessionStarted,
         EventKind::SessionPaths,
         EventKind::SessionEnded,
@@ -1333,6 +1337,7 @@ impl EventKind {
         EventKind::NoteEndorsed,
         EventKind::NoteSuperseded,
         EventKind::ConflictPredicted,
+        EventKind::RefLanded,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -1344,6 +1349,7 @@ impl EventKind {
             EventKind::NoteEndorsed => "note.endorsed",
             EventKind::NoteSuperseded => "note.superseded",
             EventKind::ConflictPredicted => "conflict.predicted",
+            EventKind::RefLanded => "ref.landed",
         }
     }
 
@@ -1415,11 +1421,15 @@ impl NewEvent {
 
 /// The extent of the events table: the oldest kept event, if any, and the
 /// newest sequence number ever handed out (committed: every event at or
-/// below it is visible to every reader), 0 before the first.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// below it is visible to every reader), 0 before the first; and the
+/// store's events epoch, random and fixed when the table was made (or a
+/// restore cleared it), which cursors carry so a cursor from another store
+/// is never read as one of this store's.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EventBounds {
     pub oldest: Option<u64>,
     pub newest: u64,
+    pub epoch: String,
 }
 
 impl EventBounds {
@@ -1589,7 +1599,7 @@ mod tests {
         assert_eq!(
             kinds.join(","),
             "session.started,session.paths,session.ended,note.added,note.endorsed,\
-             note.superseded,conflict.predicted"
+             note.superseded,conflict.predicted,ref.landed"
         );
         for k in EventKind::ALL {
             assert_eq!(EventKind::parse(k.as_str()).unwrap(), k);
@@ -1605,12 +1615,14 @@ mod tests {
         let b = EventBounds {
             oldest: Some(10),
             newest: 20,
+            epoch: "x".into(),
         };
         assert!(!b.expired(9) && !b.expired(15) && !b.expired(20));
         assert!(b.expired(8) && b.expired(0) && b.expired(21));
         let empty = EventBounds {
             oldest: None,
             newest: 20,
+            epoch: "x".into(),
         };
         assert!(!empty.expired(20) && empty.expired(19) && empty.expired(21));
         assert!(!EventBounds::default().expired(0));

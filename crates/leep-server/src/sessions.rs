@@ -367,11 +367,13 @@ pub(crate) async fn land_answer(
     LandAnswer { answer, notices }
 }
 
-/// After a land of `submitted` answered `resp`: end the session whose head
-/// it was as landed.
+/// After a land of `submitted` onto `target_ref` answered `resp`: end the
+/// session whose head it was as landed, and send the land's `ref.landed`
+/// event (ADR 0099), whatever its changesets carry.
 pub(crate) fn after_land(
     repo: &Repo,
     submitted: ChangesetId,
+    target_ref: &str,
     actor: Option<&str>,
     resp: &LandResponse,
 ) {
@@ -381,10 +383,15 @@ pub(crate) fn after_land(
     if repo.coord().is_none() {
         return;
     }
-    let (repo, landed) = (repo.clone(), *landed);
+    let (r, landed) = (repo.clone(), *landed);
     let actor = actor.map(str::to_string);
+    let who = actor.clone();
     spawn_hook("landed", async move {
-        repo.note_landed(submitted, landed, actor.as_deref()).await
+        r.note_landed(submitted, landed, who.as_deref()).await
+    });
+    let (r, target) = (repo.clone(), target_ref.to_string());
+    spawn_hook("land_event", async move {
+        r.note_land_event(&target, landed, actor.as_deref()).await
     });
 }
 
@@ -406,9 +413,14 @@ async fn sweep_notes(repo: &Repo) {
         .increment(1);
 }
 
-/// One bounded step of the event sweep (ADR 0099), as for notes.
+/// How long one minute's event sweep may run: at 1,000 rows a step it
+/// keeps up with far more than a fleet appends.
+const EVENT_SWEEP_BUDGET: Duration = Duration::from_secs(5);
+
+/// The event sweep (ADR 0099), within [`EVENT_SWEEP_BUDGET`].
 async fn sweep_events(repo: &Repo) {
-    let reason = match tokio::time::timeout(HOOK_TIMEOUT, repo.sweep_events(16)).await {
+    let sweep = repo.sweep_events(EVENT_SWEEP_BUDGET, 600);
+    let reason = match tokio::time::timeout(HOOK_TIMEOUT, sweep).await {
         Ok(Ok(_)) => return,
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "sweeping events failed");

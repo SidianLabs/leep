@@ -1078,6 +1078,22 @@ fn parse_expires_in(s: &str) -> Result<std::time::Duration, String> {
     Ok(d)
 }
 
+/// `--events-retention` is at most a day: an event names paths of a
+/// session, which are deleted a day after it ends
+/// (`PATHS_RETENTION_SECS`), so an older event would point a reader at
+/// state that is gone; and at least a minute, the sweep's period.
+fn check_events_retention(d: std::time::Duration) -> Result<(), String> {
+    let most = leep_core::coord::PATHS_RETENTION_SECS as u64;
+    if d.as_secs() > most || d.as_secs() < 60 {
+        return Err(format!(
+            "--events-retention must be between 1m and {}h (got {}s)",
+            most / 3600,
+            d.as_secs()
+        ));
+    }
+    Ok(())
+}
+
 fn parse_grace(s: &str) -> Result<std::time::Duration, String> {
     leep_derive::gc::parse_duration(s).map_err(|e| e.to_string())
 }
@@ -2016,6 +2032,7 @@ async fn run() -> anyhow::Result<()> {
     if args.sessions == Switch::Off {
         repo = repo.with_coord(None);
     }
+    check_events_retention(args.events_retention).map_err(anyhow::Error::msg)?;
     repo = repo
         .with_notices(args.notices == Switch::On)
         .with_events_retention(args.events_retention.as_secs() as i64);
@@ -2667,6 +2684,16 @@ mod tests {
         assert!(gc.contains("--meta") && gc.contains("--request-timeout"));
         let top = cmd.render_long_help().to_string();
         assert!(top.contains("--meta") && top.contains("--listen"));
+    }
+
+    #[test]
+    fn events_retention_is_a_minute_to_a_day() {
+        use std::time::Duration;
+        assert!(check_events_retention(Duration::from_secs(24 * 3600)).is_ok());
+        assert!(check_events_retention(Duration::from_secs(3600)).is_ok());
+        assert!(check_events_retention(Duration::from_secs(24 * 3600 + 1)).is_err());
+        assert!(check_events_retention(Duration::from_secs(7 * 24 * 3600)).is_err());
+        assert!(check_events_retention(Duration::from_secs(0)).is_err());
     }
 
     /// deploy/leep-server.env.example lists exactly the variables the
