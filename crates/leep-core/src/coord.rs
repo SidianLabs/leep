@@ -850,6 +850,15 @@ pub const MAX_OPEN_NOTES_PER_PRINCIPAL: usize = 200;
 /// Most notes one principal may write in an hour, supersessions included.
 /// One more is refused with [`NOTES_PER_HOUR_MARKER`] (429).
 pub const MAX_NOTES_PER_HOUR: usize = 30;
+/// Most notes one principal may write in a day, supersessions included,
+/// so what one principal keeps is bounded (open notes, plus closed ones for
+/// 30 days): one more is refused with [`NOTES_PER_DAY_MARKER`] (429).
+pub const MAX_NOTES_PER_DAY: usize = 100;
+/// The window [`MAX_NOTES_PER_DAY`] counts in.
+pub const NOTE_DAY_WINDOW_SECS: i64 = 24 * 60 * 60;
+/// Stable text in the refusal of a principal past its daily note limit;
+/// the server answers it 429.
+pub const NOTES_PER_DAY_MARKER: &str = "notes in the last day, the most one principal may write";
 /// The window [`MAX_NOTES_PER_HOUR`] counts in.
 pub const NOTE_RATE_WINDOW_SECS: i64 = 60 * 60;
 /// How long an agent note lives unless endorsed.
@@ -1025,6 +1034,9 @@ pub struct NewNote {
     /// Refuse past this many notes of the principal in the last
     /// [`NOTE_RATE_WINDOW_SECS`] ([`MAX_NOTES_PER_HOUR`] in a server).
     pub max_per_hour: usize,
+    /// Refuse past this many notes of the principal in the last
+    /// [`NOTE_DAY_WINDOW_SECS`] ([`MAX_NOTES_PER_DAY`] in a server).
+    pub max_per_day: usize,
 }
 
 /// Whether `c` may not appear in note text: control characters (C0, DEL
@@ -1146,6 +1158,13 @@ pub fn reports_per_hour(principal: &str, max: usize) -> Error {
 pub fn closed_expiry(expires: Option<i64>, at: i64) -> Option<i64> {
     let x = at + CLOSED_NOTE_RETENTION_SECS;
     Some(expires.map_or(x, |e| e.min(x)))
+}
+
+/// The refusal for a principal past its daily note limit.
+pub fn notes_per_day(principal: &str, max: usize) -> Error {
+    Error::Invalid(format!(
+        "{principal} wrote {max} {NOTES_PER_DAY_MARKER} ({max}); try again tomorrow"
+    ))
 }
 
 /// The refusal for a principal past its hourly note limit.
@@ -1423,6 +1442,7 @@ mod tests {
             expires: Some(1 + AGENT_NOTE_TTL_SECS),
             max_open: MAX_OPEN_NOTES_PER_PRINCIPAL,
             max_per_hour: MAX_NOTES_PER_HOUR,
+            max_per_day: MAX_NOTES_PER_DAY,
         }
     }
 

@@ -102,6 +102,7 @@ async fn populate(store: &dyn MetaStore) {
         expires: Some(1_800_000_000),
         max_open: 10,
         max_per_hour: 10,
+        max_per_day: 10,
     };
     let first = coord.add_note(&n).await.unwrap();
     n.supersedes = Some(first.id);
@@ -126,6 +127,7 @@ async fn populate(store: &dyn MetaStore) {
             expires: Some(1_900_000_000),
             max_open: 10,
             max_per_hour: 10,
+            max_per_day: 10,
         })
         .await
         .unwrap();
@@ -261,6 +263,7 @@ async fn next_note_id_is_fresh(store: &dyn MetaStore) {
             expires: None,
             max_open: 10,
             max_per_hour: 10,
+            max_per_day: 10,
         })
         .await
         .unwrap();

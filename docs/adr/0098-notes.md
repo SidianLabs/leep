@@ -44,9 +44,14 @@ notes(id BIGSERIAL PRIMARY KEY, repo_id BIGINT NOT NULL DEFAULT 1,
       created BIGINT NOT NULL, expires BIGINT)
   INDEX notes_anchor (repo_id, anchor_type, anchor, id)
   INDEX notes_principal (repo_id, principal, created)
+  INDEX notes_open (repo_id, principal) WHERE state = 'open'
   INDEX notes_expires (expires)
+  INDEX notes_reported (reported_by, reported_at) WHERE reported_by IS NOT NULL
 ```
 
+- **Indexes.** `notes_open` (partial, open notes only) keeps the open
+  cap's count to a principal's open notes; `notes_principal` serves the
+  hourly and daily rates and listings by principal.
 - **Bodies live in the row**, at most 4 KiB. Not in the blob store: blob
   GC marks from changesets (ADR 0008), so note blobs would need a root of
   their own for no gain.
@@ -147,10 +152,10 @@ yet.
   refuse only controls and escape the rest when shown; notes are the
   larger surface, so they refuse at write as well as escape at display,
   and a raw JSON reader never meets them either.
-- At most 200 open notes per principal (400 `too_many_notes`) and 30
-  written per principal per sliding hour, supersessions included (429
-  `rate_limited`, `Retry-After: 60`). Closing a note frees an open slot,
-  never an hourly one. The per-token request limits of ADR 0020 apply on
+- At most 200 open notes per principal (400 `too_many_notes`), 30
+  written per principal per sliding hour and 100 per sliding day,
+  supersessions included (429 `rate_limited`, `Retry-After: 60`). Closing
+  a note frees an open slot, never an hourly or daily one. The per-token request limits of ADR 0020 apply on
   top.
 - Without a tokens file every client is `anonymous`, and all of them
   share one principal's caps, as they share its sessions (ADR 0095).
@@ -242,8 +247,11 @@ restores with no notes.
   tree lookup at `at` (O(depth), node cache).
 - A listing by path: one statement probing the anchor index for the path
   and each ancestor.
-- Size: 200 open notes per principal of at most about 4.5 KiB, plus at
-  most 30 an hour kept 30 days after they close.
+- Size, worst case per principal: a row is at most about 4.9 KiB (title
+  200, body 4096, anchor 256, model 128, the rest under 250 bytes). A
+  principal holds at most 200 open notes, and at most 100 written a day
+  closed ones kept 30 days: 3,200 rows, about 15 MiB plus index entries.
+  The open count reads only the partial index `notes_open`.
 - The sweep: two bounded deletes a minute per server on `notes_expires`;
   on SQLite each is guarded by a read, so an idle sweep takes no write
   lock.

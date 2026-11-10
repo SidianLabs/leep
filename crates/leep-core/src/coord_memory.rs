@@ -292,6 +292,12 @@ impl CoordStore for MemoryCoordStore {
         if recent >= n.max_per_hour {
             return Err(notes_per_hour(&n.principal, n.max_per_hour));
         }
+        let today = mine()
+            .filter(|o| o.created > n.created - crate::coord::NOTE_DAY_WINDOW_SECS)
+            .count();
+        if today >= n.max_per_day {
+            return Err(crate::coord::notes_per_day(&n.principal, n.max_per_day));
+        }
         rows.next_note += 1;
         let id = rows.next_note;
         let note = Note {
@@ -981,8 +987,8 @@ async fn check_near_contract(store: &dyn CoordStore, t0: i64) {
 pub async fn check_notes_contract(store: &dyn CoordStore) {
     use crate::coord::{
         AnchorType, NoteKind, AGENT_NOTE_TTL_SECS, MAX_NOTES_PER_HOUR,
-        MAX_OPEN_NOTES_PER_PRINCIPAL, NOTES_PER_HOUR_MARKER, REPORTS_PER_HOUR_MARKER,
-        TOO_MANY_NOTES_MARKER,
+        MAX_OPEN_NOTES_PER_PRINCIPAL, NOTES_PER_DAY_MARKER, NOTES_PER_HOUR_MARKER,
+        REPORTS_PER_HOUR_MARKER, TOO_MANY_NOTES_MARKER,
     };
     let t0: i64 = 1_700_000_000;
     let cs = |s: &str| ChangesetId(Hash::of_blob(s.as_bytes()));
@@ -1004,6 +1010,7 @@ pub async fn check_notes_contract(store: &dyn CoordStore) {
         expires: Some(t0 + AGENT_NOTE_TTL_SECS),
         max_open: MAX_OPEN_NOTES_PER_PRINCIPAL,
         max_per_hour: 1000,
+        max_per_day: 1000,
     };
 
     // Write and read back every column.
@@ -1210,6 +1217,19 @@ pub async fn check_notes_contract(store: &dyn CoordStore) {
     rated.created = t0 + NOTE_RATE_WINDOW_SECS + 11;
     store.add_note(&rated).await.unwrap();
     assert_eq!(MAX_NOTES_PER_HOUR, 30);
+    // And per day: hours apart, the day's cap still holds.
+    let mut daily = note("day", "day/a", "one");
+    daily.max_per_day = 2;
+    store.add_note(&daily).await.unwrap();
+    daily.created = t0 + 2 * NOTE_RATE_WINDOW_SECS;
+    store.add_note(&daily).await.unwrap();
+    daily.created = t0 + 4 * NOTE_RATE_WINDOW_SECS;
+    match store.add_note(&daily).await {
+        Err(Error::Invalid(m)) => assert!(m.contains(NOTES_PER_DAY_MARKER), "{m}"),
+        other => panic!("expected the daily cap, got {other:?}"),
+    }
+    daily.created = t0 + crate::coord::NOTE_DAY_WINDOW_SECS + 1;
+    store.add_note(&daily).await.unwrap();
 
     // Changes are conditional, and close a note for 30 days.
     let at1 = t0 + 100;

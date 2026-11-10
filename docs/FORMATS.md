@@ -600,6 +600,7 @@ notes(id BIGSERIAL PRIMARY KEY,                                -- migration 0010
       expires BIGINT)                                           -- when the sweep deletes it; NULL once endorsed
 notes_anchor: INDEX ON notes(repo_id, anchor_type, anchor, id)
 notes_principal: INDEX ON notes(repo_id, principal, created)
+notes_open: INDEX ON notes(repo_id, principal) WHERE state = 'open'
 notes_expires: INDEX ON notes(expires)
 notes_reported: INDEX ON notes(reported_by, reported_at) WHERE reported_by IS NOT NULL
 ```
@@ -1099,8 +1100,8 @@ read by a land. Added:
   U+202E, U+2060 to U+206F, U+FEFF, U+FFF9 to U+FFFB or U+E0000 to
   U+E007F; `anchor` a repository path of at most 256 bytes under the
   same rule, or a full changeset id; `lines` need a file anchor, `1 <=
-  start <= end <= 10,000,000`; at most 200 open notes and 30 written in
-  the last hour per principal. Backups (ADR 0026) copy every row with its
+  start <= end <= 10,000,000`; at most 200 open notes, 30 written in the
+  last hour and 100 in the last day per principal. Backups (ADR 0026) copy every row with its
   id; a restore into Postgres moves the id sequence past them.
 - `CoordStore::add_note`, `get_note`, `list_notes(NoteFilter {path,
   changeset, principal, states, before, limit})`, `notes_at(anchors,

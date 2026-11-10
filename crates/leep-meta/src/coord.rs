@@ -19,12 +19,12 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use leep_core::coord::{
-    ancestors, apply_update, check_end, check_supersede, no_notes, notes_per_hour,
+    ancestors, apply_update, check_end, check_supersede, no_notes, notes_per_day, notes_per_hour,
     reports_per_hour, too_many_notes, AnchorType, Beat, CoordStore, NearQuery, NearRow, NewNote,
     Note, NoteChange, NoteFilter, NoteKind, NoteState, NoteSweep, NoteTrust, PathKind, Session,
     SessionEnd, SessionFilter, SessionOrigin, SessionState, SessionUpdate, SweepReport,
-    AGENT_NOTE_TTL_SECS, CLOSED_NOTE_RETENTION_SECS, EXPIRE_AFTER_SECS, NOTE_RATE_WINDOW_SECS,
-    PATHS_RETENTION_SECS, SESSION_RETENTION_SECS, TOO_MANY_SESSIONS_MARKER,
+    AGENT_NOTE_TTL_SECS, CLOSED_NOTE_RETENTION_SECS, EXPIRE_AFTER_SECS, NOTE_DAY_WINDOW_SECS,
+    NOTE_RATE_WINDOW_SECS, PATHS_RETENTION_SECS, SESSION_RETENTION_SECS, TOO_MANY_SESSIONS_MARKER,
 };
 use leep_core::{ChangesetId, Error, Result};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Sqlite, SqlitePool};
@@ -881,6 +881,19 @@ impl CoordStore for PgCoordStore {
         .await
         .map_err(storage)?;
         check_rate(n, recent)?;
+        let today: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM notes WHERE repo_id = 1 AND principal = $1 \
+             AND created > $2 LIMIT $3) t",
+        )
+        .bind(&n.principal)
+        .bind(n.created - NOTE_DAY_WINDOW_SECS)
+        .bind(to_i64(n.max_per_day as u64))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(storage)?;
+        if today as usize >= n.max_per_day {
+            return Err(notes_per_day(&n.principal, n.max_per_day));
+        }
         let id: i64 = insert_note!(Postgres, n)
             .build_query_scalar()
             .fetch_one(&mut *tx)
@@ -1586,6 +1599,19 @@ impl CoordStore for SqliteCoordStore {
         .await
         .map_err(storage)?;
         check_rate(n, recent)?;
+        let today: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM notes WHERE repo_id = 1 AND principal = ? \
+             AND created > ? LIMIT ?)",
+        )
+        .bind(&n.principal)
+        .bind(n.created - NOTE_DAY_WINDOW_SECS)
+        .bind(to_i64(n.max_per_day as u64))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(storage)?;
+        if today as usize >= n.max_per_day {
+            return Err(notes_per_day(&n.principal, n.max_per_day));
+        }
         let id: i64 = insert_note!(Sqlite, n)
             .build_query_scalar()
             .fetch_one(&mut *tx)

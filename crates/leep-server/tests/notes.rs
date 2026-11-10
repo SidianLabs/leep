@@ -13,8 +13,8 @@ use bytes::Bytes;
 use http_body_util::BodyExt;
 use leep_core::api::*;
 use leep_core::coord::{
-    AnchorType, NewNote, NoteKind, NoteTrust, MAX_NOTES_PER_HOUR, MAX_NOTE_BODY_BYTES,
-    MAX_OPEN_NOTES_PER_PRINCIPAL,
+    AnchorType, NewNote, NoteKind, NoteTrust, MAX_NOTES_PER_DAY, MAX_NOTES_PER_HOUR,
+    MAX_NOTE_BODY_BYTES, MAX_OPEN_NOTES_PER_PRINCIPAL,
 };
 use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
 use leep_core::{Changeset, ChangesetId, FileChange, FileKind, RepoPath};
@@ -414,6 +414,7 @@ async fn caps_hold() {
                 expires: None,
                 max_open: MAX_OPEN_NOTES_PER_PRINCIPAL,
                 max_per_hour: MAX_NOTES_PER_HOUR,
+                max_per_day: MAX_NOTES_PER_DAY,
             })
             .await
             .unwrap();
@@ -432,6 +433,37 @@ async fn caps_hold() {
     let mut ok = note("docs/a.md", &"t".repeat(200));
     ok["body"] = json!("x".repeat(MAX_NOTE_BODY_BYTES));
     api.add("bob", ok).await.ok::<NoteEntry>();
+    // A day's writes: with the two above, notes bob wrote earlier today
+    // fill his daily cap, and the next is 429 though the hour is quiet.
+    let now = leep_core::store::unix_now();
+    for i in 0..MAX_NOTES_PER_DAY - 2 {
+        coord
+            .add_note(&NewNote {
+                kind: NoteKind::Finding,
+                anchor_type: AnchorType::Path,
+                anchor: "docs/a.md".into(),
+                at_changeset: None,
+                at_blob: None,
+                lines: None,
+                title: format!("today {i}"),
+                body: String::new(),
+                principal: "bob".into(),
+                agent_model: None,
+                session_id: None,
+                trust: NoteTrust::Agent,
+                supersedes: None,
+                created: now - 7200 - i as i64 * 600,
+                expires: None,
+                max_open: 1000,
+                max_per_hour: 1000,
+                max_per_day: 1000,
+            })
+            .await
+            .unwrap();
+    }
+    let r = api.add("bob", note("docs/a.md", "one more today")).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS, "{}", r.text());
+    assert!(r.text().contains("last day"), "{}", r.text());
 }
 
 /// Agent-written text in a note never leaves `untrusted`: with every
@@ -649,6 +681,7 @@ async fn reports_are_attributed_capped_and_undone() {
                 expires: None,
                 max_open: 1000,
                 max_per_hour: 1000,
+                max_per_day: 1000,
             })
             .await
             .unwrap();

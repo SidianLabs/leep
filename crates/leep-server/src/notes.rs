@@ -16,7 +16,9 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use leep_core::api::{error_code, AddNoteRequest, NoteEntry, NotesResponse};
-use leep_core::coord::{NoteState, NOTES_PER_HOUR_MARKER, REPORTS_PER_HOUR_MARKER};
+use leep_core::coord::{
+    NoteState, NOTES_PER_DAY_MARKER, NOTES_PER_HOUR_MARKER, REPORTS_PER_HOUR_MARKER,
+};
 use leep_core::Error;
 use leep_derive::notes::NoteQuery;
 use serde::Deserialize;
@@ -52,7 +54,11 @@ pub(crate) async fn add(
         .await
     {
         Ok(e) => Ok((StatusCode::OK, Json(e)).into_response()),
-        Err(Error::Invalid(m)) if m.contains(NOTES_PER_HOUR_MARKER) => Ok(rate_limited(&m)),
+        Err(Error::Invalid(m))
+            if m.contains(NOTES_PER_HOUR_MARKER) || m.contains(NOTES_PER_DAY_MARKER) =>
+        {
+            Ok(rate_limited(&m))
+        }
         Err(Error::Policy(m)) => Ok(auth::reject(
             StatusCode::FORBIDDEN,
             error_code::FORBIDDEN,

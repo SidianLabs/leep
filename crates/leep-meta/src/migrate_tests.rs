@@ -618,6 +618,7 @@ fn full_schema() -> BTreeSet<String> {
         "notes_principal",
         "notes_expires",
         "notes_reported",
+        "notes_open",
     ]
     .map(String::from)
     .into()
@@ -1409,6 +1410,7 @@ async fn upgrade_from_v9_adds_notes() {
                 expires: None,
                 max_open: 10,
                 max_per_hour: 10,
+                max_per_day: 10,
             })
             .await
             .unwrap();

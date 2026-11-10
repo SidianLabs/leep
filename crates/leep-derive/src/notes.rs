@@ -14,9 +14,9 @@ use leep_core::api::{AddNoteRequest, NoteEntry, NoteText, NotesResponse, ReportN
 use leep_core::coord::{
     check_anchor, check_key, normalize_path, AnchorType, CoordStore, NewNote, Note, NoteChange,
     NoteFilter, NoteKind, NoteState, NoteSweep, NoteTrust, SessionFilter, SessionState,
-    AGENT_NOTE_TTL_SECS, HUMAN_NOTE_TTL_SECS, MAX_NOTES_PER_HOUR, MAX_OPEN_NOTES_PER_PRINCIPAL,
-    MAX_PATH_BYTES, MAX_REPORTS_PER_HOUR, NOTES_PER_HOUR_MARKER, REPORTS_PER_HOUR_MARKER,
-    TOO_MANY_NOTES_MARKER,
+    AGENT_NOTE_TTL_SECS, HUMAN_NOTE_TTL_SECS, MAX_NOTES_PER_DAY, MAX_NOTES_PER_HOUR,
+    MAX_OPEN_NOTES_PER_PRINCIPAL, MAX_PATH_BYTES, MAX_REPORTS_PER_HOUR, NOTES_PER_HOUR_MARKER,
+    REPORTS_PER_HOUR_MARKER, TOO_MANY_NOTES_MARKER,
 };
 use leep_core::store::unix_now;
 use leep_core::{Error, Result, TreeEntry};
@@ -83,6 +83,7 @@ fn refusal(e: &Error) -> Option<&'static str> {
     match e {
         Error::Invalid(m) if m.contains(TOO_MANY_NOTES_MARKER) => Some("too_many"),
         Error::Invalid(m) if m.contains(NOTES_PER_HOUR_MARKER) => Some("rate"),
+        Error::Invalid(m) if m.contains(leep_core::coord::NOTES_PER_DAY_MARKER) => Some("daily"),
         Error::Invalid(_) | Error::InvalidPath(..) | Error::InvalidHash(_) => Some("invalid"),
         Error::Policy(_) | Error::Conflict(_) => Some("supersede"),
         _ => None,
@@ -159,6 +160,7 @@ impl Repo {
             expires: Some(now + ttl),
             max_open: MAX_OPEN_NOTES_PER_PRINCIPAL,
             max_per_hour: MAX_NOTES_PER_HOUR,
+            max_per_day: MAX_NOTES_PER_DAY,
         };
         if anchor_type == AnchorType::Changeset {
             // A full id or a ref is stored as the full id it names now;
@@ -668,6 +670,7 @@ mod tests {
             expires: Some(2),
             max_open: 10,
             max_per_hour: 10,
+            max_per_day: 10,
         };
         let stale = c.add_note(&old).await.unwrap();
         assert_eq!(r.note(stale.id).await.unwrap().state, "expired");

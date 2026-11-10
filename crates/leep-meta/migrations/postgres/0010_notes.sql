@@ -37,8 +37,11 @@ CREATE TABLE notes (
 -- Notes on a path or changeset, newest first: exact probes of the anchor
 -- and the directories above it.
 CREATE INDEX notes_anchor ON notes (repo_id, anchor_type, anchor, id);
--- A principal's notes: its open count and hourly rate, and its listing.
+-- A principal's notes: its hourly and daily rates, and its listing.
 CREATE INDEX notes_principal ON notes (repo_id, principal, created);
+-- A principal's open notes: the open cap counts these without reading its
+-- closed ones.
+CREATE INDEX notes_open ON notes (repo_id, principal) WHERE state = 'open';
 CREATE INDEX notes_expires ON notes (expires);
 -- Who hid notes by reporting them, and when: a reporter's hourly cap, and
 -- an operator's undo of one reporter's reports.
