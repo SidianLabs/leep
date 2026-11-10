@@ -819,3 +819,43 @@ async fn each_land_of_a_duplicate_is_its_own_notice() {
     assert!(n[..2].iter().all(|n| n.by.as_deref() == Some("task_key")));
     assert_eq!(n[2].principal.as_deref(), Some("dee"));
 }
+
+/// However many sessions of a reused task key have landed, a live
+/// duplicate behind them is still found.
+#[tokio::test]
+async fn landed_sessions_never_hide_a_live_duplicate() {
+    let r = repo();
+    let mut a = declare("a-1", "Fix invoice totals");
+    a.task_key = Some("BILL-1".into());
+    let old = r
+        .declare_session_with("ada", a, None)
+        .await
+        .unwrap()
+        .session
+        .id;
+    let coord = r.coord().unwrap().clone();
+    for i in 0..=crate::notices::KEY_SESSIONS {
+        let mut d = declare(&format!("k-{i}"), "an earlier fix");
+        d.task_key = Some("BILL-1".into());
+        let who = format!("p{i}");
+        let id = r
+            .declare_session_with(&who, d, None)
+            .await
+            .unwrap()
+            .session
+            .id;
+        let end = SessionEnd {
+            state: SessionState::Landed,
+            at: leep_core::store::unix_now(),
+            landed_as: None,
+            principal: None,
+            if_head: None,
+        };
+        assert!(coord.end_session(id, &end).await.unwrap());
+    }
+    let mut b = declare("b-1", "Invoice totals are off");
+    b.task_key = Some("BILL-1".into());
+    let n = r.declare_session("bo", b).await.unwrap().notices;
+    assert_eq!(levels(&n), ["possible_duplicate"], "{n:?}");
+    assert_eq!(n[0].session, Some(old));
+}

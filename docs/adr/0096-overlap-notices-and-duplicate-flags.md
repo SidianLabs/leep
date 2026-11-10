@@ -254,9 +254,10 @@ and says so is never walked against `main`.
 ### A duplicate's land says so (2026-11-10)
 In the demo eli heard "[landed] changeset ... landed on your target ref"
 when dee, its duplicate on `BILL-42`, landed the task, and nothing said
-whose land it was. The task-key listing of the first amendment now reads
-sessions with the key that are live or landed (at most 64, still one
-indexed listing; the live ones are the duplicates), and the `landed` walk
+whose land it was. The task-key lookup of the first amendment now reads
+the key's live sessions (at most 40, the duplicates) and its landed ones
+(at most 64) in two indexed listings run together, so however many
+sessions of a reused key landed they never hide a live duplicate; and the `landed` walk
 keeps, for each changeset it reports, its `agent.session` and its creator
 (through server rebases; when that read fails, nothing, so the
 writer-chosen `agent.session` alone never tags a land, and the walk's

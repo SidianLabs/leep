@@ -63,8 +63,11 @@ pub const LANDED_WINDOW: usize = 64;
 pub const OWN_WALK: usize = 32;
 /// Most recent active declared sessions compared for a similar intent.
 pub const DUPLICATE_CANDIDATES: usize = 200;
-/// Sessions of one task key read per answer, live and landed.
+/// Landed sessions of one task key read per answer (to tell a duplicate's
+/// land), and live ones (the duplicates, with room for the asking session
+/// and its own restarts).
 pub const KEY_SESSIONS: usize = 64;
+pub const KEY_LIVE_SESSIONS: usize = 2 * DUPLICATE_BY_KEY;
 /// Most sessions of one task key flagged.
 pub const DUPLICATE_BY_KEY: usize = 20;
 /// Trigram similarity (percent) of two intents from which they are flagged.
@@ -934,22 +937,30 @@ impl Repo {
         Ok((!bases.is_empty()).then_some((bases, own)))
     }
 
-    /// Sessions with `s`'s task key, live or landed, newest first, at
-    /// most [`KEY_SESSIONS`]: one indexed listing, none without a key.
+    /// Sessions with `s`'s task key: the live ones (at most
+    /// [`KEY_LIVE_SESSIONS`]), then the landed ones (at most
+    /// [`KEY_SESSIONS`]), each newest first, from two indexed listings run
+    /// together; none without a key.
     /// Live ones are duplicates; landed ones tell a duplicate's land.
     pub(crate) async fn key_sessions(&self, s: &Session) -> Result<Vec<Session>> {
         let (Some(coord), Some(k)) = (self.coord.as_ref(), &s.task_key) else {
             return Ok(Vec::new());
         };
-        coord
-            .list_sessions(&SessionFilter {
-                task_key: Some(k.clone()),
-                states: vec![SessionState::Active, SessionState::Landed],
-                limit: KEY_SESSIONS,
-                skip_paths: true,
-                ..Default::default()
-            })
-            .await
+        // Live and landed apart, each bounded: however many sessions of a
+        // reused key landed, they never hide a live duplicate.
+        let of = |state, limit| SessionFilter {
+            task_key: Some(k.clone()),
+            states: vec![state],
+            limit,
+            skip_paths: true,
+            ..Default::default()
+        };
+        let live = of(SessionState::Active, KEY_LIVE_SESSIONS);
+        let landed = of(SessionState::Landed, KEY_SESSIONS);
+        let (live, landed) = tokio::join!(coord.list_sessions(&live), coord.list_sessions(&landed));
+        let mut out = live?;
+        out.extend(landed?);
+        Ok(out)
     }
 
     /// Live declared sessions whose title and approach are at least
