@@ -258,7 +258,9 @@ whose land it was. The task-key listing of the first amendment now reads
 sessions with the key that are live or landed (at most 64, still one
 indexed listing; the live ones are the duplicates), and the `landed` walk
 keeps, for each changeset it reports, its `agent.session` and its creator
-(through server rebases). A landed changeset whose `agent.session` is that
+(through server rebases; when that read fails, nothing, so the
+writer-chosen `agent.session` alone never tags a land, and the walk's
+cache keeps that). A landed changeset whose `agent.session` is that
 of a session with my task key, created by that session's principal when
 the server recorded one, and not of my own principal (my own restart), is
 tagged: `by: task_key`, `session` and `principal` of that session, and

@@ -326,6 +326,23 @@ pub(crate) fn key_duplicates(s: &Session, keyed: &[Session]) -> Vec<Found> {
         .collect()
 }
 
+/// Who landed a changeset carrying `agent.session` `key`, for telling a
+/// duplicate's land: the key and the creator the server recorded (none
+/// when it recorded none). `None` when the creator could not be read: the
+/// key alone is whatever the writer chose, so such a land is never tagged.
+fn landed_by(
+    key: &str,
+    creator: Result<Option<leep_core::review_request::CreatedBy>>,
+) -> Option<(String, Option<String>)> {
+    match creator {
+        Ok(c) => Some((key.to_string(), c.map(|c| c.principal))),
+        Err(e) => {
+            tracing::debug!(error = %e, "reading a landed changeset's creator failed");
+            None
+        }
+    }
+}
+
 /// Mark each `landed` overlap that a session with `s`'s task key landed
 /// (of `keyed`): `by: task_key`, naming that session and the key, so the
 /// agent reads it as its duplicate's land of the task. Matched by the
@@ -823,14 +840,7 @@ impl Repo {
                     // Who landed it, to tell a duplicate's land (read only
                     // for a hit; kept with the walk).
                     let landed_by = match cs.extra.get(EXTRA_AGENT_SESSION) {
-                        Some(k) => Some((
-                            k.clone(),
-                            self.created_by_through_rebases(id)
-                                .await
-                                .ok()
-                                .flatten()
-                                .map(|c| c.principal),
-                        )),
+                        Some(k) => landed_by(k, self.created_by_through_rebases(id).await),
                         None => None,
                     };
                     let mut n = notice(NoticeLevel::Landed, None);
@@ -1298,6 +1308,22 @@ mod tests {
             "fix flaky test crates/leep-server/tests/notices.rs",
         );
         assert!(p >= SIMILAR_PERCENT, "{p}");
+    }
+
+    /// A creator that could not be read never lets the writer-chosen
+    /// `agent.session` alone tag a land as a duplicate's.
+    #[test]
+    fn an_unread_creator_never_tags_a_land() {
+        let c = leep_core::review_request::CreatedBy {
+            principal: "dee".into(),
+            timestamp: 1,
+        };
+        assert_eq!(
+            landed_by("d-1", Ok(Some(c))),
+            Some(("d-1".into(), Some("dee".into())))
+        );
+        assert_eq!(landed_by("d-1", Ok(None)), Some(("d-1".into(), None)));
+        assert_eq!(landed_by("d-1", Err(Error::Storage("down".into()))), None);
     }
 
     #[test]
