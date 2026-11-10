@@ -236,7 +236,7 @@ impl Server {
             changes,
             extra,
         };
-        let created = self.client.create_changeset(&cs)?;
+        let created = self.client.create_changeset_for(&cs, Some(&target_ref))?;
         if let Some(r) = &request_id {
             self.requests
                 .lock()

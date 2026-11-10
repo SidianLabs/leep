@@ -193,8 +193,10 @@ then records as `agent.session`. Every request sends the key as
 `Leep-Session`, so any command keeps the session live; a session not heard
 from for 10 minutes shows as `idle`, and after 24 hours it expires. The
 server also infers a session from any commit carrying `agent.session`, with
-the commit's subject as its title and its paths as `touched`, so `leep who`
-shows agents that never declared anything. A session ends as `landed` when
+the commit's subject as its title, its paths as `touched` and the working
+copy's target ref (sent as `Leep-Target-Ref`) as where it lands, so `leep
+who` shows agents that never declared anything and they hear `landed`
+notices too. A session ends as `landed` when
 its newest commit lands on any ref (a review ref included); the next commit
 with the same key starts it again. `leep session end` also forgets the key
 it kept in the working copy, so the next commit starts a new session.
@@ -231,9 +233,12 @@ notice: [landed] 3f2a9c1d0b7e landed "auth: faster parser" at "src/auth/token.rs
 
 Levels, lowest first: `near` (same directory), `same_file` (the same path,
 or a directory holding it), `claimed` (another session claimed it),
-`possible_duplicate` (same task key, or a declared title and approach much
-like yours; also `N% alike`) and `landed` (a change touching your paths
-landed on your target ref since your base: sync before you land). A
+`possible_duplicate` (same task key, told to both sessions on their next
+answer, or a declared title and approach much like yours; also `N%
+alike`) and `landed` (a change touching your paths
+landed on your target ref since your base: sync before you land; `by
+task_key` when a session with your task key landed it, with a hint to
+check whether your work is still needed). A
 crowded path is one line with a count. `commit`, `land`, `session
 start|update`, `who` and `status` show them; `--json` output on stdout also
 carries them where the answer does. Titles, paths and names are quoted and
@@ -248,7 +253,7 @@ what a command does or its exit code.
 
 | Command | Effect |
 |---|---|
-| `leep context [-t TEXT] [PATHS...] [--task-key KEY] [--ref REF] [--budget BYTES]` | The context pack for the task `TEXT` (default: your session's title and approach) starting from `PATHS`: `files:` (each `[seed, search, co_change]` with its matching lines and how often it changed with your paths), `owners:` (names, the `carry` rule and the `OWNERS` file stating it), `last changes:` (changeset, creator, author, model, title), `work in flight:` and `possible duplicates:` (as notices are shown, without marking them said), `ref:` (head, `green/<ref>`, how far behind, red and the suspects touching these files), then what the budget `cut:` and which parts were `omitted:` (timeout, error, or `off` without sessions). `--budget` defaults to 32768 bytes, at most 262144. `--json` prints `ContextPack`. |
+| `leep context [-t TEXT] [PATHS...] [--task-key KEY] [--ref REF] [--budget BYTES]` | The context pack for the task `TEXT` (default: your session's title and approach) starting from `PATHS`: `files:` (each `[seed, search, co_change]` with its matching lines and how often it changed with your paths), `owners:` (names, the `carry` rule and the `OWNERS` file stating it), `last changes:` (changeset, creator, author, model, title), `work in flight:` and `possible duplicates:` (as notices are shown, without marking them said), `ref:` (head, `green/<ref>`, how far behind, red and the suspects touching these files), then what the budget `cut:` and which parts were `omitted:` (timeout, error, or `off` without sessions). `--budget` defaults to 32768 bytes, at most 262144. `--json` prints `ContextPack`. Files with the same owners, or the same last change, share one line naming them all; `leep work start` does not repeat as a notice what its pack lists. |
 | `leep work start [-t TITLE] [--approach TEXT] [--task KEY] [--scope PATH]... [--claim PATH]... [--ref REF] [--budget BYTES]` | `leep session start`, then `leep context` for the declared title, approach, scope and claims: one command to begin a task. `--json` prints `{session, context}`. |
 
 Identifiers in the task (words in backticks, `snake_case`, `camelCase`)

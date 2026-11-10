@@ -3064,10 +3064,12 @@ fn run_two_agents_notices(stores: &Stores, root: &Path) {
     let b_commit = run(&b, &["commit", "-m", "auth: b's parser"]);
     write(&a, "src/auth/token.rs", "fn a() {}\n");
     let a_commit = run(&a, &["commit", "-m", "auth: a's parser"]);
-    let warned = [&b_commit, &a_commit, &second]
-        .iter()
-        .any(|e| e.contains("notice: [same_file]"));
-    assert!(warned, "b: {b_commit}\na: {a_commit}\nstart: {second}");
+    // a, the first of the pair, hears of b on its commit: as a duplicate
+    // by task key (higher than `same_file`), naming the file.
+    assert!(
+        a_commit.contains("notice: [possible_duplicate]"),
+        "{a_commit}"
+    );
     for e in [&first, &second, &b_commit, &a_commit] {
         assert!(!e.chars().any(|c| c.is_control() && c != '\n'), "{e:?}");
     }
@@ -3095,6 +3097,66 @@ fn run_two_agents_notices(stores: &Stores, root: &Path) {
     assert!(status.contains(&head[..12]), "{status}");
     // Said once.
     assert!(!run(&a, &["status"]).contains("[landed]"));
+    drop(server);
+}
+
+/// An agent that never declares a session (only `LEEP_AGENT_SESSION`)
+/// hears that a change to its file landed: the CLI names the working
+/// copy's target ref on each commit (`Leep-Target-Ref`), so the inferred
+/// session knows where it lands (ADR 0095 amendment).
+#[test]
+fn an_undeclared_agent_hears_of_a_land_on_its_file() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stores = Stores::sqlite(&root.join("data"));
+    let server = Server::start(&stores, root);
+    let client = Client::new(&server.url, &root.join("cache"));
+    let seed = root.join("seed");
+    client.ok(root, &["init", seed.to_str().unwrap()]);
+    write(&seed, "src/token.rs", "fn parse() {}\n");
+    client.ok(&seed, &["commit", "-m", "seed"]);
+    client.ok(&seed, &["land"]);
+    let b = root.join("b");
+    client.ok(root, &["init", b.to_str().unwrap()]);
+    let run_b = |args: &[&str]| {
+        let out = client
+            .cmd(&b)
+            .env("LEEP_AGENT_SESSION", "b-1")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_ok(&out, &format!("leep {args:?}"));
+        stderr(&out)
+    };
+    write(&b, "src/token.rs", "fn parse() { b() }\n");
+    run_b(&["commit", "-m", "token: b's change"]);
+    let who = client.json(root, &["who", "src/token.rs"]);
+    let s = &who["sessions"][0];
+    assert_eq!(s["session"], "b-1", "{who}");
+    assert_eq!(s["origin"], "inferred");
+    assert_eq!(s["target_ref"], "main", "{who}");
+
+    // Someone else lands a change to the file; b's next command names it.
+    write(&seed, "src/token.rs", "fn parse() { seed() }\n");
+    client.ok(&seed, &["commit", "-m", "token: the seed's change"]);
+    client.ok(&seed, &["land"]);
+    let head = client.json(&seed, &["log", "-n", "1", "main"])["entries"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The land hook and notices are advisory and asynchronous: ask a
+    // bounded number of times, never against a clock.
+    let mut status = String::new();
+    for _ in 0..100 {
+        status = run_b(&["status"]);
+        if status.contains("notice: [landed]") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(status.contains("notice: [landed]"), "{status}");
+    assert!(status.contains(&head[..12]), "{status}");
     drop(server);
 }
 
@@ -3206,7 +3268,11 @@ fn run_two_agents_context(stores: &Stores, root: &Path) {
     );
     assert!(text.contains("work in flight:"), "{text}");
     assert!(text.contains("of \"ada\""), "{text}");
-    assert!(text.contains("\"src/auth/token.rs\": \"rhea\""), "{text}");
+    // Files with the same owners share one line, the seed first.
+    assert!(
+        text.contains("owners:\n  \"src/auth/token.rs\"") && text.contains(": \"rhea\""),
+        "{text}"
+    );
     assert!(
         text.contains("from \"ada\"") && text.contains("model \"model-a\""),
         "{text}"

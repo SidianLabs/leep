@@ -28,6 +28,7 @@ of retries of a command, so a loaded machine makes it slower, not flaky.
 | Agents | Via | Work |
 |---|---|---|
 | ada, bo, cy | `leep` | `src/auth/`: ada rotates keys in `keys.rs`; bo claims `token.rs`, cy scopes it; both edit it |
+| (maintainer) | `leep` | starts documenting token refresh in `docs/auth.md` before fay arrives |
 | dee, eli | `leep-mcp` | both handed issue `BILL-42` (`src/billing/invoice.rs`), worded differently |
 | fay | `leep-mcp` | arrives last, to add refresh tokens to `parse_token` |
 | gus ... tess (14) | 12 `leep`, 2 `leep-mcp` | one file each in their own area, concurrently with everything else; rex and sol share `src/api/` and ask for `near` notices |
@@ -42,10 +43,10 @@ ref is red with bo's land as a suspect.
 
 1. `leep who src/auth/` shows the three agents working there.
 2. bo and cy, editing `token.rs`, are each warned about the other
-   (`claimed` at cy's `leep work start`, `same_file` on bo's commit)
-   before either lands.
+   (`claimed` in the pack of cy's `leep work start`, `same_file` on bo's
+   commit) before either lands.
 3. eli's `leep_task_start` lists dee's session as a `possible_duplicate`
-   by task key in its pack; the result's notices say so too.
+   by task key in its pack (and not again as a notice).
 4. bo lands and cy's next `leep status` names the changeset in a
    `landed` notice; dee lands over MCP and eli's next tool call names it.
 5. fay's first call, `leep_task_start`, answers the owners of its file,
@@ -53,18 +54,40 @@ ref is red with bo's land as a suspect.
    it (cy) and the red ref with bo's land as the suspect touching it.
 6. The fourteen solo agents all land, and hear nothing about each other
    but `near` (rex and sol, who asked for it).
+7. A pack ranks live work by the agent's own files, as notices do: the
+   pack of rex or sol names the other, and as `near` (sol starts first and
+   lands only after rex has started, so this never depends on
+   scheduling); fay's pack lists the maintainer's live work on
+   `docs/auth.md`, which changed with `token.rs`, as on "a file related to
+   your task", after cy's work on fay's own file.
+8. dee, the first of the `BILL-42` pair, is told `possible_duplicate` of
+   eli by task key, and eli's `landed` notice for dee's land says its
+   duplicate landed the task.
+9. A task start says each thing once: eli's names dee as a duplicate on
+   exactly one line, and dee's pack explains `carry identical` exactly
+   once.
 
 ## Reading the transcript critically
 
 The demo is also a check on how the notices read. Things to look at:
 
-- A pack's "work in flight" probes the files the task turned up (co-changes
-  and search hits), not only the agent's own, and reports overlaps there
-  as `same_file` "(your ...)": rex's pack calls sol `same_file` on
-  `handlers.rs` while the notice in the same output says `near`.
-- The first agent of a duplicate pair is not told it is one: duplicates are
-  flagged on declarations only, so dee hears eli as `same_file` (with no
-  task key), and only in the answer of the call that already landed.
-- `leep_commit_and_land` creates and lands in one call, so an MCP agent
-  hears of overlaps on its commit after it has landed.
-- Packs repeat the same owners and last change for every co-changed file.
+- A pack's "work in flight" ranks levels by the agent's own paths, so it
+  agrees with the notices: rex's pack and notice both call sol `near`.
+  Work met only on a file the task turned up (a co-change) is marked
+  "a file related to your task" and listed last (fay's pack names ada so
+  on `keys.rs`).
+- Both agents of a duplicate pair are told: eli at `leep_task_start`, dee
+  on its next answer (the task-key lookup runs on creates, lands and notice
+  reads too), as `possible_duplicate` by task key.
+- eli's `landed` notice for dee's land is tagged `by task_key`, naming dee
+  and telling eli its duplicate landed the task.
+- Known limit, left to the maintainer: `leep_commit_and_land` creates and
+  lands in one call, so an MCP agent hears of overlaps on its commit after
+  it has landed (dee hears eli in that answer). A commit-only tool or a
+  pre-flight check would change that.
+- Known limit, left to the maintainer: `leep-mcp` asks for notices at most
+  every 30 s when a tool's answers carry none, so a `landed` notice can
+  take up to 30 s to reach an MCP agent that is only reading.
+- Packs list owners and last changes once per distinct answer, naming the
+  files each covers, and `leep_task_start` does not repeat as a notice
+  what its pack shows.

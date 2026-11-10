@@ -457,6 +457,13 @@ pub fn valid_request_id(id: &str) -> bool {
 /// one, and a bad value is ignored, never refused.
 pub const SESSION_HEADER: &str = "leep-session";
 
+/// Request header on `POST /v1/changesets` naming the ref the work is meant
+/// to land on (ADR 0095 amendment): a session inferred from the changeset
+/// records it as its target ref when it has none, so it hears of lands on
+/// that ref. A bad name is ignored, never refused; a server that does not
+/// know the header ignores it.
+pub const TARGET_REF_HEADER: &str = "leep-target-ref";
+
 /// Request header choosing what a query does when its index is behind
 /// (ADR 0058): [`INDEXING_RETRY`] or [`INDEXING_STALE_OK`]. Servers that
 /// list [`FEATURE_INDEXING_RETRY`] honour it; others ignore it.
@@ -1235,6 +1242,17 @@ pub struct Notice {
     /// and approaches, in percent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub similarity: Option<u32>,
+    /// `related` when the overlap is only on a file related to the task (a
+    /// context pack's co-change or search file), not on one of yours:
+    /// `untrusted.path` is then that file. Such an overlap never ranks above
+    /// one on your own paths. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+    /// `landed`, for a session that named no target ref: the ref the
+    /// server took it to land on (its default ref), which the session never
+    /// said is its own. Absent when the session named its target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed_on: Option<String>,
     #[serde(default)]
     pub untrusted: NoticeText,
 }
@@ -1333,7 +1351,9 @@ pub struct ContextText {
     /// The `OWNERS` file stating the `carry` directive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carry_file: Option<String>,
-    /// A suspect's changed paths that meet the pack's files.
+    /// A suspect's changed paths that meet the pack's files; or every
+    /// file an owners or history item covers, `path` first, when it covers
+    /// more than one (files with the same owners, or the same last change).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
 }
@@ -1428,6 +1448,26 @@ pub struct ContextRefHealth {
     pub required_checks: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suspects: Vec<ContextSuspect>,
+}
+
+impl ContextPack {
+    /// Whether the pack already shows `n`: an in-flight or duplicate item
+    /// about the same session or landed changeset, at the same level. A
+    /// client printing the pack and the notices of the same answer drops
+    /// such a notice rather than say it twice.
+    pub fn shows(&self, n: &Notice) -> bool {
+        self.in_flight
+            .iter()
+            .chain(&self.duplicates)
+            .map(|w| &w.notice)
+            .any(|w| {
+                w.level == n.level
+                    && w.changeset == n.changeset
+                    && w.session == n.session
+                    && w.count == n.count
+                    && (w.session.is_some() || w.changeset.is_some())
+            })
+    }
 }
 
 /// Items of a section left out to keep within the budget.
@@ -3326,6 +3366,8 @@ mod tests {
                 count: None,
                 by: None,
                 similarity: None,
+                via: None,
+                landed_on: None,
                 untrusted: NoticeText {
                     title: "t".into(),
                     path: Some("src/a.rs".into()),
@@ -3339,11 +3381,12 @@ mod tests {
                 &["level", "session", "principal", "untrusted"],
                 "Notice",
             );
-            for absent in ["changeset", "count", "by", "similarity"] {
+            for absent in ["changeset", "count", "by", "similarity", "via"] {
                 assert!(v.get(absent).is_none(), "{absent}");
             }
             let small: Notice = serde_json::from_value(json!({ "level": "near" })).unwrap();
             assert!(small.session.is_none() && small.untrusted.title.is_empty());
+            assert!(small.via.is_none(), "an old body has no `via`");
             let land = LandAnswer {
                 answer: LandResponse::Landed {
                     landed: id,
@@ -3484,6 +3527,8 @@ mod tests {
                         count: None,
                         by: None,
                         similarity: None,
+                        via: None,
+                        landed_on: None,
                         untrusted: NoticeText::default(),
                     },
                 }],

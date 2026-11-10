@@ -78,6 +78,9 @@ pub struct Client {
     notices: Arc<Mutex<Vec<Notice>>>,
     /// Sent as `Leep-Notices` when set: the lowest level wanted, or `off`.
     notice_level: Option<String>,
+    /// Sent as `Leep-Target-Ref` on changeset creates: the working copy's
+    /// target ref.
+    target_ref: Option<String>,
 }
 
 /// The environment variable a client sends as `Leep-Notices` (ADR 0096):
@@ -406,7 +409,15 @@ impl Client {
                 .ok()
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty() && HeaderValue::from_str(v).is_ok()),
+            target_ref: None,
         }
+    }
+
+    /// Name `target` as where this client's changesets are meant to land
+    /// (`Leep-Target-Ref` on creates).
+    pub fn with_target_ref(mut self, target: Option<&str>) -> Self {
+        self.target_ref = target.map(str::to_string);
+        self
     }
 
     /// Send `Leep-Session: KEY` on every request from now on, in this
@@ -534,6 +545,12 @@ impl Client {
         let mut seen = std::collections::BTreeSet::new();
         all.retain(|n| seen.insert(serde_json::to_string(n).unwrap_or_default()));
         all
+    }
+
+    /// Forget the gathered notices `shown` says were already shown (in a
+    /// context pack printed with them), so none is said twice.
+    pub fn forget_notices(&self, shown: impl Fn(&Notice) -> bool) {
+        self.notices.lock().unwrap().retain(|n| !shown(n));
     }
 
     /// Gather notices into `sink`, shared with other clients of one command.
@@ -705,9 +722,26 @@ impl Client {
         Ok(missing)
     }
 
+    /// Store `cs`, naming the client's target ref (if set) as where the
+    /// work is meant to land.
     pub fn create_changeset(&self, cs: &Changeset) -> Result<ChangesetId> {
-        let r: CreateChangesetResponse =
-            self.json(self.http.post(self.url("/v1/changesets")).json(cs))?;
+        self.create_changeset_for(cs, self.target_ref.as_deref())
+    }
+
+    /// Store `cs`, sending `target_ref` as `Leep-Target-Ref`: a session
+    /// the server infers from the changeset records it, so it hears of
+    /// lands there (ADR 0095 amendment). A server that does not know the
+    /// header ignores it.
+    pub fn create_changeset_for(
+        &self,
+        cs: &Changeset,
+        target_ref: Option<&str>,
+    ) -> Result<ChangesetId> {
+        let mut req = self.http.post(self.url("/v1/changesets")).json(cs);
+        if let Some(t) = target_ref.filter(|t| HeaderValue::from_str(t).is_ok()) {
+            req = req.header(TARGET_REF_HEADER, t);
+        }
+        let r: CreateChangesetResponse = self.json(req)?;
         self.gather(r.notices);
         Ok(r.id)
     }

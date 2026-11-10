@@ -3,7 +3,7 @@
 # agents, each with its own token and agent session, on one repository,
 # through the real leep-server, leep and leep-mcp binaries. Prints a
 # narrated Markdown transcript of what each agent ran and was told, then a
-# table of the six claims and the notices each agent heard. Exits 1 when a
+# table of the nine claims and the notices each agent heard. Exits 1 when a
 # claim did not hold. The same scenario runs as the leep-e2e test
 # `coord_demo`, which asserts the claims.
 #

@@ -440,7 +440,7 @@ impl Repo {
         };
         let me = self.context_session(ask, &c, session.clone(), session_key, &task_text);
         let section_until = || deadline.min(Instant::now() + SECTION_BOUND);
-        let (owners, history, in_flight, health, dups) = tokio::join!(
+        let (owners, history, (in_flight, dups), health) = tokio::join!(
             bounded(
                 "owners",
                 section_until(),
@@ -451,13 +451,12 @@ impl Repo {
                 section_until(),
                 self.context_history(head, &detail)
             ),
-            self.context_in_flight(&me, &paths, section_until()),
+            self.context_live(&me, &c.paths, &paths, section_until()),
             bounded(
                 "ref_health",
                 section_until(),
                 self.context_ref_health(ask, &c.target_ref, &paths)
             ),
-            self.context_duplicates(&me, section_until()),
         );
         let owners = take(&mut omitted, "owners", owners);
         let history = take(&mut omitted, "history", history);
@@ -759,14 +758,16 @@ impl Repo {
     }
 
     /// Owners and `carry` directives of `paths` as of `head`, for the paths
-    /// that have either.
+    /// that have either: one item per distinct answer, in the order of its
+    /// first path, listing in `paths` every path it covers when more than
+    /// one (a directory's files share their `OWNERS` files).
     async fn context_owners(
         &self,
         head: ChangesetId,
         paths: &[String],
     ) -> Result<Vec<ContextOwners>> {
         let mut r = OwnersResolver::new(self, Some(head)).await?;
-        let mut out = Vec::new();
+        let mut groups: Vec<ContextOwners> = Vec::new();
         for p in paths {
             let Ok(path) = RepoPath::new(p.as_str()) else {
                 continue;
@@ -790,27 +791,37 @@ impl Repo {
                 ),
                 None => (None, None),
             };
-            out.push(sized(
-                ContextOwners {
-                    id: item_id("owners", p),
-                    bytes: 0,
-                    carry,
-                    untrusted: ContextText {
-                        path: Some(p.clone()),
-                        owners: owners
-                            .iter()
-                            .take(MAX_OWNERS)
-                            .map(|o| cut(o, NAME_BYTES))
-                            .collect(),
-                        owners_files: files.iter().take(MAX_OWNERS).cloned().collect(),
-                        carry_file,
-                        ..Default::default()
-                    },
+            let item = ContextOwners {
+                id: item_id("owners", p),
+                bytes: 0,
+                carry,
+                untrusted: ContextText {
+                    path: Some(p.clone()),
+                    owners: owners
+                        .iter()
+                        .take(MAX_OWNERS)
+                        .map(|o| cut(o, NAME_BYTES))
+                        .collect(),
+                    owners_files: files.iter().take(MAX_OWNERS).cloned().collect(),
+                    carry_file,
+                    ..Default::default()
                 },
-                |i, n| i.bytes = n,
-            ));
+            };
+            let same = |g: &ContextOwners| {
+                g.carry == item.carry
+                    && g.untrusted.owners == item.untrusted.owners
+                    && g.untrusted.owners_files == item.untrusted.owners_files
+                    && g.untrusted.carry_file == item.untrusted.carry_file
+            };
+            match groups.iter_mut().find(|g| same(g)) {
+                Some(g) => cover(&mut g.untrusted, p),
+                None => groups.push(item),
+            }
         }
-        Ok(out)
+        Ok(groups
+            .into_iter()
+            .map(|g| sized(g, |i, n| i.bytes = n))
+            .collect())
     }
 
     /// The newest change to each of `paths` at `head`, and who made it.
@@ -834,71 +845,97 @@ impl Repo {
             })
             .buffered(HISTORY_CONCURRENCY);
         let found: Vec<Result<_>> = reads.collect().await;
-        let mut out = Vec::new();
+        let mut out: Vec<ContextChange> = Vec::new();
         for f in found {
             let Some((p, info, concurrent, by)) = f? else {
                 continue;
             };
+            // Files whose newest change is the same changeset are one item.
+            if let Some(g) = out
+                .iter_mut()
+                .find(|g| g.changeset == info.id && g.concurrent == concurrent)
+            {
+                cover(&mut g.untrusted, &p);
+                continue;
+            }
             let cs = &info.changeset;
             let title = crate::sessions::title_of(&cs.message);
-            out.push(sized(
-                ContextChange {
-                    id: item_id("change", &p),
-                    bytes: 0,
-                    changeset: info.id,
-                    time: cs.timestamp,
-                    created_by: by.map(|b| b.principal),
-                    concurrent,
-                    untrusted: ContextText {
-                        path: Some(p),
-                        title: Some(cut(&title, NOTICE_TITLE_BYTES)),
-                        author: Some(cut(&cs.author, NOTICE_TITLE_BYTES)),
-                        agent_model: cs.extra.get(EXTRA_AGENT_MODEL).map(|m| cut(m, NAME_BYTES)),
-                        agent_session: cs
-                            .extra
-                            .get(EXTRA_AGENT_SESSION)
-                            .map(|k| cut(k, NAME_BYTES)),
-                        ..Default::default()
-                    },
+            out.push(ContextChange {
+                id: item_id("change", &p),
+                bytes: 0,
+                changeset: info.id,
+                time: cs.timestamp,
+                created_by: by.map(|b| b.principal),
+                concurrent,
+                untrusted: ContextText {
+                    path: Some(p),
+                    title: Some(cut(&title, NOTICE_TITLE_BYTES)),
+                    author: Some(cut(&cs.author, NOTICE_TITLE_BYTES)),
+                    agent_model: cs.extra.get(EXTRA_AGENT_MODEL).map(|m| cut(m, NAME_BYTES)),
+                    agent_session: cs
+                        .extra
+                        .get(EXTRA_AGENT_SESSION)
+                        .map(|k| cut(k, NAME_BYTES)),
+                    ..Default::default()
                 },
-                |i, n| i.bytes = n,
-            ));
+            });
         }
-        Ok(out)
+        Ok(out
+            .into_iter()
+            .map(|c| sized(c, |i, n| i.bytes = n))
+            .collect())
     }
 
-    /// Live work overlapping the pack's files (and the session's own
-    /// paths), each other session once at its highest level, plus lands
-    /// on the target ref since the session's base. Nothing is marked
-    /// said. The path and `landed` parts are bounded together.
-    async fn context_in_flight(
+    /// The `in_flight` and `duplicates` sections. In flight: live work
+    /// overlapping the request's paths and the session's own, each other
+    /// session once at its highest level, then work met only on the pack's
+    /// other files (`via: related`), plus lands on the target ref since the
+    /// session's base. Duplicates: live sessions with the same task key, or
+    /// a title and approach much like the task (ADR 0096). The sessions of
+    /// the task key are read once for both: they are the duplicates by key
+    /// and tag a duplicate's land; when that read fails, lands go untagged
+    /// and only `duplicates` is omitted. Nothing is marked said.
+    async fn context_live(
         &self,
         s: &Session,
-        paths: &[String],
+        own: &[String],
+        related: &[String],
         until: Instant,
-    ) -> Part<Vec<ContextWork>> {
+    ) -> (Part<Vec<ContextWork>>, Part<Vec<ContextWork>>) {
         if self.coord.is_none() {
-            return Err(Omit::Off);
+            return (Err(Omit::Off), Err(Omit::Off));
         }
-        let work = async {
-            let (p, l) = tokio::join!(self.path_overlaps(s, paths), self.landed_overlaps(s));
-            let mut found = p?;
-            found.extend(l?);
-            found.sort_by_key(|f| std::cmp::Reverse(f.level));
-            Ok(one_per_session(found))
+        let (p, l, keyed, similar) = tokio::join!(
+            bounded("in_flight", until, self.path_overlaps(s, own, related)),
+            bounded("in_flight", until, self.landed_overlaps(s)),
+            bounded("duplicates", until, self.key_sessions(s)),
+            bounded("duplicates", until, self.similar_duplicates(s)),
+        );
+        let in_flight = match (p, l) {
+            (Ok(mut found), Ok(mut landed)) => {
+                if let Ok(k) = &keyed {
+                    crate::notices::tag_duplicate_lands(s, &mut landed, k);
+                }
+                found.extend(landed);
+                found.sort_by_key(|f| std::cmp::Reverse(crate::notices::rank(f)));
+                Ok(works(one_per_session(found), MAX_OVERLAPS))
+            }
+            (Err(o), _) | (_, Err(o)) => Err(o),
         };
-        let found = bounded("in_flight", until, work).await?;
-        Ok(works(found, MAX_OVERLAPS))
-    }
-
-    /// Live sessions that may be doing this task: the same task key, or a
-    /// title and approach much like the task (ADR 0096).
-    async fn context_duplicates(&self, s: &Session, until: Instant) -> Part<Vec<ContextWork>> {
-        if self.coord.is_none() {
-            return Err(Omit::Off);
-        }
-        let found = bounded("duplicates", until, self.duplicates(s)).await?;
-        Ok(works(found, MAX_DUPLICATES))
+        let duplicates = match (keyed, similar) {
+            (Ok(k), Ok(similar)) => {
+                let mut out = crate::notices::key_duplicates(s, &k);
+                let flagged: BTreeSet<u64> = out.iter().filter_map(|f| f.notice.session).collect();
+                out.extend(
+                    similar
+                        .into_iter()
+                        .filter(|f| f.notice.session.is_none_or(|id| !flagged.contains(&id))),
+                );
+                Ok(works(out, MAX_DUPLICATES))
+            }
+            (Err(o), _) | (_, Err(o)) => Err(o),
+        };
+        (in_flight, duplicates)
     }
 
     /// The ref's known-good state and red, and the suspects of a red head
@@ -971,6 +1008,15 @@ impl Repo {
     }
 }
 
+/// Add `p` to the paths an owners or history item covers: `paths` lists
+/// them all, its `path` first, once there is more than one.
+fn cover(t: &mut ContextText, p: &str) {
+    if t.paths.is_empty() {
+        t.paths.extend(t.path.clone());
+    }
+    t.paths.push(p.to_string());
+}
+
 /// Each other session once: a session that is a possible duplicate and
 /// also works on the pack's files is listed under `duplicates` only,
 /// taking the paths its in-flight item named when it has none (as one
@@ -984,7 +1030,8 @@ fn merge_duplicates(
     let in_flight: Vec<ContextWork> = in_flight
         .into_iter()
         .filter(|w| match w.notice.session {
-            Some(id) if dup_ids.contains(&id) => {
+            // A duplicate's land stays a land of its own.
+            Some(id) if dup_ids.contains(&id) && w.notice.changeset.is_none() => {
                 let t = &w.notice.untrusted;
                 paths.insert(id, (t.path.clone(), t.other_path.clone()));
                 false
@@ -1018,8 +1065,8 @@ fn works(found: Vec<Found>, max: usize) -> Vec<ContextWork> {
         .take(max)
         .map(|f| {
             let id = match (&f.notice.session, &f.notice.changeset) {
-                (Some(s), _) => format!("session:{s}"),
-                (None, Some(c)) => format!("landed:{}", &c.to_string()[..12]),
+                (_, Some(c)) => format!("landed:{}", &c.to_string()[..12]),
+                (Some(s), None) => format!("session:{s}"),
                 _ => item_id("crowd", &f.key),
             };
             work(id, f.notice)
@@ -1076,6 +1123,8 @@ mod tests {
                 count: None,
                 by: None,
                 similarity: None,
+                via: None,
+                landed_on: None,
                 untrusted: Default::default(),
             },
         );

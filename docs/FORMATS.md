@@ -1023,6 +1023,38 @@ Added:
   client shows a section, `why` or reason it does not know as it is.
 - Same request on the same state, same bytes.
 
+## Notice and pack refinements (additive API, ADR 0095, 0096 and 0097 amendments)
+
+No table, column, index or stored encoding changed; nothing is persisted.
+Added:
+
+- `Notice.via?` (omitted when absent, default absent): `related` on a
+  context pack's `in_flight` item met only on a file related to the task,
+  never on one of the agent's own paths; `untrusted.path` then names that
+  file. A client shows a `via` it does not know as it is (the CLI quoted
+  and escaped, the MCP tools as `?` unless it is a plain word).
+- `possible_duplicate` by `task_key` may now come on any answer carrying
+  notices (creates, lands, `GET /v1/notices`, listings), not only on
+  declarations. No shape changed.
+- Request header `Leep-Target-Ref: <ref>` on `POST /v1/changesets`: the
+  ref the work is meant to land on. A session inferred from the changeset
+  records it as its `target_ref` when it has none; a bad name is ignored.
+  The CLI sends its working copy's target ref, `leep-mcp` the
+  `target_ref` of `leep_commit_and_land`. Nothing else changes; older
+  servers ignore it.
+- `Notice.by` may be `task_key` on a `landed` notice too: the changeset
+  was landed by a session with the caller's task key, which `session`,
+  `principal` and `untrusted.task_key` then name. No shape changed.
+- `Notice.landed_on?` (omitted when absent): on a `landed` notice for a
+  session that named no target ref, the ref the server took it to land on
+  (its `--default-ref`). A client says "landed on <ref>" then, not "your
+  target ref".
+- `ContextOwners` and `ContextChange` items may cover several files: one
+  item per distinct owners answer, or per changeset that last changed the
+  files, with `untrusted.path` its first file (and the id of that file)
+  and `untrusted.paths` every file it covers, that one first, when more
+  than one. An older client reading only `path` sees the first file.
+
 ## Index leases and bounded queries (additive, ADR 0058)
 
 No table, column or stored encoding changed.

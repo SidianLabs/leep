@@ -59,7 +59,8 @@ it as one statement with a `LATERAL ... LIMIT` per exact path and per
 range; SQLite runs one short statement per probe. No new table, column
 or index.
 
-**`landed`** needs the session's `target_ref` and a base or head. Its base
+**`landed`** needs the session's `target_ref` (`main` when it has none;
+see the amendments) and a base or head. Its base
 is its declared base plus every parent outside the session of the
 session's own changesets, walked from its head (at most 32): a merge of
 the target into the work counts, so work already merged is not reported.
@@ -78,8 +79,9 @@ reads history, not the coordination store, so it holds across servers
 and restarts; the land path itself is unchanged.
 
 **Duplicates** are flagged when a session is declared (start or update):
-live sessions with the same `task_key` (an indexed lookup, at most 20),
-and, among the 200 newest active declared sessions (`SessionFilter.origin`),
+live sessions with the same `task_key` (an indexed lookup, at most 20;
+since the amendments below, on every answer that carries notices), and,
+among the 200 newest active declared sessions (`SessionFilter.origin`),
 those whose title and approach are at least 60% alike by trigram Jaccard
 similarity, with the search index's trigram extraction
 (`search::trigram::extract`) over the lowercased words. Intents shorter
@@ -224,3 +226,55 @@ new shapes (as ADR 0095 notes for sessions).
   out until a measured case needs it.
 - **A stored minimum level per session.** It needs a migration; the
   header gives each client the choice without one.
+
+## Amendments
+
+### The first of a duplicate pair is told too (2026-11-10)
+Duplicates were looked for only when a session was declared, so only the
+second of a pair heard of the first: in the phase 1 demo dee, who started
+`BILL-42` first, heard eli only as `same_file` with no task key, in the
+answer of the call that had already landed. The task-key part now runs on
+every answer that carries notices (changeset creates, lands, `GET
+/v1/notices`, listings, declarations): one indexed listing of live
+sessions with the session's task key, at most 20, within the same 150 ms
+as the other parts, and nothing at all for a session without a key. It is
+said once like any notice, and a session already told about at a lower
+level (`same_file`) is told again because `possible_duplicate` is higher.
+The same principal with the same key is still its own earlier session
+and never flagged. Duplicates by wording still wait for a declaration:
+they read 200 sessions, and inferred titles are not compared.
+
+### Undeclared sessions hear `landed` (2026-11-10)
+An inferred session had no target ref, so it had no `landed` part. Clients
+now name it on creates (`Leep-Target-Ref`, ADR 0095 amendment), and a
+session that still has none (an older client) is walked against the
+server's default ref: the new `--default-ref` setting (`LEEP_DEFAULT_REF`,
+default `main`, the ref clients land on by default; the server had no
+such setting before). A session whose work lands elsewhere and says so is
+never walked against it. A `landed` notice found this way carries
+`landed_on` (a new optional `Notice` field) naming that ref, and clients
+say "landed on main", never "your target ref": the session never said it
+was.
+
+### A duplicate's land says so (2026-11-10)
+In the demo eli heard "[landed] changeset ... landed on your target ref"
+when dee, its duplicate on `BILL-42`, landed the task, and nothing said
+whose land it was. The task-key lookup of the first amendment now reads
+the key's live sessions (at most 40, the duplicates) and its landed ones
+(at most 64) in two indexed listings run together, so however many
+sessions of a reused key landed they never hide a live duplicate; and the `landed` walk
+keeps, for each changeset it reports, its `agent.session` and its creator
+(through server rebases; when that read fails, nothing, so the
+writer-chosen `agent.session` alone never tags a land, and the walk's
+cache keeps that). A landed changeset whose `agent.session` is that
+of a session with my task key, created by that session's principal when
+the server recorded one, and not of my own principal (my own restart), is
+tagged: `by: task_key`, `session` and `principal` of that session, and
+`untrusted.task_key`. It is still keyed by the changeset for saying once,
+and it stands only for its changeset: each land is its own notice, and
+the session's live work (a `possible_duplicate` or a path level) is still
+said beside it. Clients add a hint: the CLI ends the line with
+"your duplicate landed this task; check whether your work is still
+needed", the MCP tools say the same outside the fence and keep the task
+key in the fenced row. A context pack tags its `landed` items the same way
+and keeps them as lands (`landed:` ids), never folded into the duplicate.

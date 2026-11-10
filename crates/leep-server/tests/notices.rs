@@ -278,7 +278,8 @@ async fn same_task_key_is_flagged_at_start_and_overlaps_list_everything() {
         b.notices[0].untrusted.other_path.as_deref(),
         Some("src/auth")
     );
-    // alice hears of bob's claim on her next listing.
+    // alice, the first of the pair, hears of bob on her next listing: as
+    // a duplicate by key, naming the file bob claims.
     let listed: SessionsResponse = api
         .call(
             Method::GET,
@@ -291,7 +292,12 @@ async fn same_task_key_is_flagged_at_start_and_overlaps_list_everything() {
         .ok();
     assert_eq!(listed.sessions.len(), 2);
     assert_eq!(listed.notices.len(), 1);
-    assert_eq!(listed.notices[0].level, "claimed");
+    assert_eq!(listed.notices[0].level, "possible_duplicate");
+    assert_eq!(listed.notices[0].by.as_deref(), Some("task_key"));
+    assert_eq!(
+        listed.notices[0].untrusted.other_path.as_deref(),
+        Some("src/auth/token.rs")
+    );
     // bob's title is only ever in `untrusted`.
     let raw = String::from_utf8(
         api.call(
@@ -383,4 +389,109 @@ async fn a_landed_answer_always_carries_its_notices() {
         assert!(matches!(answer.answer, LandResponse::Landed { .. }));
         assert_eq!(answer.notices.len(), 1, "run {i}: {:?}", answer.notices);
     }
+}
+
+/// The first of a duplicate pair is told when it lands, though it
+/// declared before the second existed (ADR 0096 amendment).
+#[tokio::test]
+async fn the_first_of_a_duplicate_pair_hears_it_on_its_land() {
+    let api = Api::over(repo());
+    api.declare(
+        "alice",
+        serde_json::json!({ "session": "a-1", "title": "Fix rounding", "task_key": "BILL-42" }),
+    )
+    .await;
+    let a = api
+        .commit("alice", "a-1", &[], &["src/billing/invoice.rs"], &[])
+        .await;
+    assert!(a.notices.is_empty(), "{:?}", a.notices);
+    let b = api
+        .declare(
+            "bob",
+            serde_json::json!({ "session": "b-1", "title": "Off by one cent", "task_key": "BILL-42" }),
+        )
+        .await;
+    assert_eq!(b.notices.len(), 1);
+    let answer: LandAnswer = api
+        .land("alice", a.id, &[(SESSION_HEADER, "a-1")])
+        .await
+        .ok();
+    assert!(matches!(answer.answer, LandResponse::Landed { .. }));
+    let levels: Vec<_> = answer.notices.iter().map(|n| n.level.as_str()).collect();
+    assert_eq!(levels, ["possible_duplicate"], "{:?}", answer.notices);
+    assert_eq!(answer.notices[0].principal.as_deref(), Some("bob"));
+    assert_eq!(
+        answer.notices[0].untrusted.task_key.as_deref(),
+        Some("BILL-42")
+    );
+}
+
+/// `Leep-Target-Ref` on a create names where an inferred session lands
+/// (ADR 0095 amendment). Additive: a create without it (an older client)
+/// answers as before and its session, with no target, still hears of a
+/// land on `main`; a bad name is ignored, not refused.
+#[tokio::test]
+async fn a_create_names_the_inferred_sessions_target_ref() {
+    let api = Api::over(repo());
+    let seed = api.commit("carol", "c-0", &[], &["README"], &[]).await;
+    let base = match api
+        .land("carol", seed.id, &[])
+        .await
+        .ok::<LandAnswer>()
+        .answer
+    {
+        LandResponse::Landed { landed, .. } => landed,
+        other => panic!("{other:?}"),
+    };
+    api.commit(
+        "alice",
+        "a-1",
+        &[base],
+        &["src/x.rs"],
+        &[(TARGET_REF_HEADER, "release")],
+    )
+    .await;
+    api.commit("bob", "b-1", &[base], &["src/x.rs"], &[]).await;
+    api.commit(
+        "carol",
+        "c-1",
+        &[base],
+        &["docs/y.md"],
+        &[(TARGET_REF_HEADER, "bad ref")],
+    )
+    .await;
+    let api = &api;
+    let target = |who: &'static str, key: &'static str| async move {
+        let r: SessionsResponse = api
+            .call(
+                Method::GET,
+                &format!("/v1/sessions?principal={who}&session={key}"),
+                who,
+                &[],
+                vec![],
+            )
+            .await
+            .ok();
+        r.sessions[0].target_ref.clone()
+    };
+    assert_eq!(target("alice", "a-1").await.as_deref(), Some("release"));
+    assert_eq!(target("bob", "b-1").await, None, "an older client");
+    assert_eq!(target("carol", "c-1").await, None, "a bad name is ignored");
+
+    // carol lands on main: bob (no target) hears of it as `main`'s.
+    let mine = api
+        .commit("carol", "c-2", &[base], &["src/x.rs"], &[])
+        .await;
+    api.land("carol", mine.id, &[]).await.ok::<LandAnswer>();
+    let n: NoticesResponse = api
+        .call(
+            Method::GET,
+            "/v1/notices",
+            "bob",
+            &[(SESSION_HEADER, "b-1")],
+            vec![],
+        )
+        .await
+        .ok();
+    assert!(n.notices.iter().any(|n| n.level == "landed"), "{n:?}");
 }

@@ -197,12 +197,17 @@ async fn a_pack_holds_files_owners_history_live_work_and_duplicates() {
         h.untrusted.title.as_deref(),
         Some("auth: document parse_token")
     );
+    // Files whose last change is one changeset are one item covering them.
     let mod_rs = p
         .history
         .iter()
-        .find(|h| h.untrusted.path.as_deref() == Some("src/auth/mod.rs"))
+        .find(|h| h.untrusted.paths.iter().any(|q| q == "src/auth/mod.rs"))
         .unwrap();
     assert_eq!(mod_rs.created_by.as_deref(), Some("ada"));
+    assert_eq!(
+        mod_rs.untrusted.paths[0],
+        *mod_rs.untrusted.path.as_ref().unwrap()
+    );
 
     // Live work: cy's session on the file, which may be the same task:
     // listed once, as a duplicate, with the path it works on.
@@ -869,4 +874,220 @@ async fn history_names_the_creator_of_a_rebased_land() {
     assert_eq!(h.changeset, landed);
     assert_eq!(h.created_by.as_deref(), Some("bo"));
     assert_eq!(h.untrusted.agent_model.as_deref(), Some("model-b"));
+}
+
+fn scoped(key: &str, title: &str, scope: &str) -> DeclareSessionRequest {
+    DeclareSessionRequest {
+        session: key.into(),
+        title: Some(title.into()),
+        target_ref: Some("main".into()),
+        scope: Some(vec![scope.into()]),
+        ..Default::default()
+    }
+}
+
+/// Live work is ranked by the agent's own paths: a session in the same
+/// directory as my file is `near`, as the notice says, even when it also
+/// works on a file that changed with mine; a session met only on such a
+/// related file is marked `via: related`, names that file, and ranks below
+/// every overlap on my own paths (the demo's rex, sol and bo).
+#[tokio::test]
+async fn related_files_never_outrank_my_own() {
+    let r = repo();
+    land(
+        &r,
+        "maint",
+        "m",
+        "seed",
+        &[
+            ("src/api/routes.rs", "r\n"),
+            ("src/api/handlers.rs", "h\n"),
+            ("src/billing/tax.rs", "t\n"),
+        ],
+    )
+    .await;
+    for (who, key, title, scope) in [
+        (
+            "sol",
+            "sol-1",
+            "Return 422 for bad JSON",
+            "src/api/handlers.rs",
+        ),
+        ("ada", "ada-1", "Round the tax", "src/billing/tax.rs"),
+        ("rex", "rex-1", "Version the routes", "src/api/routes.rs"),
+    ] {
+        r.declare_session_with(who, scoped(key, title, scope), None)
+            .await
+            .unwrap();
+    }
+    let mut a = ask("rex", "Version the routes", &["src/api/routes.rs"]);
+    a.req.session = Some("rex-1".into());
+    let p = r.context_pack(&a).await.unwrap();
+    assert!(paths_of(&p).contains(&"src/billing/tax.rs".to_string()));
+    let seen: Vec<(&str, &str, Option<&str>, Option<&str>)> = p
+        .in_flight
+        .iter()
+        .map(|w| {
+            (
+                w.notice.principal.as_deref().unwrap(),
+                w.notice.level.as_str(),
+                w.notice.via.as_deref(),
+                w.notice.untrusted.path.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("sol", "near", None, Some("src/api/routes.rs")),
+            (
+                "ada",
+                "same_file",
+                Some("related"),
+                Some("src/billing/tax.rs")
+            ),
+        ]
+    );
+    // The notice for the same session agrees with the pack.
+    let near = NoticeAsk {
+        min: leep_core::coord::NoticeLevel::Near,
+        ..Default::default()
+    };
+    let n = r.notices_for("rex", "rex-1", &near).await;
+    let sol: Vec<_> = n
+        .iter()
+        .filter(|n| n.principal.as_deref() == Some("sol"))
+        .collect();
+    assert_eq!(sol.len(), 1, "{n:?}");
+    assert_eq!(sol[0].level, p.in_flight[0].notice.level);
+    assert!(n.iter().all(|n| n.via.is_none()), "{n:?}");
+}
+
+/// Owners and history rows that would repeat for every co-changed file are
+/// one item each, listing the files they cover in rank order; ids stay the
+/// first file's, sizes stay exact, and the pack stays byte-identical (the
+/// demo's billing pack said `carry identical` four times).
+#[tokio::test]
+async fn identical_owners_and_history_rows_are_one_item() {
+    let r = repo();
+    land(
+        &r,
+        "maint",
+        "m",
+        "billing",
+        &[
+            ("OWNERS", "maint\n"),
+            ("src/billing/OWNERS", "carry identical\nmoe\n"),
+            ("src/billing/invoice.rs", "i\n"),
+            ("src/billing/mod.rs", "m\n"),
+            ("src/billing/tax.rs", "t\n"),
+        ],
+    )
+    .await;
+    land(
+        &r,
+        "bo",
+        "model-b",
+        "tax: round",
+        &[("src/billing/tax.rs", "t2\n")],
+    )
+    .await;
+    let a = ask("dee", "Fix invoice totals", &["src/billing/invoice.rs"]);
+    let p = r.context_pack(&a).await.unwrap();
+    let files = paths_of(&p);
+    assert_eq!(files[0], "src/billing/invoice.rs");
+    // The billing files share one answer; the root OWNERS file has its own.
+    assert_eq!(p.owners.len(), 2, "{:?}", p.owners);
+    let o = &p.owners[0];
+    assert_eq!(p.owners[1].untrusted.path.as_deref(), Some("OWNERS"));
+    let billing: Vec<&String> = files
+        .iter()
+        .filter(|f| f.starts_with("src/billing/"))
+        .collect();
+    assert_eq!(o.untrusted.paths.iter().collect::<Vec<_>>(), billing);
+    assert_eq!(o.untrusted.path.as_deref(), Some("src/billing/invoice.rs"));
+    assert_eq!(o.carry.as_deref(), Some("identical"));
+    // Two last changes: the seed's (most files) and bo's (tax.rs alone).
+    assert_eq!(p.history.len(), 2, "{:?}", p.history);
+    let tax = p
+        .history
+        .iter()
+        .find(|h| h.created_by.as_deref() == Some("bo"))
+        .unwrap();
+    assert_eq!(tax.untrusted.path.as_deref(), Some("src/billing/tax.rs"));
+    assert!(tax.untrusted.paths.is_empty(), "one file: no list");
+    let seed = p
+        .history
+        .iter()
+        .find(|h| h.created_by.as_deref() == Some("maint"))
+        .unwrap();
+    assert!(seed.untrusted.paths.len() >= 2, "{seed:?}");
+    assert!(!seed
+        .untrusted
+        .paths
+        .iter()
+        .any(|q| q == "src/billing/tax.rs"));
+    for b in p
+        .owners
+        .iter()
+        .map(|i| i.bytes)
+        .chain(p.history.iter().map(|i| i.bytes))
+    {
+        assert!(b > 0);
+    }
+    assert_eq!(o.bytes, serde_json::to_vec(o).unwrap().len() as u64);
+    assert_eq!(seed.bytes, serde_json::to_vec(seed).unwrap().len() as u64);
+    let again = r.context_pack(&a).await.unwrap();
+    assert_eq!(
+        serde_json::to_vec(&p).unwrap(),
+        serde_json::to_vec(&again).unwrap()
+    );
+}
+
+/// A coordination store whose task-key listings fail and the rest answer.
+struct KeyListingFails(MemoryCoordStore);
+
+#[async_trait]
+impl CoordStore for KeyListingFails {
+    async fn upsert_session(&self, u: &SessionUpdate) -> Result<(Session, bool)> {
+        self.0.upsert_session(u).await
+    }
+    async fn get_session(&self, id: u64) -> Result<Option<Session>> {
+        self.0.get_session(id).await
+    }
+    async fn list_sessions(&self, f: &SessionFilter) -> Result<Vec<Session>> {
+        if f.task_key.is_some() {
+            return Err(Error::Storage("task-key index down".into()));
+        }
+        self.0.list_sessions(f).await
+    }
+    async fn end_session(&self, id: u64, e: &SessionEnd) -> Result<bool> {
+        self.0.end_session(id, e).await
+    }
+    async fn beat_sessions(&self, b: &[Beat]) -> Result<u64> {
+        self.0.beat_sessions(b).await
+    }
+    async fn sweep_sessions(&self, now: i64, limit: usize) -> Result<SweepReport> {
+        self.0.sweep_sessions(now, limit).await
+    }
+    async fn count_sessions(&self, s: SessionState, cap: usize) -> Result<u64> {
+        self.0.count_sessions(s, cap).await
+    }
+    async fn near_paths(&self, q: &NearQuery) -> Result<Vec<NearRow>> {
+        self.0.near_paths(q).await
+    }
+}
+
+/// A failed task-key listing costs the pack its duplicates, never its live
+/// work: the in-flight section still lists the session on the file.
+#[tokio::test]
+async fn a_failed_task_key_listing_keeps_live_work() {
+    let r = repo().with_coord(Some(Arc::new(KeyListingFails(MemoryCoordStore::new()))));
+    busy_repo(&r).await;
+    let mut a = ask("dee", "Make `parse_token` faster", &["src/auth/token.rs"]);
+    a.req.task_key = Some("T-9".into());
+    let p = r.context_pack(&a).await.unwrap();
+    assert_eq!(omitted(&p), [("duplicates", "error")]);
+    assert_eq!(p.in_flight.len(), 1, "{p:?}");
+    assert_eq!(p.in_flight[0].notice.principal.as_deref(), Some("cy"));
 }

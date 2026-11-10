@@ -26,7 +26,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use leep_core::api::{
     error_code, DeclareSessionRequest, LandAnswer, LandResponse, Notice, NoticesResponse,
-    OverlapsResponse, NOTICES_HEADER, SESSION_HEADER,
+    OverlapsResponse, NOTICES_HEADER, SESSION_HEADER, TARGET_REF_HEADER,
 };
 use leep_core::coord::SessionState;
 use leep_core::{ChangesetId, Error};
@@ -281,12 +281,21 @@ where
 /// changeset's paths probed first.
 pub(crate) async fn after_create(
     repo: &Repo,
-    seed: SessionSeed,
+    mut seed: SessionSeed,
     id: ChangesetId,
     who: &Option<auth::Principal>,
     headers: &HeaderMap,
 ) -> Vec<Notice> {
     let principal = principal(who);
+    // Where the work is meant to land, when the client says: an inferred
+    // session needs it to hear of lands (`Leep-Target-Ref`). A bad name is
+    // ignored, as a bad `Leep-Session` is.
+    seed.target_ref = headers
+        .get(TARGET_REF_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|r| leep_core::refname::validate(r).is_ok())
+        .map(str::to_string);
     let focus = seed.touch.clone();
     let noted = tokio::time::timeout(
         CREATE_HOOK_BOUND,

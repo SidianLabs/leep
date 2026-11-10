@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use leep_core::api::{Notice, NoticeText, OverlapsResponse};
@@ -54,12 +54,20 @@ pub const NEAR_LIMIT: usize = 512;
 /// More sessions than this on one of my paths make it crowded: one notice
 /// with a count instead of one each (design D.3, the hot-path rule).
 pub const HOT_SESSIONS: usize = 50;
+/// The default of `--default-ref`: the ref a session that names none is
+/// taken to land on, for `landed`.
+pub const DEFAULT_TARGET_REF: &str = "main";
 /// Changesets of the target ref walked for `landed`.
 pub const LANDED_WINDOW: usize = 64;
 /// The session's own changesets walked to find what it is based on.
 pub const OWN_WALK: usize = 32;
 /// Most recent active declared sessions compared for a similar intent.
 pub const DUPLICATE_CANDIDATES: usize = 200;
+/// Landed sessions of one task key read per answer (to tell a duplicate's
+/// land), and live ones (the duplicates, with room for the asking session
+/// and its own restarts).
+pub const KEY_SESSIONS: usize = 64;
+pub const KEY_LIVE_SESSIONS: usize = 2 * DUPLICATE_BY_KEY;
 /// Most sessions of one task key flagged.
 pub const DUPLICATE_BY_KEY: usize = 20;
 /// Trigram similarity (percent) of two intents from which they are flagged.
@@ -78,7 +86,10 @@ const PURGE_EVERY_SECS: i64 = 60;
 const MAX_LANDED_CACHE: usize = 10_000;
 
 /// Which notices an answer carries: the lowest level wanted, the request's
-/// own paths (probed first), and whether to look for duplicates.
+/// own paths (probed first), and whether to compare intents for
+/// duplicates by wording. Duplicates by task key are looked for on every
+/// answer (one indexed listing), so the first of a pair hears of the
+/// second on its next create, land or notice read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoticeAsk {
     pub min: NoticeLevel,
@@ -121,6 +132,10 @@ pub struct Found {
     /// My path it is about, and whether I declared it (scope or claim),
     /// so a later scope change can be counted as following it.
     pub mine: Option<(String, bool)>,
+    /// `landed`: the landed changeset's `agent.session` and the principal
+    /// that created it (through server rebases), when known, to tell a
+    /// duplicate's land.
+    pub landed_by: Option<(String, Option<String>)>,
 }
 
 /// A session's `landed` walk, as far as it got: of the target ref at
@@ -281,13 +296,98 @@ impl NoticeState {
     }
 }
 
+/// Live sessions of `keyed` (sessions with `s`'s task key) as duplicates,
+/// at most [`DUPLICATE_BY_KEY`]. The same principal under the same key is
+/// `s`'s own earlier session, never flagged.
+pub(crate) fn key_duplicates(s: &Session, keyed: &[Session]) -> Vec<Found> {
+    let Some(k) = &s.task_key else {
+        return Vec::new();
+    };
+    let now = unix_now();
+    keyed
+        .iter()
+        .filter(|o| {
+            o.id != s.id
+                && !o.state.is_ended()
+                && o.state_at(now) != SessionState::Expired
+                && o.task_key.as_ref() == Some(k)
+                && !same_agent_and_task(s, o)
+        })
+        .take(DUPLICATE_BY_KEY)
+        .map(|o| {
+            let mut n = notice(NoticeLevel::PossibleDuplicate, Some(o));
+            n.by = Some("task_key".into());
+            n.untrusted.task_key = Some(k.clone());
+            Found {
+                level: NoticeLevel::PossibleDuplicate,
+                key: format!("session:{}", o.id),
+                notice: n,
+                mine: None,
+                landed_by: None,
+            }
+        })
+        .collect()
+}
+
+/// Who landed a changeset carrying `agent.session` `key`, for telling a
+/// duplicate's land: the key and the creator the server recorded (none
+/// when it recorded none). `None` when the creator could not be read: the
+/// key alone is whatever the writer chose, so such a land is never tagged.
+fn landed_by(
+    key: &str,
+    creator: Result<Option<leep_core::review_request::CreatedBy>>,
+) -> Option<(String, Option<String>)> {
+    match creator {
+        Ok(c) => Some((key.to_string(), c.map(|c| c.principal))),
+        Err(e) => {
+            tracing::debug!(error = %e, "reading a landed changeset's creator failed");
+            None
+        }
+    }
+}
+
+/// Mark each `landed` overlap that a session with `s`'s task key landed
+/// (of `keyed`): `by: task_key`, naming that session and the key, so the
+/// agent reads it as its duplicate's land of the task. Matched by the
+/// changeset's `agent.session` and, when the server recorded one, its
+/// creator; never `s`'s own principal (its own restart).
+pub(crate) fn tag_duplicate_lands(s: &Session, landed: &mut [Found], keyed: &[Session]) {
+    let Some(k) = &s.task_key else {
+        return;
+    };
+    for f in landed.iter_mut() {
+        let Some((key, creator)) = &f.landed_by else {
+            continue;
+        };
+        let twin = keyed.iter().find(|o| {
+            o.id != s.id
+                && &o.agent_session == key
+                && o.task_key.as_ref() == Some(k)
+                && o.principal != s.principal
+                && creator.as_ref().is_none_or(|c| c == &o.principal)
+        });
+        if let Some(o) = twin {
+            f.notice.by = Some("task_key".into());
+            f.notice.session = Some(o.id);
+            f.notice.principal = Some(o.principal.clone());
+            f.notice.untrusted.task_key = Some(k.clone());
+        }
+    }
+}
+
 /// Each other session once, at its highest level (`found` is ranked),
 /// taking the paths a lower level of it named when the highest has none:
-/// a duplicate that also claims my file is one notice, not two.
+/// a duplicate that also claims my file is one notice, not two. A `landed`
+/// notice is about its changeset, not the session that landed it: each
+/// one passes through, and none stands for that session's live work.
 pub(crate) fn one_per_session(found: Vec<Found>) -> Vec<Found> {
     let mut at: HashMap<u64, usize> = HashMap::new();
     let mut out: Vec<Found> = Vec::with_capacity(found.len());
     for f in found {
+        if f.notice.changeset.is_some() {
+            out.push(f);
+            continue;
+        }
         let Some(id) = f.notice.session else {
             out.push(f);
             continue;
@@ -312,20 +412,17 @@ pub(crate) fn one_per_session(found: Vec<Found>) -> Vec<Found> {
 
 /// One part of the overlaps, within `bound`; nothing (counted) if it
 /// fails or runs out of time.
-async fn part(
-    bound: Duration,
-    f: impl std::future::Future<Output = Result<Vec<Found>>>,
-) -> Vec<Found> {
+async fn part<T: Default>(bound: Duration, f: impl std::future::Future<Output = Result<T>>) -> T {
     match tokio::time::timeout(bound, f).await {
         Ok(Ok(found)) => found,
         Ok(Err(e)) => {
             metrics::counter!("leep_notices_omitted_total", "reason" => "error").increment(1);
             tracing::debug!(error = %e, "computing notices failed");
-            Vec::new()
+            T::default()
         }
         Err(_) => {
             metrics::counter!("leep_notices_omitted_total", "reason" => "timeout").increment(1);
-            Vec::new()
+            T::default()
         }
     }
 }
@@ -347,6 +444,8 @@ fn notice(level: NoticeLevel, other: Option<&Session>) -> Notice {
         count: None,
         by: None,
         similarity: None,
+        via: None,
+        landed_on: None,
         untrusted: NoticeText {
             title: other.map_or_else(String::new, |o| cut(&o.title, NOTICE_TITLE_BYTES)),
             ..Default::default()
@@ -354,10 +453,21 @@ fn notice(level: NoticeLevel, other: Option<&Session>) -> Notice {
     }
 }
 
-/// The session's paths to probe: `focus` first, then claims, scope and
-/// touched paths, each once, at most [`MAX_PROBED_PATHS`]. Each with
-/// whether the session declared it.
-fn probed(s: &Session, focus: &[String]) -> Vec<(String, bool)> {
+/// One path probed for overlaps.
+#[derive(Clone, Debug)]
+struct Probe {
+    path: String,
+    /// The session declared it (scope or claim).
+    declared: bool,
+    /// Only related to the task (a context pack's co-change or search
+    /// file), not the session's or the request's own.
+    related: bool,
+}
+
+/// The session's paths to probe: `focus` (the request's own paths) first,
+/// then claims, scope and touched paths, then `related` paths, each once,
+/// at most [`MAX_PROBED_PATHS`].
+fn probed(s: &Session, focus: &[String], related: &[String]) -> Vec<Probe> {
     let declared: BTreeSet<&str> = s
         .scope
         .iter()
@@ -366,20 +476,31 @@ fn probed(s: &Session, focus: &[String]) -> Vec<(String, bool)> {
         .collect();
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
-    let all = focus
+    let own = focus
         .iter()
         .chain(&s.claims)
         .chain(&s.scope)
-        .chain(&s.touched);
-    for p in all {
+        .chain(&s.touched)
+        .map(|p| (p, false));
+    for (p, related) in own.chain(related.iter().map(|p| (p, true))) {
         if out.len() >= MAX_PROBED_PATHS {
             break;
         }
         if seen.insert(p.as_str()) {
-            out.push((p.clone(), declared.contains(p.as_str())));
+            out.push(Probe {
+                path: p.clone(),
+                declared: declared.contains(p.as_str()),
+                related,
+            });
         }
     }
     out
+}
+
+/// How a found overlap ranks: on my own paths above one found only through
+/// related files, then by level. Higher first.
+pub(crate) fn rank(f: &Found) -> (bool, NoticeLevel) {
+    (f.notice.via.is_none(), f.level)
 }
 
 /// The level of another session's path `theirs` (of `kind`) against mine.
@@ -523,11 +644,23 @@ impl Repo {
         self.notices_on && self.coord.is_some()
     }
 
+    /// Take `name` as the ref work lands on when a session names none
+    /// (`--default-ref`, default `main`).
+    pub fn with_default_ref(mut self, name: &str) -> Self {
+        self.default_ref = Arc::from(name);
+        self
+    }
+
+    pub fn default_ref(&self) -> &str {
+        &self.default_ref
+    }
+
     /// Everything overlapping `s` now, highest level first. Path levels
-    /// need `near_paths`; `landed` walks the target ref; duplicates (when
-    /// `duplicates`) read recent sessions. The parts run together, each
-    /// within `bound`: one that fails or runs out of time is left out
-    /// (and counted), never the others.
+    /// need `near_paths`; `landed` walks the target ref; duplicates by
+    /// task key read one indexed listing, and by wording (when
+    /// `duplicates`) recent sessions. The parts run together, each within
+    /// `bound`: one that fails or runs out of time is left out (and
+    /// counted), never the others.
     pub async fn find_overlaps(
         &self,
         s: &Session,
@@ -535,36 +668,50 @@ impl Repo {
         duplicates: bool,
         bound: Duration,
     ) -> Vec<Found> {
-        let dups = async {
+        let similar = async {
             if duplicates {
-                part(bound, self.duplicates(s)).await
+                part(bound, self.similar_duplicates(s)).await
             } else {
                 Vec::new()
             }
         };
-        let (paths, landed, dups) = tokio::join!(
-            part(bound, self.path_overlaps(s, focus)),
+        let (paths, mut landed, keyed, similar) = tokio::join!(
+            part(bound, self.path_overlaps(s, focus, &[])),
             part(bound, self.landed_overlaps(s)),
-            dups,
+            part(bound, self.key_sessions(s)),
+            similar,
         );
+        tag_duplicate_lands(s, &mut landed, &keyed);
         let mut found = paths;
         found.extend(landed);
-        found.extend(dups);
+        // By key before by wording: one session flagged both ways is one
+        // notice, `by: task_key`.
+        found.extend(key_duplicates(s, &keyed));
+        found.extend(similar);
         // Stable: within a level, the order each part found them in.
-        found.sort_by_key(|f| std::cmp::Reverse(f.level));
+        found.sort_by_key(|f| std::cmp::Reverse(rank(f)));
         one_per_session(found)
     }
 
-    pub(crate) async fn path_overlaps(&self, s: &Session, focus: &[String]) -> Result<Vec<Found>> {
+    /// Path levels of other live sessions against `s`'s paths, `focus`
+    /// (the request's own) first. A session met only on a `related` path
+    /// is marked `via: related` and ranks below every one met on mine:
+    /// its level says how it meets a file related to the task, never mine.
+    pub(crate) async fn path_overlaps(
+        &self,
+        s: &Session,
+        focus: &[String],
+        related: &[String],
+    ) -> Result<Vec<Found>> {
         let Some(coord) = self.coord.as_ref() else {
             return Ok(Vec::new());
         };
-        let mine = probed(s, focus);
+        let mine = probed(s, focus, related);
         if mine.is_empty() {
             return Ok(Vec::new());
         }
         let q = NearQuery {
-            paths: mine.iter().map(|(p, _)| p.clone()).collect(),
+            paths: mine.iter().map(|p| p.path.clone()).collect(),
             siblings: true,
             exclude: Some(s.id),
             per_range: PER_RANGE,
@@ -583,13 +730,14 @@ impl Repo {
             {
                 continue;
             }
+            // My own paths first, whatever a related file's level.
             let best = mine
                 .iter()
                 .enumerate()
-                .filter_map(|(i, (p, _))| path_level(p, &r.path, r.kind).map(|l| (l, i)))
-                .max_by_key(|(l, i)| (*l, std::cmp::Reverse(*i)));
+                .filter_map(|(i, p)| path_level(&p.path, &r.path, r.kind).map(|l| (l, i)))
+                .max_by_key(|(l, i)| (!mine[*i].related, *l, std::cmp::Reverse(*i)));
             let Some((level, i)) = best else { continue };
-            if level >= NoticeLevel::SameFile {
+            if level >= NoticeLevel::SameFile && !mine[i].related {
                 let e = crowd.entry(r.path.as_str()).or_insert((i, BTreeSet::new()));
                 e.1.insert(r.session.id);
             }
@@ -599,16 +747,17 @@ impl Repo {
         let mut hot: BTreeSet<&str> = BTreeSet::new();
         for (theirs, (i, ids)) in &crowd {
             if ids.len() > HOT_SESSIONS {
-                let (p, declared) = &mine[*i];
+                let p = &mine[*i];
                 let mut n = notice(NoticeLevel::SameFile, None);
                 n.count = Some(ids.len() as u64);
-                n.untrusted.path = Some(p.clone());
+                n.untrusted.path = Some(p.path.clone());
                 n.untrusted.other_path = Some(theirs.to_string());
                 out.push(Found {
                     level: NoticeLevel::SameFile,
                     key: format!("hot:{theirs}"),
                     notice: n,
-                    mine: Some((p.clone(), *declared)),
+                    mine: Some((p.path.clone(), p.declared)),
+                    landed_by: None,
                 });
                 hot.insert(theirs);
             }
@@ -616,29 +765,35 @@ impl Repo {
         // The best (level, my path, their path) per other session, leaving
         // out its rows on crowded paths (their count) unless they claim:
         // a session that also meets me on an uncrowded path is named there.
-        type Best = (NoticeLevel, usize, String);
+        // A row on one of my paths beats any on a related file.
+        type Best = ((bool, NoticeLevel), usize, String);
         let mut best: BTreeMap<u64, (&Session, Best)> = BTreeMap::new();
         for (r, level, i) in met {
             if hot.contains(r.path.as_str()) && level < NoticeLevel::Claimed {
                 continue;
             }
+            let at = (!mine[i].related, level);
             let e = best
                 .entry(r.session.id)
-                .or_insert_with(|| (&r.session, (level, i, r.path.clone())));
-            if level > e.1 .0 {
-                e.1 = (level, i, r.path.clone());
+                .or_insert_with(|| (&r.session, (at, i, r.path.clone())));
+            if at > e.1 .0 {
+                e.1 = (at, i, r.path.clone());
             }
         }
-        for (id, (o, (level, i, theirs))) in best.into_iter().rev() {
-            let (p, declared) = &mine[i];
+        for (id, (o, ((_, level), i, theirs))) in best.into_iter().rev() {
+            let p = &mine[i];
             let mut n = notice(level, Some(o));
-            n.untrusted.path = Some(p.clone());
+            n.untrusted.path = Some(p.path.clone());
             n.untrusted.other_path = Some(theirs);
+            if p.related {
+                n.via = Some("related".into());
+            }
             out.push(Found {
                 level,
                 key: format!("session:{id}"),
                 notice: n,
-                mine: Some((p.clone(), *declared)),
+                mine: Some((p.path.clone(), p.declared)),
+                landed_by: None,
             });
         }
         Ok(out)
@@ -653,9 +808,12 @@ impl Repo {
     /// short by the notice bound resumes on the next answer; it is redone
     /// when the ref or the session's head moves.
     pub(crate) async fn landed_overlaps(&self, s: &Session) -> Result<Vec<Found>> {
-        let Some(target) = s.target_ref.as_deref() else {
-            return Ok(Vec::new());
-        };
+        // A session that never said where it lands (inferred from an older
+        // client's commit) is taken to land on the default ref.
+        let target = s.target_ref.as_deref().unwrap_or(&self.default_ref);
+        // Said as "landed on <ref>", never "your target ref": the session
+        // did not say this one.
+        let landed_on = s.target_ref.is_none().then(|| target.to_string());
         if s.head.is_none() && s.base.is_none() {
             return Ok(Vec::new());
         }
@@ -682,7 +840,7 @@ impl Repo {
                 }
             }
         };
-        let mine = probed(s, &[]);
+        let mine = probed(s, &[], &[]);
         let mut reader = ChainReader::new();
         while let Some(id) = w.at {
             if w.walked >= LANDED_WINDOW || w.bases.contains(&id) || w.own.contains(&id) {
@@ -693,12 +851,19 @@ impl Repo {
             w.walked += 1;
             w.at = cs.parents.first().copied();
             if !self.is_own(s, id, &cs).await? {
-                let hit = mine
-                    .iter()
-                    .find_map(|(p, d)| changed_near(&cs, p).map(|c| (p, *d, c.to_string())));
+                let hit = mine.iter().find_map(|p| {
+                    changed_near(&cs, &p.path).map(|c| (&p.path, p.declared, c.to_string()))
+                });
                 if let Some((p, declared, theirs)) = hit {
+                    // Who landed it, to tell a duplicate's land (read only
+                    // for a hit; kept with the walk).
+                    let landed_by = match cs.extra.get(EXTRA_AGENT_SESSION) {
+                        Some(k) => landed_by(k, self.created_by_through_rebases(id).await),
+                        None => None,
+                    };
                     let mut n = notice(NoticeLevel::Landed, None);
                     n.changeset = Some(id);
+                    n.landed_on = landed_on.clone();
                     n.untrusted.title =
                         cut(&crate::sessions::title_of(&cs.message), NOTICE_TITLE_BYTES);
                     n.untrusted.path = Some(p.clone());
@@ -708,6 +873,7 @@ impl Repo {
                         key: format!("landed:{id}"),
                         notice: n,
                         mine: Some((p.clone(), declared)),
+                        landed_by,
                     });
                 }
             }
@@ -787,11 +953,36 @@ impl Repo {
         Ok((!bases.is_empty()).then_some((bases, own)))
     }
 
-    /// Live sessions that look like `s`'s task: the same task key, or an
-    /// intent (title and approach) at least [`SIMILAR_PERCENT`] alike by
-    /// trigrams among the [`DUPLICATE_CANDIDATES`] newest active sessions
-    /// (declared ones only, on both sides).
-    pub(crate) async fn duplicates(&self, s: &Session) -> Result<Vec<Found>> {
+    /// Sessions with `s`'s task key: the live ones (at most
+    /// [`KEY_LIVE_SESSIONS`]), then the landed ones (at most
+    /// [`KEY_SESSIONS`]), each newest first, from two indexed listings run
+    /// together; none without a key.
+    /// Live ones are duplicates; landed ones tell a duplicate's land.
+    pub(crate) async fn key_sessions(&self, s: &Session) -> Result<Vec<Session>> {
+        let (Some(coord), Some(k)) = (self.coord.as_ref(), &s.task_key) else {
+            return Ok(Vec::new());
+        };
+        // Live and landed apart, each bounded: however many sessions of a
+        // reused key landed, they never hide a live duplicate.
+        let of = |state, limit| SessionFilter {
+            task_key: Some(k.clone()),
+            states: vec![state],
+            limit,
+            skip_paths: true,
+            ..Default::default()
+        };
+        let live = of(SessionState::Active, KEY_LIVE_SESSIONS);
+        let landed = of(SessionState::Landed, KEY_SESSIONS);
+        let (live, landed) = tokio::join!(coord.list_sessions(&live), coord.list_sessions(&landed));
+        let mut out = live?;
+        out.extend(landed?);
+        Ok(out)
+    }
+
+    /// Live declared sessions whose title and approach are at least
+    /// [`SIMILAR_PERCENT`] alike to `s`'s, among the
+    /// [`DUPLICATE_CANDIDATES`] newest.
+    pub(crate) async fn similar_duplicates(&self, s: &Session) -> Result<Vec<Found>> {
         let Some(coord) = self.coord.as_ref() else {
             return Ok(Vec::new());
         };
@@ -800,30 +991,6 @@ impl Repo {
             o.id != s.id && o.state_at(now) != SessionState::Expired && !same_agent_and_task(s, o)
         };
         let mut out = Vec::new();
-        let mut flagged = BTreeSet::new();
-        if let Some(k) = &s.task_key {
-            let same = coord
-                .list_sessions(&SessionFilter {
-                    task_key: Some(k.clone()),
-                    states: vec![SessionState::Active],
-                    limit: DUPLICATE_BY_KEY + 1,
-                    skip_paths: true,
-                    ..Default::default()
-                })
-                .await?;
-            for o in same.iter().filter(|o| live(o)) {
-                let mut n = notice(NoticeLevel::PossibleDuplicate, Some(o));
-                n.by = Some("task_key".into());
-                n.untrusted.task_key = Some(k.clone());
-                flagged.insert(o.id);
-                out.push(Found {
-                    level: NoticeLevel::PossibleDuplicate,
-                    key: format!("session:{}", o.id),
-                    notice: n,
-                    mine: None,
-                });
-            }
-        }
         // Only declared intents are compared: an inferred title is a commit
         // subject, and two commits to one file often read alike.
         let me = intent(&s.title, &s.approach);
@@ -841,7 +1008,7 @@ impl Repo {
             .await?;
         let mut similar: Vec<(u32, &Session)> = recent
             .iter()
-            .filter(|o| live(o) && !flagged.contains(&o.id))
+            .filter(|o| live(o))
             .map(|o| (alike(&me, &intent(&o.title, &o.approach)), o))
             .filter(|(p, _)| *p >= SIMILAR_PERCENT)
             .collect();
@@ -855,6 +1022,7 @@ impl Repo {
                 key: format!("session:{}", o.id),
                 notice: n,
                 mine: None,
+                landed_by: None,
             });
         }
         Ok(out)
@@ -1009,6 +1177,7 @@ mod tests {
             key: key.into(),
             notice: notice(level, None),
             mine: Some(("src/a.rs".into(), true)),
+            landed_by: None,
         }
     }
 
@@ -1166,6 +1335,22 @@ mod tests {
             "fix flaky test crates/leep-server/tests/notices.rs",
         );
         assert!(p >= SIMILAR_PERCENT, "{p}");
+    }
+
+    /// A creator that could not be read never lets the writer-chosen
+    /// `agent.session` alone tag a land as a duplicate's.
+    #[test]
+    fn an_unread_creator_never_tags_a_land() {
+        let c = leep_core::review_request::CreatedBy {
+            principal: "dee".into(),
+            timestamp: 1,
+        };
+        assert_eq!(
+            landed_by("d-1", Ok(Some(c))),
+            Some(("d-1".into(), Some("dee".into())))
+        );
+        assert_eq!(landed_by("d-1", Ok(None)), Some(("d-1".into(), None)));
+        assert_eq!(landed_by("d-1", Err(Error::Storage("down".into()))), None);
     }
 
     #[test]

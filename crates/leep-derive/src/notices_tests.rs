@@ -578,3 +578,319 @@ async fn one_notice_per_session_at_its_highest_level() {
     assert_eq!(n.untrusted.path.as_deref(), Some("src/auth/token.rs"));
     assert_eq!(n.untrusted.task_key.as_deref(), Some("L-3"));
 }
+
+/// The first of a duplicate pair hears of the second on its next answer
+/// (a create, a land or a notice read), not only the second at its
+/// declaration: the demo's dee was told `same_file` with no task key.
+/// Said once, and an agent restarted under a new key is never its own
+/// duplicate.
+#[tokio::test]
+async fn the_first_of_a_duplicate_pair_is_told_too() {
+    let r = repo();
+    let mut a = declare("a-1", "Fix rounding of invoice totals");
+    a.task_key = Some("BILL-42".into());
+    r.declare_session("ada", a).await.unwrap();
+    let mut b = declare("b-1", "Invoice totals are off by one cent");
+    b.task_key = Some("BILL-42".into());
+    b.scope = Some(vec!["src/billing/invoice.rs".into()]);
+    let told = r.declare_session("bo", b).await.unwrap().notices;
+    assert_eq!(levels(&told), ["possible_duplicate"]);
+
+    // ada's next create says so, naming bo, the key and the shared file.
+    let (_, n) = commit(&r, "ada", "a-1", &[], &["src/billing/invoice.rs"]).await;
+    assert_eq!(levels(&n), ["possible_duplicate"], "{n:?}");
+    assert_eq!(n[0].principal.as_deref(), Some("bo"));
+    assert_eq!(n[0].by.as_deref(), Some("task_key"));
+    assert_eq!(n[0].untrusted.task_key.as_deref(), Some("BILL-42"));
+    assert_eq!(
+        n[0].untrusted.other_path.as_deref(),
+        Some("src/billing/invoice.rs")
+    );
+    // Once.
+    assert!(r
+        .notices_for("ada", "a-1", &NoticeAsk::default())
+        .await
+        .is_empty());
+
+    // A notice read (and a land, which asks the same way) finds it too.
+    let mut c = declare("c-1", "Something else");
+    c.task_key = Some("BILL-42".into());
+    r.declare_session_with("cy", c, None).await.unwrap();
+    let n = r.notices_for("ada", "a-1", &NoticeAsk::default()).await;
+    assert_eq!(levels(&n), ["possible_duplicate"]);
+    assert_eq!(n[0].principal.as_deref(), Some("cy"));
+
+    // ada restarted under a new key: told of the others, never of itself.
+    let mut again = declare("a-2", "Fix rounding of invoice totals");
+    again.task_key = Some("BILL-42".into());
+    r.declare_session_with("ada", again, None).await.unwrap();
+    let n = r.notices_for("ada", "a-2", &NoticeAsk::default()).await;
+    assert_eq!(levels(&n), ["possible_duplicate", "possible_duplicate"]);
+    assert!(
+        n.iter().all(|n| n.principal.as_deref() != Some("ada")),
+        "{n:?}"
+    );
+}
+
+/// A session only ever inferred from commits (`LEEP_AGENT_SESSION`, no
+/// declaration) records the target ref its client names on the create
+/// (`Leep-Target-Ref`), never over a declared one, and hears of lands on
+/// it; one whose client named none (an older client) is taken to land on
+/// `main`, so it hears of lands there too.
+#[tokio::test]
+async fn an_undeclared_session_hears_of_lands() {
+    let r = repo();
+    let (seed, _) = commit(&r, "root", "r-0", &[], &["README"]).await;
+    let LandResponse::Landed { landed: base, .. } =
+        r.land_as(seed, "main", Some("root")).await.unwrap()
+    else {
+        panic!()
+    };
+    // ada commits without declaring, from a client that names no target.
+    commit(&r, "ada", "a-1", &[base], &["src/auth/token.rs"]).await;
+    let (theirs, _) = commit(&r, "bo", "b-1", &[base], &["src/auth/token.rs"]).await;
+    let LandResponse::Landed { landed, .. } = r.land_as(theirs, "main", Some("bo")).await.unwrap()
+    else {
+        panic!()
+    };
+    r.note_landed(theirs, landed, Some("bo")).await.unwrap();
+    let n = r.notices_for("ada", "a-1", &NoticeAsk::default()).await;
+    let l: Vec<_> = n.iter().filter(|n| n.level == "landed").collect();
+    assert_eq!(l.len(), 1, "{n:?}");
+    assert_eq!(l[0].changeset, Some(landed));
+
+    // A client that names its target: recorded on an inferred session.
+    let named = |key: &str, target: &str| {
+        let content = leep_core::Hash::of_blob(b"x");
+        let cs = Changeset {
+            parents: vec![base],
+            author: "cy".into(),
+            timestamp: 1_700_000_000,
+            message: "cy: edit".into(),
+            changes: [(
+                RepoPath::new("docs/x.md").unwrap(),
+                FileChange::Modify {
+                    content,
+                    kind: FileKind::Regular,
+                    size: 1,
+                },
+            )]
+            .into(),
+            extra: [(EXTRA_AGENT_SESSION.to_string(), key.to_string())].into(),
+        };
+        let mut seed = SessionSeed::of(&cs).unwrap();
+        seed.target_ref = Some(target.to_string());
+        (cs, seed)
+    };
+    r.put_blob(Bytes::from_static(b"x")).await.unwrap();
+    for (key, target, want) in [
+        ("c-1", "release", Some("release")),
+        ("c-2", "bad ref", None),
+    ] {
+        let (cs, seed) = named(key, target);
+        let id = r.create_changeset_by(cs, Some("cy")).await.unwrap();
+        let s = r
+            .note_created_session(seed, id, "cy")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.target_ref.as_deref(), want, "{key}");
+    }
+    // A declared target is never replaced by a commit's.
+    r.declare_session("dee", declare("d-1", "docs"))
+        .await
+        .unwrap();
+    let (cs, seed) = named("d-1", "release");
+    let id = r.create_changeset_by(cs, Some("dee")).await.unwrap();
+    let s = r
+        .note_created_session(seed, id, "dee")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.target_ref.as_deref(), Some("main"));
+}
+
+/// A land by a session with my task key is my duplicate's: its `landed`
+/// notice says `by: task_key` and names that session and the key; a land
+/// by anyone else is a plain `landed` (the demo's eli was told only that a
+/// changeset landed).
+#[tokio::test]
+async fn a_duplicates_land_is_named_as_such() {
+    let r = repo();
+    let (seed, _) = commit(&r, "root", "r-0", &[], &["README"]).await;
+    let LandResponse::Landed { landed: base, .. } =
+        r.land_as(seed, "main", Some("root")).await.unwrap()
+    else {
+        panic!()
+    };
+    let mut ids = Vec::new();
+    for (who, key) in [("dee", "d-1"), ("eli", "e-1")] {
+        let mut d = declare(key, "Fix invoice totals");
+        d.task_key = Some("BILL-42".into());
+        d.base = Some(base);
+        d.scope = Some(vec!["src/billing".into()]);
+        ids.push(
+            r.declare_session_with(who, d, None)
+                .await
+                .unwrap()
+                .session
+                .id,
+        );
+    }
+    // Someone else lands in billing first: plain.
+    let (other, _) = commit(&r, "bo", "b-1", &[base], &["src/billing/tax.rs"]).await;
+    let LandResponse::Landed { landed: l1, .. } =
+        r.land_as(other, "main", Some("bo")).await.unwrap()
+    else {
+        panic!()
+    };
+    r.note_landed(other, l1, Some("bo")).await.unwrap();
+    // dee lands its fix (rebased by the server onto bo's).
+    let (mine, _) = commit(&r, "dee", "d-1", &[base], &["src/billing/invoice.rs"]).await;
+    let LandResponse::Landed { landed: l2, .. } =
+        r.land_as(mine, "main", Some("dee")).await.unwrap()
+    else {
+        panic!()
+    };
+    r.note_landed(mine, l2, Some("dee")).await.unwrap();
+    let dee = ids[0];
+    let n = r.notices_for("eli", "e-1", &NoticeAsk::default()).await;
+    assert_eq!(levels(&n), ["landed", "landed"], "{n:?}");
+    let twin = n.iter().find(|n| n.changeset == Some(l2)).unwrap();
+    assert_eq!(twin.by.as_deref(), Some("task_key"));
+    assert_eq!(twin.session, Some(dee));
+    assert_eq!(twin.principal.as_deref(), Some("dee"));
+    assert_eq!(twin.untrusted.task_key.as_deref(), Some("BILL-42"));
+    let plain = n.iter().find(|n| n.changeset == Some(l1)).unwrap();
+    assert!(plain.by.is_none() && plain.session.is_none(), "{plain:?}");
+
+    // A pack lists the same land, tagged, as a land of its own.
+    let mut a = crate::context::ContextAsk {
+        principal: "eli".into(),
+        ..Default::default()
+    };
+    a.req.task = "Fix invoice totals".into();
+    a.req.session = Some("e-1".into());
+    let p = r.context_pack(&a).await.unwrap();
+    let w = p
+        .in_flight
+        .iter()
+        .find(|w| w.notice.changeset == Some(l2))
+        .unwrap_or_else(|| panic!("{:?}", p.in_flight));
+    assert!(w.id.starts_with("landed:"), "{}", w.id);
+    assert_eq!(w.notice.by.as_deref(), Some("task_key"));
+}
+
+/// Two lands by my duplicate are two `landed` notices, and its live work
+/// is still said beside them: a tagged land names the session but stands
+/// only for its changeset.
+#[tokio::test]
+async fn each_land_of_a_duplicate_is_its_own_notice() {
+    let r = repo();
+    let (seed, _) = commit(&r, "root", "r-0", &[], &["README"]).await;
+    let LandResponse::Landed { landed: base, .. } =
+        r.land_as(seed, "main", Some("root")).await.unwrap()
+    else {
+        panic!()
+    };
+    for (who, key) in [("dee", "d-1"), ("eli", "e-1")] {
+        let mut d = declare(key, "Fix invoice totals");
+        d.task_key = Some("BILL-42".into());
+        d.base = Some(base);
+        d.scope = Some(vec!["src/billing".into()]);
+        r.declare_session_with(who, d, None).await.unwrap();
+    }
+    // dee lands a stack of two changesets to the file; its session stays
+    // live (no land hook ran yet).
+    let (one, _) = commit(&r, "dee", "d-1", &[base], &["src/billing/invoice.rs"]).await;
+    let (two, _) = commit(&r, "dee", "d-1", &[one], &["src/billing/invoice.rs"]).await;
+    let LandResponse::Landed { landed, .. } = r.land_as(two, "main", Some("dee")).await.unwrap()
+    else {
+        panic!()
+    };
+    let n = r.notices_for("eli", "e-1", &NoticeAsk::default()).await;
+    assert_eq!(
+        levels(&n),
+        ["landed", "landed", "possible_duplicate"],
+        "{n:?}"
+    );
+    let lands: Vec<_> = n.iter().filter_map(|n| n.changeset).collect();
+    assert!(lands.contains(&landed) && lands.len() == 2, "{lands:?}");
+    assert!(n[..2].iter().all(|n| n.by.as_deref() == Some("task_key")));
+    assert_eq!(n[2].principal.as_deref(), Some("dee"));
+}
+
+/// However many sessions of a reused task key have landed, a live
+/// duplicate behind them is still found.
+#[tokio::test]
+async fn landed_sessions_never_hide_a_live_duplicate() {
+    let r = repo();
+    let mut a = declare("a-1", "Fix invoice totals");
+    a.task_key = Some("BILL-1".into());
+    let old = r
+        .declare_session_with("ada", a, None)
+        .await
+        .unwrap()
+        .session
+        .id;
+    let coord = r.coord().unwrap().clone();
+    for i in 0..=crate::notices::KEY_SESSIONS {
+        let mut d = declare(&format!("k-{i}"), "an earlier fix");
+        d.task_key = Some("BILL-1".into());
+        let who = format!("p{i}");
+        let id = r
+            .declare_session_with(&who, d, None)
+            .await
+            .unwrap()
+            .session
+            .id;
+        let end = SessionEnd {
+            state: SessionState::Landed,
+            at: leep_core::store::unix_now(),
+            landed_as: None,
+            principal: None,
+            if_head: None,
+        };
+        assert!(coord.end_session(id, &end).await.unwrap());
+    }
+    let mut b = declare("b-1", "Invoice totals are off");
+    b.task_key = Some("BILL-1".into());
+    let n = r.declare_session("bo", b).await.unwrap().notices;
+    assert_eq!(levels(&n), ["possible_duplicate"], "{n:?}");
+    assert_eq!(n[0].session, Some(old));
+}
+
+/// A session that named no target ref is walked against the server's
+/// default ref (`--default-ref`), not a fixed `main`, and its `landed`
+/// notice says which ref (`landed_on`) instead of calling it its own.
+#[tokio::test]
+async fn a_session_without_a_target_hears_of_the_default_ref() {
+    let r = repo().with_default_ref("trunk");
+    let (seed, _) = commit(&r, "root", "r-0", &[], &["README"]).await;
+    let LandResponse::Landed { landed: base, .. } =
+        r.land_as(seed, "trunk", Some("root")).await.unwrap()
+    else {
+        panic!()
+    };
+    commit(&r, "ada", "a-1", &[base], &["src/x.rs"]).await;
+    let (theirs, _) = commit(&r, "bo", "b-1", &[base], &["src/x.rs"]).await;
+    let LandResponse::Landed { landed, .. } = r.land_as(theirs, "trunk", Some("bo")).await.unwrap()
+    else {
+        panic!()
+    };
+    r.note_landed(theirs, landed, Some("bo")).await.unwrap();
+    let n = r.notices_for("ada", "a-1", &NoticeAsk::default()).await;
+    let l: Vec<_> = n.iter().filter(|n| n.level == "landed").collect();
+    assert_eq!(l.len(), 1, "{n:?}");
+    assert_eq!(l[0].landed_on.as_deref(), Some("trunk"));
+    // A session that names its target is told without it.
+    let mut d = declare("c-1", "work");
+    d.target_ref = Some("trunk".into());
+    d.base = Some(base);
+    d.scope = Some(vec!["src".into()]);
+    r.declare_session_with("cy", d, None).await.unwrap();
+    let n = r.notices_for("cy", "c-1", &NoticeAsk::default()).await;
+    let l: Vec<_> = n.iter().filter(|n| n.level == "landed").collect();
+    assert_eq!(l.len(), 1, "{n:?}");
+    assert!(l[0].landed_on.is_none());
+}

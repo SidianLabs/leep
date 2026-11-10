@@ -1788,7 +1788,9 @@ a second kind of mutable state beside refs, behind its own trait,
   agent's changesets already carry. Declared through `POST /v1/sessions`
   (title, approach, task key, scope, claims), or inferred from any created
   changeset carrying `agent.session` (head, base, touched paths, commit
-  subject as title), so clients that never declare anything still appear.
+  subject as title, and the target ref the client names in
+  `Leep-Target-Ref`), so clients that never declare anything still appear
+  and hear of lands.
   A land of a session's head ends it as `landed`. Upserts hold the row's
   lock while they merge, so concurrent commits never lose each other's
   paths. Touched paths are capped at 256, folding the deepest into their
@@ -1809,9 +1811,11 @@ a second kind of mutable state beside refs, behind its own trait,
   Answers to changeset creates, lands, session declarations and listings
   carry at most three notices for the caller's session, highest level
   first: `landed` (a changeset touching its paths landed on its target
-  ref since its base, found by walking at most 64 first parents),
-  `possible_duplicate` (same task key, or a declared title and approach at
-  least 60% alike by trigrams), `claimed`, `same_file` and `near` (one
+  ref since its base, found by walking at most 64 first parents; `by
+  task_key` when a session with the same task key landed it),
+  `possible_duplicate` (same task key, looked for on every answer, or a
+  declared title and approach at least 60% alike by trigrams, compared on
+  declarations), `claimed`, `same_file` and `near` (one
   `CoordStore::near_paths` call: exact probes plus capped range scans on
   `(repo_id, path)`, claims and exact rows first). Each other session is
   one notice at its highest level, said once per session for 30 minutes
@@ -1831,9 +1835,12 @@ a second kind of mutable state beside refs, behind its own trait,
   that changed with the paths in their newest 200 path-history changesets),
   owners and `carry` directives, the last change per file with its creator
   and model, in-flight work and duplicates (ADR 0096's overlap functions,
-  marking nothing said) and the ref's green, red and suspects touching the
+  marking nothing said; levels ranked by the request's and the session's
+  own paths, work met only on a related file marked `via: related` and
+  listed after) and the ref's green, red and suspects touching the
   files. Each section within 1 s and the call within 2 s; a section that
   fails or runs out of time is listed as omitted and the rest still comes.
+  Owners and history items each cover every file with the same answer.
   Items carry ids and exact sizes and are cut to the byte budget by
   per-section quotas, each section a ranked prefix; the same request on the
   same state is the same bytes. Agent-written text is under `untrusted`.

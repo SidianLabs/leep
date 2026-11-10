@@ -427,9 +427,12 @@ fn run_with(cli: Cli, sink: &Arc<Mutex<Vec<Notice>>>) -> Result<i32> {
         env_token().as_deref(),
         wc.config.token.as_deref(),
     );
-    // Every request is a heartbeat of the agent's session (ADR 0095).
+    // Every request is a heartbeat of the agent's session (ADR 0095), and
+    // a commit names where it is meant to land, so a session inferred from
+    // it hears of lands there.
     let client = Client::with_token(&server_for(Some(&wc))?, token.as_deref())
         .with_session(session::session_key(None, Some(&wc)).as_deref())
+        .with_target_ref(Some(&wc.config.target_ref))
         .with_notice_sink(sink.clone());
     let mut ctx = Ctx {
         wc,

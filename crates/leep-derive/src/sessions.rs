@@ -197,6 +197,9 @@ pub struct SessionSeed {
     pub model: Option<String>,
     /// Clean paths (see [`leep_core::coord::clean_path`]), possibly folded.
     pub touch: Vec<String>,
+    /// The ref the work is meant to land on, when the client said
+    /// (`Leep-Target-Ref`): recorded only when the session has none.
+    pub target_ref: Option<String>,
 }
 
 impl SessionSeed {
@@ -239,6 +242,7 @@ impl SessionSeed {
                 .filter(|m| m.len() <= MAX_KEY_BYTES && !m.chars().any(char::is_control))
                 .cloned(),
             touch,
+            target_ref: None,
         })
     }
 }
@@ -536,6 +540,9 @@ impl Repo {
         u.base = seed.base;
         u.head = Some(id);
         u.agent_model = seed.model;
+        u.target_ref = seed
+            .target_ref
+            .filter(|r| leep_core::refname::validate(r).is_ok());
         u.touch = if seed.touch.len() > MAX_TOUCHED_PATHS {
             let touch = seed.touch;
             tokio::task::spawn_blocking(move || bound_paths(&touch, MAX_TOUCHED_PATHS))
