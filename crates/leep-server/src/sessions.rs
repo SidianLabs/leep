@@ -389,8 +389,9 @@ pub(crate) fn after_land(
 }
 
 /// Write held heartbeats every [`FLUSH_EVERY`], and sweep expired and
-/// long-ended sessions and refresh `leep_sessions_active` every
-/// [`SWEEP_EVERY`], until the process ends. Every server runs it; the
+/// long-ended sessions, expired and long-closed notes (ADR 0098), and
+/// refresh `leep_sessions_active` every [`SWEEP_EVERY`], until the process
+/// ends. Every server runs it; the
 /// statements are conditional, so several servers sweeping at once agree.
 pub fn spawn_session_tasks(repo: Repo) {
     if repo.coord().is_none() {
@@ -415,6 +416,11 @@ pub fn spawn_session_tasks(repo: Repo) {
                 metrics::counter!("leep_session_hook_errors_total", "hook" => "sweep", "reason" => "error")
                     .increment(1);
                 tracing::warn!(error = %e, "sweeping sessions failed");
+            }
+            if let Err(e) = repo.sweep_notes(16).await {
+                metrics::counter!("leep_session_hook_errors_total", "hook" => "notes_sweep", "reason" => "error")
+                    .increment(1);
+                tracing::warn!(error = %e, "sweeping notes failed");
             }
             match repo.count_active_sessions(GAUGE_CAP).await {
                 Ok(n) => metrics::gauge!("leep_sessions_active").set(n as f64),

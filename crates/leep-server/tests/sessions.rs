@@ -625,6 +625,46 @@ impl leep_core::coord::CoordStore for Hanging {
     ) -> leep_core::Result<Vec<leep_core::coord::NearRow>> {
         std::future::pending().await
     }
+    async fn add_note(
+        &self,
+        _: &leep_core::coord::NewNote,
+    ) -> leep_core::Result<leep_core::coord::Note> {
+        std::future::pending().await
+    }
+    async fn get_note(&self, _: u64) -> leep_core::Result<Option<leep_core::coord::Note>> {
+        std::future::pending().await
+    }
+    async fn list_notes(
+        &self,
+        _: &leep_core::coord::NoteFilter,
+    ) -> leep_core::Result<Vec<leep_core::coord::Note>> {
+        std::future::pending().await
+    }
+    async fn notes_at(
+        &self,
+        _: &[String],
+        _: usize,
+    ) -> leep_core::Result<Vec<leep_core::coord::Note>> {
+        std::future::pending().await
+    }
+    async fn change_note(
+        &self,
+        _: u64,
+        _: &leep_core::coord::NoteChange,
+        _: i64,
+    ) -> leep_core::Result<bool> {
+        std::future::pending().await
+    }
+    async fn revoke_notes(&self, _: &str, _: i64) -> leep_core::Result<u64> {
+        std::future::pending().await
+    }
+    async fn sweep_notes(
+        &self,
+        _: i64,
+        _: usize,
+    ) -> leep_core::Result<leep_core::coord::NoteSweep> {
+        std::future::pending().await
+    }
 }
 
 /// A coordination store that hangs costs a create at most its 250 ms

@@ -16,6 +16,7 @@ pub mod errors;
 pub mod fingerprint;
 pub mod guard;
 pub mod limits;
+mod notes;
 pub mod observe;
 pub mod protect;
 pub mod read_limits;
@@ -335,6 +336,9 @@ pub fn router_with_read_classes(
         )
         .route("/v1/sessions/{id}/overlaps", get(sessions::overlaps))
         .route("/v1/notices", get(sessions::notices))
+        .route("/v1/notes", get(notes::list).post(notes::add))
+        .route("/v1/notes/{id}", get(notes::get_one).delete(notes::retract))
+        .route("/v1/notes/{id}/report", post(notes::report))
         .route("/v1/context", post(context::pack))
         .route("/v1/refs", get(list_refs))
         .route("/v1/refs/{*name}", get(get_ref).post(post_ref))
@@ -708,6 +712,7 @@ async fn whoami(auth::MaybePrincipal(who): auth::MaybePrincipal) -> Json<WhoAmIR
             role: Some(p.role.as_str().to_string()),
             name: Some(p.name),
             author: p.author,
+            kind: Some(p.kind.as_str().to_string()),
         },
         None => WhoAmIResponse::default(),
     })

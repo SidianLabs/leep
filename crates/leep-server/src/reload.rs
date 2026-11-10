@@ -384,6 +384,7 @@ impl ReloadReport {
                 expiry_changed = ?t.expiry_changed,
                 review_changed = ?t.review_changed,
                 checks_changed = ?t.checks_changed,
+                kind_changed = ?t.kind_changed,
                 "tokens changed"
             );
         }

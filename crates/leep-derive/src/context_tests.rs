@@ -432,6 +432,35 @@ impl CoordStore for Stuck {
         self.wait().await?;
         self.inner.near_paths(q).await
     }
+    async fn add_note(&self, n: &leep_core::coord::NewNote) -> Result<leep_core::coord::Note> {
+        self.inner.add_note(n).await
+    }
+    async fn get_note(&self, id: u64) -> Result<Option<leep_core::coord::Note>> {
+        self.inner.get_note(id).await
+    }
+    async fn list_notes(
+        &self,
+        f: &leep_core::coord::NoteFilter,
+    ) -> Result<Vec<leep_core::coord::Note>> {
+        self.inner.list_notes(f).await
+    }
+    async fn notes_at(&self, a: &[String], cap: usize) -> Result<Vec<leep_core::coord::Note>> {
+        self.inner.notes_at(a, cap).await
+    }
+    async fn change_note(
+        &self,
+        id: u64,
+        c: &leep_core::coord::NoteChange,
+        at: i64,
+    ) -> Result<bool> {
+        self.inner.change_note(id, c, at).await
+    }
+    async fn revoke_notes(&self, p: &str, at: i64) -> Result<u64> {
+        self.inner.revoke_notes(p, at).await
+    }
+    async fn sweep_notes(&self, now: i64, limit: usize) -> Result<leep_core::coord::NoteSweep> {
+        self.inner.sweep_notes(now, limit).await
+    }
 }
 
 fn omitted(p: &ContextPack) -> Vec<(&str, &str)> {
@@ -675,6 +704,35 @@ impl CoordStore for NoLookup {
     }
     async fn near_paths(&self, q: &NearQuery) -> Result<Vec<NearRow>> {
         self.0.near_paths(q).await
+    }
+    async fn add_note(&self, n: &leep_core::coord::NewNote) -> Result<leep_core::coord::Note> {
+        self.0.add_note(n).await
+    }
+    async fn get_note(&self, id: u64) -> Result<Option<leep_core::coord::Note>> {
+        self.0.get_note(id).await
+    }
+    async fn list_notes(
+        &self,
+        f: &leep_core::coord::NoteFilter,
+    ) -> Result<Vec<leep_core::coord::Note>> {
+        self.0.list_notes(f).await
+    }
+    async fn notes_at(&self, a: &[String], cap: usize) -> Result<Vec<leep_core::coord::Note>> {
+        self.0.notes_at(a, cap).await
+    }
+    async fn change_note(
+        &self,
+        id: u64,
+        c: &leep_core::coord::NoteChange,
+        at: i64,
+    ) -> Result<bool> {
+        self.0.change_note(id, c, at).await
+    }
+    async fn revoke_notes(&self, p: &str, at: i64) -> Result<u64> {
+        self.0.revoke_notes(p, at).await
+    }
+    async fn sweep_notes(&self, now: i64, limit: usize) -> Result<leep_core::coord::NoteSweep> {
+        self.0.sweep_notes(now, limit).await
     }
 }
 
@@ -1075,6 +1133,35 @@ impl CoordStore for KeyListingFails {
     }
     async fn near_paths(&self, q: &NearQuery) -> Result<Vec<NearRow>> {
         self.0.near_paths(q).await
+    }
+    async fn add_note(&self, n: &leep_core::coord::NewNote) -> Result<leep_core::coord::Note> {
+        self.0.add_note(n).await
+    }
+    async fn get_note(&self, id: u64) -> Result<Option<leep_core::coord::Note>> {
+        self.0.get_note(id).await
+    }
+    async fn list_notes(
+        &self,
+        f: &leep_core::coord::NoteFilter,
+    ) -> Result<Vec<leep_core::coord::Note>> {
+        self.0.list_notes(f).await
+    }
+    async fn notes_at(&self, a: &[String], cap: usize) -> Result<Vec<leep_core::coord::Note>> {
+        self.0.notes_at(a, cap).await
+    }
+    async fn change_note(
+        &self,
+        id: u64,
+        c: &leep_core::coord::NoteChange,
+        at: i64,
+    ) -> Result<bool> {
+        self.0.change_note(id, c, at).await
+    }
+    async fn revoke_notes(&self, p: &str, at: i64) -> Result<u64> {
+        self.0.revoke_notes(p, at).await
+    }
+    async fn sweep_notes(&self, now: i64, limit: usize) -> Result<leep_core::coord::NoteSweep> {
+        self.0.sweep_notes(now, limit).await
     }
 }
 

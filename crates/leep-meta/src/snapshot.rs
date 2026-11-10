@@ -8,7 +8,8 @@
 //! always appear together. Because it is an ordinary Leep metadata database,
 //! `verify` and the server open it unchanged, and it restores into either
 //! backend. Leases and sessions (ADR 0095) are left out: both describe the
-//! live servers and agents of the old store, not its history.
+//! live servers and agents of the old store, not its history. Notes (ADR
+//! 0098) are kept: an endorsed note is long-lived shared memory.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -45,6 +46,8 @@ pub struct SnapshotInfo {
     /// Highest ref log `seq` ever issued, which can exceed the highest entry
     /// that still exists.
     pub ref_log_last_seq: u64,
+    /// Notes (ADR 0098), every state.
+    pub notes: u64,
 }
 
 /// Say which step failed: "database is locked" alone does not.
@@ -127,6 +130,97 @@ type ReviewerRow = (i64, String);
 const REQUEST_COLUMNS: &str =
     "id, repo_id, changeset, target_ref, requester, message, created, state, closed, landed_as";
 
+/// A `notes` row with every column (ADR 0098), as stored.
+#[derive(Debug, Clone)]
+struct NoteRow {
+    id: i64,
+    repo_id: i64,
+    kind: String,
+    anchor_type: String,
+    anchor: String,
+    at_changeset: Option<Vec<u8>>,
+    at_blob: Option<Vec<u8>>,
+    line_start: Option<i32>,
+    line_end: Option<i32>,
+    title: String,
+    body: String,
+    principal: String,
+    agent_model: Option<String>,
+    session_id: Option<i64>,
+    trust: String,
+    endorsed_by: Option<String>,
+    endorsed_at: Option<i64>,
+    state: String,
+    superseded_by: Option<i64>,
+    created: i64,
+    expires: Option<i64>,
+}
+
+const NOTE_COLUMNS: &str = "id, repo_id, kind, anchor_type, anchor, at_changeset, at_blob, \
+     line_start, line_end, title, body, principal, agent_model, session_id, trust, endorsed_by, \
+     endorsed_at, state, superseded_by, created, expires";
+
+/// Read a `notes` row of either backend, columns in [`NOTE_COLUMNS`] order.
+macro_rules! note_row {
+    ($r:expr) => {{
+        let r = $r;
+        NoteRow {
+            id: r.try_get(0).map_err(storage)?,
+            repo_id: r.try_get(1).map_err(storage)?,
+            kind: r.try_get(2).map_err(storage)?,
+            anchor_type: r.try_get(3).map_err(storage)?,
+            anchor: r.try_get(4).map_err(storage)?,
+            at_changeset: r.try_get(5).map_err(storage)?,
+            at_blob: r.try_get(6).map_err(storage)?,
+            line_start: r.try_get(7).map_err(storage)?,
+            line_end: r.try_get(8).map_err(storage)?,
+            title: r.try_get(9).map_err(storage)?,
+            body: r.try_get(10).map_err(storage)?,
+            principal: r.try_get(11).map_err(storage)?,
+            agent_model: r.try_get(12).map_err(storage)?,
+            session_id: r.try_get(13).map_err(storage)?,
+            trust: r.try_get(14).map_err(storage)?,
+            endorsed_by: r.try_get(15).map_err(storage)?,
+            endorsed_at: r.try_get(16).map_err(storage)?,
+            state: r.try_get(17).map_err(storage)?,
+            superseded_by: r.try_get(18).map_err(storage)?,
+            created: r.try_get(19).map_err(storage)?,
+            expires: r.try_get(20).map_err(storage)?,
+        }
+    }};
+}
+
+/// An `INSERT` of `rows` into `notes`, keeping their ids.
+macro_rules! insert_notes {
+    ($db:ty, $rows:expr) => {{
+        let mut q = QueryBuilder::<$db>::new(format!("INSERT INTO notes ({NOTE_COLUMNS}) "));
+        q.push_values($rows, |mut b, r: &NoteRow| {
+            b.push_bind(r.id)
+                .push_bind(r.repo_id)
+                .push_bind(r.kind.clone())
+                .push_bind(r.anchor_type.clone())
+                .push_bind(r.anchor.clone())
+                .push_bind(r.at_changeset.clone())
+                .push_bind(r.at_blob.clone())
+                .push_bind(r.line_start)
+                .push_bind(r.line_end)
+                .push_bind(r.title.clone())
+                .push_bind(r.body.clone())
+                .push_bind(r.principal.clone())
+                .push_bind(r.agent_model.clone())
+                .push_bind(r.session_id)
+                .push_bind(r.trust.clone())
+                .push_bind(r.endorsed_by.clone())
+                .push_bind(r.endorsed_at)
+                .push_bind(r.state.clone())
+                .push_bind(r.superseded_by)
+                .push_bind(r.created)
+                .push_bind(r.expires);
+        });
+        q
+    }};
+}
+
 /// Rows of one read transaction on the source.
 #[async_trait]
 trait Source: Send {
@@ -145,6 +239,8 @@ trait Source: Send {
         after: &ReviewerRow,
         limit: usize,
     ) -> Result<Vec<ReviewerRow>>;
+    /// `notes` rows with ids above `after`, in id order (ADR 0098).
+    async fn notes(&mut self, after: i64, limit: usize) -> Result<Vec<NoteRow>>;
 }
 
 /// One write transaction on the destination.
@@ -162,6 +258,8 @@ trait Sink: Send {
     /// Rows keep their ids; later requests get higher ones.
     async fn put_review_requests(&mut self, rows: &[RequestRow]) -> Result<()>;
     async fn put_review_request_reviewers(&mut self, rows: &[ReviewerRow]) -> Result<()>;
+    /// Rows keep their ids; later notes get higher ones.
+    async fn put_notes(&mut self, rows: &[NoteRow]) -> Result<()>;
     async fn commit(self: Box<Self>) -> Result<()>;
 }
 
@@ -176,6 +274,7 @@ async fn copy(src: &mut dyn Source, dst: &mut dyn Sink) -> Result<SnapshotInfo> 
         derived: 0,
         ref_log: 0,
         ref_log_last_seq: 0,
+        notes: 0,
     };
     // Features first: they say how to read the rows that follow.
     dst.put_store_features(&src.store_features().await?).await?;
@@ -227,6 +326,14 @@ async fn copy(src: &mut dyn Source, dst: &mut dyn Sink) -> Result<SnapshotInfo> 
         let Some(last) = page.last() else { break };
         after = last.clone();
         dst.put_review_request_reviewers(&page).await?;
+    }
+    let mut after = 0i64;
+    loop {
+        let page = src.notes(after, PAGE).await?;
+        let Some(last) = page.last() else { break };
+        after = last.id;
+        info.notes += page.len() as u64;
+        dst.put_notes(&page).await?;
     }
     Ok(info)
 }
@@ -502,6 +609,22 @@ impl SqliteSource {
 
 #[async_trait]
 impl Source for SqliteSource {
+    async fn notes(&mut self, after: i64, limit: usize) -> Result<Vec<NoteRow>> {
+        let rows = sqlx::query(AssertSqlSafe(format!(
+            "SELECT {NOTE_COLUMNS} FROM notes WHERE id > ? ORDER BY id LIMIT ?"
+        )))
+        .bind(after)
+        .bind(limit as i64)
+        .fetch_all(&mut *self.0)
+        .await
+        .map_err(storage)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            out.push(note_row!(r));
+        }
+        Ok(out)
+    }
+
     async fn review_requests(&mut self, after: i64, limit: usize) -> Result<Vec<RequestRow>> {
         sqlx::query_as(AssertSqlSafe(format!(
             "SELECT {REQUEST_COLUMNS} FROM review_requests WHERE id > ? ORDER BY id LIMIT ?"
@@ -634,6 +757,15 @@ impl SqliteSink {
 
 #[async_trait]
 impl Sink for SqliteSink {
+    async fn put_notes(&mut self, rows: &[NoteRow]) -> Result<()> {
+        insert_notes!(Sqlite, rows)
+            .build()
+            .execute(&mut *self.0)
+            .await
+            .map_err(storage)?;
+        Ok(())
+    }
+
     async fn put_review_requests(&mut self, rows: &[RequestRow]) -> Result<()> {
         let mut q = QueryBuilder::<Sqlite>::new(format!(
             "INSERT INTO review_requests ({REQUEST_COLUMNS}) "
@@ -673,7 +805,8 @@ impl Sink for SqliteSink {
              + (SELECT COUNT(*) FROM (SELECT 1 FROM ref_log LIMIT 1)) \
              + (SELECT COUNT(*) FROM (SELECT 1 FROM changeset_dicts LIMIT 1)) \
              + (SELECT COUNT(*) FROM (SELECT 1 FROM store_features LIMIT 1)) \
-             + (SELECT COUNT(*) FROM (SELECT 1 FROM review_requests LIMIT 1))",
+             + (SELECT COUNT(*) FROM (SELECT 1 FROM review_requests LIMIT 1)) \
+             + (SELECT COUNT(*) FROM (SELECT 1 FROM notes LIMIT 1))",
         )
         .fetch_one(&mut *self.0)
         .await
@@ -691,6 +824,8 @@ impl Sink for SqliteSink {
             "ref_log",
             "review_requests",
             "review_request_reviewers",
+            // Notes are shared memory (ADR 0098): backed up and restored.
+            "notes",
             // Leases name servers of the old store; never restored.
             "leases",
             // Sessions are advisory and expiring (ADR 0095): never backed
@@ -824,6 +959,22 @@ impl PgSource {
 
 #[async_trait]
 impl Source for PgSource {
+    async fn notes(&mut self, after: i64, limit: usize) -> Result<Vec<NoteRow>> {
+        let rows = sqlx::query(AssertSqlSafe(format!(
+            "SELECT {NOTE_COLUMNS} FROM notes WHERE id > $1 ORDER BY id LIMIT $2"
+        )))
+        .bind(after)
+        .bind(limit as i64)
+        .fetch_all(&mut *self.0)
+        .await
+        .map_err(storage)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            out.push(note_row!(r));
+        }
+        Ok(out)
+    }
+
     async fn review_requests(&mut self, after: i64, limit: usize) -> Result<Vec<RequestRow>> {
         sqlx::query_as(AssertSqlSafe(format!(
             "SELECT {REQUEST_COLUMNS} FROM review_requests WHERE id > $1 ORDER BY id LIMIT $2"
@@ -961,6 +1112,23 @@ impl PgSink {
 
 #[async_trait]
 impl Sink for PgSink {
+    async fn put_notes(&mut self, rows: &[NoteRow]) -> Result<()> {
+        insert_notes!(Postgres, rows)
+            .build()
+            .execute(&mut *self.0)
+            .await
+            .map_err(storage)?;
+        // Explicit ids do not move the sequence; the next note must get a
+        // higher id than any restored one.
+        sqlx::query(
+            "SELECT setval(pg_get_serial_sequence('notes', 'id'), (SELECT MAX(id) FROM notes))",
+        )
+        .execute(&mut *self.0)
+        .await
+        .map_err(storage)?;
+        Ok(())
+    }
+
     async fn put_review_requests(&mut self, rows: &[RequestRow]) -> Result<()> {
         let mut q = QueryBuilder::<Postgres>::new(format!(
             "INSERT INTO review_requests ({REQUEST_COLUMNS}) "
@@ -1007,7 +1175,7 @@ impl Sink for PgSink {
         // the lock turns it into a wait, not a corrupt mix.
         sqlx::query(
             "LOCK TABLE changesets, changeset_dicts, store_features, refs, derived, ref_log, \
-             review_requests, review_request_reviewers IN ACCESS EXCLUSIVE MODE",
+             review_requests, review_request_reviewers, notes IN ACCESS EXCLUSIVE MODE",
         )
         .execute(&mut *self.0)
         .await
@@ -1019,7 +1187,8 @@ impl Sink for PgSink {
              + (SELECT COUNT(*) FROM (SELECT 1 FROM ref_log LIMIT 1) d) \
              + (SELECT COUNT(*) FROM (SELECT 1 FROM changeset_dicts LIMIT 1) e) \
              + (SELECT COUNT(*) FROM (SELECT 1 FROM store_features LIMIT 1) f) \
-             + (SELECT COUNT(*) FROM (SELECT 1 FROM review_requests LIMIT 1) g)",
+             + (SELECT COUNT(*) FROM (SELECT 1 FROM review_requests LIMIT 1) g) \
+             + (SELECT COUNT(*) FROM (SELECT 1 FROM notes LIMIT 1) h)",
         )
         .fetch_one(&mut *self.0)
         .await
@@ -1037,6 +1206,8 @@ impl Sink for PgSink {
             "ref_log",
             "review_requests",
             "review_request_reviewers",
+            // Notes are shared memory (ADR 0098): backed up and restored.
+            "notes",
             // Leases name servers of the old store; never restored.
             "leases",
             // Sessions are advisory and expiring (ADR 0095): never backed

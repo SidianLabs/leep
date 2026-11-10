@@ -37,6 +37,7 @@ fn start(with_endpoints: bool) -> (String, Shared) {
                 name: Some("ada".into()),
                 role: Some("write".into()),
                 author: None,
+                kind: None,
             })
         }),
     );

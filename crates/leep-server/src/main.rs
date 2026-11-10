@@ -520,6 +520,17 @@ enum LogFormat {
 }
 
 #[derive(Subcommand)]
+enum NotesCmd {
+    /// Retract every open note of one principal (a token name), whoever
+    /// reads them: the response to a token found writing hostile notes.
+    /// Prints how many. The notes stay listable as `retracted` for 30 days.
+    Revoke {
+        #[arg(long)]
+        principal: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Read a token from stdin and print its `blake3:` digest.
     HashToken,
@@ -543,6 +554,12 @@ enum Cmd {
         /// reviews never count. For agent tokens.
         #[arg(long)]
         no_review: bool,
+        /// Who holds the token: `human` marks a person's (`"kind":
+        /// "human"`), so its notes are trusted as a person's (ADR 0098).
+        /// Unset, the entry has no `kind` and counts as an agent's. Every
+        /// server must be upgraded before a tokens file uses it.
+        #[arg(long)]
+        kind: Option<auth::TokenKind>,
     },
     /// Delete blobs no changeset references (uses --meta and --blobs; safe
     /// beside running servers). Without a phase: condemn, wait --fence, then
@@ -694,6 +711,12 @@ enum Cmd {
     DeriveSearch {
         /// Ref name or full changeset id.
         rev: String,
+    },
+    /// Operate on notes (ADR 0098). Uses --meta; safe beside running
+    /// servers.
+    Notes {
+        #[command(subcommand)]
+        cmd: NotesCmd,
     },
     /// Check a store without writing to it: every ref's history, tree nodes
     /// and blobs exist and match their addresses, the ref log replays to the
@@ -1315,6 +1338,19 @@ async fn run_unreachable_report(
     Ok(())
 }
 
+/// `notes revoke --principal P` (ADR 0098): one conditional statement.
+async fn run_revoke_notes(meta: &str, principal: &str) -> anyhow::Result<()> {
+    let meta = open_meta(meta).await.context("opening meta store")?;
+    let coord = meta
+        .coord_store()
+        .context("this metadata store keeps no notes (its schema is older than migration 10)")?;
+    let n = coord
+        .revoke_notes(principal, leep_core::store::unix_now())
+        .await?;
+    outln!("revoked {n} open notes of {principal:?}");
+    Ok(())
+}
+
 async fn run_derive_search(meta: &str, blobs: &str, rev: &str) -> anyhow::Result<()> {
     let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
     let meta = open_meta(meta).await.context("opening meta store")?;
@@ -1342,6 +1378,7 @@ fn run_command(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Gc { .. }
         | Cmd::Repack(_)
         | Cmd::DeriveSearch { .. }
+        | Cmd::Notes { .. }
         | Cmd::Migrate { .. }
         | Cmd::CompactChangesets { .. }
         | Cmd::Verify(_)
@@ -1358,10 +1395,12 @@ fn run_command(cmd: Cmd) -> anyhow::Result<()> {
             author,
             expires_in,
             no_review,
+            kind,
         } => {
             let (token, mut entry) = auth::generate(&name, role).map_err(anyhow::Error::msg)?;
             entry.author = author;
             entry.review = no_review.then_some(false);
+            entry.kind = kind;
             if let Some(d) = expires_in {
                 let at = jiff::Timestamp::now()
                     .checked_add(d)
@@ -1820,6 +1859,9 @@ async fn run() -> anyhow::Result<()> {
         Some(Cmd::DeriveSearch { rev }) => {
             return run_derive_search(&args.meta, &args.blobs, &rev).await
         }
+        Some(Cmd::Notes {
+            cmd: NotesCmd::Revoke { principal },
+        }) => return run_revoke_notes(&args.meta, &principal).await,
         Some(Cmd::Verify(v)) => {
             std::process::exit(repair::run_verify(&args.meta, &args.blobs, v).await)
         }
@@ -2530,6 +2572,16 @@ mod tests {
             &["gc", "condemn"],
             &["migrate", "--status"],
             &["derive-search", "main"],
+            &["notes", "revoke", "--principal", "p"],
+            &[
+                "gen-token",
+                "--name",
+                "n",
+                "--role",
+                "write",
+                "--kind",
+                "human",
+            ],
         ];
         let flags: Vec<&str> = global_flags().concat();
         for sub in subcommands {

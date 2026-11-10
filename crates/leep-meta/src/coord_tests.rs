@@ -48,6 +48,33 @@ async fn an_older_schema_has_no_coord_store() {
     assert!(c.upsert_session(&u).await.unwrap().1);
 }
 
+/// A store opened with the schema of migration 0009 keeps sessions but no
+/// notes (ADR 0098): note calls answer 404, and the sweep does nothing.
+#[tokio::test]
+async fn a_schema_before_notes_keeps_no_notes() {
+    use leep_core::coord::{NoteFilter, NoteSweep};
+    let migs = &SQLITE_MIGRATIONS[..9];
+    let s = SqliteMetaStore::connect_with_migrations("sqlite::memory:", SchemaMode::Migrate, migs)
+        .await
+        .unwrap();
+    let c = s.coord_store().unwrap();
+    let u = SessionUpdate::new("ada", "k", SessionOrigin::Declared, 1);
+    assert!(c.upsert_session(&u).await.unwrap().1);
+    let f = NoteFilter {
+        limit: 10,
+        ..Default::default()
+    };
+    assert!(matches!(
+        c.list_notes(&f).await,
+        Err(leep_core::Error::NotFound(_))
+    ));
+    assert!(matches!(
+        c.get_note(1).await,
+        Err(leep_core::Error::NotFound(_))
+    ));
+    assert_eq!(c.sweep_notes(1, 10).await.unwrap(), NoteSweep::default());
+}
+
 /// Paths compare bytewise on Postgres too: a directory's range scan holds
 /// what is below it and nothing beside it, whatever the database's
 /// collation would say about `/`, `-` and `.`.

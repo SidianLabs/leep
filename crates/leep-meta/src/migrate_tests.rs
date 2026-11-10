@@ -613,6 +613,10 @@ fn full_schema() -> BTreeSet<String> {
         "session_paths_path",
         "session_beats",
         "session_beats_at",
+        "notes",
+        "notes_anchor",
+        "notes_principal",
+        "notes_expires",
     ]
     .map(String::from)
     .into()
@@ -1011,7 +1015,8 @@ async fn upgrade_from_v4_adds_land_ids() {
                 "leases",
                 "changeset_stored_at",
                 "review_requests",
-                "sessions"
+                "sessions",
+                "notes"
             ],
             "{kind}"
         );
@@ -1068,7 +1073,12 @@ async fn upgrade_from_v6_adds_stored_at() {
         assert_eq!(plan.from, v6 as u64, "{kind}");
         assert_eq!(
             plan.pending.iter().map(|m| m.name).collect::<Vec<_>>(),
-            ["changeset_stored_at", "review_requests", "sessions"],
+            [
+                "changeset_stored_at",
+                "review_requests",
+                "sessions",
+                "notes"
+            ],
             "{kind}"
         );
         assert!(
@@ -1149,7 +1159,7 @@ async fn upgrade_from_v7_adds_review_requests() {
         assert_eq!(plan.from, 7, "{kind}");
         assert_eq!(
             plan.pending.iter().map(|m| m.name).collect::<Vec<_>>(),
-            ["review_requests", "sessions"],
+            ["review_requests", "sessions", "notes"],
             "{kind}"
         );
         db.migrate(db.compiled(), false).await.unwrap();
@@ -1237,7 +1247,7 @@ async fn upgrade_from_v8_adds_sessions() {
         assert_eq!(plan.from, 8, "{kind}");
         assert_eq!(
             plan.pending.iter().map(|m| m.name).collect::<Vec<_>>(),
-            ["sessions"],
+            ["sessions", "notes"],
             "{kind}"
         );
         db.migrate(db.compiled(), false).await.unwrap();
@@ -1289,6 +1299,120 @@ async fn upgrade_from_v8_adds_sessions() {
             [made],
             "{kind}"
         );
+        assert_eq!(db.objects().await, full_schema(), "{kind}");
+        drop((s, coord));
+        db.cleanup().await;
+    }
+}
+
+/// A database at v9 upgrades to notes (ADR 0098) beside a v9 server that
+/// keeps running: its sessions read back, it keeps working on the new
+/// schema (it never names the table), and the table starts empty and takes
+/// notes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upgrade_from_v9_adds_notes() {
+    use leep_core::coord::{
+        AnchorType, NewNote, NoteFilter, NoteKind, NoteState, NoteTrust, SessionEnd, SessionFilter,
+        SessionOrigin, SessionState, SessionUpdate, SweepReport,
+    };
+    for db in dbs("fromv9").await {
+        let kind = db.kind();
+        let d = data();
+        let old = db
+            .open(&db.compiled()[..9], SchemaMode::Migrate)
+            .await
+            .unwrap();
+        load(&db, &STAGES[1], &d).await;
+        // A session written by the v9 server survives the upgrade.
+        let old_coord = old.coord_store().expect("sessions at v9");
+        let u = SessionUpdate::new("ada", "s-9", SessionOrigin::Declared, 1_700_000_400);
+        let (before, _) = old_coord.upsert_session(&u).await.unwrap();
+        assert!(old_coord
+            .list_notes(&NoteFilter {
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .is_err());
+        let plan = db.report(db.compiled()).await;
+        assert_eq!(plan.from, 9, "{kind}");
+        assert_eq!(
+            plan.pending.iter().map(|m| m.name).collect::<Vec<_>>(),
+            ["notes"],
+            "{kind}"
+        );
+        db.migrate(db.compiled(), false).await.unwrap();
+        let s = db
+            .open(db.compiled(), SchemaMode::RequireCurrent)
+            .await
+            .unwrap();
+        let coord = s.coord_store().expect("notes after 0010");
+        let every = SessionFilter {
+            principal: Some("ada".into()),
+            limit: 10,
+            ..Default::default()
+        };
+        assert_eq!(
+            coord.list_sessions(&every).await.unwrap(),
+            [before.clone()],
+            "{kind}"
+        );
+        // The contract runs on an empty store: end and forget that session.
+        let end = SessionEnd {
+            state: SessionState::Abandoned,
+            at: 1_700_000_401,
+            landed_as: None,
+            principal: None,
+            if_head: None,
+        };
+        assert!(coord.end_session(before.id, &end).await.unwrap());
+        while coord.sweep_sessions(1_800_000_000, 100).await.unwrap() != SweepReport::default() {}
+        verify(&*s, &STAGES[1], &d, LATEST as u64).await;
+        let all = NoteFilter {
+            limit: 10,
+            ..Default::default()
+        };
+        assert!(coord.list_notes(&all).await.unwrap().is_empty(), "{kind}");
+        // The v9 server still stores, moves refs and keeps sessions.
+        let late = old.put_changeset(&crate::tests::cs(919191)).await.unwrap();
+        let head = old.get_ref("feature/x").await.unwrap();
+        assert!(
+            old.cas_ref("feature/x", head, Some(late)).await.unwrap(),
+            "{kind}"
+        );
+        let mut again = SessionUpdate::new("ada", "s-9", SessionOrigin::Inferred, 1_700_000_500);
+        again.head = Some(late);
+        let (revived, _) = old_coord.upsert_session(&again).await.unwrap();
+        assert_eq!(
+            coord.get_session(revived.id).await.unwrap(),
+            Some(revived),
+            "{kind}"
+        );
+        drop((old, old_coord));
+        let n = coord
+            .add_note(&NewNote {
+                kind: NoteKind::Finding,
+                anchor_type: AnchorType::Path,
+                anchor: "src/f1.rs".into(),
+                at_changeset: Some(late),
+                at_blob: None,
+                lines: None,
+                title: "after the upgrade".into(),
+                body: String::new(),
+                principal: "ada".into(),
+                agent_model: None,
+                session_id: Some(before.id),
+                trust: NoteTrust::Agent,
+                supersedes: None,
+                created: 1_700_000_600,
+                expires: None,
+                max_open: 10,
+                max_per_hour: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(n.state, NoteState::Open, "{kind}");
+        assert_eq!(coord.list_notes(&all).await.unwrap(), [n], "{kind}");
         assert_eq!(db.objects().await, full_schema(), "{kind}");
         drop((s, coord));
         db.cleanup().await;
