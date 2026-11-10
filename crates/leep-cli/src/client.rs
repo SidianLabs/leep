@@ -84,6 +84,10 @@ pub struct Client {
 /// the lowest notice level wanted (`near`, `same_file`, ...) or `off`.
 pub const NOTICE_LEVEL_ENV: &str = "LEEP_NOTICE_LEVEL";
 
+/// How long asking for notices alone may take: they are advisory, so a
+/// slow server costs them, not the command.
+pub const NOTICE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// How long index-backed queries keep retrying an indexing 503, unless
 /// `LEEP_INDEX_WAIT` (seconds) says otherwise.
 const INDEX_WAIT: Duration = Duration::from_secs(60);
@@ -873,7 +877,11 @@ impl Client {
     /// `GET /v1/notices`: the notices for this client's session now
     /// (ADR 0096), also gathered for [`Client::take_notices`].
     pub fn notices_now(&self) -> Result<NoticesResponse> {
-        let r: NoticesResponse = self.json(self.http.get(self.url("/v1/notices")))?;
+        let req = self
+            .http
+            .get(self.url("/v1/notices"))
+            .timeout(NOTICE_TIMEOUT);
+        let r: NoticesResponse = self.json(req)?;
         self.gather(r.notices.clone());
         Ok(r)
     }
@@ -1626,6 +1634,30 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// Asking for notices, which are advisory, gives up after a few
+    /// seconds on a server that does not answer, instead of holding the
+    /// command (or the MCP tool call) for the request timeout.
+    #[test]
+    fn notices_give_up_soon() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for conn in listener.incoming() {
+                held.push(conn);
+            }
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let c = Client::new(&url).with_session(Some("k"));
+            let _ = tx.send(c.notices_now().is_err());
+        });
+        let failed = rx
+            .recv_timeout(NOTICE_TIMEOUT * 3)
+            .expect("notices_now waited past its timeout");
+        assert!(failed);
+    }
 
     /// Answers each connection with the next canned response (the last one
     /// repeats) and counts the requests it saw.
