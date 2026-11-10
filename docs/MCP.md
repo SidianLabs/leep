@@ -119,7 +119,8 @@ fenced too: endorsement ranks a note higher, it never makes it an
 instruction. `leep_note_add` answers with the note's id, kind and trust
 only. A note's text is plain: one line of title (200 bytes), a body of at
 most 4096 bytes, no control characters other than the body's newlines, no
-line separators or bidirectional controls. At most 30 notes an hour and
+line separators, bidirectional controls or invisible characters (zero-width,
+tag characters). At most 30 notes an hour and
 200 open per token; an error says when either is reached. There is no tool
 to endorse a note.
 

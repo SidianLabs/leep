@@ -137,8 +137,13 @@ yet.
   repository path of at most 256 bytes, or a changeset.
 - Plain text: no C0 or C1 control characters (a body may hold `\n`, and
   nothing else: no tab, no `\r`), no line or paragraph separators
-  (U+2028, U+2029), and no bidirectional embedding, override or isolate
-  controls (U+202A to U+202E, U+2066 to U+2069). Sessions (ADR 0095)
+  (U+2028, U+2029), no bidirectional marks, embeddings, overrides or
+  isolates (U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069),
+  and nothing people cannot see but a model reads: zero-width spaces and
+  joiners (U+200B to U+200D), U+180E, word joiners and invisible
+  operators (U+2060 to U+2064), deprecated format controls (U+206A to
+  U+206F), the byte order mark (U+FEFF), interlinear annotation controls
+  (U+FFF9 to U+FFFB) and tag characters (U+E0000 to U+E007F). Sessions (ADR 0095)
   refuse only controls and escape the rest when shown; notes are the
   larger surface, so they refuse at write as well as escape at display,
   and a raw JSON reader never meets them either.

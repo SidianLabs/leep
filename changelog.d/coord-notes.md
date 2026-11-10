@@ -16,7 +16,8 @@
   `gen-token --kind`, and `kind` in `GET /v1/whoami`. Upgrade every
   server before a tokens file uses it.
 - **Added.** Limits: titles 200 bytes, bodies 4 KiB, plain text only (no
-  control characters, line separators or bidirectional controls); 200
+  control characters, line separators, bidirectional controls or
+  invisible characters such as zero-width spaces and tags); 200
   open notes and 30 an hour per principal (400 `too_many_notes`, 429).
   Agent notes expire after 90 days, human ones after a year.
   `leep-server notes revoke --principal P` retracts every open note of a

@@ -1095,8 +1095,9 @@ read by a land. Added:
   at); `at_blob` only for a file anchor. Limits: `title` one line of 1 to
   200 bytes, `body` at most 4096 bytes, `agent_model` at most 128 bytes,
   none with a C0 or C1 control
-  (a body may hold `\n`), U+2028, U+2029, or U+202A to U+202E and U+2066
-  to U+2069; `anchor` a repository path of at most 256 bytes under the
+  (a body may hold `\n`), U+061C, U+180E, U+200B to U+200F, U+2028 to
+  U+202E, U+2060 to U+206F, U+FEFF, U+FFF9 to U+FFFB or U+E0000 to
+  U+E007F; `anchor` a repository path of at most 256 bytes under the
   same rule, or a full changeset id; `lines` need a file anchor, `1 <=
   start <= end <= 10,000,000`; at most 200 open notes and 30 written in
   the last hour per principal. Backups (ADR 0026) copy every row with its

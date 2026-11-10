@@ -1028,14 +1028,24 @@ pub struct NewNote {
 }
 
 /// Whether `c` may not appear in note text: control characters (C0, DEL
-/// and C1), line and paragraph separators, and the bidirectional
-/// embedding, override and isolate controls that reorder what a reader
-/// sees (Trojan Source). Newlines in a body are allowed by the caller.
+/// and C1), line and paragraph separators, the bidirectional marks,
+/// embeddings, overrides and isolates that reorder what a reader sees
+/// (Trojan Source), and the characters people cannot see but models read:
+/// zero-width spaces and joiners, word joiners and invisible operators,
+/// the byte order mark, deprecated format controls and tag characters.
+/// Newlines in a body are allowed by the caller.
 pub fn forbidden_in_note(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            '\u{061c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{e0000}'..='\u{e007f}'
         )
 }
 
@@ -1052,8 +1062,8 @@ fn check_note_text(what: &str, s: &str, max: usize, newlines: bool) -> Result<()
         .any(|c| forbidden_in_note(c) && !(newlines && c == '\n'))
     {
         return Err(Error::Invalid(format!(
-            "note {what} must be plain text: no control characters{}, line separators or \
-             bidirectional controls",
+            "note {what} must be plain text: no control characters{}, line separators, \
+             bidirectional controls or invisible characters",
             if newlines { " other than newline" } else { "" }
         )));
     }
@@ -1433,6 +1443,20 @@ mod tests {
             Box::new(move |n| n.title = format!("{evil}\u{2028}x")),
             Box::new(move |n| n.title = format!("{evil}\u{202e}x")),
             Box::new(move |n| n.title = format!("{evil}\u{2066}x")),
+            // Invisible to people, read by models: zero-width, marks,
+            // word joiners, BOM and tag characters.
+            Box::new(move |n| n.title = format!("{evil}\u{200b}x")),
+            Box::new(move |n| n.title = format!("{evil}\u{200d}x")),
+            Box::new(move |n| n.title = format!("{evil}\u{200e}x")),
+            Box::new(move |n| n.title = format!("{evil}\u{200f}x")),
+            Box::new(move |n| n.title = format!("{evil}\u{061c}x")),
+            Box::new(move |n| n.title = format!("{evil}\u{feff}x")),
+            Box::new(move |n| n.title = format!("{evil}\u{2060}x")),
+            Box::new(move |n| n.title = format!("{evil}\u{2064}x")),
+            Box::new(move |n| n.body = format!("{evil}\u{e0041}\u{e0042}")),
+            Box::new(move |n| n.body = format!("{evil}\u{e007f}")),
+            Box::new(move |n| n.agent_model = Some(format!("m\u{200b}{evil}"))),
+            Box::new(|n| n.anchor = "src/\u{200b}x".into()),
             Box::new(|n| n.title = "x".repeat(MAX_NOTE_TITLE_BYTES + 1)),
             Box::new(move |n| n.body = format!("{evil}\r\nx")),
             Box::new(move |n| n.body = format!("{evil}\tx")),
