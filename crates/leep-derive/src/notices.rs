@@ -38,6 +38,9 @@ pub const MAX_NOTICES: usize = 3;
 pub const MAX_OVERLAPS: usize = 50;
 /// How long an answer waits for its notices; past it they are left out.
 pub const NOTICE_BOUND: Duration = Duration::from_millis(150);
+/// How long each part of `GET /v1/sessions/{id}/overlaps` may take: a
+/// question asked on purpose, so looser than [`NOTICE_BOUND`].
+pub const OVERLAPS_BOUND: Duration = Duration::from_secs(2);
 /// A notice said to a session is not said again for this long.
 pub const SEEN_TTL_SECS: i64 = 30 * 60;
 /// A scope change this soon after a notice counts as following it.
@@ -119,8 +122,56 @@ pub struct Found {
     pub mine: Option<(String, bool)>,
 }
 
-/// A session's `landed` overlaps as of (target head, session head).
-type LandedAt = (ChangesetId, Option<ChangesetId>, Vec<Found>);
+/// A session's `landed` walk, as far as it got: of the target ref at
+/// `tip`, for the session's `head`.
+#[derive(Clone)]
+struct LandedWalk {
+    tip: ChangesetId,
+    head: Option<ChangesetId>,
+    bases: BTreeSet<ChangesetId>,
+    own: BTreeSet<ChangesetId>,
+    /// The next changeset to read; `None` once done.
+    at: Option<ChangesetId>,
+    walked: usize,
+    found: Vec<Found>,
+}
+
+impl LandedWalk {
+    /// `w`'s base, walked again from the ref's new `tip`.
+    fn restart(w: LandedWalk, tip: ChangesetId) -> Self {
+        LandedWalk {
+            tip,
+            at: Some(tip),
+            walked: 0,
+            found: Vec::new(),
+            ..w
+        }
+    }
+}
+
+/// Reads a first-parent chain newest first, a batch at a time: each read
+/// also asks for the ancestors the store's skiplists name (ADR 0030).
+struct ChainReader {
+    ahead: crate::prefetch::ReadAhead,
+}
+
+impl ChainReader {
+    fn new() -> Self {
+        ChainReader {
+            ahead: crate::prefetch::ReadAhead::new(false),
+        }
+    }
+
+    /// Changeset `id`, reading ahead up to `want` more of the chain.
+    async fn read(&mut self, repo: &Repo, id: ChangesetId, want: usize) -> Result<Changeset> {
+        let at = self.ahead.known_generation(repo, id).unwrap_or(u64::MAX);
+        self.ahead.ensure(repo, &[id], at, want.max(1)).await;
+        match self.ahead.take(id).0 {
+            Some(cs) => Ok(cs),
+            None => repo.get_changeset(id).await,
+        }
+    }
+}
 
 struct Seen {
     key: String,
@@ -137,7 +188,7 @@ pub struct NoticeState {
     /// When the full memory was last purged of expired entries.
     purged: Mutex<i64>,
     /// Session id to (target head, session head, `landed` found).
-    landed: Mutex<HashMap<u64, LandedAt>>,
+    landed: Mutex<HashMap<u64, LandedWalk>>,
 }
 
 impl NoticeState {
@@ -220,6 +271,26 @@ impl NoticeState {
             }
         }
         n
+    }
+}
+
+/// One part of the overlaps, within `bound`; nothing (counted) if it
+/// fails or runs out of time.
+async fn part(
+    bound: Duration,
+    f: impl std::future::Future<Output = Result<Vec<Found>>>,
+) -> Vec<Found> {
+    match tokio::time::timeout(bound, f).await {
+        Ok(Ok(found)) => found,
+        Ok(Err(e)) => {
+            metrics::counter!("leep_notices_omitted_total", "reason" => "error").increment(1);
+            tracing::debug!(error = %e, "computing notices failed");
+            Vec::new()
+        }
+        Err(_) => {
+            metrics::counter!("leep_notices_omitted_total", "reason" => "timeout").increment(1);
+            Vec::new()
+        }
     }
 }
 
@@ -364,21 +435,34 @@ impl Repo {
 
     /// Everything overlapping `s` now, highest level first. Path levels
     /// need `near_paths`; `landed` walks the target ref; duplicates (when
-    /// `duplicates`) read recent sessions.
+    /// `duplicates`) read recent sessions. The parts run together, each
+    /// within `bound`: one that fails or runs out of time is left out
+    /// (and counted), never the others.
     pub async fn find_overlaps(
         &self,
         s: &Session,
         focus: &[String],
         duplicates: bool,
-    ) -> Result<Vec<Found>> {
-        let mut found = self.path_overlaps(s, focus).await?;
-        found.extend(self.landed_overlaps(s).await?);
-        if duplicates {
-            found.extend(self.duplicates(s).await?);
-        }
+        bound: Duration,
+    ) -> Vec<Found> {
+        let dups = async {
+            if duplicates {
+                part(bound, self.duplicates(s)).await
+            } else {
+                Vec::new()
+            }
+        };
+        let (paths, landed, dups) = tokio::join!(
+            part(bound, self.path_overlaps(s, focus)),
+            part(bound, self.landed_overlaps(s)),
+            dups,
+        );
+        let mut found = paths;
+        found.extend(landed);
+        found.extend(dups);
         // Stable: within a level, the order each part found them in.
         found.sort_by_key(|f| std::cmp::Reverse(f.level));
-        Ok(found)
+        found
     }
 
     async fn path_overlaps(&self, s: &Session, focus: &[String]) -> Result<Vec<Found>> {
@@ -472,8 +556,10 @@ impl Repo {
     /// The base is every parent outside the session of the session's own
     /// changesets from its head (at most [`OWN_WALK`]), and its declared
     /// base; the walk down the ref's first parents stops at one of them or
-    /// after [`LANDED_WINDOW`] changesets. Kept per session until the ref
-    /// or the session's head moves.
+    /// after [`LANDED_WINDOW`] changesets. Both walks read ahead in batches
+    /// (ADR 0030). Progress is kept per session as it goes, so a walk cut
+    /// short by the notice bound resumes on the next answer; it is redone
+    /// when the ref or the session's head moves.
     async fn landed_overlaps(&self, s: &Session) -> Result<Vec<Found>> {
         let Some(target) = s.target_ref.as_deref() else {
             return Ok(Vec::new());
@@ -484,20 +570,117 @@ impl Repo {
         let Some(tip) = self.meta().get_ref(target).await? else {
             return Ok(Vec::new());
         };
-        if let Some((t, h, found)) = self.notices.landed.lock().unwrap().get(&s.id) {
-            if *t == tip && *h == s.head {
-                return Ok(found.clone());
+        let kept = self.notices.landed.lock().unwrap().get(&s.id).cloned();
+        let mut w = match kept {
+            Some(w) if w.head == s.head && w.tip == tip => w,
+            // The same work on a moved ref: its base stands, the walk does not.
+            Some(w) if w.head == s.head => LandedWalk::restart(w, tip),
+            _ => {
+                let Some((bases, own)) = self.landed_bases(s).await? else {
+                    return Ok(Vec::new());
+                };
+                LandedWalk {
+                    tip,
+                    head: s.head,
+                    bases,
+                    own,
+                    at: Some(tip),
+                    walked: 0,
+                    found: Vec::new(),
+                }
             }
-        }
-        let mut bases: BTreeSet<ChangesetId> = s.base.into_iter().collect();
-        let mut own: BTreeSet<ChangesetId> = BTreeSet::new();
-        let mut next = s.head;
-        for _ in 0..OWN_WALK {
-            let Some(id) = next.take() else { break };
-            if !own.insert(id) {
+        };
+        let mine = probed(s, &[]);
+        let mut reader = ChainReader::new();
+        while let Some(id) = w.at {
+            if w.walked >= LANDED_WINDOW || w.bases.contains(&id) || w.own.contains(&id) {
+                w.at = None;
                 break;
             }
-            let cs = self.get_changeset(id).await?;
+            let cs = reader.read(self, id, LANDED_WINDOW - w.walked).await?;
+            w.walked += 1;
+            w.at = cs.parents.first().copied();
+            if !self.is_own(s, id, &cs).await? {
+                let hit = mine
+                    .iter()
+                    .find_map(|(p, d)| changed_near(&cs, p).map(|c| (p, *d, c.to_string())));
+                if let Some((p, declared, theirs)) = hit {
+                    let mut n = notice(NoticeLevel::Landed, None);
+                    n.changeset = Some(id);
+                    n.untrusted.title =
+                        cut(&crate::sessions::title_of(&cs.message), NOTICE_TITLE_BYTES);
+                    n.untrusted.path = Some(p.clone());
+                    n.untrusted.other_path = Some(theirs);
+                    w.found.push(Found {
+                        level: NoticeLevel::Landed,
+                        key: format!("landed:{id}"),
+                        notice: n,
+                        mine: Some((p.clone(), declared)),
+                    });
+                }
+            }
+            // Kept as it goes: a walk the bound cuts short resumes here.
+            self.keep_landed(s.id, &w);
+        }
+        self.keep_landed(s.id, &w);
+        Ok(w.found)
+    }
+
+    fn keep_landed(&self, session: u64, w: &LandedWalk) {
+        let mut cache = self.notices.landed.lock().unwrap();
+        if cache.len() >= MAX_LANDED_CACHE && !cache.contains_key(&session) {
+            cache.clear();
+        }
+        cache.insert(session, w.clone());
+    }
+
+    /// Whether `cs` (`id`) is the session's own work: it carries the
+    /// session's `agent.session` and its creator is the session's
+    /// principal (when the server recorded one), so another principal's
+    /// work under the same key is not hidden.
+    async fn is_own(&self, s: &Session, id: ChangesetId, cs: &Changeset) -> Result<bool> {
+        if cs.extra.get(EXTRA_AGENT_SESSION) != Some(&s.agent_session) {
+            return Ok(false);
+        }
+        Ok(self
+            .created_by(id)
+            .await?
+            .is_none_or(|c| c.principal == s.principal))
+    }
+
+    /// What the session's work is based on: its declared base and the
+    /// parents outside the session of its own changesets from its head, at
+    /// most [`OWN_WALK`]; with those own changesets. A changeset that is
+    /// gone (collected) ends the walk there; `None` when nothing is known
+    /// to stop the `landed` walk at.
+    async fn landed_bases(
+        &self,
+        s: &Session,
+    ) -> Result<Option<(BTreeSet<ChangesetId>, BTreeSet<ChangesetId>)>> {
+        let mut bases: BTreeSet<ChangesetId> = s.base.into_iter().collect();
+        let mut own: BTreeSet<ChangesetId> = BTreeSet::new();
+        let mut reader = ChainReader::new();
+        let mut next = s.head;
+        let mut first = true;
+        while let Some(id) = next.take() {
+            if own.len() >= OWN_WALK || !own.insert(id) {
+                break;
+            }
+            let cs = match reader.read(self, id, OWN_WALK).await {
+                Ok(cs) => cs,
+                Err(Error::NotFound(_)) => {
+                    own.remove(&id);
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
+            if !first && cs.extra.get(EXTRA_AGENT_SESSION) != Some(&s.agent_session) {
+                // Not the session's: its base.
+                own.remove(&id);
+                bases.insert(id);
+                break;
+            }
+            first = false;
             for (i, p) in cs.parents.iter().enumerate() {
                 if i == 0 {
                     next = Some(*p);
@@ -505,51 +688,11 @@ impl Repo {
                     bases.insert(*p);
                 }
             }
-            if let Some(p) = next {
-                let parent = self.get_changeset(p).await?;
-                if parent.extra.get(EXTRA_AGENT_SESSION) != Some(&s.agent_session) {
-                    bases.insert(p);
-                    break;
-                }
-            }
         }
-        let mine = probed(s, &[]);
-        let mut out = Vec::new();
-        let mut at = Some(tip);
-        for _ in 0..LANDED_WINDOW {
-            let Some(id) = at else { break };
-            if bases.contains(&id) || own.contains(&id) {
-                break;
-            }
-            let cs = self.get_changeset(id).await?;
-            at = cs.parents.first().copied();
-            if cs.extra.get(EXTRA_AGENT_SESSION) == Some(&s.agent_session) {
-                continue;
-            }
-            let hit = mine
-                .iter()
-                .find_map(|(p, d)| changed_near(&cs, p).map(|c| (p, *d, c.to_string())));
-            if let Some((p, declared, theirs)) = hit {
-                let mut n = notice(NoticeLevel::Landed, None);
-                n.changeset = Some(id);
-                n.untrusted.title =
-                    cut(&crate::sessions::title_of(&cs.message), NOTICE_TITLE_BYTES);
-                n.untrusted.path = Some(p.clone());
-                n.untrusted.other_path = Some(theirs);
-                out.push(Found {
-                    level: NoticeLevel::Landed,
-                    key: format!("landed:{id}"),
-                    notice: n,
-                    mine: Some((p.clone(), declared)),
-                });
-            }
+        if let Some(p) = next {
+            bases.insert(p);
         }
-        let mut cache = self.notices.landed.lock().unwrap();
-        if cache.len() >= MAX_LANDED_CACHE {
-            cache.clear();
-        }
-        cache.insert(s.id, (tip, s.head, out.clone()));
-        Ok(out)
+        Ok((!bases.is_empty()).then_some((bases, own)))
     }
 
     /// Live sessions that look like `s`'s task: the same task key, or an
@@ -636,8 +779,8 @@ impl Repo {
         let overlaps = if s.state.is_ended() {
             Vec::new()
         } else {
-            self.find_overlaps(&s, &[], true)
-                .await?
+            self.find_overlaps(&s, &[], true, OVERLAPS_BOUND)
+                .await
                 .into_iter()
                 .take(MAX_OVERLAPS)
                 .map(|f| f.notice)
@@ -658,19 +801,9 @@ impl Repo {
         if !self.notices_on() || s.state.is_ended() {
             return Vec::new();
         }
-        let work = self.find_overlaps(s, &ask.focus, ask.duplicates);
-        let found = match tokio::time::timeout(NOTICE_BOUND, work).await {
-            Ok(Ok(f)) => f,
-            Ok(Err(e)) => {
-                metrics::counter!("leep_notices_omitted_total", "reason" => "error").increment(1);
-                tracing::debug!(error = %e, "computing notices failed");
-                return Vec::new();
-            }
-            Err(_) => {
-                metrics::counter!("leep_notices_omitted_total", "reason" => "timeout").increment(1);
-                return Vec::new();
-            }
-        };
+        let found = self
+            .find_overlaps(s, &ask.focus, ask.duplicates, NOTICE_BOUND)
+            .await;
         let found: Vec<Found> = found.into_iter().filter(|f| f.level >= ask.min).collect();
         let picked = self.notices.pick(s.id, found, MAX_NOTICES, unix_now());
         picked

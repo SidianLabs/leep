@@ -156,6 +156,91 @@ async fn a_claim_is_louder_and_ranks_first() {
     );
 }
 
+/// Land `n` changesets by `who` on `main`, each changing `path`; answers
+/// the new head.
+async fn land_many(r: &Repo, who: &str, n: usize, path: &str) -> ChangesetId {
+    let mut head = r.meta().get_ref("main").await.unwrap();
+    for i in 0..n {
+        let (id, _) = commit(
+            r,
+            who,
+            &format!("{who}-{i}"),
+            &head.into_iter().collect::<Vec<_>>(),
+            &[path],
+        )
+        .await;
+        let LandResponse::Landed { landed, .. } = r.land_as(id, "main", Some(who)).await.unwrap()
+        else {
+            panic!()
+        };
+        head = Some(landed);
+    }
+    head.unwrap()
+}
+
+/// A session based far behind a busy ref: the `landed` walk reads in
+/// batches, answers again from its cache, and costs nothing once said.
+#[tokio::test]
+async fn a_session_far_behind_reads_its_lands_in_batches() {
+    let r = repo();
+    let base = land_many(&r, "root", 1, "README").await;
+    let mut a = declare("a-1", "tokens");
+    a.base = Some(base);
+    a.scope = Some(vec!["src/auth".into()]);
+    r.declare_session("ada", a).await.unwrap();
+    land_many(&r, "bo", 60, "docs/x.md").await;
+    land_many(&r, "cy", 1, "src/auth/token.rs").await;
+    let id = mine_id(&r, "ada").await;
+    let (all, reads) = crate::read_stats::measure(r.session_overlaps(id)).await;
+    let landed: Vec<_> = all
+        .unwrap()
+        .overlaps
+        .into_iter()
+        .filter(|n| n.level == "landed")
+        .collect();
+    assert_eq!(landed.len(), 1, "{landed:?}");
+    assert!(reads.rounds <= 20, "{reads:?}");
+    let (_, again) = crate::read_stats::measure(r.session_overlaps(id)).await;
+    assert!(again.rounds <= 3, "cached: {again:?}");
+}
+
+/// Another principal's land under my session key is not mine: only work
+/// with my key and by me is skipped.
+#[tokio::test]
+async fn a_land_under_my_key_by_someone_else_is_named() {
+    let r = repo();
+    let base = land_many(&r, "root", 1, "README").await;
+    let mut a = declare("a-1", "tokens");
+    a.base = Some(base);
+    a.scope = Some(vec!["src/auth".into()]);
+    r.declare_session("ada", a).await.unwrap();
+    let (theirs, _) = commit(&r, "bo", "a-1", &[base], &["src/auth/token.rs"]).await;
+    r.land_as(theirs, "main", Some("bo")).await.unwrap();
+    let n = r.notices_for("ada", "a-1", &NoticeAsk::default()).await;
+    assert_eq!(n[0].level, "landed", "{n:?}");
+    assert_eq!(n[0].changeset, r.meta().get_ref("main").await.unwrap());
+}
+
+/// A session whose head was collected still hears of its path overlaps:
+/// the `landed` part failing costs only that part.
+#[tokio::test]
+async fn a_missing_head_costs_only_the_landed_notices() {
+    let r = repo();
+    let base = land_many(&r, "root", 1, "README").await;
+    let mut a = declare("a-1", "tokens");
+    a.base = Some(base);
+    r.declare_session("ada", a).await.unwrap();
+    let (head, _) = commit(&r, "ada", "a-1", &[base], &["x/a.rs"]).await;
+    land_many(&r, "cy", 1, "docs/y.md").await;
+    r.meta().delete_changesets(&[head], &[]).await.unwrap();
+    commit(&r, "bo", "b-1", &[], &["x/a.rs"]).await;
+    let n = r.notices_for("ada", "a-1", &NoticeAsk::default()).await;
+    assert_eq!(levels(&n), ["same_file"], "{n:?}");
+    let id = mine_id(&r, "ada").await;
+    let all = r.session_overlaps(id).await.unwrap();
+    assert_eq!(levels(&all.overlaps), ["same_file"]);
+}
+
 #[tokio::test]
 async fn a_land_touching_my_files_is_named() {
     let r = repo();
