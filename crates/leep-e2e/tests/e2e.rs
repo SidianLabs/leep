@@ -3057,6 +3057,7 @@ fn run_two_agents_notices(stores: &Stores, root: &Path) {
     let second = start(&b, "Rewrite the \"token\" parser");
     assert!(second.contains("notice: [possible_duplicate]"), "{second}");
     assert!(second.contains("by task_key \"L-7\""), "{second}");
+    assert!(second.contains("(your \"src/auth/token.rs\")"), "{second}");
 
     // Both edit the file; each is warned before landing.
     write(&b, "src/auth/token.rs", "fn b() {}\n");
@@ -3077,8 +3078,11 @@ fn run_two_agents_notices(stores: &Stores, root: &Path) {
         .iter()
         .map(|n| n["level"].as_str().unwrap())
         .collect();
-    assert_eq!(levels, ["possible_duplicate", "same_file"], "{overlaps}");
-    assert!(ada.ok(&a, &["who", "--overlaps"]).contains("[same_file]"));
+    // One line for b's session, at its highest level.
+    assert_eq!(levels, ["possible_duplicate"], "{overlaps}");
+    assert!(ada
+        .ok(&a, &["who", "--overlaps"])
+        .contains("[possible_duplicate]"));
 
     // b lands; a's next command names the landed changeset.
     run(&b, &["land"]);

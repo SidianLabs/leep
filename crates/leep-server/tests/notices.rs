@@ -270,8 +270,14 @@ async fn same_task_key_is_flagged_at_start_and_overlaps_list_everything() {
         )
         .await;
     let levels: Vec<_> = b.notices.iter().map(|n| n.level.as_str()).collect();
-    assert_eq!(levels, ["possible_duplicate", "same_file"]);
+    // One notice for alice's session, at its highest level, naming the
+    // path its lower level was about.
+    assert_eq!(levels, ["possible_duplicate"]);
     assert_eq!(b.notices[0].by.as_deref(), Some("task_key"));
+    assert_eq!(
+        b.notices[0].untrusted.other_path.as_deref(),
+        Some("src/auth")
+    );
     // alice hears of bob's claim on her next listing.
     let listed: SessionsResponse = api
         .call(
@@ -302,7 +308,11 @@ async fn same_task_key_is_flagged_at_start_and_overlaps_list_everything() {
     let o: OverlapsResponse = serde_json::from_str(&raw).unwrap();
     assert_eq!(o.session, a.session.id);
     let levels: Vec<_> = o.overlaps.iter().map(|n| n.level.as_str()).collect();
-    assert_eq!(levels, ["possible_duplicate", "claimed"]);
+    assert_eq!(levels, ["possible_duplicate"]);
+    assert_eq!(
+        o.overlaps[0].untrusted.other_path.as_deref(),
+        Some("src/auth/token.rs")
+    );
     for n in &o.overlaps {
         assert!(!n.level.contains("Ignore") && n.by.as_deref() != Some("Ignore"));
     }

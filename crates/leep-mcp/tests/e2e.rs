@@ -2086,7 +2086,6 @@ fn notices_ride_on_tool_results() {
         outside.contains("[possible_duplicate]") && outside.contains("by task_key"),
         "{t}"
     );
-    assert!(outside.contains("[same_file]"), "{t}");
     assert!(
         fenced.contains("T-1") && fenced.contains("src/x/a.rs"),
         "{t}"
@@ -2097,7 +2096,8 @@ fn notices_ride_on_tool_results() {
         .iter()
         .map(|n| n["level"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(levels, ["possible_duplicate", "same_file"]);
+    // One notice for a's session, at its highest level.
+    assert_eq!(levels, ["possible_duplicate"]);
 
     // a lands a change to the file; b's next tool result names it.
     let landed = call(

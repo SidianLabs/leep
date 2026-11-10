@@ -559,3 +559,22 @@ async fn declared_duplicates_are_found_behind_many_inferred_sessions() {
         .unwrap();
     assert_eq!(levels(&resp.notices), ["possible_duplicate"]);
 }
+
+/// A session that is a duplicate and also claims my file is one notice,
+/// at its highest level, naming the file.
+#[tokio::test]
+async fn one_notice_per_session_at_its_highest_level() {
+    let r = repo();
+    let mut a = declare("a-1", "own the token code");
+    a.task_key = Some("L-3".into());
+    a.claims = Some(vec!["src/auth/token.rs".into()]);
+    r.declare_session("ada", a).await.unwrap();
+    let mut b = declare("b-1", "parse tokens");
+    b.task_key = Some("L-3".into());
+    b.scope = Some(vec!["src/auth/token.rs".into()]);
+    let resp = r.declare_session("bo", b).await.unwrap();
+    assert_eq!(levels(&resp.notices), ["possible_duplicate"]);
+    let n = &resp.notices[0];
+    assert_eq!(n.untrusted.path.as_deref(), Some("src/auth/token.rs"));
+    assert_eq!(n.untrusted.task_key.as_deref(), Some("L-3"));
+}

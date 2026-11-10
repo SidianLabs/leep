@@ -114,7 +114,8 @@ pub fn ask_from_header(v: Option<&str>) -> Option<NoticeAsk> {
 #[derive(Clone, Debug)]
 pub struct Found {
     pub level: NoticeLevel,
-    /// Stable within a session: (level, other session or changeset).
+    /// Stable within a session: the other session (`session:ID`), the
+    /// landed changeset or the crowded path.
     pub key: String,
     pub notice: Notice,
     /// My path it is about, and whether I declared it (scope or claim),
@@ -207,8 +208,14 @@ impl NoticeState {
             if out.len() >= max || seen.len() >= MAX_SEEN_PER_SESSION {
                 break;
             }
-            if seen.iter().any(|s| s.key == f.key) {
-                continue;
+            // Another session is said once at a level; again only if it
+            // comes back higher (near, then a claim on my file).
+            match seen.iter().position(|s| s.key == f.key) {
+                Some(i) if seen[i].level >= f.level => continue,
+                Some(i) => {
+                    seen.remove(i);
+                }
+                None => {}
             }
             seen.push(Seen {
                 key: f.key.clone(),
@@ -272,6 +279,35 @@ impl NoticeState {
         }
         n
     }
+}
+
+/// Each other session once, at its highest level (`found` is ranked),
+/// taking the paths a lower level of it named when the highest has none:
+/// a duplicate that also claims my file is one notice, not two.
+fn one_per_session(found: Vec<Found>) -> Vec<Found> {
+    let mut at: HashMap<u64, usize> = HashMap::new();
+    let mut out: Vec<Found> = Vec::with_capacity(found.len());
+    for f in found {
+        let Some(id) = f.notice.session else {
+            out.push(f);
+            continue;
+        };
+        match at.get(&id) {
+            Some(&i) => {
+                let kept = &mut out[i];
+                if kept.notice.untrusted.path.is_none() {
+                    kept.notice.untrusted.path = f.notice.untrusted.path;
+                    kept.notice.untrusted.other_path = f.notice.untrusted.other_path;
+                    kept.mine = kept.mine.take().or(f.mine);
+                }
+            }
+            None => {
+                at.insert(id, out.len());
+                out.push(f);
+            }
+        }
+    }
+    out
 }
 
 /// One part of the overlaps, within `bound`; nothing (counted) if it
@@ -508,7 +544,7 @@ impl Repo {
         found.extend(dups);
         // Stable: within a level, the order each part found them in.
         found.sort_by_key(|f| std::cmp::Reverse(f.level));
-        found
+        one_per_session(found)
     }
 
     async fn path_overlaps(&self, s: &Session, focus: &[String]) -> Result<Vec<Found>> {
@@ -592,7 +628,7 @@ impl Repo {
             n.untrusted.other_path = Some(theirs);
             out.push(Found {
                 level,
-                key: format!("{}:{id}", level.as_str()),
+                key: format!("session:{id}"),
                 notice: n,
                 mine: Some((p.clone(), *declared)),
             });
@@ -774,7 +810,7 @@ impl Repo {
                 flagged.insert(o.id);
                 out.push(Found {
                     level: NoticeLevel::PossibleDuplicate,
-                    key: format!("possible_duplicate:{}", o.id),
+                    key: format!("session:{}", o.id),
                     notice: n,
                     mine: None,
                 });
@@ -808,7 +844,7 @@ impl Repo {
             n.similarity = Some(pct);
             out.push(Found {
                 level: NoticeLevel::PossibleDuplicate,
-                key: format!("possible_duplicate:{}", o.id),
+                key: format!("session:{}", o.id),
                 notice: n,
                 mine: None,
             });
@@ -1006,6 +1042,36 @@ mod tests {
         }
         assert!(said.values().all(|n| *n == 1), "{said:?}");
         assert!(said.contains_key("s0") && said.len() <= MAX_SEEN_PER_SESSION);
+    }
+
+    /// A session said at one level is not said again at that level or
+    /// below, through any answer; it is when it comes back higher.
+    #[test]
+    fn a_session_is_said_again_only_higher() {
+        let st = NoticeState::default();
+        let keys = |v: Vec<Found>| v.into_iter().map(|f| f.level).collect::<Vec<_>>();
+        assert_eq!(
+            keys(st.pick(
+                1,
+                vec![found(NoticeLevel::PossibleDuplicate, "session:9")],
+                3,
+                1000
+            ))
+            .len(),
+            1
+        );
+        assert!(st
+            .pick(1, vec![found(NoticeLevel::SameFile, "session:9")], 3, 1001)
+            .is_empty());
+        let st = NoticeState::default();
+        st.pick(1, vec![found(NoticeLevel::Near, "session:9")], 3, 1000);
+        assert_eq!(
+            keys(st.pick(1, vec![found(NoticeLevel::Claimed, "session:9")], 3, 1001)),
+            [NoticeLevel::Claimed]
+        );
+        assert!(st
+            .pick(1, vec![found(NoticeLevel::Claimed, "session:9")], 3, 1002)
+            .is_empty());
     }
 
     /// Answers that say nothing leave nothing behind, so sessions without
