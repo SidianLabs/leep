@@ -91,6 +91,15 @@ pub const NOTICE_LEVEL_ENV: &str = "LEEP_NOTICE_LEVEL";
 /// slow server costs them, not the command.
 pub const NOTICE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// The answer to [`Client::events`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EventsRead {
+    Page(EventsResponse),
+    /// 410: the cursor is older than the events kept, or from another
+    /// store.
+    Expired(CursorExpiredResponse),
+}
+
 /// How long index-backed queries keep retrying an indexing 503, unless
 /// `LEEP_INDEX_WAIT` (seconds) says otherwise.
 const INDEX_WAIT: Duration = Duration::from_secs(60);
@@ -928,6 +937,25 @@ impl Client {
         let r: NoticesResponse = self.json(req)?;
         self.gather(r.notices.clone());
         Ok(r)
+    }
+
+    /// `GET /v1/events` (ADR 0099) with `query` (`after`, `session`,
+    /// `paths`, `kinds`), waiting up to `wait` on the server. A 410 is an
+    /// answer, not an error: the cursor expired and the caller resyncs.
+    pub fn events(&self, query: &[(&str, String)], wait: Duration) -> Result<EventsRead> {
+        let mut query = query.to_vec();
+        if !wait.is_zero() {
+            query.push(("wait", wait.as_secs().to_string()));
+        }
+        let req = self
+            .named(self.http.get(self.url("/v1/events")).query(&query))
+            .timeout(wait + NOTICE_TIMEOUT);
+        let resp = req.send().map_err(|e| self.unreachable(e))?;
+        match resp.status() {
+            StatusCode::OK => Ok(EventsRead::Page(resp.json().map_err(bad_response)?)),
+            StatusCode::GONE => Ok(EventsRead::Expired(resp.json().map_err(bad_response)?)),
+            _ => Err(self.error_from(resp)),
+        }
     }
 
     /// `POST /v1/context` (ADR 0097): a context pack for a task.

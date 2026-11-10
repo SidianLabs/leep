@@ -2039,6 +2039,31 @@ fn sessions_show_who_works_where() {
     );
 }
 
+/// Wait until the server has appended `n` `session.ended` events of
+/// `principal` (it appends every 250 ms, after the land's answer).
+fn await_lands(url: &str, principal: &str, n: usize) {
+    let reader = leep_cli::client::Client::with_token(url, Some("ben-t"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let q = [
+            ("kinds", "session.ended".to_string()),
+            ("after", "e0".to_string()),
+        ];
+        if let Ok(leep_cli::client::EventsRead::Page(p)) =
+            reader.events(&q, std::time::Duration::ZERO)
+        {
+            if p.events.iter().filter(|e| e.principal == principal).count() >= n {
+                return;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the land's event never came"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Notices (ADR 0096) in MCP tool results: two agents given one task are
 /// told when the second starts, the second hears when the first lands a
 /// change to its file, and other agents' words stay in the fence.
@@ -2107,6 +2132,8 @@ fn notices_ride_on_tool_results() {
         json!({ "message": "parser: faster", "changes": [{ "path": "src/x/a.rs", "content": "fast\n" }], "force": true }),
     );
     assert_eq!(landed["isError"], false, "{landed}");
+    // The land is an event once the server appends it (ADR 0099).
+    await_lands(&url, "ana", 2);
     let refs = call(&b, "leep_refs", json!({}));
     let t = text(&refs);
     assert!(t.contains("[landed] changeset"), "{t}");
@@ -2144,6 +2171,61 @@ fn notices_ride_on_tool_results() {
         !outside.contains("SYSTEM") && !outside.contains("src/x"),
         "{t}"
     );
+}
+
+/// Events decide when to ask for notices (ADR 0099): a tool call reads
+/// the events bearing on the agent's session and asks for notices only
+/// when one matched. A land on the agent's file arrives on its very next
+/// tool call, though it asked for notices a moment before (the 30 s
+/// throttle this replaced said nothing then); an idle call asks nothing.
+#[test]
+fn a_landed_notice_arrives_on_the_next_tool_call() {
+    let (url, counts) = counted_server();
+    let a = agent_on(&url, "ana", "e-a");
+    let b = agent_on(&url, "ben", "e-b");
+    seed(&a, &["src/x/a.rs", "docs/b.md"]);
+    await_lands(&url, "ana", 1);
+    // b's first call reads the events tail and asks for notices once.
+    let started = call(
+        &b,
+        "leep_session_start",
+        json!({ "title": "Parser work", "scope": ["src/x/a.rs"], "base": "main" }),
+    );
+    assert_eq!(started["isError"], false, "{started}");
+    // Nothing new: the next calls ask for no notices.
+    let before = counts.get().2;
+    call(&b, "leep_refs", json!({}));
+    call(&b, "leep_refs", json!({}));
+    assert_eq!(counts.get().2, before, "no event, no notices read");
+    // ana's land elsewhere is no reason to ask either.
+    let elsewhere = commit(
+        &a,
+        json!({ "message": "docs", "changes": [{ "path": "docs/b.md", "content": "new\n" }], "force": true }),
+    );
+    assert_eq!(elsewhere["isError"], false, "{elsewhere}");
+    await_lands(&url, "ana", 2);
+    let quiet = text(&call(&b, "leep_refs", json!({})));
+    assert!(!quiet.contains("[landed]"), "{quiet}");
+    assert_eq!(counts.get().2, before, "an unrelated land asks nothing");
+    // ana lands a change to b's file; b's very next call says so, a moment
+    // after its last one.
+    let landed = commit(
+        &a,
+        json!({ "message": "parser: faster", "changes": [{ "path": "src/x/a.rs", "content": "fast\n" }], "force": true }),
+    );
+    assert_eq!(landed["isError"], false, "{landed}");
+    await_lands(&url, "ana", 3);
+    let next = call(&b, "leep_refs", json!({}));
+    let t = text(&next);
+    assert!(t.contains("[landed] changeset"), "{t}");
+    let main = data(&next)["refs"]["main"].as_str().unwrap().to_string();
+    assert!(t.contains(&main), "names the landed changeset: {t}");
+    assert!(counts.get().2 > before, "asked GET /v1/notices");
+    // Said once: the call after asks nothing and says nothing.
+    let asked = counts.get().2;
+    let again = text(&call(&b, "leep_refs", json!({})));
+    assert!(!again.contains("[landed]"), "{again}");
+    assert_eq!(counts.get().2, asked);
 }
 
 /// `leep_task_start` (ADR 0097): one call declares the session and answers

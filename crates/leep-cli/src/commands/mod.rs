@@ -29,6 +29,7 @@ pub mod search;
 pub mod session;
 pub mod stash;
 pub mod status;
+pub mod watch;
 
 use leep_core::outln;
 use leep_core::ChangesetId;

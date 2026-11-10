@@ -47,8 +47,9 @@ pub struct Server {
     pub(crate) stopped: Mutex<tools::StoppedLands>,
     /// The token's name, once asked (`leep_who` marks your own session).
     pub(crate) principal: std::sync::OnceLock<String>,
-    /// When notices were last asked for (ADR 0096).
-    pub(crate) notice_poll: Mutex<Option<std::time::Instant>>,
+    /// Where this server is in the events it reads to decide when to ask
+    /// for notices (ADR 0096, ADR 0099).
+    pub(crate) notice_poll: Mutex<tools::NoticeWatch>,
 }
 
 impl Server {
