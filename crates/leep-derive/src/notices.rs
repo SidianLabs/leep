@@ -772,9 +772,9 @@ impl Repo {
             .coord
             .as_ref()
             .ok_or_else(|| Error::NotFound("sessions: this server keeps none".into()))?;
-        let s = coord
-            .get_session(id)
-            .await?
+        let s = tokio::time::timeout(OVERLAPS_BOUND, coord.get_session(id))
+            .await
+            .map_err(|_| Error::Other("sessions: the coordination store did not answer".into()))??
             .ok_or_else(|| Error::NotFound(format!("session {id}")))?;
         let overlaps = if s.state.is_ended() {
             Vec::new()

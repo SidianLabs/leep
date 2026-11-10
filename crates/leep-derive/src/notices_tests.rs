@@ -487,3 +487,26 @@ async fn a_slow_store_leaves_notices_out_within_the_bound() {
         started.elapsed()
     );
 }
+
+/// Overlaps asked for on purpose wait longer than notices, but not for
+/// ever: each part at most `OVERLAPS_BOUND`.
+#[tokio::test(start_paused = true)]
+async fn overlaps_on_a_slow_store_answer_within_their_bound() {
+    let r = repo().with_coord(Some(Arc::new(Slow(MemoryCoordStore::new()))));
+    let mut d = declare("b-1", "a long enough title to compare");
+    d.scope = Some(vec!["x/a".into()]);
+    let id = r
+        .declare_session_with("bo", d, None)
+        .await
+        .unwrap()
+        .session
+        .id;
+    let started = tokio::time::Instant::now();
+    let o = r.session_overlaps(id).await.unwrap();
+    assert!(o.overlaps.is_empty());
+    assert!(
+        started.elapsed() <= crate::notices::OVERLAPS_BOUND,
+        "{:?}",
+        started.elapsed()
+    );
+}
