@@ -1453,7 +1453,9 @@ a restore starts with no sessions.
 **Overlap notices (ADR 0096)** need no migration: they read the session
 tables of migration 9 and the refs. `--notices off` (`LEEP_NOTICES=off`)
 leaves them out of every answer and changes nothing else;
-`GET /v1/sessions/{id}/overlaps` still answers. To see whether they help,
+`GET /v1/sessions/{id}/overlaps` still answers. `--default-ref`
+(`LEEP_DEFAULT_REF`, default `main`) is the ref a session that never named
+its target is taken to land on, for its `landed` notices. To see whether they help,
 compare land conflicts per 1,000 lands,
 `1000 * rate(leep_land_total{outcome="conflicts"}) / rate(leep_land_total)`,
 over comparable periods with `--notices on` and `off`, beside the share of

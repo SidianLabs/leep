@@ -202,6 +202,9 @@ pub struct Repo {
     /// Whether answers carry notices (`--notices`); overlaps are still
     /// answered when asked for.
     pub(crate) notices_on: bool,
+    /// The ref work lands on when it names none (`--default-ref`): a
+    /// session without a target ref hears of lands there (ADR 0096).
+    pub(crate) default_ref: Arc<str>,
 }
 
 /// Whether a derivation may go on writing rows: the index lease it derives
@@ -700,6 +703,7 @@ impl Repo {
             beats: Arc::default(),
             notices: Arc::default(),
             notices_on: true,
+            default_ref: Arc::from(crate::notices::DEFAULT_TARGET_REF),
         }
     }
 

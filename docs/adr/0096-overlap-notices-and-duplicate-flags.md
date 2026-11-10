@@ -247,9 +247,14 @@ they read 200 sessions, and inferred titles are not compared.
 ### Undeclared sessions hear `landed` (2026-11-10)
 An inferred session had no target ref, so it had no `landed` part. Clients
 now name it on creates (`Leep-Target-Ref`, ADR 0095 amendment), and a
-session that still has none (an older client) is walked against `main`,
-the ref clients land on by default. A session whose work lands elsewhere
-and says so is never walked against `main`.
+session that still has none (an older client) is walked against the
+server's default ref: the new `--default-ref` setting (`LEEP_DEFAULT_REF`,
+default `main`, the ref clients land on by default; the server had no
+such setting before). A session whose work lands elsewhere and says so is
+never walked against it. A `landed` notice found this way carries
+`landed_on` (a new optional `Notice` field) naming that ref, and clients
+say "landed on main", never "your target ref": the session never said it
+was.
 
 ### A duplicate's land says so (2026-11-10)
 In the demo eli heard "[landed] changeset ... landed on your target ref"

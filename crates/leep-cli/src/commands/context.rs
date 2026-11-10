@@ -403,6 +403,7 @@ mod tests {
                     by: None,
                     similarity: None,
                     via: None,
+                    landed_on: None,
                     untrusted: NoticeText {
                         title: evil.into(),
                         path: Some(evil.into()),

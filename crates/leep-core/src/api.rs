@@ -1248,6 +1248,11 @@ pub struct Notice {
     /// one on your own paths. Absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
+    /// `landed`, for a session that named no target ref: the ref the
+    /// server took it to land on (its default ref), which the session never
+    /// said is its own. Absent when the session named its target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed_on: Option<String>,
     #[serde(default)]
     pub untrusted: NoticeText,
 }
@@ -3362,6 +3367,7 @@ mod tests {
                 by: None,
                 similarity: None,
                 via: None,
+                landed_on: None,
                 untrusted: NoticeText {
                     title: "t".into(),
                     path: Some("src/a.rs".into()),
@@ -3522,6 +3528,7 @@ mod tests {
                         by: None,
                         similarity: None,
                         via: None,
+                        landed_on: None,
                         untrusted: NoticeText::default(),
                     },
                 }],

@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use leep_core::api::{Notice, NoticeText, OverlapsResponse};
@@ -54,8 +54,8 @@ pub const NEAR_LIMIT: usize = 512;
 /// More sessions than this on one of my paths make it crowded: one notice
 /// with a count instead of one each (design D.3, the hot-path rule).
 pub const HOT_SESSIONS: usize = 50;
-/// The target ref of a session that names none, for `landed`: the ref
-/// clients land on by default.
+/// The default of `--default-ref`: the ref a session that names none is
+/// taken to land on, for `landed`.
 pub const DEFAULT_TARGET_REF: &str = "main";
 /// Changesets of the target ref walked for `landed`.
 pub const LANDED_WINDOW: usize = 64;
@@ -445,6 +445,7 @@ fn notice(level: NoticeLevel, other: Option<&Session>) -> Notice {
         by: None,
         similarity: None,
         via: None,
+        landed_on: None,
         untrusted: NoticeText {
             title: other.map_or_else(String::new, |o| cut(&o.title, NOTICE_TITLE_BYTES)),
             ..Default::default()
@@ -643,6 +644,17 @@ impl Repo {
         self.notices_on && self.coord.is_some()
     }
 
+    /// Take `name` as the ref work lands on when a session names none
+    /// (`--default-ref`, default `main`).
+    pub fn with_default_ref(mut self, name: &str) -> Self {
+        self.default_ref = Arc::from(name);
+        self
+    }
+
+    pub fn default_ref(&self) -> &str {
+        &self.default_ref
+    }
+
     /// Everything overlapping `s` now, highest level first. Path levels
     /// need `near_paths`; `landed` walks the target ref; duplicates by
     /// task key read one indexed listing, and by wording (when
@@ -798,7 +810,10 @@ impl Repo {
     pub(crate) async fn landed_overlaps(&self, s: &Session) -> Result<Vec<Found>> {
         // A session that never said where it lands (inferred from an older
         // client's commit) is taken to land on the default ref.
-        let target = s.target_ref.as_deref().unwrap_or(DEFAULT_TARGET_REF);
+        let target = s.target_ref.as_deref().unwrap_or(&self.default_ref);
+        // Said as "landed on <ref>", never "your target ref": the session
+        // did not say this one.
+        let landed_on = s.target_ref.is_none().then(|| target.to_string());
         if s.head.is_none() && s.base.is_none() {
             return Ok(Vec::new());
         }
@@ -848,6 +863,7 @@ impl Repo {
                     };
                     let mut n = notice(NoticeLevel::Landed, None);
                     n.changeset = Some(id);
+                    n.landed_on = landed_on.clone();
                     n.untrusted.title =
                         cut(&crate::sessions::title_of(&cs.message), NOTICE_TITLE_BYTES);
                     n.untrusted.path = Some(p.clone());

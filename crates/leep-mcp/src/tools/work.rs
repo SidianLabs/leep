@@ -704,6 +704,7 @@ mod tests {
                     by: None,
                     similarity: None,
                     via: None,
+                    landed_on: None,
                     untrusted: NoticeText {
                         title: evil.into(),
                         path: Some(evil.into()),
@@ -810,6 +811,7 @@ mod tests {
             by: Some("task_key".into()),
             similarity: None,
             via: None,
+            landed_on: None,
             untrusted: Default::default(),
         };
         let p = ContextPack {

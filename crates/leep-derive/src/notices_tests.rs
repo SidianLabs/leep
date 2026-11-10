@@ -859,3 +859,38 @@ async fn landed_sessions_never_hide_a_live_duplicate() {
     assert_eq!(levels(&n), ["possible_duplicate"], "{n:?}");
     assert_eq!(n[0].session, Some(old));
 }
+
+/// A session that named no target ref is walked against the server's
+/// default ref (`--default-ref`), not a fixed `main`, and its `landed`
+/// notice says which ref (`landed_on`) instead of calling it its own.
+#[tokio::test]
+async fn a_session_without_a_target_hears_of_the_default_ref() {
+    let r = repo().with_default_ref("trunk");
+    let (seed, _) = commit(&r, "root", "r-0", &[], &["README"]).await;
+    let LandResponse::Landed { landed: base, .. } =
+        r.land_as(seed, "trunk", Some("root")).await.unwrap()
+    else {
+        panic!()
+    };
+    commit(&r, "ada", "a-1", &[base], &["src/x.rs"]).await;
+    let (theirs, _) = commit(&r, "bo", "b-1", &[base], &["src/x.rs"]).await;
+    let LandResponse::Landed { landed, .. } = r.land_as(theirs, "trunk", Some("bo")).await.unwrap()
+    else {
+        panic!()
+    };
+    r.note_landed(theirs, landed, Some("bo")).await.unwrap();
+    let n = r.notices_for("ada", "a-1", &NoticeAsk::default()).await;
+    let l: Vec<_> = n.iter().filter(|n| n.level == "landed").collect();
+    assert_eq!(l.len(), 1, "{n:?}");
+    assert_eq!(l[0].landed_on.as_deref(), Some("trunk"));
+    // A session that names its target is told without it.
+    let mut d = declare("c-1", "work");
+    d.target_ref = Some("trunk".into());
+    d.base = Some(base);
+    d.scope = Some(vec!["src".into()]);
+    r.declare_session_with("cy", d, None).await.unwrap();
+    let n = r.notices_for("cy", "c-1", &NoticeAsk::default()).await;
+    let l: Vec<_> = n.iter().filter(|n| n.level == "landed").collect();
+    assert_eq!(l.len(), 1, "{n:?}");
+    assert!(l[0].landed_on.is_none());
+}

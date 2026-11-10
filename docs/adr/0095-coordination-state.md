@@ -342,5 +342,5 @@ makes a later land look like a duplicate's. A bad ref name is ignored, never ref
 as a bad `Leep-Session` is, and a server that does not know the header
 ignores it. The changeset, its hash and the create's answer are
 unchanged. A session with no target ref at all (an older client) is taken
-to land on `main` when its `landed` notices are computed (ADR 0096
-amendment).
+to land on the server's default ref (`--default-ref`, default `main`)
+when its `landed` notices are computed (ADR 0096 amendment).

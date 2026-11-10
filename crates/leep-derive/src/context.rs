@@ -1124,6 +1124,7 @@ mod tests {
                 by: None,
                 similarity: None,
                 via: None,
+                landed_on: None,
                 untrusted: Default::default(),
             },
         );

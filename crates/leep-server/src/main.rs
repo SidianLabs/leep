@@ -458,6 +458,11 @@ struct Args {
     /// conflicts per 1,000 lands with and without them.
     #[arg(long, env = "LEEP_NOTICES", value_enum, default_value_t = Switch::On)]
     notices: Switch,
+    /// The ref work lands on when it names none: a session that never said
+    /// its target ref (an inferred session from an older client) hears of
+    /// lands here (ADR 0096).
+    #[arg(long, env = "LEEP_DEFAULT_REF", default_value = "main")]
+    default_ref: String,
     /// Leave a create's tree nodes out of the blob store and derive them
     /// when read (ADR 0069): a create then writes no tree node, and a land
     /// stores the tree of a changeset the ref moves to as it is. The answers
@@ -1934,6 +1939,9 @@ async fn run() -> anyhow::Result<()> {
         repo = repo.with_coord(None);
     }
     repo = repo.with_notices(args.notices == Switch::On);
+    leep_core::refname::validate(&args.default_ref)
+        .map_err(|e| anyhow::anyhow!("--default-ref: {e}"))?;
+    repo = repo.with_default_ref(&args.default_ref);
     if repo.coord().is_some() {
         tracing::info!(
             notices = args.notices == Switch::On,
