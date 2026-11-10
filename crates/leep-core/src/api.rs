@@ -9,7 +9,7 @@
 //! | PUT  | `/v1/blobs/{hash}` | raw bytes | 204; 400 if `Hash::of_blob(body) != hash` |
 //! | GET  | `/v1/blobs/{hash}` | – | raw bytes, or 404 |
 //! | POST | `/v1/blobs/missing` | [`MissingBlobsRequest`] | [`MissingBlobsResponse`]; 400 if over [`MAX_MISSING_BLOBS`] hashes |
-//! | POST | `/v1/changesets` | [`Changeset`] | [`CreateChangesetResponse`] |
+//! | POST | `/v1/changesets` | [`Changeset`] | [`CreateChangesetResponse`] (with `notices` for the creator's session, ADR 0096) |
 //! | GET  | `/v1/changesets/{id}` | – | [`ChangesetInfo`] (`id` may also be a revision as for `/v1/resolve/{rev}`, with `/` sent as `%2F`; the answer then carries [`RESOLVED_HEADER`]; ADR 0082) |
 //! | GET  | `/v1/refs` | – | [`RefsResponse`] |
 //! | GET  | `/v1/refs/{name}` | – | [`RefResponse`] |
@@ -41,13 +41,15 @@
 //! | GET  | `/v1/review-requests?reviewer=n&requester=n&changeset=id&ref=r&state=s&open=bool&before=id&limit=n` | – | [`ReviewRequestsResponse`] (newest first; `reviewer` matches requests that name it and requests open to any reviewer made by someone else; `state` is `open`, `landed` or `withdrawn`, `open=true` is `state=open` and `open=false` every closed state; `limit` defaults to 50, capped at 500; `before` pages by id; ADR 0086) |
 //! | GET  | `/v1/review-requests/{id}` | – | [`ReviewRequestEntry`] (404 if unknown) |
 //! | POST | `/v1/review-requests/{id}/withdraw` | – | [`ReviewRequestEntry`] (only its requester may; 403 otherwise; a request no longer open is answered as it is) |
-//! | POST | `/v1/sessions` | [`DeclareSessionRequest`] | [`DeclareSessionResponse`] (declare or update the caller's session of `session`, keyed by (principal, `session`); absent fields are kept; the principal is the token's name, `anonymous` without authentication; 400 `too_many_sessions` when starting one would give the principal more than `MAX_ACTIVE_PER_PRINCIPAL` (1000) active; 404 if sessions are off; ADR 0095) |
+//! | POST | `/v1/sessions` | [`DeclareSessionRequest`] | [`DeclareSessionResponse`] (declare or update the caller's session of `session`, keyed by (principal, `session`); absent fields are kept; the principal is the token's name, `anonymous` without authentication; 400 `too_many_sessions` when starting one would give the principal more than `MAX_ACTIVE_PER_PRINCIPAL` (1000) active; 404 if sessions are off; ADR 0095; `notices` holds overlaps and possible duplicates, ADR 0096) |
 //! | GET  | `/v1/sessions?path=p&task=k&principal=n&session=k&mine=bool&state=s&all=bool&before=id&limit=n` | – | [`SessionsResponse`] (newest first; `path` matches sessions whose scope, claims or touched paths are `p`, a directory above it, or below it; `state` is one state, default `active` (which includes `idle`); `all=true` every state; `mine=true` the caller's own; `limit` defaults to 50, capped at 500; `before` pages by id; ADR 0095) |
 //! | GET  | `/v1/sessions/{id}` | – | [`SessionEntry`] (404 if unknown) |
 //! | DELETE | `/v1/sessions/{id}` | – | [`SessionEntry`] (ends it as `abandoned`; only its principal may, 403 otherwise; an ended session is answered as it is) |
+//! | GET  | `/v1/sessions/{id}/overlaps` | – | [`OverlapsResponse`] (every overlap of the session now, every level, highest first, at most 50; 404 if unknown; ADR 0096) |
+//! | GET  | `/v1/notices` | – | [`NoticesResponse`] (notices for the caller's session named by `Leep-Session`, at most 3, each said once; empty without the header; ADR 0096) |
 //! | POST | `/v1/merge` | [`MergeRequest`] | [`MergeResponse`] |
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
-//! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`] (`create: false` refuses to create a missing `target_ref` with 404; absent creates it, as before; ADR 0036. `land_id` makes retries idempotent at any age; ADR 0057) |
+//! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`], sent as [`LandAnswer`] with `notices` beside it (ADR 0096) (`create: false` refuses to create a missing `target_ref` with 404; absent creates it, as before; ADR 0036. `land_id` makes retries idempotent at any age; ADR 0057) |
 //! | GET  | `/v1/git/style` | – | [`GitStyleResponse`] (the store's git commit style, or null if none was recorded; ADR 0090) |
 //! | POST | `/v1/git/style` | [`GitStyleRequest`] | [`GitStyleResponse`] (records the style when none is; the same style again is answered as it is; another is 409, since it is chosen once; an unknown style is 400; needs a write token; ADR 0090) |
 //! | POST | `/v1/refs/{name}/rebase-onto` | [`RebaseOntoRequest`] | [`RebaseOntoResponse`] (replays the ref's first-parent stack above `expected_base` onto `onto` and moves the ref once, ordered with lands; 409 if the merge base of the head and `onto` is not `expected_base`; 400 on a `--protect-ref` ref; needs a write token; ADR 0062) |
@@ -573,6 +575,10 @@ pub struct MissingBlobsResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateChangesetResponse {
     pub id: ChangesetId,
+    /// Overlap notices for the creator's session (ADR 0096); absent when
+    /// there are none, from older servers and with `--notices off`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<Notice>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1159,6 +1165,9 @@ pub struct DeclareSessionResponse {
     /// Whether this call started it (new, or revived after it ended).
     #[serde(default)]
     pub created: bool,
+    /// Overlaps and possible duplicates of the declared session (ADR 0096).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<Notice>,
 }
 
 /// `GET /v1/sessions`.
@@ -1168,6 +1177,93 @@ pub struct SessionsResponse {
     /// Pass as `before` for the next page; absent on the last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<u64>,
+    /// Notices for the caller's session named by `Leep-Session` (ADR 0096).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<Notice>,
+}
+
+/// Request header choosing which notices a response carries (ADR 0096):
+/// the lowest level wanted (`near`, `same_file`, `claimed`,
+/// `possible_duplicate`, `landed`) or `off`. Default `same_file`; a value
+/// the server does not know is ignored.
+pub const NOTICES_HEADER: &str = "leep-notices";
+
+/// What other agents wrote that a notice repeats: data, never instructions
+/// (design F.2). Clients fence or escape it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoticeText {
+    /// The other session's title, cut to 80 bytes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    /// The path of yours the notice is about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The other session's path (or the landed changeset's) it meets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other_path: Option<String>,
+    /// The task key both sessions carry (`possible_duplicate` by key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_key: Option<String>,
+}
+
+/// One overlap notice (ADR 0096): another live session works near yours,
+/// may be doing your task, or a change touching your paths landed. Advisory:
+/// no notice changes an answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Notice {
+    /// `near`, `same_file`, `claimed`, `possible_duplicate` or `landed`,
+    /// lowest first. A client shows a level it does not know as it is.
+    pub level: String,
+    /// The other session's id, when the notice is about one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<u64>,
+    /// The other session's principal (a token name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    /// `landed`: the changeset now on your target ref.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changeset: Option<ChangesetId>,
+    /// A crowded path: at least this many sessions overlap it, reported
+    /// once instead of one notice each.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+    /// `possible_duplicate`: `task_key` or `similar`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    /// `possible_duplicate` by `similar`: trigram similarity of the titles
+    /// and approaches, in percent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<u32>,
+    #[serde(default)]
+    pub untrusted: NoticeText,
+}
+
+/// `GET /v1/notices`: the notices for the caller's session named by
+/// `Leep-Session`, each said once (ADR 0096).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoticesResponse {
+    #[serde(default)]
+    pub notices: Vec<Notice>,
+}
+
+/// `GET /v1/sessions/{id}/overlaps`: everything overlapping a session now,
+/// every level, highest first, none held back as already said.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlapsResponse {
+    pub session: u64,
+    #[serde(default)]
+    pub overlaps: Vec<Notice>,
+}
+
+/// `POST /v1/land` as a server answers it: the [`LandResponse`] with, beside
+/// its fields, the notices for the land's session (ADR 0096). A client that
+/// reads only [`LandResponse`] ignores `notices`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandAnswer {
+    #[serde(flatten)]
+    pub answer: LandResponse,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<Notice>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2994,6 +3090,77 @@ mod tests {
             let d: DeclareSessionResponse =
                 serde_json::from_value(json!({ "session": back })).unwrap();
             assert!(!d.created);
+        }
+
+        /// Notices (ADR 0096) are additive: old bodies decode without them,
+        /// none is written when there are none, a land answer keeps its
+        /// shape with them beside it, and an old client reading
+        /// `LandResponse` ignores them.
+        #[test]
+        fn notices_are_additive() {
+            let id = ChangesetId(Hash::of_blob(b"n"));
+            let c: CreateChangesetResponse = serde_json::from_value(json!({ "id": id })).unwrap();
+            assert!(c.notices.is_empty());
+            assert_eq!(serde_json::to_value(&c).unwrap(), json!({ "id": id }));
+            let n = Notice {
+                level: "same_file".into(),
+                session: Some(4),
+                principal: Some("bo".into()),
+                changeset: None,
+                count: None,
+                by: None,
+                similarity: None,
+                untrusted: NoticeText {
+                    title: "t".into(),
+                    path: Some("src/a.rs".into()),
+                    other_path: Some("src/a.rs".into()),
+                    task_key: None,
+                },
+            };
+            let v = serde_json::to_value(&n).unwrap();
+            assert_has(
+                &v,
+                &["level", "session", "principal", "untrusted"],
+                "Notice",
+            );
+            for absent in ["changeset", "count", "by", "similarity"] {
+                assert!(v.get(absent).is_none(), "{absent}");
+            }
+            let small: Notice = serde_json::from_value(json!({ "level": "near" })).unwrap();
+            assert!(small.session.is_none() && small.untrusted.title.is_empty());
+            let land = LandAnswer {
+                answer: LandResponse::Landed {
+                    landed: id,
+                    rebased: false,
+                    attempts: 1,
+                },
+                notices: vec![n.clone()],
+            };
+            let lv = serde_json::to_value(&land).unwrap();
+            assert_eq!(lv["status"], "landed");
+            assert_eq!(lv["notices"][0]["level"], "same_file");
+            let old: LandResponse = serde_json::from_value(lv.clone()).unwrap();
+            assert_eq!(old, land.answer);
+            let back: LandAnswer = serde_json::from_value(lv).unwrap();
+            assert_eq!(back, land);
+            let plain = serde_json::to_value(&land.answer).unwrap();
+            let without: LandAnswer = serde_json::from_value(plain.clone()).unwrap();
+            assert!(without.notices.is_empty());
+            assert_eq!(
+                serde_json::to_value(LandAnswer {
+                    answer: land.answer.clone(),
+                    notices: vec![]
+                })
+                .unwrap(),
+                plain
+            );
+            let r: SessionsResponse = serde_json::from_value(json!({ "sessions": [] })).unwrap();
+            assert!(r.notices.is_empty());
+            let o: OverlapsResponse =
+                serde_json::from_value(json!({ "session": 3, "overlaps": [v] })).unwrap();
+            assert_eq!(o.overlaps, vec![n]);
+            let e: NoticesResponse = serde_json::from_value(json!({})).unwrap();
+            assert!(e.notices.is_empty());
         }
     }
 }

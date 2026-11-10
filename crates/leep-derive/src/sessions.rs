@@ -363,6 +363,7 @@ impl Repo {
         Ok(DeclareSessionResponse {
             session: entry(s, now),
             created,
+            notices: Vec::new(),
         })
     }
 
@@ -421,7 +422,11 @@ impl Repo {
             .map(|s| entry(s, now))
             .filter(|e| SessionState::parse(&e.state).is_ok_and(shown))
             .collect();
-        Ok(SessionsResponse { sessions, next })
+        Ok(SessionsResponse {
+            sessions,
+            next,
+            notices: Vec::new(),
+        })
     }
 
     /// One session; 404 if unknown.

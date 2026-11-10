@@ -941,7 +941,10 @@ async fn create_changeset(
     if let Some(seed) = seed {
         sessions::after_create(&repo, seed, id, &who).await;
     }
-    Ok(Json(CreateChangesetResponse { id }))
+    Ok(Json(CreateChangesetResponse {
+        id,
+        notices: vec![],
+    }))
 }
 
 /// `{id}` of a read endpoint that also takes a revision (ADR 0082): a full

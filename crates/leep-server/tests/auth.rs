@@ -218,7 +218,7 @@ async fn write_token_does_everything() {
     assert_eq!(r.status, StatusCode::NO_CONTENT);
     let r = call(&app, Method::POST, "/v1/changesets", t, json(&changeset())).await;
     assert_eq!(r.status, StatusCode::OK);
-    let CreateChangesetResponse { id } = serde_json::from_slice(&r.body).unwrap();
+    let CreateChangesetResponse { id, .. } = serde_json::from_slice(&r.body).unwrap();
     let r = call(
         &app,
         Method::POST,
@@ -546,7 +546,7 @@ async fn read_token_reads_the_reflog_and_the_actor_is_the_token_name() {
         json(&changeset()),
     )
     .await;
-    let CreateChangesetResponse { id } = serde_json::from_slice(&r.body).unwrap();
+    let CreateChangesetResponse { id, .. } = serde_json::from_slice(&r.body).unwrap();
 
     for uri in ["/v1/reflog", "/v1/reflog/main"] {
         let r = call(&app, Method::GET, uri, None, vec![]).await;
