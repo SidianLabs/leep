@@ -547,6 +547,12 @@ impl Client {
         all
     }
 
+    /// The notices gathered so far, left for [`Client::take_notices`]: for
+    /// a caller that decides something on them before they are shown.
+    pub fn pending_notices(&self) -> Vec<Notice> {
+        self.notices.lock().unwrap().clone()
+    }
+
     /// Forget the gathered notices `shown` says were already shown (in a
     /// context pack printed with them), so none is said twice.
     pub fn forget_notices(&self, shown: impl Fn(&Notice) -> bool) {

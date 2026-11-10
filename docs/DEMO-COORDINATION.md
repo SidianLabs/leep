@@ -66,6 +66,11 @@ ref is red with bo's land as a suspect.
 9. A task start says each thing once: eli's names dee as a duplicate on
    exactly one line, and dee's pack explains `carry identical` exactly
    once.
+10. dee's `leep_commit_and_land` into eli's file (the same task key, the
+    same file) is stopped by the pre-flight check before it lands: the
+    result names the changeset it made and eli's notice, and `main` has not
+    moved. dee lands that changeset with `changeset` and `force: true`, and
+    no second changeset is made.
 
 ## Reading the transcript critically
 
@@ -81,10 +86,11 @@ The demo is also a check on how the notices read. Things to look at:
   reads too), as `possible_duplicate` by task key.
 - eli's `landed` notice for dee's land is tagged `by task_key`, naming dee
   and telling eli its duplicate landed the task.
-- Known limit, left to the maintainer: `leep_commit_and_land` creates and
-  lands in one call, so an MCP agent hears of overlaps on its commit after
-  it has landed (dee hears eli in that answer). A commit-only tool or a
-  pre-flight check would change that.
+- The pre-flight check (ADR 0096 amendment) stops dee's commit before it
+  lands, so dee hears of eli first; it reads the warning and lands with
+  `force`. Only notices dee had not been shown stop it, so the check never
+  loops, and the solo agents' commits, which meet nothing louder than
+  `near`, land in one call as before.
 - Known limit, left to the maintainer: `leep-mcp` asks for notices at most
   every 30 s when a tool's answers carry none, so a `landed` notice can
   take up to 30 s to reach an MCP agent that is only reading.

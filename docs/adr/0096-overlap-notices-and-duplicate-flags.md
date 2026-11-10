@@ -278,3 +278,60 @@ said beside it. Clients add a hint: the CLI ends the line with
 needed", the MCP tools say the same outside the fence and keep the task
 key in the fenced row. A context pack tags its `landed` items the same way
 and keeps them as lands (`landed:` ids), never folded into the duplicate.
+
+### The MCP land waits for what it should read first (2026-11-10)
+`leep_commit_and_land` created and landed in one call, so an MCP agent
+heard of overlaps on its commit only after it had landed (dee heard eli
+in that answer, in the phase 1 demo). The maintainer chose a pre-flight
+check: the create's answer already carries the session's notices (section
+2), so the tool reads them before landing and stops when one of them
+should be read first. With nothing to stop for, the call is the same one
+create and one land as before: the check costs no request.
+
+**What stops a land** is one function, `Notice::stops_land` in `leep-core`,
+given the files the changeset changes:
+
+| Level | Stops when |
+|---|---|
+| `possible_duplicate` | always |
+| `landed` | its changeset changed a file of this change, or it is a duplicate's land (`by: task_key`) |
+| `claimed` | the claim is on a file of this change or a directory holding it |
+| `same_file` | the other session names a file of this change itself, not only a directory holding it |
+| `near`, a level the client does not know, anything `via` a related file | never |
+
+A directory someone scoped, `near`, and related files are too common to
+stop work for; they still end the result as advisory notices. The paths
+compared are agent-written (`untrusted`): they decide whether to stop and
+are never shown outside the fence. So that a notice names the file both
+sessions work on, two rankings prefer it: among one session's rows at the
+same level the server keeps the one whose path equals mine, then my
+earlier path (the request's own first), not the first in index order (a
+directory sorts first); and the `landed` walk names a path of mine its
+changeset changed itself before one met through a directory of mine.
+Only which paths a notice carries changes; levels, counts and what is
+said once do not.
+
+**Only notices not shown before stop.** The server says each notice once
+per session (section 2), so the notices that stopped a call never stop
+another: an agent that read them and changes its work lands. A stopped call
+has created its changeset but not landed it; the answer (`status:
+stopped`, an error result) names it, lists the notices that stopped it in
+the fence, and says how to go on: land it with `changeset` and `force:
+true`, or change the work. The MCP server remembers the changesets it
+stopped (64 per process): a call with the same changes, message, parents
+and metadata reuses the stopped changeset, with `force` or without, so
+retrying never makes a second one; without `force` it asks `GET
+/v1/notices` for anything new and lands unless that stops it.
+`leep_resolve_and_land` checks the same way, keeping its conflict
+remembered for the retry with `force`. An agent whose stop answer was lost
+can land without having read it; the notices are advisory, and the server
+said them, so this is no worse than a lost notice before.
+
+**The CLI needs none.** `leep commit` and `leep land` are separate
+commands; the notices of the create are printed when `leep commit` ends,
+before the agent lands, and `leep land` refuses uncommitted work.
+
+Also in this change: `leep_task_start` asks once more for a context pack
+the server shed (`Leep-Refused`, ADR 0060) when its `Retry-After` is at
+most 2 s, so a task's first call carries its context on a briefly busy
+server; a longer pause, or a second shed, is reported as before.

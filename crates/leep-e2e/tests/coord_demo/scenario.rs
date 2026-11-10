@@ -159,20 +159,23 @@ fn cli_notices(stderr: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The numbered notice lines a leep-mcp tool result ends with.
+/// The numbered notice lines of a leep-mcp tool result: those that
+/// stopped a land (pre-flight) and those it ends with.
 fn mcp_notices(text: &str) -> Vec<(String, String)> {
-    let Some((_, tail)) = text.split_once("Notices about other agents' work near yours") else {
-        return Vec::new();
-    };
-    tail.lines()
-        .take_while(|l| !l.starts_with("The fenced block"))
-        .filter_map(|l| {
-            let (num, rest) = l.split_once(". [")?;
-            if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            let (level, _) = rest.split_once(']')?;
-            Some((level.to_string(), l.to_string()))
+    text.split("Notices about other agents' work near yours")
+        .skip(1)
+        .flat_map(|tail| {
+            tail.lines()
+                .take_while(|l| !l.starts_with("The fenced block"))
+                .filter_map(|l| {
+                    let (num, rest) = l.split_once(". [")?;
+                    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+                        return None;
+                    }
+                    let (level, _) = rest.split_once(']')?;
+                    Some((level.to_string(), l.to_string()))
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -1148,9 +1151,11 @@ pub fn run(stores: &Stores, root: &Path, n: &Narrator) -> Report {
         ),
     });
 
-    // The duplicate pair: dee lands; eli is told.
-    n.say("Back to `BILL-42`: dee lands its fix. eli, about to start editing, reads the file.\n\n");
+    // The duplicate pair: dee commits; the pre-flight check stops the
+    // land on eli's file with the warning, and dee lands it with force.
+    n.say("Back to `BILL-42`: dee commits its fix. Before landing, `leep_commit_and_land` checks the notices its commit got: eli, whom dee has not been told of, has the same task on the same file, so the land stops there, naming the changeset it made. dee reads the warning and lands that changeset with `force`. eli, about to start editing, reads the file.\n\n");
     let dee = a("dee");
+    let head_before = head_of(&w, &maint);
     let d = dee.tool(
         &w,
         "leep_commit_and_land",
@@ -1158,8 +1163,62 @@ pub fn run(stores: &Stores, root: &Path, n: &Narrator) -> Report {
                 "changes": [{ "path": "src/billing/invoice.rs",
                               "content": "pub fn total(lines: &[Line]) -> Cents {\n    round_half_even(lines.iter().map(|l| l.exact).sum())\n}\n" }] }),
     );
+    let stopped = (d.data["status"] == "stopped")
+        .then(|| d.data["changeset"].as_str().unwrap_or("").to_string());
+    let stopped_by: Vec<String> = d.data["stopped_by"]
+        .as_array()
+        .map(|v| {
+            v.iter()
+                .map(|n| {
+                    format!(
+                        "{} of {}",
+                        n["level"].as_str().unwrap_or("?"),
+                        n["principal"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let unmoved = head_of(&w, &maint) == head_before;
+    let d = match &stopped {
+        Some(id) => dee.tool(
+            &w,
+            "leep_commit_and_land",
+            json!({ "changeset": id, "force": true }),
+        ),
+        None => d,
+    };
     assert!(!d.is_error, "{}", d.text);
     let dee_landed = d.data["landed"].as_str().unwrap_or("").to_string();
+    let forced_same = stopped
+        .as_deref()
+        .is_some_and(|id| d.data["changeset"] == id && !dee_landed.is_empty());
+    claims.push(Claim {
+        n: 10,
+        what: "an MCP commit into another agent's file stops before landing, then lands with force",
+        pass: stopped.is_some()
+            && unmoved
+            && stopped_by.iter().any(|n| n.ends_with("of eli"))
+            && forced_same,
+        evidence: format!(
+            "dee's first call: status {}, changeset {}, stopped by {stopped_by:?}, main unmoved: \
+             {unmoved}; with force: landed {} as {}",
+            if stopped.is_some() {
+                "stopped"
+            } else {
+                "not stopped"
+            },
+            stopped.as_deref().map_or("-", |id| &id[..12.min(id.len())]),
+            d.data["changeset"]
+                .as_str()
+                .map_or("-", |id| &id[..12.min(id.len())]),
+            if dee_landed.is_empty() {
+                "-"
+            } else {
+                &dee_landed[..12]
+            },
+        ),
+    });
     let eli = a("eli");
     eli.tool(
         &w,

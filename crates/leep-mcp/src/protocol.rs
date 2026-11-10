@@ -25,7 +25,9 @@ with git-style suffixes (`main~2` is two first parents back, `main^2` a merge's 
 no working copy: \
 leep_commit_and_land sends complete file contents, creates one changeset and lands it. If it \
 reports conflicts, nothing landed; call leep_resolve_and_land with the report's conflict_id and \
-resolved content for the conflicting paths only.";
+resolved content for the conflicting paths only. If it reports `stopped`, nothing landed either: \
+another agent's work meets your change; read the notices, then land the named changeset with \
+force:true or change your work.";
 
 pub struct Server {
     pub(crate) client: Client,
@@ -40,6 +42,9 @@ pub struct Server {
     pub(crate) pending_lands: Mutex<HashMap<(ChangesetId, String), LandId>>,
     /// Conflict reports `leep_resolve_and_land` can still finish.
     pub(crate) conflicts: Mutex<tools::Conflicts>,
+    /// Changesets made by calls the pre-flight check stopped, which a later
+    /// call lands instead of making them again (ADR 0096 amendment).
+    pub(crate) stopped: Mutex<tools::StoppedLands>,
     /// The token's name, once asked (`leep_who` marks your own session).
     pub(crate) principal: std::sync::OnceLock<String>,
     /// When notices were last asked for (ADR 0096).
@@ -60,6 +65,7 @@ impl Server {
             requests: Mutex::default(),
             pending_lands: Mutex::default(),
             conflicts: Mutex::default(),
+            stopped: Mutex::default(),
             principal: std::sync::OnceLock::new(),
             notice_poll: Mutex::default(),
         }

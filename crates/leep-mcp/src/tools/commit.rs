@@ -1,11 +1,11 @@
 //! `leep_commit_and_land`: the agent write path, with no working copy.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use leep_cli::client::new_land_id;
 use leep_cli::error::{CliError, ErrorKind};
-use leep_core::api::{error_code, Conflict, FileInfo, LandRequest, LandResponse};
+use leep_core::api::{error_code, Conflict, FileInfo, LandRequest, LandResponse, Notice};
 use leep_core::changeset::{
     EXTRA_AGENT_MODEL, EXTRA_AGENT_PROMPT, EXTRA_AGENT_REQUEST_ID, EXTRA_AGENT_SESSION,
     EXTRA_AGENT_TESTS,
@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::resolve::conflict_request;
+use super::session::notices_text;
 use super::{as_text, parse_args, truncate, ToolError, ToolOutput, ToolResult, DEFAULT_REF};
 use crate::Server;
 
@@ -27,6 +28,60 @@ const RECORD_SCAN_PAGES: usize = 10;
 const RECORD_SCAN_PAGE: usize = 1000;
 /// Text of a `land_id_reused` refusal from servers that send no code.
 const LAND_ID_REUSED_MARKER: &str = "; use a new land id";
+/// Changesets the pre-flight check stopped, remembered per MCP process;
+/// the oldest is forgotten first.
+const MAX_STOPPED: usize = 64;
+
+/// A changeset a call made and then did not land, because the pre-flight
+/// check stopped it (ADR 0096 amendment).
+#[derive(Clone)]
+pub(crate) struct Stopped {
+    id: ChangesetId,
+    target_ref: String,
+    /// What was created, with its timestamp zeroed: a later call making
+    /// the same changes lands this changeset instead of making another.
+    content: Changeset,
+    /// The request it belongs to, which keeps naming its land.
+    request_id: Option<String>,
+}
+
+#[derive(Default)]
+pub(crate) struct StoppedLands(VecDeque<Stopped>);
+
+impl StoppedLands {
+    fn find(&self, id: ChangesetId, target_ref: &str) -> Option<&Stopped> {
+        self.0
+            .iter()
+            .find(|s| s.id == id && s.target_ref == target_ref)
+    }
+
+    fn remember(&mut self, s: Stopped) {
+        self.forget(s.id);
+        self.0.push_back(s);
+        while self.0.len() > MAX_STOPPED {
+            self.0.pop_front();
+        }
+    }
+
+    fn forget(&mut self, id: ChangesetId) {
+        self.0.retain(|s| s.id != id);
+    }
+}
+
+/// `cs` without its timestamp: what two calls making the same changes share.
+fn timeless(cs: &Changeset) -> Changeset {
+    Changeset {
+        timestamp: 0,
+        ..cs.clone()
+    }
+}
+
+/// Which tool stopped a land, for how to go on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Lander {
+    Commit,
+    Resolve,
+}
 
 /// The land id of `request_id` on `target_ref` (ADR 0057), namespaced by
 /// the author and, when set, the agent session. Derived, not random, so
@@ -71,6 +126,9 @@ struct Args {
     /// Land this existing changeset instead of making one: the retry of a
     /// call whose answer was lost.
     changeset: Option<String>,
+    /// Land without the pre-flight check (ADR 0096 amendment).
+    #[serde(default)]
+    force: bool,
     /// Client-chosen id of this request. A second call with the same id
     /// lands at most once: in this process it lands the changeset the first
     /// call made, and in any process the server answers the land id derived
@@ -148,7 +206,14 @@ impl Server {
                 ));
             }
             let id = self.resolve_rev(Some(rev))?;
-            return self.land_existing(id, &target_ref, a.create_ref, None);
+            // A changeset a stopped call made keeps naming its request.
+            let request = self
+                .stopped
+                .lock()
+                .unwrap()
+                .find(id, &target_ref)
+                .and_then(|s| s.request_id.clone());
+            return self.land_existing(id, &target_ref, a.create_ref, request.as_deref(), a.force);
         }
         let request_id = non_empty(a.request_id.as_deref()).map(str::to_string);
         if let Some(r) = &request_id {
@@ -161,7 +226,13 @@ impl Server {
                     )));
                 }
                 if a.changes.is_empty() || self.same_changes(id, &a.changes)? {
-                    return self.land_existing(id, &target_ref, a.create_ref, Some(r.as_str()));
+                    return self.land_existing(
+                        id,
+                        &target_ref,
+                        a.create_ref,
+                        Some(r.as_str()),
+                        a.force,
+                    );
                 }
                 // Other changes under a known id: the remembered changeset may
                 // never have landed (its land failed), so forget it and let
@@ -236,7 +307,7 @@ impl Server {
             changes,
             extra,
         };
-        let created = self.client.create_changeset_for(&cs, Some(&target_ref))?;
+        let (created, made) = self.create_or_reuse(&cs, &target_ref, true)?;
         if let Some(r) = &request_id {
             self.requests
                 .lock()
@@ -244,6 +315,16 @@ impl Server {
                 .insert(r.clone(), (created, target_ref.clone()));
         }
         let files = cs.changes.len();
+        if let Some(stop) = self.preflight(
+            created,
+            &target_ref,
+            made.then_some(&cs),
+            a.force,
+            request_id.as_deref(),
+            Lander::Commit,
+        )? {
+            return Ok(stop);
+        }
         self.land_and_report(
             created,
             &target_ref,
@@ -287,16 +368,115 @@ impl Server {
 
     /// Land a changeset that already exists. Safe to repeat: one already on
     /// the ref, or landed there as a rebased copy, is reported as landed
-    /// rather than added again.
+    /// rather than added again. One the pre-flight check stopped is checked
+    /// again unless `force`.
     fn land_existing(
         &self,
         id: ChangesetId,
         target_ref: &str,
         create: bool,
         request_id: Option<&str>,
+        force: bool,
     ) -> ToolResult {
         let files = self.client.get_changeset(&id)?.changeset.changes.len();
+        if let Some(stop) =
+            self.preflight(id, target_ref, None, force, request_id, Lander::Commit)?
+        {
+            return Ok(stop);
+        }
         self.land_and_report(id, target_ref, create, files, request_id)
+    }
+
+    /// Store `cs`, or reuse the changeset a stopped call made with the same
+    /// changes, message, parents and metadata for `target_ref`, so calling
+    /// again (with `force` or not) never makes a second one. Answers the id
+    /// and whether this call made it. `send_target` names the ref to the
+    /// server (`Leep-Target-Ref`) as `leep_commit_and_land` does.
+    pub(super) fn create_or_reuse(
+        &self,
+        cs: &Changeset,
+        target_ref: &str,
+        send_target: bool,
+    ) -> Result<(ChangesetId, bool), ToolError> {
+        let content = timeless(cs);
+        let reused = self
+            .stopped
+            .lock()
+            .unwrap()
+            .0
+            .iter()
+            .find(|s| s.target_ref == target_ref && s.content == content)
+            .map(|s| s.id);
+        if let Some(id) = reused {
+            return Ok((id, false));
+        }
+        let id = if send_target {
+            self.client.create_changeset_for(cs, Some(target_ref))?
+        } else {
+            self.client.create_changeset(cs)?
+        };
+        Ok((id, true))
+    }
+
+    /// The pre-flight check (ADR 0096 amendment), before landing `id` on
+    /// `target_ref`: a stop answer when a notice the agent has not been
+    /// shown says another agent's work meets this change
+    /// ([`Notice::stops_land`]), else `None` and the land goes ahead.
+    ///
+    /// `made` is the changeset when this call just created it: its create's
+    /// answer carries the notices (ADR 0096), so a clean check costs no
+    /// request. The server says each notice once per session, so one that
+    /// stopped a call never stops another. Landing a changeset a call
+    /// stopped before asks the server (`GET /v1/notices`) for anything new
+    /// since; any other existing changeset (finishing a call whose answer
+    /// was lost) lands unchecked, as before. `force` skips the check.
+    pub(super) fn preflight(
+        &self,
+        id: ChangesetId,
+        target_ref: &str,
+        made: Option<&Changeset>,
+        force: bool,
+        request_id: Option<&str>,
+        lander: Lander,
+    ) -> Result<Option<ToolOutput>, ToolError> {
+        let earlier = self.stopped.lock().unwrap().find(id, target_ref).cloned();
+        if force {
+            self.stopped.lock().unwrap().forget(id);
+            return Ok(None);
+        }
+        let content = match (made, earlier) {
+            (Some(cs), _) => timeless(cs),
+            (None, Some(s)) => {
+                // Best effort, like every notice read: a server that does
+                // not answer leaves nothing new to stop for.
+                if self.client.notices_now().is_ok() {
+                    *self.notice_poll.lock().unwrap() = Some(std::time::Instant::now());
+                }
+                s.content
+            }
+            (None, None) => return Ok(None),
+        };
+        let changed: BTreeSet<String> = content.changes.keys().map(|p| p.to_string()).collect();
+        let mut stops: Vec<Notice> = Vec::new();
+        for n in self.client.pending_notices() {
+            if n.stops_land(|p| changed.contains(p)) && !stops.contains(&n) {
+                stops.push(n);
+            }
+        }
+        if stops.is_empty() {
+            self.stopped.lock().unwrap().forget(id);
+            return Ok(None);
+        }
+        // Said here, in the stop answer; the rest still end the result.
+        self.client.forget_notices(|n| stops.contains(n));
+        let files = content.changes.len();
+        self.stopped.lock().unwrap().remember(Stopped {
+            id,
+            target_ref: target_ref.to_string(),
+            content,
+            request_id: request_id.map(str::to_string),
+        });
+        Ok(Some(stop_report(id, target_ref, files, &stops, lander)))
     }
 
     /// Land `created` and report the outcome. A conflict forgets the
@@ -610,6 +790,57 @@ impl Server {
                 json!({ "text": shown, "size": f.size, "truncated": cut })
             }
         })
+    }
+}
+
+/// The answer of a land the pre-flight check stopped: not landed, which
+/// changeset was made, the notices that stopped it (other agents' words
+/// fenced) and exactly how to go on.
+fn stop_report(
+    id: ChangesetId,
+    target_ref: &str,
+    files: usize,
+    stops: &[Notice],
+    lander: Lander,
+) -> ToolOutput {
+    let land_it = match lander {
+        Lander::Commit => format!(
+            "call leep_commit_and_land with changeset: \"{id}\" and force: true (or repeat \
+             this call with force: true)"
+        ),
+        Lander::Resolve => {
+            "call leep_resolve_and_land again with the same arguments and force: true".to_string()
+        }
+    };
+    let guidance = format!(
+        "Nothing was landed: {target_ref} is unchanged. Changeset {id} was created but NOT \
+         landed, because the notices below, which you had not been shown, say other agents' \
+         work meets this change. Read them; leep_overlaps lists everything overlapping your \
+         work and leep_read_file shows {target_ref} now. Then either land it as it is: \
+         {land_it}; that lands this changeset and makes no new one. Or change your work and \
+         call leep_commit_and_land with the new changes. These notices never stop a call \
+         again: without force, a call stops only for a notice you have not been shown."
+    );
+    let v = json!({
+        "status": "stopped",
+        "landed": false,
+        "changeset": id.to_string(),
+        "target_ref": target_ref,
+        "files_changed": files,
+        "stopped_by": stops,
+        "guidance": guidance,
+    });
+    let notices = notices_text(
+        "Notices about other agents' work near yours that stopped this land",
+        stops,
+    )
+    .unwrap_or_default();
+    ToolOutput {
+        text: format!(
+            "NOT LANDED: stopped before landing (pre-flight check).\n{guidance}\n\n{notices}"
+        ),
+        structured: Some(v),
+        is_error: true,
     }
 }
 
