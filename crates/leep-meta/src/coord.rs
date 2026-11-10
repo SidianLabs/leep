@@ -354,6 +354,9 @@ impl CoordStore for PgCoordStore {
         if let Some(k) = &f.agent_session {
             q.push(" AND s.agent_session = ").push_bind(k.clone());
         }
+        if let Some(o) = f.origin {
+            q.push(" AND s.origin = ").push_bind(o.as_str());
+        }
         if !f.states.is_empty() {
             let states: Vec<&str> = f.states.iter().map(|s| s.as_str()).collect();
             q.push(" AND s.state = ANY(").push_bind(states).push(")");
@@ -764,6 +767,9 @@ impl CoordStore for SqliteCoordStore {
         }
         if let Some(k) = &f.agent_session {
             q.push(" AND s.agent_session = ").push_bind(k.clone());
+        }
+        if let Some(o) = f.origin {
+            q.push(" AND s.origin = ").push_bind(o.as_str());
         }
         if !f.states.is_empty() {
             q.push(" AND s.state IN (");

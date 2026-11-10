@@ -510,3 +510,52 @@ async fn overlaps_on_a_slow_store_answer_within_their_bound() {
         started.elapsed()
     );
 }
+
+/// An agent that restarts under a new session key, with the same task,
+/// is not told about its own earlier session.
+#[tokio::test]
+async fn a_restarted_agent_is_not_its_own_duplicate() {
+    let r = repo();
+    let mut a = declare("a-1", "Fix the flaky login test in the auth module");
+    a.task_key = Some("L-1".into());
+    a.scope = Some(vec!["src/auth/login.rs".into()]);
+    r.declare_session("ada", a).await.unwrap();
+    let mut again = declare("a-2", "Fix the flaky login test in the auth module");
+    again.task_key = Some("L-1".into());
+    again.scope = Some(vec!["src/auth/login.rs".into()]);
+    let resp = r.declare_session("ada", again).await.unwrap();
+    assert!(resp.notices.is_empty(), "{:?}", resp.notices);
+    // Another principal on the task is still flagged.
+    let mut b = declare("b-1", "Something else");
+    b.task_key = Some("L-1".into());
+    let resp = r.declare_session("bo", b).await.unwrap();
+    assert!(resp.notices.iter().any(|n| n.level == "possible_duplicate"));
+}
+
+/// Duplicates by wording are looked for among declared sessions, however
+/// many inferred ones are newer.
+#[tokio::test]
+async fn declared_duplicates_are_found_behind_many_inferred_sessions() {
+    let r = repo();
+    r.declare_session(
+        "ada",
+        declare("a-1", "Fix the flaky login test in the auth module"),
+    )
+    .await
+    .unwrap();
+    for i in 0..=crate::notices::DUPLICATE_CANDIDATES {
+        commit(
+            &r,
+            &format!("p{i}"),
+            &format!("k{i}"),
+            &[],
+            &[&format!("d{i}/f.rs")],
+        )
+        .await;
+    }
+    let resp = r
+        .declare_session("bo", declare("b-1", "fix flaky login test in auth module"))
+        .await
+        .unwrap();
+    assert_eq!(levels(&resp.notices), ["possible_duplicate"]);
+}

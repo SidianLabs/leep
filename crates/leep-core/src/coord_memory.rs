@@ -365,6 +365,16 @@ pub async fn check_coord_contract(store: &dyn CoordStore) {
         ..all.clone()
     };
     assert_eq!(list(by).await, [b.id]);
+    let declared = SessionFilter {
+        origin: Some(SessionOrigin::Declared),
+        ..all.clone()
+    };
+    assert_eq!(list(declared).await, [c.id, a.id]);
+    let inferred = SessionFilter {
+        origin: Some(SessionOrigin::Inferred),
+        ..all.clone()
+    };
+    assert_eq!(list(inferred).await, [b.id]);
     let key = SessionFilter {
         agent_session: Some("s-1".into()),
         principal: Some("ada".into()),

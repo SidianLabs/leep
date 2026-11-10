@@ -436,6 +436,7 @@ impl Repo {
             before: q.before,
             limit,
             skip_paths: false,
+            origin: None,
         };
         let rows = coord.list_sessions(&filter).await?;
         let next = (rows.len() == limit)

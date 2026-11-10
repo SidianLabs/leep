@@ -616,6 +616,9 @@ pub struct SessionFilter {
     /// Any of these stored states; empty means every state. `Idle` is not
     /// a stored state: ask for `Active` and look at `last_seen`.
     pub states: Vec<SessionState>,
+    /// Only sessions of this origin (duplicate detection compares
+    /// declared intents; ADR 0096).
+    pub origin: Option<SessionOrigin>,
     /// Only ids below this, for paging.
     pub before: Option<u64>,
     /// At most this many; 0 means none.
@@ -642,6 +645,7 @@ impl SessionFilter {
                 .as_ref()
                 .is_none_or(|k| &s.agent_session == k)
             && (self.states.is_empty() || self.states.contains(&s.state))
+            && self.origin.is_none_or(|o| s.origin == o)
             && self.before.is_none_or(|b| s.id < b)
     }
 }

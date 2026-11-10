@@ -58,7 +58,7 @@ pub const HOT_SESSIONS: usize = 50;
 pub const LANDED_WINDOW: usize = 64;
 /// The session's own changesets walked to find what it is based on.
 pub const OWN_WALK: usize = 32;
-/// Most recent active sessions compared for a similar intent.
+/// Most recent active declared sessions compared for a similar intent.
 pub const DUPLICATE_CANDIDATES: usize = 200;
 /// Most sessions of one task key flagged.
 pub const DUPLICATE_BY_KEY: usize = 20;
@@ -381,6 +381,52 @@ pub fn intent_trigrams(title: &str, approach: &str) -> Vec<u32> {
     crate::search::trigram::extract(text.as_bytes())
 }
 
+/// What a session says it is doing, as compared for duplicates: its
+/// trigrams and the paths it names (words with a `/`, or a name and an
+/// extension).
+#[derive(Clone, Debug, Default)]
+pub struct Intent {
+    grams: Vec<u32>,
+    paths: BTreeSet<String>,
+}
+
+pub fn intent(title: &str, approach: &str) -> Intent {
+    let paths = title
+        .split_whitespace()
+        .chain(approach.split_whitespace())
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '_'))
+        .filter(|w| {
+            w.contains('/')
+                || w.split_once('.').is_some_and(|(a, b)| {
+                    !a.is_empty() && !b.is_empty() && b.chars().all(char::is_alphanumeric)
+                })
+        })
+        .map(str::to_lowercase)
+        .collect();
+    Intent {
+        grams: intent_trigrams(title, approach),
+        paths,
+    }
+}
+
+/// How alike two intents are, in percent: trigram similarity, but none
+/// when both name paths and share none. A template filled in with other
+/// files ("Fix flaky test in <path>") is other work, however long the
+/// shared words.
+pub fn alike(a: &Intent, b: &Intent) -> u32 {
+    if !a.paths.is_empty() && !b.paths.is_empty() && a.paths.is_disjoint(&b.paths) {
+        return 0;
+    }
+    similarity(&a.grams, &b.grams)
+}
+
+/// The same agent on the same task under another session key (a
+/// restart): the same principal and task key. It is not told about
+/// itself.
+fn same_agent_and_task(s: &Session, o: &Session) -> bool {
+    s.task_key.is_some() && o.task_key == s.task_key && o.principal == s.principal
+}
+
 /// Jaccard similarity of two sorted trigram sets, in percent.
 pub fn similarity(a: &[u32], b: &[u32]) -> u32 {
     if a.is_empty() || b.is_empty() {
@@ -488,7 +534,9 @@ impl Repo {
         // path is one notice, whichever and however many of mine it holds.
         let mut crowd: BTreeMap<&str, (usize, BTreeSet<u64>)> = BTreeMap::new();
         for r in &rows {
-            if r.session.state_at(now) == SessionState::Expired {
+            if r.session.state_at(now) == SessionState::Expired
+                || same_agent_and_task(s, &r.session)
+            {
                 continue;
             }
             let best = mine
@@ -704,7 +752,9 @@ impl Repo {
             return Ok(Vec::new());
         };
         let now = unix_now();
-        let live = |o: &Session| o.id != s.id && o.state_at(now) != SessionState::Expired;
+        let live = |o: &Session| {
+            o.id != s.id && o.state_at(now) != SessionState::Expired && !same_agent_and_task(s, o)
+        };
         let mut out = Vec::new();
         let mut flagged = BTreeSet::new();
         if let Some(k) = &s.task_key {
@@ -732,13 +782,14 @@ impl Repo {
         }
         // Only declared intents are compared: an inferred title is a commit
         // subject, and two commits to one file often read alike.
-        let me = intent_trigrams(&s.title, &s.approach);
-        if me.is_empty() || s.origin != SessionOrigin::Declared {
+        let me = intent(&s.title, &s.approach);
+        if me.grams.is_empty() || s.origin != SessionOrigin::Declared {
             return Ok(out);
         }
         let recent = coord
             .list_sessions(&SessionFilter {
                 states: vec![SessionState::Active],
+                origin: Some(SessionOrigin::Declared),
                 limit: DUPLICATE_CANDIDATES,
                 skip_paths: true,
                 ..Default::default()
@@ -746,8 +797,8 @@ impl Repo {
             .await?;
         let mut similar: Vec<(u32, &Session)> = recent
             .iter()
-            .filter(|o| live(o) && !flagged.contains(&o.id) && o.origin == SessionOrigin::Declared)
-            .map(|o| (similarity(&me, &intent_trigrams(&o.title, &o.approach)), o))
+            .filter(|o| live(o) && !flagged.contains(&o.id))
+            .map(|o| (alike(&me, &intent(&o.title, &o.approach)), o))
             .filter(|(p, _)| *p >= SIMILAR_PERCENT)
             .collect();
         similar.sort_by_key(|s| std::cmp::Reverse(s.0));
@@ -998,7 +1049,7 @@ mod tests {
 
     #[test]
     fn similar_intents_and_near_misses() {
-        let sim = |a: &str, b: &str| similarity(&intent_trigrams(a, ""), &intent_trigrams(b, ""));
+        let sim = |a: &str, b: &str| alike(&intent(a, ""), &intent(b, ""));
         let same = sim(
             "Fix the flaky login test in the auth module",
             "fix flaky login test in auth module",
@@ -1017,6 +1068,30 @@ mod tests {
         let other = sim("Add a cache for blame results", "Fix the flaky login test");
         assert!(other < 20, "{other}");
         assert_eq!(sim("fix bug", "fix bug"), 0, "too short to compare");
+        // A shared path or template is not a shared task.
+        for (a, b) in [
+            (
+                "Fix flaky test in crates/leep-server/tests/notices.rs",
+                "Fix flaky test in crates/leep-server/tests/sessions.rs",
+            ),
+            (
+                "Fix flaky test in crates/leep-server/tests/land_forwarding.rs",
+                "Fix flaky test in crates/leep-server/tests/land_retries.rs",
+            ),
+            (
+                "Bump the version of crates/leep-meta/Cargo.toml",
+                "Bump the version of crates/leep-store/Cargo.toml",
+            ),
+        ] {
+            let p = sim(a, b);
+            assert!(p < SIMILAR_PERCENT, "{p}: {a:?} {b:?}");
+        }
+        // The same path and goal still are.
+        let p = sim(
+            "Fix the flaky test in crates/leep-server/tests/notices.rs",
+            "fix flaky test crates/leep-server/tests/notices.rs",
+        );
+        assert!(p >= SIMILAR_PERCENT, "{p}");
     }
 
     #[test]
