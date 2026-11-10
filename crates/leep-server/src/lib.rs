@@ -1825,19 +1825,18 @@ async fn land(
         let resp = repo
             .land_keyed(req.changeset, &req.target_ref, actor, create, req.land_id)
             .await?;
-        sessions::after_land(&repo, req.changeset, actor, &resp);
+        // Notices first: the hook below ends the landing session.
+        let answer = sessions::land_answer(&repo, req.changeset, actor, &headers, resp).await;
+        sessions::after_land(&repo, req.changeset, actor, &answer.answer);
         review_requests::after_land(
             repo.clone(),
             &config,
             req.target_ref,
             req.changeset,
             actor,
-            &resp,
+            &answer.answer,
         );
-        return Ok(
-            Json(sessions::land_answer(&repo, req.changeset, actor, &headers, resp).await)
-                .into_response(),
-        );
+        return Ok(Json(answer).into_response());
     };
     // The client's body byte for byte, so fields this server does not know
     // reach the coordinating server unchanged.
@@ -1857,17 +1856,18 @@ async fn land(
             .await?
         {
             Coordinated::Landed(r) => {
-                sessions::after_land(&repo, req.changeset, actor, &r);
+                // Notices first: the hook below ends the landing session.
+                let answer = sessions::land_answer(&repo, req.changeset, actor, &headers, r).await;
+                sessions::after_land(&repo, req.changeset, actor, &answer.answer);
                 review_requests::after_land(
                     repo.clone(),
                     &config,
                     req.target_ref,
                     req.changeset,
                     actor,
-                    &r,
+                    &answer.answer,
                 );
-                Json(sessions::land_answer(&repo, req.changeset, actor, &headers, r).await)
-                    .into_response()
+                Json(answer).into_response()
             }
             Coordinated::Forwarded(relayed) => relayed.into_response(),
             Coordinated::NotLeader => coord::not_leader(),

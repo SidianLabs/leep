@@ -346,3 +346,31 @@ async fn notices_off_answers_without_them() {
         .ok();
     assert!(!o.overlaps.is_empty(), "asked for, still answered");
 }
+
+/// The land's notices are computed before the hook that ends the landing
+/// session runs, so they come on every Landed answer, on a runtime with
+/// several threads too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_landed_answer_always_carries_its_notices() {
+    for i in 0..20 {
+        let api = Api::over(repo());
+        let a = api
+            .commit(
+                "alice",
+                &format!("a-{i}"),
+                &[],
+                &["src/x.rs"],
+                &[(NOTICES_HEADER, "off")],
+            )
+            .await;
+        api.commit("bob", &format!("b-{i}"), &[], &["src/x.rs"], &[])
+            .await;
+        let key = format!("a-{i}");
+        let answer: LandAnswer = api
+            .land("alice", a.id, &[(SESSION_HEADER, key.as_str())])
+            .await
+            .ok();
+        assert!(matches!(answer.answer, LandResponse::Landed { .. }));
+        assert_eq!(answer.notices.len(), 1, "run {i}: {:?}", answer.notices);
+    }
+}
