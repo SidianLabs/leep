@@ -66,6 +66,8 @@ fn tools_list_schemas_are_sane() {
         "leep_context",
         "leep_review_request",
         "leep_review_inbox",
+        "leep_note_add",
+        "leep_notes",
     ] {
         assert!(names.contains(&expected), "missing {expected}");
     }
