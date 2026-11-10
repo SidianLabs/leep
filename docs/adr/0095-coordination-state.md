@@ -322,3 +322,21 @@ corpora. Adding both families, with a corpus rebuild, is a separate change.
   and keep it, and inference could not match an undeclared session.
 - **Locks.** Rejected by the design: a claim an expired agent holds would
   block landing until its expiry.
+
+## Amendments
+
+### An inferred session knows its target ref (2026-11-10)
+A session only ever inferred from commits (an agent with
+`LEEP_AGENT_SESSION` that never ran `leep work start`) had no target ref,
+so it never heard a `landed` notice (ADR 0096): the phase 1 demo's
+friction list. A client now names where the work is meant to land on
+`POST /v1/changesets` with the request header `Leep-Target-Ref: <ref>`;
+the CLI sends its working copy's target ref, `leep-mcp`'s
+`leep_commit_and_land` its `target_ref`. Inference records it as the
+session's target ref like any inferred value: only when the session has
+none, never over a declared one. A bad ref name is ignored, never refused,
+as a bad `Leep-Session` is, and a server that does not know the header
+ignores it. The changeset, its hash and the create's answer are
+unchanged. A session with no target ref at all (an older client) is taken
+to land on `main` when its `landed` notices are computed (ADR 0096
+amendment).

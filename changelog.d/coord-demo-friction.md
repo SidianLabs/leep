@@ -9,3 +9,8 @@
   duplicate: the task-key lookup (one indexed listing) now runs on
   changeset creates, lands and `GET /v1/notices`, not only on declarations
   (ADR 0096 amendment).
+- **Fixed.** An agent that only sets `LEEP_AGENT_SESSION` (no `leep work
+  start`) now hears `landed` notices: the CLI and `leep_commit_and_land`
+  send the new request header `Leep-Target-Ref` on changeset creates, the
+  inferred session records it, and a session with no target ref is taken
+  to land on `main` (ADR 0095 and 0096 amendments).

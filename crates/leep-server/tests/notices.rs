@@ -425,3 +425,73 @@ async fn the_first_of_a_duplicate_pair_hears_it_on_its_land() {
         Some("BILL-42")
     );
 }
+
+/// `Leep-Target-Ref` on a create names where an inferred session lands
+/// (ADR 0095 amendment). Additive: a create without it (an older client)
+/// answers as before and its session, with no target, still hears of a
+/// land on `main`; a bad name is ignored, not refused.
+#[tokio::test]
+async fn a_create_names_the_inferred_sessions_target_ref() {
+    let api = Api::over(repo());
+    let seed = api.commit("carol", "c-0", &[], &["README"], &[]).await;
+    let base = match api
+        .land("carol", seed.id, &[])
+        .await
+        .ok::<LandAnswer>()
+        .answer
+    {
+        LandResponse::Landed { landed, .. } => landed,
+        other => panic!("{other:?}"),
+    };
+    api.commit(
+        "alice",
+        "a-1",
+        &[base],
+        &["src/x.rs"],
+        &[(TARGET_REF_HEADER, "release")],
+    )
+    .await;
+    api.commit("bob", "b-1", &[base], &["src/x.rs"], &[]).await;
+    api.commit(
+        "carol",
+        "c-1",
+        &[base],
+        &["docs/y.md"],
+        &[(TARGET_REF_HEADER, "bad ref")],
+    )
+    .await;
+    let api = &api;
+    let target = |who: &'static str, key: &'static str| async move {
+        let r: SessionsResponse = api
+            .call(
+                Method::GET,
+                &format!("/v1/sessions?principal={who}&session={key}"),
+                who,
+                &[],
+                vec![],
+            )
+            .await
+            .ok();
+        r.sessions[0].target_ref.clone()
+    };
+    assert_eq!(target("alice", "a-1").await.as_deref(), Some("release"));
+    assert_eq!(target("bob", "b-1").await, None, "an older client");
+    assert_eq!(target("carol", "c-1").await, None, "a bad name is ignored");
+
+    // carol lands on main: bob (no target) hears of it as `main`'s.
+    let mine = api
+        .commit("carol", "c-2", &[base], &["src/x.rs"], &[])
+        .await;
+    api.land("carol", mine.id, &[]).await.ok::<LandAnswer>();
+    let n: NoticesResponse = api
+        .call(
+            Method::GET,
+            "/v1/notices",
+            "bob",
+            &[(SESSION_HEADER, "b-1")],
+            vec![],
+        )
+        .await
+        .ok();
+    assert!(n.notices.iter().any(|n| n.level == "landed"), "{n:?}");
+}

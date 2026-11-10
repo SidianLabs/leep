@@ -1035,6 +1035,12 @@ Added:
 - `possible_duplicate` by `task_key` may now come on any answer carrying
   notices (creates, lands, `GET /v1/notices`, listings), not only on
   declarations. No shape changed.
+- Request header `Leep-Target-Ref: <ref>` on `POST /v1/changesets`: the
+  ref the work is meant to land on. A session inferred from the changeset
+  records it as its `target_ref` when it has none; a bad name is ignored.
+  The CLI sends its working copy's target ref, `leep-mcp` the
+  `target_ref` of `leep_commit_and_land`. Nothing else changes; older
+  servers ignore it.
 
 ## Index leases and bounded queries (additive, ADR 0058)
 

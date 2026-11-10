@@ -457,6 +457,13 @@ pub fn valid_request_id(id: &str) -> bool {
 /// one, and a bad value is ignored, never refused.
 pub const SESSION_HEADER: &str = "leep-session";
 
+/// Request header on `POST /v1/changesets` naming the ref the work is meant
+/// to land on (ADR 0095 amendment): a session inferred from the changeset
+/// records it as its target ref when it has none, so it hears of lands on
+/// that ref. A bad name is ignored, never refused; a server that does not
+/// know the header ignores it.
+pub const TARGET_REF_HEADER: &str = "leep-target-ref";
+
 /// Request header choosing what a query does when its index is behind
 /// (ADR 0058): [`INDEXING_RETRY`] or [`INDEXING_STALE_OK`]. Servers that
 /// list [`FEATURE_INDEXING_RETRY`] honour it; others ignore it.

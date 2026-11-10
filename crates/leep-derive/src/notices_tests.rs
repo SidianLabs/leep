@@ -631,3 +631,81 @@ async fn the_first_of_a_duplicate_pair_is_told_too() {
         "{n:?}"
     );
 }
+
+/// A session only ever inferred from commits (`LEEP_AGENT_SESSION`, no
+/// declaration) records the target ref its client names on the create
+/// (`Leep-Target-Ref`), never over a declared one, and hears of lands on
+/// it; one whose client named none (an older client) is taken to land on
+/// `main`, so it hears of lands there too.
+#[tokio::test]
+async fn an_undeclared_session_hears_of_lands() {
+    let r = repo();
+    let (seed, _) = commit(&r, "root", "r-0", &[], &["README"]).await;
+    let LandResponse::Landed { landed: base, .. } =
+        r.land_as(seed, "main", Some("root")).await.unwrap()
+    else {
+        panic!()
+    };
+    // ada commits without declaring, from a client that names no target.
+    commit(&r, "ada", "a-1", &[base], &["src/auth/token.rs"]).await;
+    let (theirs, _) = commit(&r, "bo", "b-1", &[base], &["src/auth/token.rs"]).await;
+    let LandResponse::Landed { landed, .. } = r.land_as(theirs, "main", Some("bo")).await.unwrap()
+    else {
+        panic!()
+    };
+    r.note_landed(theirs, landed, Some("bo")).await.unwrap();
+    let n = r.notices_for("ada", "a-1", &NoticeAsk::default()).await;
+    let l: Vec<_> = n.iter().filter(|n| n.level == "landed").collect();
+    assert_eq!(l.len(), 1, "{n:?}");
+    assert_eq!(l[0].changeset, Some(landed));
+
+    // A client that names its target: recorded on an inferred session.
+    let named = |key: &str, target: &str| {
+        let content = leep_core::Hash::of_blob(b"x");
+        let cs = Changeset {
+            parents: vec![base],
+            author: "cy".into(),
+            timestamp: 1_700_000_000,
+            message: "cy: edit".into(),
+            changes: [(
+                RepoPath::new("docs/x.md").unwrap(),
+                FileChange::Modify {
+                    content,
+                    kind: FileKind::Regular,
+                    size: 1,
+                },
+            )]
+            .into(),
+            extra: [(EXTRA_AGENT_SESSION.to_string(), key.to_string())].into(),
+        };
+        let mut seed = SessionSeed::of(&cs).unwrap();
+        seed.target_ref = Some(target.to_string());
+        (cs, seed)
+    };
+    r.put_blob(Bytes::from_static(b"x")).await.unwrap();
+    for (key, target, want) in [
+        ("c-1", "release", Some("release")),
+        ("c-2", "bad ref", None),
+    ] {
+        let (cs, seed) = named(key, target);
+        let id = r.create_changeset_by(cs, Some("cy")).await.unwrap();
+        let s = r
+            .note_created_session(seed, id, "cy")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.target_ref.as_deref(), want, "{key}");
+    }
+    // A declared target is never replaced by a commit's.
+    r.declare_session("dee", declare("d-1", "docs"))
+        .await
+        .unwrap();
+    let (cs, seed) = named("d-1", "release");
+    let id = r.create_changeset_by(cs, Some("dee")).await.unwrap();
+    let s = r
+        .note_created_session(seed, id, "dee")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.target_ref.as_deref(), Some("main"));
+}

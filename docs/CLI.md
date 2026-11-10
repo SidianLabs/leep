@@ -193,8 +193,10 @@ then records as `agent.session`. Every request sends the key as
 `Leep-Session`, so any command keeps the session live; a session not heard
 from for 10 minutes shows as `idle`, and after 24 hours it expires. The
 server also infers a session from any commit carrying `agent.session`, with
-the commit's subject as its title and its paths as `touched`, so `leep who`
-shows agents that never declared anything. A session ends as `landed` when
+the commit's subject as its title, its paths as `touched` and the working
+copy's target ref (sent as `Leep-Target-Ref`) as where it lands, so `leep
+who` shows agents that never declared anything and they hear `landed`
+notices too. A session ends as `landed` when
 its newest commit lands on any ref (a review ref included); the next commit
 with the same key starts it again. `leep session end` also forgets the key
 it kept in the working copy, so the next commit starts a new session.

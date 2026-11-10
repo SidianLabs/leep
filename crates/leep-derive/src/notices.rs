@@ -54,6 +54,9 @@ pub const NEAR_LIMIT: usize = 512;
 /// More sessions than this on one of my paths make it crowded: one notice
 /// with a count instead of one each (design D.3, the hot-path rule).
 pub const HOT_SESSIONS: usize = 50;
+/// The target ref of a session that names none, for `landed`: the ref
+/// clients land on by default.
+pub const DEFAULT_TARGET_REF: &str = "main";
 /// Changesets of the target ref walked for `landed`.
 pub const LANDED_WINDOW: usize = 64;
 /// The session's own changesets walked to find what it is based on.
@@ -699,9 +702,9 @@ impl Repo {
     /// short by the notice bound resumes on the next answer; it is redone
     /// when the ref or the session's head moves.
     pub(crate) async fn landed_overlaps(&self, s: &Session) -> Result<Vec<Found>> {
-        let Some(target) = s.target_ref.as_deref() else {
-            return Ok(Vec::new());
-        };
+        // A session that never said where it lands (inferred from an older
+        // client's commit) is taken to land on the default ref.
+        let target = s.target_ref.as_deref().unwrap_or(DEFAULT_TARGET_REF);
         if s.head.is_none() && s.base.is_none() {
             return Ok(Vec::new());
         }

@@ -59,7 +59,8 @@ it as one statement with a `LATERAL ... LIMIT` per exact path and per
 range; SQLite runs one short statement per probe. No new table, column
 or index.
 
-**`landed`** needs the session's `target_ref` and a base or head. Its base
+**`landed`** needs the session's `target_ref` (`main` when it has none;
+see the amendments) and a base or head. Its base
 is its declared base plus every parent outside the session of the
 session's own changesets, walked from its head (at most 32): a merge of
 the target into the work counts, so work already merged is not reported.
@@ -243,3 +244,9 @@ The same principal with the same key is still its own earlier session
 and never flagged. Duplicates by wording still wait for a declaration:
 they read 200 sessions, and inferred titles are not compared.
 
+### Undeclared sessions hear `landed` (2026-11-10)
+An inferred session had no target ref, so it had no `landed` part. Clients
+now name it on creates (`Leep-Target-Ref`, ADR 0095 amendment), and a
+session that still has none (an older client) is walked against `main`,
+the ref clients land on by default. A session whose work lands elsewhere
+and says so is never walked against `main`.

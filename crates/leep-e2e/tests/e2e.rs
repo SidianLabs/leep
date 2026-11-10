@@ -3070,9 +3070,9 @@ fn run_two_agents_notices(stores: &Stores, root: &Path) {
         a_commit.contains("notice: [possible_duplicate]"),
         "{a_commit}"
     );
-    let warned = [&b_commit, &a_commit, &second].iter().any(|e| {
-        e.contains("notice: [same_file]") || e.contains("notice: [possible_duplicate]")
-    });
+    let warned = [&b_commit, &a_commit, &second]
+        .iter()
+        .any(|e| e.contains("notice: [same_file]") || e.contains("notice: [possible_duplicate]"));
     assert!(warned, "b: {b_commit}\na: {a_commit}\nstart: {second}");
     for e in [&first, &second, &b_commit, &a_commit] {
         assert!(!e.chars().any(|c| c.is_control() && c != '\n'), "{e:?}");
@@ -3101,6 +3101,57 @@ fn run_two_agents_notices(stores: &Stores, root: &Path) {
     assert!(status.contains(&head[..12]), "{status}");
     // Said once.
     assert!(!run(&a, &["status"]).contains("[landed]"));
+    drop(server);
+}
+
+/// An agent that never declares a session (only `LEEP_AGENT_SESSION`)
+/// hears that a change to its file landed: the CLI names the working
+/// copy's target ref on each commit (`Leep-Target-Ref`), so the inferred
+/// session knows where it lands (ADR 0095 amendment).
+#[test]
+fn an_undeclared_agent_hears_of_a_land_on_its_file() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stores = Stores::sqlite(&root.join("data"));
+    let server = Server::start(&stores, root);
+    let client = Client::new(&server.url, &root.join("cache"));
+    let seed = root.join("seed");
+    client.ok(root, &["init", seed.to_str().unwrap()]);
+    write(&seed, "src/token.rs", "fn parse() {}\n");
+    client.ok(&seed, &["commit", "-m", "seed"]);
+    client.ok(&seed, &["land"]);
+    let b = root.join("b");
+    client.ok(root, &["init", b.to_str().unwrap()]);
+    let run_b = |args: &[&str]| {
+        let out = client
+            .cmd(&b)
+            .env("LEEP_AGENT_SESSION", "b-1")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_ok(&out, &format!("leep {args:?}"));
+        stderr(&out)
+    };
+    write(&b, "src/token.rs", "fn parse() { b() }\n");
+    run_b(&["commit", "-m", "token: b's change"]);
+    let who = client.json(root, &["who", "src/token.rs"]);
+    let s = &who["sessions"][0];
+    assert_eq!(s["session"], "b-1", "{who}");
+    assert_eq!(s["origin"], "inferred");
+    assert_eq!(s["target_ref"], "main", "{who}");
+
+    // Someone else lands a change to the file; b's next command names it.
+    write(&seed, "src/token.rs", "fn parse() { seed() }\n");
+    client.ok(&seed, &["commit", "-m", "token: the seed's change"]);
+    client.ok(&seed, &["land"]);
+    let head = client.json(&seed, &["log", "-n", "1", "main"])["entries"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let status = run_b(&["status"]);
+    assert!(status.contains("notice: [landed]"), "{status}");
+    assert!(status.contains(&head[..12]), "{status}");
     drop(server);
 }
 

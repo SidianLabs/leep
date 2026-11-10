@@ -1788,7 +1788,9 @@ a second kind of mutable state beside refs, behind its own trait,
   agent's changesets already carry. Declared through `POST /v1/sessions`
   (title, approach, task key, scope, claims), or inferred from any created
   changeset carrying `agent.session` (head, base, touched paths, commit
-  subject as title), so clients that never declare anything still appear.
+  subject as title, and the target ref the client names in
+  `Leep-Target-Ref`), so clients that never declare anything still appear
+  and hear of lands.
   A land of a session's head ends it as `landed`. Upserts hold the row's
   lock while they merge, so concurrent commits never lose each other's
   paths. Touched paths are capped at 256, folding the deepest into their
