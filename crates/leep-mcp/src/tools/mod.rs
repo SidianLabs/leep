@@ -844,7 +844,8 @@ pub fn definitions() -> Vec<Value> {
                     "principal": { "type": "string", "description": "Only notes of this token name." },
                     "mine": { "type": "boolean", "description": "Only your own notes (default false)." },
                     "all": { "type": "boolean", "description": "Superseded, retracted and reported notes too (default false)." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Max notes (default 20)." }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Max notes (default 20)." },
+                    "before": { "type": "integer", "minimum": 1, "description": "The `next` of the previous page, to continue it." }
                 },
                 "additionalProperties": false
             }),

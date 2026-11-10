@@ -139,17 +139,15 @@ pub(crate) async fn retract(
     auth::MaybePrincipal(who): auth::MaybePrincipal,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    let id = note_id(&id)?;
-    let me = principal(&who);
-    let n = repo.note(id).await?;
-    if n.principal != me {
-        return Ok(auth::reject(
+    match repo.retract_note(note_id(&id)?, &principal(&who)).await {
+        Ok(n) => Ok(Json(n).into_response()),
+        Err(Error::Policy(m)) => Ok(auth::reject(
             StatusCode::FORBIDDEN,
             error_code::FORBIDDEN,
-            &format!("note {id} is another principal's; only its principal may retract it"),
-        ));
+            &m,
+        )),
+        Err(e) => Err(e.into()),
     }
-    Ok(Json(repo.retract_note(id, &me).await?).into_response())
 }
 
 /// `POST /v1/notes/{id}/report`. Past the reporter's hourly cap the

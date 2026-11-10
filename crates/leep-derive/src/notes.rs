@@ -297,16 +297,28 @@ impl Repo {
     /// as it is.
     pub async fn retract_note(&self, id: u64, principal: &str) -> Result<NoteEntry> {
         let coord = self.notes_on()?;
-        let n = self.note(id).await?;
+        let n = coord
+            .get_note(id)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("note {id}")))?;
         if n.principal != principal {
             return Err(Error::Policy(format!(
                 "note {id} is another principal's; only its principal may retract it"
             )));
         }
         let by = principal.to_string();
-        coord
-            .change_note(id, &NoteChange::Retract { by }, unix_now())
-            .await?;
+        let now = unix_now();
+        if coord
+            .change_note(id, &NoteChange::Retract { by }, now)
+            .await?
+        {
+            // What the conditional update wrote, without reading it back.
+            let mut n = n;
+            n.state = NoteState::Retracted;
+            n.expires = leep_core::coord::closed_expiry(n.expires, now);
+            return Ok(note_entry(n, now));
+        }
+        // Closed already (or by a concurrent change): as it is now.
         self.note(id).await
     }
 

@@ -52,6 +52,8 @@ struct ListArgs {
     all: bool,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    before: Option<u64>,
 }
 
 fn notes_off(e: leep_cli::error::CliError) -> ToolError {
@@ -193,9 +195,18 @@ impl Server {
         if a.all {
             q.push(("all", "true".into()));
         }
+        if let Some(b) = a.before {
+            q.push(("before", b.to_string()));
+        }
         q.push(("limit", a.limit.unwrap_or(20).clamp(1, 100).to_string()));
         let resp: NotesResponse = self.client.notes(&q).map_err(notes_off)?;
-        let text = notes_text("Notes", &resp.notes);
+        let mut text = notes_text("Notes", &resp.notes);
+        if let Some(next) = resp.next {
+            text.push_str(&format!(
+                "\nMore notes follow: call leep_notes again with the same arguments and \
+                 `before: {next}`."
+            ));
+        }
         let v = serde_json::to_value(&resp).map_err(|e| ToolError(e.to_string()))?;
         Ok(ToolOutput {
             text,

@@ -2640,6 +2640,26 @@ fn notes_are_written_read_and_fenced() {
         !stripped.contains("Ignore") && !stripped.contains("SYSTEM"),
         "{stripped}"
     );
+    // Paging: one note a page, then the rest with `before`.
+    let page = call(&agent, "leep_notes", json!({ "all": true, "limit": 1 }));
+    let first_page = data(&page);
+    let next = first_page["next"].as_u64().expect("more pages");
+    assert!(
+        text(&page).contains(&format!("`before: {next}`")),
+        "{}",
+        text(&page)
+    );
+    let rest = data(&call(
+        &agent,
+        "leep_notes",
+        json!({ "all": true, "limit": 100, "before": next }),
+    ));
+    assert!(rest["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|n| n["id"].as_u64().unwrap() < next));
+    assert_eq!(rest["notes"].as_array().unwrap().len(), 3);
     let on = data(&call(&agent, "leep_notes", json!({ "changeset": landed })));
     assert_eq!(on["notes"].as_array().unwrap().len(), 1);
     // Refused text is refused, and not echoed.

@@ -86,7 +86,7 @@ printf '%s\n' \
 | `leep_review_request` | `rev`, `reviewers?[]`, `message?`, `ref?` (default `main`) | opens a review request (ADR 0086), as `leep review request`: reviewers default to the owners still pending; an equal open request is answered (`existing: true`); needs authentication |
 | `leep_review_inbox` | `mine?`, `all?`, `limit?` (default 20, max 100) | open review requests naming this agent that it has not answered (or, with `mine`, the ones it made), as `leep review inbox`; `all` adds closed and answered ones; needs authentication |
 | `leep_note_add` | `title`, `path?` or `changeset?` (one of them), `kind?` (`finding` default, `gotcha`, `decision`, `howto`), `body?`, `lines?` (`[start, end]`), `at?`, `supersedes?` | writes a note other agents will read on that file, directory or changeset (ADR 0098), as `leep note add`: the `NoteEntry`; trust comes from the token, the model from `LEEP_AGENT_MODEL` |
-| `leep_notes` | `path?`, `changeset?`, `principal?`, `mine?`, `all?`, `limit?` (default 20, max 100) | notes on `path` and the directories above it (or on a changeset, or by a principal), newest first, open ones unless `all`: `{notes, next?}` |
+| `leep_notes` | `path?`, `changeset?`, `principal?`, `mine?`, `all?`, `limit?` (default 20, max 100), `before?` | notes on `path` and the directories above it (or on a changeset, or by a principal), newest first, open ones unless `all`: `{notes, next?}`; pass `next` back as `before` for the next page |
 
 Sessions are advisory: nothing in them can stop or change a land. Every
 request the MCP server sends carries `Leep-Session` with its agent session,
