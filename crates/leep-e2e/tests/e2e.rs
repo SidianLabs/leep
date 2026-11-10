@@ -2996,18 +2996,42 @@ fn two_agents_on_one_file_are_warned_before_landing_postgres() {
 }
 
 fn run_two_agents_notices(stores: &Stores, root: &Path) {
-    let server = Server::start(stores, root);
+    // Two principals: one agent's own sessions are never notices to it.
+    let (ada_t, ada_e) = gen_token("ada", "write");
+    let (bo_t, bo_e) = gen_token("bo", "write");
+    let tokens = root.join("tokens.json");
+    fs::write(
+        &tokens,
+        serde_json::json!({ "tokens": [ada_e, bo_e] }).to_string(),
+    )
+    .unwrap();
+    let server = Server::start_with(
+        free_port(),
+        stores,
+        root,
+        &["--tokens-file", tokens.to_str().unwrap()],
+    );
     let client = Client::new(&server.url, &root.join("cache"));
+    let ada = User {
+        client: &client,
+        token: ada_t.clone(),
+    };
     let seed = root.join("seed");
-    client.ok(root, &["init", seed.to_str().unwrap()]);
+    ada.ok(root, &["init", seed.to_str().unwrap()]);
     write(&seed, "README", "hi\n");
-    client.ok(&seed, &["commit", "-m", "seed"]);
-    client.ok(&seed, &["land"]);
+    ada.ok(&seed, &["commit", "-m", "seed"]);
+    ada.ok(&seed, &["land"]);
     let (a, b) = (root.join("a"), root.join("b"));
-    client.ok(root, &["init", a.to_str().unwrap()]);
-    client.ok(root, &["init", b.to_str().unwrap()]);
+    ada.ok(root, &["init", a.to_str().unwrap()]);
+    ada.ok(root, &["init", b.to_str().unwrap()]);
     let run = |wc: &Path, args: &[&str]| {
-        let out = client.cmd(wc).args(args).output().unwrap();
+        let t = if wc == b.as_path() { &bo_t } else { &ada_t };
+        let out = client
+            .cmd(wc)
+            .env("LEEP_TOKEN", t)
+            .args(args)
+            .output()
+            .unwrap();
         assert_ok(&out, &format!("leep {args:?}"));
         stderr(&out)
     };
@@ -3046,7 +3070,7 @@ fn run_two_agents_notices(stores: &Stores, root: &Path) {
     for e in [&first, &second, &b_commit, &a_commit] {
         assert!(!e.chars().any(|c| c.is_control() && c != '\n'), "{e:?}");
     }
-    let overlaps = client.json(&a, &["who", "--overlaps"]);
+    let overlaps = ada.json(&a, &["who", "--overlaps"]);
     let levels: Vec<&str> = overlaps["overlaps"]
         .as_array()
         .unwrap()
@@ -3054,13 +3078,11 @@ fn run_two_agents_notices(stores: &Stores, root: &Path) {
         .map(|n| n["level"].as_str().unwrap())
         .collect();
     assert_eq!(levels, ["possible_duplicate", "same_file"], "{overlaps}");
-    assert!(client
-        .ok(&a, &["who", "--overlaps"])
-        .contains("[same_file]"));
+    assert!(ada.ok(&a, &["who", "--overlaps"]).contains("[same_file]"));
 
     // b lands; a's next command names the landed changeset.
     run(&b, &["land"]);
-    let head = client.json(&a, &["log", "-n", "1", "main"])["entries"][0]["id"]
+    let head = ada.json(&a, &["log", "-n", "1", "main"])["entries"][0]["id"]
         .as_str()
         .unwrap()
         .to_string();
