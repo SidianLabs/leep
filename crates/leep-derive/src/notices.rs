@@ -14,14 +14,16 @@
 //! it; in-band notices are computed within [`NOTICE_BOUND`] and dropped (and
 //! counted) past it, so a slow coordination store costs an answer its
 //! notices, never its time. Each notice is said once per session and
-//! [`SEEN_TTL_SECS`] (per server), at most [`MAX_NOTICES`] per answer.
+//! [`SEEN_TTL_SECS`] (per server), and again when it comes to stop a land
+//! of a file it did not stop before; at most [`MAX_NOTICES`] per answer
+//! besides those that stop one.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use leep_core::api::{Notice, NoticeText, OverlapsResponse};
+use leep_core::api::{path_stops_land, Notice, NoticeText, OverlapsResponse};
 use leep_core::changeset::EXTRA_AGENT_SESSION;
 use leep_core::coord::{
     ancestors, parent_dir, paths_overlap, NearQuery, NoticeLevel, PathKind, Session, SessionFilter,
@@ -32,7 +34,8 @@ use leep_core::{Changeset, ChangesetId, Error, RepoPath, Result};
 
 use crate::Repo;
 
-/// Most notices one answer carries.
+/// Most notices one answer carries, besides every one that stops a land
+/// of the request's files (the pre-flight check, ADR 0096 amendment).
 pub const MAX_NOTICES: usize = 3;
 /// Most overlaps `GET /v1/sessions/{id}/overlaps` lists.
 pub const MAX_OVERLAPS: usize = 50;
@@ -136,6 +139,13 @@ pub struct Found {
     /// that created it (through server rebases), when known, to tell a
     /// duplicate's land.
     pub landed_by: Option<(String, Option<String>)>,
+    /// `landed`: the paths of mine the changeset changed itself, so the
+    /// notice can name the one a request changes.
+    pub landed_paths: Vec<String>,
+    /// The files of the request (or the session's touched files) this
+    /// notice stops a land of ([`Notice::stops_land`]): it is said again
+    /// when it comes to stop one it did not stop before.
+    pub stops_on: Vec<String>,
 }
 
 /// A session's `landed` walk, as far as it got: of the target ref at
@@ -192,6 +202,8 @@ impl ChainReader {
 struct Seen {
     key: String,
     level: NoticeLevel,
+    /// Files it was said to stop a land of.
+    stopped_on: Vec<String>,
     at: i64,
     mine: Option<(String, bool)>,
     followed: bool,
@@ -209,7 +221,9 @@ pub struct NoticeState {
 
 impl NoticeState {
     /// The first `max` of `found` (ranked) not said to `session` lately,
-    /// marked said at `now`.
+    /// marked said at `now`, and beyond `max` every one that stops a land
+    /// of a file it did not stop before (`stops_on`): a pre-flight check
+    /// hears every reason to stop in one answer.
     fn pick(&self, session: u64, found: Vec<Found>, max: usize, now: i64) -> Vec<Found> {
         let mut all = self.seen.lock().unwrap();
         let fresh = |s: &Seen| now - s.at < SEEN_TTL_SECS;
@@ -220,21 +234,39 @@ impl NoticeState {
         // unexpired entry is never dropped: a session with more overlaps
         // than its memory holds hears the first ones once, not in a loop.
         for f in found.into_iter().take(MAX_SEEN_PER_SESSION) {
-            if out.len() >= max || seen.len() >= MAX_SEEN_PER_SESSION {
-                break;
+            let earlier = seen.iter().position(|s| s.key == f.key);
+            // Files it stops a land of that it was not said to stop.
+            let stops_anew = f
+                .stops_on
+                .iter()
+                .any(|p| earlier.is_none_or(|i| !seen[i].stopped_on.contains(p)));
+            if out.len() >= max && !stops_anew {
+                continue;
             }
             // Another session is said once at a level; again only if it
-            // comes back higher (near, then a claim on my file).
-            match seen.iter().position(|s| s.key == f.key) {
-                Some(i) if seen[i].level >= f.level => continue,
+            // comes back higher (near, then a claim on my file), or comes
+            // to stop a land of another file (a scope it was said at, then
+            // my file).
+            let (mut level, mut stopped_on) = (f.level, Vec::new());
+            match earlier {
+                Some(i) if seen[i].level >= f.level && !stops_anew => continue,
                 Some(i) => {
-                    seen.remove(i);
+                    let e = seen.remove(i);
+                    level = level.max(e.level);
+                    stopped_on = e.stopped_on;
                 }
+                None if seen.len() >= MAX_SEEN_PER_SESSION => continue,
                 None => {}
+            }
+            for p in &f.stops_on {
+                if !stopped_on.contains(p) && stopped_on.len() < MAX_PROBED_PATHS {
+                    stopped_on.push(p.clone());
+                }
             }
             seen.push(Seen {
                 key: f.key.clone(),
-                level: f.level,
+                level,
+                stopped_on,
                 at: now,
                 mine: f.mine.clone(),
                 followed: false,
@@ -324,6 +356,8 @@ pub(crate) fn key_duplicates(s: &Session, keyed: &[Session]) -> Vec<Found> {
                 notice: n,
                 mine: None,
                 landed_by: None,
+                landed_paths: Vec::new(),
+                stops_on: Vec::new(),
             }
         })
         .collect()
@@ -451,6 +485,41 @@ fn notice(level: NoticeLevel, other: Option<&Session>) -> Notice {
             ..Default::default()
         },
     }
+}
+
+/// The files a land's pre-flight check is about: the request's own paths
+/// (`focus`, a changeset's changed files), or without a request the
+/// session's touched files, claims and scope, at most [`MAX_PROBED_PATHS`].
+fn stop_files(s: &Session, focus: &[String]) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    let all: Box<dyn Iterator<Item = &String>> = if focus.is_empty() {
+        Box::new(s.touched.iter().chain(&s.claims).chain(&s.scope))
+    } else {
+        Box::new(focus.iter())
+    };
+    for p in all {
+        if files.len() >= MAX_PROBED_PATHS {
+            break;
+        }
+        if !files.contains(p) {
+            files.push(p.clone());
+        }
+    }
+    files
+}
+
+/// What `f` stops a land of ([`Found::stops_on`]): `""` alone for a
+/// notice that stops whatever the files (a duplicate, a duplicate's land),
+/// so it is said as such once; else the files of `files` it stops.
+fn stops_on(f: &Found, files: &[String]) -> Vec<String> {
+    if f.notice.stops_land::<&str>(&[]) {
+        return vec![String::new()];
+    }
+    files
+        .iter()
+        .filter(|p| f.notice.stops_land(std::slice::from_ref(*p)))
+        .cloned()
+        .collect()
 }
 
 /// One path probed for overlaps.
@@ -682,6 +751,14 @@ impl Repo {
             similar,
         );
         tag_duplicate_lands(s, &mut landed, &keyed);
+        let files = stop_files(s, focus);
+        for f in &mut landed {
+            // Name the file of the request (or the session's) it changed.
+            if let Some(p) = f.landed_paths.iter().find(|p| files.contains(p)) {
+                f.notice.untrusted.path = Some(p.clone());
+                f.notice.untrusted.other_path = Some(p.clone());
+            }
+        }
         let mut found = paths;
         found.extend(landed);
         // By key before by wording: one session flagged both ways is one
@@ -690,7 +767,11 @@ impl Repo {
         found.extend(similar);
         // Stable: within a level, the order each part found them in.
         found.sort_by_key(|f| std::cmp::Reverse(rank(f)));
-        one_per_session(found)
+        let mut found = one_per_session(found);
+        for f in &mut found {
+            f.stops_on = stops_on(f, &files);
+        }
+        found
     }
 
     /// Path levels of other live sessions against `s`'s paths, `focus`
@@ -735,7 +816,14 @@ impl Repo {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, p)| path_level(&p.path, &r.path, r.kind).map(|l| (l, i)))
-                .max_by_key(|(l, i)| (!mine[*i].related, *l, std::cmp::Reverse(*i)));
+                .max_by_key(|(l, i)| {
+                    (
+                        !mine[*i].related,
+                        *l,
+                        mine[*i].path == r.path,
+                        std::cmp::Reverse(*i),
+                    )
+                });
             let Some((level, i)) = best else { continue };
             if level >= NoticeLevel::SameFile && !mine[i].related {
                 let e = crowd.entry(r.path.as_str()).or_insert((i, BTreeSet::new()));
@@ -758,6 +846,8 @@ impl Repo {
                     notice: n,
                     mine: Some((p.path.clone(), p.declared)),
                     landed_by: None,
+                    landed_paths: Vec::new(),
+                    stops_on: Vec::new(),
                 });
                 hot.insert(theirs);
             }
@@ -766,11 +856,14 @@ impl Repo {
         // out its rows on crowded paths (their count) unless they claim:
         // a session that also meets me on an uncrowded path is named there.
         // A row on one of my paths beats any on a related file.
-        // At one level, a row naming my path itself beats one naming a
+        // At one level, a row that stops a land of the request's files
+        // (the session's touched files without a request) beats one that
+        // does not, then a row naming my path itself beats one naming a
         // directory holding it, then my earlier path (the request's own
         // first): the notice names the file both work on, which is what
         // the pre-flight check reads (`Notice::stops_land`).
-        type Rank = (bool, NoticeLevel, bool, std::cmp::Reverse<usize>);
+        let files = stop_files(s, focus);
+        type Rank = (bool, NoticeLevel, bool, bool, std::cmp::Reverse<usize>);
         type Best = (Rank, usize, String);
         let mut best: BTreeMap<u64, (&Session, Best)> = BTreeMap::new();
         for (r, level, i) in met {
@@ -780,6 +873,7 @@ impl Repo {
             let at = (
                 !mine[i].related,
                 level,
+                !mine[i].related && path_stops_land(level.as_str(), &r.path, &files),
                 r.path == mine[i].path,
                 std::cmp::Reverse(i),
             );
@@ -790,7 +884,7 @@ impl Repo {
                 e.1 = (at, i, r.path.clone());
             }
         }
-        for (id, (o, ((_, level, _, _), i, theirs))) in best.into_iter().rev() {
+        for (id, (o, ((_, level, _, _, _), i, theirs))) in best.into_iter().rev() {
             let p = &mine[i];
             let mut n = notice(level, Some(o));
             n.untrusted.path = Some(p.path.clone());
@@ -804,6 +898,8 @@ impl Repo {
                 notice: n,
                 mine: Some((p.path.clone(), p.declared)),
                 landed_by: None,
+                landed_paths: Vec::new(),
+                stops_on: Vec::new(),
             });
         }
         Ok(out)
@@ -861,9 +957,16 @@ impl Repo {
             w.walked += 1;
             w.at = cs.parents.first().copied();
             if !self.is_own(s, id, &cs).await? {
-                // A path of mine it changed itself first, so the notice
-                // names the file rather than a directory holding it.
+                // The paths of mine it changed itself, so the notice can
+                // name the file a request changes rather than a directory
+                // holding it (see `find_overlaps`).
                 let exact = |p: &&Probe| changed_near(&cs, &p.path) == Some(p.path.as_str());
+                let changed: Vec<String> = mine
+                    .iter()
+                    .filter(exact)
+                    .take(MAX_PROBED_PATHS)
+                    .map(|p| p.path.clone())
+                    .collect();
                 let hit = mine
                     .iter()
                     .find(exact)
@@ -893,6 +996,8 @@ impl Repo {
                         notice: n,
                         mine: Some((p.clone(), declared)),
                         landed_by,
+                        landed_paths: changed,
+                        stops_on: Vec::new(),
                     });
                 }
             }
@@ -1042,6 +1147,8 @@ impl Repo {
                 notice: n,
                 mine: None,
                 landed_by: None,
+                landed_paths: Vec::new(),
+                stops_on: Vec::new(),
             });
         }
         Ok(out)
@@ -1197,6 +1304,8 @@ mod tests {
             notice: notice(level, None),
             mine: Some(("src/a.rs".into(), true)),
             landed_by: None,
+            landed_paths: Vec::new(),
+            stops_on: Vec::new(),
         }
     }
 

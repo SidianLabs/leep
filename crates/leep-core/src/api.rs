@@ -1259,33 +1259,54 @@ pub struct Notice {
 
 impl Notice {
     /// Whether this notice stops an agent's land before it happens (the
-    /// pre-flight check, ADR 0096 amendment), for a change whose changed
-    /// files `changes` answers. The one place the rule lives:
+    /// pre-flight check, ADR 0096 amendment), for a change of the files
+    /// `changes`. The one place the rule lives:
     /// - `possible_duplicate`, and a duplicate's land (`landed` by
     ///   `task_key`), always stop;
-    /// - `landed` stops when the landed changeset changed one of these files;
-    /// - `claimed` stops when the claim is on one of these files or on a
-    ///   directory holding it;
-    /// - `same_file` stops when the other session names one of these files
-    ///   itself, not only a directory holding it (a scope);
-    /// - `near`, a level this client does not know, and anything met only
-    ///   through a related file (`via`) never stop.
+    /// - otherwise [`path_stops_land`] on the other side's path
+    ///   (`untrusted.other_path`);
+    /// - anything met only through a related file (`via`) never stops.
     ///
-    /// The paths compared are agent-written (`untrusted`): they decide only
-    /// whether to stop, never what is shown outside the fence.
-    pub fn stops_land(&self, changes: impl Fn(&str) -> bool) -> bool {
+    /// Only the other side's path is read, never which of mine the server
+    /// paired it with, so a notice found through a directory of mine still
+    /// stops when their path is one of my files. The paths compared are
+    /// agent-written (`untrusted`): they decide only whether to stop, never
+    /// what is shown outside the fence.
+    pub fn stops_land<S: AsRef<str>>(&self, changes: &[S]) -> bool {
         if self.via.is_some() {
             return false;
         }
-        let mine = self.untrusted.path.as_deref();
-        let theirs = self.untrusted.other_path.as_deref();
-        match self.level.as_str() {
-            "possible_duplicate" => true,
-            "landed" => self.by.as_deref() == Some("task_key") || theirs.is_some_and(&changes),
-            "claimed" => mine.is_some_and(&changes),
-            "same_file" => mine.is_some_and(&changes) && theirs == mine,
-            _ => false,
+        if self.level == "possible_duplicate"
+            || (self.level == "landed" && self.by.as_deref() == Some("task_key"))
+        {
+            return true;
         }
+        self.untrusted
+            .other_path
+            .as_deref()
+            .is_some_and(|theirs| path_stops_land(&self.level, theirs, changes))
+    }
+}
+
+/// Whether another side's path `theirs`, met at `level`, stops a land of
+/// the files `changes` ([`Notice::stops_land`]): `landed` and `same_file`
+/// when `theirs` is one of the files itself (a directory someone scoped
+/// does not stop), `claimed` when it is one of them or a directory holding
+/// one; `near` and levels not known here never.
+pub fn path_stops_land<S: AsRef<str>>(level: &str, theirs: &str, changes: &[S]) -> bool {
+    let theirs = theirs.trim_end_matches('/');
+    let is = |c: &S| c.as_ref() == theirs;
+    let holds = |c: &S| {
+        let c = c.as_ref();
+        theirs.is_empty()
+            || (c.len() > theirs.len()
+                && c.starts_with(theirs)
+                && c.as_bytes()[theirs.len()] == b'/')
+    };
+    match level {
+        "landed" | "same_file" => changes.iter().any(is),
+        "claimed" => changes.iter().any(|c| is(c) || holds(c)),
+        _ => false,
     }
 }
 
@@ -2205,26 +2226,32 @@ mod tests {
                 ..Default::default()
             },
         };
-        let changes = |p: &str| p == "src/a.rs";
-        // Their own file is mine; a scope above it is not enough.
-        assert!(n("same_file", "src/a.rs", "src/a.rs").stops_land(changes));
-        assert!(!n("same_file", "src/a.rs", "src").stops_land(changes));
-        assert!(!n("same_file", "src", "src/b.rs").stops_land(changes));
+        let changes = ["src/a.rs"];
+        // Their own file is mine, whichever of mine it was paired with; a
+        // scope above it is not enough.
+        assert!(n("same_file", "src/a.rs", "src/a.rs").stops_land(&changes));
+        assert!(n("same_file", "src", "src/a.rs").stops_land(&changes));
+        assert!(!n("same_file", "src/a.rs", "src").stops_land(&changes));
+        assert!(!n("same_file", "src", "src/b.rs").stops_land(&changes));
         // A claim on my file or a directory above it.
-        assert!(n("claimed", "src/a.rs", "src").stops_land(changes));
-        assert!(!n("claimed", "src", "src/b.rs").stops_land(changes));
-        assert!(n("possible_duplicate", "src", "src").stops_land(changes));
-        assert!(n("landed", "src/a.rs", "src/a.rs").stops_land(changes));
-        assert!(!n("landed", "src", "src/b.rs").stops_land(changes));
+        assert!(n("claimed", "src/a.rs", "src").stops_land(&changes));
+        assert!(n("claimed", "src/a.rs", "src/").stops_land(&changes));
+        assert!(n("claimed", "src", "src/a.rs").stops_land(&changes));
+        assert!(!n("claimed", "src", "src/b.rs").stops_land(&changes));
+        assert!(!n("claimed", "src/a.rs", "sr").stops_land(&changes));
+        assert!(n("possible_duplicate", "src", "src").stops_land(&changes));
+        assert!(n("landed", "src", "src/a.rs").stops_land(&changes));
+        assert!(!n("landed", "src", "src/b.rs").stops_land(&changes));
         let mut dup_land = n("landed", "src", "src/b.rs");
         dup_land.by = Some("task_key".into());
-        assert!(dup_land.stops_land(changes));
-        // Never: near, an unknown level, a related file.
-        assert!(!n("near", "src/a.rs", "src/b.rs").stops_land(changes));
-        assert!(!n("conflict", "src/a.rs", "src/a.rs").stops_land(changes));
+        assert!(dup_land.stops_land(&changes));
+        // Never: near, an unknown level, a related file, no changes.
+        assert!(!n("near", "src/a.rs", "src/a.rs").stops_land(&changes));
+        assert!(!n("conflict", "src/a.rs", "src/a.rs").stops_land(&changes));
         let mut related = n("claimed", "src/a.rs", "src/a.rs");
         related.via = Some("related".into());
-        assert!(!related.stops_land(changes));
+        assert!(!related.stops_land(&changes));
+        assert!(!n("claimed", "src/a.rs", "src").stops_land::<&str>(&[]));
     }
 
     #[test]

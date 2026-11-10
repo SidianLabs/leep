@@ -456,10 +456,10 @@ impl Server {
             }
             (None, None) => return Ok(None),
         };
-        let changed: BTreeSet<String> = content.changes.keys().map(|p| p.to_string()).collect();
+        let changed: Vec<String> = content.changes.keys().map(|p| p.to_string()).collect();
         let mut stops: Vec<Notice> = Vec::new();
         for n in self.client.pending_notices() {
-            if n.stops_land(|p| changed.contains(p)) && !stops.contains(&n) {
+            if n.stops_land(&changed) && !stops.contains(&n) {
                 stops.push(n);
             }
         }
