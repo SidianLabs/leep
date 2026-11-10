@@ -78,7 +78,10 @@ const PURGE_EVERY_SECS: i64 = 60;
 const MAX_LANDED_CACHE: usize = 10_000;
 
 /// Which notices an answer carries: the lowest level wanted, the request's
-/// own paths (probed first), and whether to look for duplicates.
+/// own paths (probed first), and whether to compare intents for
+/// duplicates by wording. Duplicates by task key are looked for on every
+/// answer (one indexed listing), so the first of a pair hears of the
+/// second on its next create, land or notice read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoticeAsk {
     pub min: NoticeLevel,
@@ -547,10 +550,11 @@ impl Repo {
     }
 
     /// Everything overlapping `s` now, highest level first. Path levels
-    /// need `near_paths`; `landed` walks the target ref; duplicates (when
-    /// `duplicates`) read recent sessions. The parts run together, each
-    /// within `bound`: one that fails or runs out of time is left out
-    /// (and counted), never the others.
+    /// need `near_paths`; `landed` walks the target ref; duplicates by
+    /// task key read one indexed listing, and by wording (when
+    /// `duplicates`) recent sessions. The parts run together, each within
+    /// `bound`: one that fails or runs out of time is left out (and
+    /// counted), never the others.
     pub async fn find_overlaps(
         &self,
         s: &Session,
@@ -558,21 +562,25 @@ impl Repo {
         duplicates: bool,
         bound: Duration,
     ) -> Vec<Found> {
-        let dups = async {
+        let similar = async {
             if duplicates {
-                part(bound, self.duplicates(s)).await
+                part(bound, self.similar_duplicates(s)).await
             } else {
                 Vec::new()
             }
         };
-        let (paths, landed, dups) = tokio::join!(
+        let (paths, landed, keyed, similar) = tokio::join!(
             part(bound, self.path_overlaps(s, focus, &[])),
             part(bound, self.landed_overlaps(s)),
-            dups,
+            part(bound, self.key_duplicates(s)),
+            similar,
         );
         let mut found = paths;
         found.extend(landed);
-        found.extend(dups);
+        // By key before by wording: one session flagged both ways is one
+        // notice, `by: task_key`.
+        found.extend(keyed);
+        found.extend(similar);
         // Stable: within a level, the order each part found them in.
         found.sort_by_key(|f| std::cmp::Reverse(rank(f)));
         one_per_session(found)
@@ -830,6 +838,21 @@ impl Repo {
     /// trigrams among the [`DUPLICATE_CANDIDATES`] newest active sessions
     /// (declared ones only, on both sides).
     pub(crate) async fn duplicates(&self, s: &Session) -> Result<Vec<Found>> {
+        let mut out = self.key_duplicates(s).await?;
+        let flagged: BTreeSet<u64> = out.iter().filter_map(|f| f.notice.session).collect();
+        out.extend(
+            self.similar_duplicates(s)
+                .await?
+                .into_iter()
+                .filter(|f| f.notice.session.is_none_or(|id| !flagged.contains(&id))),
+        );
+        Ok(out)
+    }
+
+    /// Live sessions with `s`'s task key (at most [`DUPLICATE_BY_KEY`]),
+    /// from one indexed listing: none without a key. The same principal
+    /// under the same key is `s`'s own earlier session, never flagged.
+    pub(crate) async fn key_duplicates(&self, s: &Session) -> Result<Vec<Found>> {
         let Some(coord) = self.coord.as_ref() else {
             return Ok(Vec::new());
         };
@@ -838,7 +861,6 @@ impl Repo {
             o.id != s.id && o.state_at(now) != SessionState::Expired && !same_agent_and_task(s, o)
         };
         let mut out = Vec::new();
-        let mut flagged = BTreeSet::new();
         if let Some(k) = &s.task_key {
             let same = coord
                 .list_sessions(&SessionFilter {
@@ -849,11 +871,10 @@ impl Repo {
                     ..Default::default()
                 })
                 .await?;
-            for o in same.iter().filter(|o| live(o)) {
+            for o in same.iter().filter(|o| live(o)).take(DUPLICATE_BY_KEY) {
                 let mut n = notice(NoticeLevel::PossibleDuplicate, Some(o));
                 n.by = Some("task_key".into());
                 n.untrusted.task_key = Some(k.clone());
-                flagged.insert(o.id);
                 out.push(Found {
                     level: NoticeLevel::PossibleDuplicate,
                     key: format!("session:{}", o.id),
@@ -862,6 +883,21 @@ impl Repo {
                 });
             }
         }
+        Ok(out)
+    }
+
+    /// Live declared sessions whose title and approach are at least
+    /// [`SIMILAR_PERCENT`] alike to `s`'s, among the
+    /// [`DUPLICATE_CANDIDATES`] newest.
+    pub(crate) async fn similar_duplicates(&self, s: &Session) -> Result<Vec<Found>> {
+        let Some(coord) = self.coord.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let now = unix_now();
+        let live = |o: &Session| {
+            o.id != s.id && o.state_at(now) != SessionState::Expired && !same_agent_and_task(s, o)
+        };
+        let mut out = Vec::new();
         // Only declared intents are compared: an inferred title is a commit
         // subject, and two commits to one file often read alike.
         let me = intent(&s.title, &s.approach);
@@ -879,7 +915,7 @@ impl Repo {
             .await?;
         let mut similar: Vec<(u32, &Session)> = recent
             .iter()
-            .filter(|o| live(o) && !flagged.contains(&o.id))
+            .filter(|o| live(o))
             .map(|o| (alike(&me, &intent(&o.title, &o.approach)), o))
             .filter(|(p, _)| *p >= SIMILAR_PERCENT)
             .collect();

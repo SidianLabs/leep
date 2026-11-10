@@ -278,7 +278,8 @@ async fn same_task_key_is_flagged_at_start_and_overlaps_list_everything() {
         b.notices[0].untrusted.other_path.as_deref(),
         Some("src/auth")
     );
-    // alice hears of bob's claim on her next listing.
+    // alice, the first of the pair, hears of bob on her next listing: as
+    // a duplicate by key, naming the file bob claims.
     let listed: SessionsResponse = api
         .call(
             Method::GET,
@@ -291,7 +292,12 @@ async fn same_task_key_is_flagged_at_start_and_overlaps_list_everything() {
         .ok();
     assert_eq!(listed.sessions.len(), 2);
     assert_eq!(listed.notices.len(), 1);
-    assert_eq!(listed.notices[0].level, "claimed");
+    assert_eq!(listed.notices[0].level, "possible_duplicate");
+    assert_eq!(listed.notices[0].by.as_deref(), Some("task_key"));
+    assert_eq!(
+        listed.notices[0].untrusted.other_path.as_deref(),
+        Some("src/auth/token.rs")
+    );
     // bob's title is only ever in `untrusted`.
     let raw = String::from_utf8(
         api.call(
@@ -383,4 +389,39 @@ async fn a_landed_answer_always_carries_its_notices() {
         assert!(matches!(answer.answer, LandResponse::Landed { .. }));
         assert_eq!(answer.notices.len(), 1, "run {i}: {:?}", answer.notices);
     }
+}
+
+/// The first of a duplicate pair is told when it lands, though it
+/// declared before the second existed (ADR 0096 amendment).
+#[tokio::test]
+async fn the_first_of_a_duplicate_pair_hears_it_on_its_land() {
+    let api = Api::over(repo());
+    api.declare(
+        "alice",
+        serde_json::json!({ "session": "a-1", "title": "Fix rounding", "task_key": "BILL-42" }),
+    )
+    .await;
+    let a = api
+        .commit("alice", "a-1", &[], &["src/billing/invoice.rs"], &[])
+        .await;
+    assert!(a.notices.is_empty(), "{:?}", a.notices);
+    let b = api
+        .declare(
+            "bob",
+            serde_json::json!({ "session": "b-1", "title": "Off by one cent", "task_key": "BILL-42" }),
+        )
+        .await;
+    assert_eq!(b.notices.len(), 1);
+    let answer: LandAnswer = api
+        .land("alice", a.id, &[(SESSION_HEADER, "a-1")])
+        .await
+        .ok();
+    assert!(matches!(answer.answer, LandResponse::Landed { .. }));
+    let levels: Vec<_> = answer.notices.iter().map(|n| n.level.as_str()).collect();
+    assert_eq!(levels, ["possible_duplicate"], "{:?}", answer.notices);
+    assert_eq!(answer.notices[0].principal.as_deref(), Some("bob"));
+    assert_eq!(
+        answer.notices[0].untrusted.task_key.as_deref(),
+        Some("BILL-42")
+    );
 }

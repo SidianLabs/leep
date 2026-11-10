@@ -5,3 +5,7 @@
   met only on a file related to the task carries `via: "related"` (a new
   optional `Notice` field) and is listed after work on the agent's own
   files (ADR 0097 amendment).
+- **Fixed.** The first of two sessions with one task key is told it has a
+  duplicate: the task-key lookup (one indexed listing) now runs on
+  changeset creates, lands and `GET /v1/notices`, not only on declarations
+  (ADR 0096 amendment).

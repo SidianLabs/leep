@@ -1032,6 +1032,9 @@ Added:
   context pack's `in_flight` item met only on a file related to the task,
   never on one of the agent's own paths; `untrusted.path` then names that
   file. A client shows a `via` it does not know as it is.
+- `possible_duplicate` by `task_key` may now come on any answer carrying
+  notices (creates, lands, `GET /v1/notices`, listings), not only on
+  declarations. No shape changed.
 
 ## Index leases and bounded queries (additive, ADR 0058)
 

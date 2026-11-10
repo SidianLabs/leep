@@ -3064,9 +3064,15 @@ fn run_two_agents_notices(stores: &Stores, root: &Path) {
     let b_commit = run(&b, &["commit", "-m", "auth: b's parser"]);
     write(&a, "src/auth/token.rs", "fn a() {}\n");
     let a_commit = run(&a, &["commit", "-m", "auth: a's parser"]);
-    let warned = [&b_commit, &a_commit, &second]
-        .iter()
-        .any(|e| e.contains("notice: [same_file]"));
+    // a, the first of the pair, hears of b on its commit: as a duplicate
+    // by task key (higher than `same_file`), naming the file.
+    assert!(
+        a_commit.contains("notice: [possible_duplicate]"),
+        "{a_commit}"
+    );
+    let warned = [&b_commit, &a_commit, &second].iter().any(|e| {
+        e.contains("notice: [same_file]") || e.contains("notice: [possible_duplicate]")
+    });
     assert!(warned, "b: {b_commit}\na: {a_commit}\nstart: {second}");
     for e in [&first, &second, &b_commit, &a_commit] {
         assert!(!e.chars().any(|c| c.is_control() && c != '\n'), "{e:?}");

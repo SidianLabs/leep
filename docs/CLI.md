@@ -231,8 +231,9 @@ notice: [landed] 3f2a9c1d0b7e landed "auth: faster parser" at "src/auth/token.rs
 
 Levels, lowest first: `near` (same directory), `same_file` (the same path,
 or a directory holding it), `claimed` (another session claimed it),
-`possible_duplicate` (same task key, or a declared title and approach much
-like yours; also `N% alike`) and `landed` (a change touching your paths
+`possible_duplicate` (same task key, told to both sessions on their next
+answer, or a declared title and approach much like yours; also `N%
+alike`) and `landed` (a change touching your paths
 landed on your target ref since your base: sync before you land). A
 crowded path is one line with a count. `commit`, `land`, `session
 start|update`, `who` and `status` show them; `--json` output on stdout also

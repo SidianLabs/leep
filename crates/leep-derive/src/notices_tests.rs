@@ -578,3 +578,56 @@ async fn one_notice_per_session_at_its_highest_level() {
     assert_eq!(n.untrusted.path.as_deref(), Some("src/auth/token.rs"));
     assert_eq!(n.untrusted.task_key.as_deref(), Some("L-3"));
 }
+
+/// The first of a duplicate pair hears of the second on its next answer
+/// (a create, a land or a notice read), not only the second at its
+/// declaration: the demo's dee was told `same_file` with no task key.
+/// Said once, and an agent restarted under a new key is never its own
+/// duplicate.
+#[tokio::test]
+async fn the_first_of_a_duplicate_pair_is_told_too() {
+    let r = repo();
+    let mut a = declare("a-1", "Fix rounding of invoice totals");
+    a.task_key = Some("BILL-42".into());
+    r.declare_session("ada", a).await.unwrap();
+    let mut b = declare("b-1", "Invoice totals are off by one cent");
+    b.task_key = Some("BILL-42".into());
+    b.scope = Some(vec!["src/billing/invoice.rs".into()]);
+    let told = r.declare_session("bo", b).await.unwrap().notices;
+    assert_eq!(levels(&told), ["possible_duplicate"]);
+
+    // ada's next create says so, naming bo, the key and the shared file.
+    let (_, n) = commit(&r, "ada", "a-1", &[], &["src/billing/invoice.rs"]).await;
+    assert_eq!(levels(&n), ["possible_duplicate"], "{n:?}");
+    assert_eq!(n[0].principal.as_deref(), Some("bo"));
+    assert_eq!(n[0].by.as_deref(), Some("task_key"));
+    assert_eq!(n[0].untrusted.task_key.as_deref(), Some("BILL-42"));
+    assert_eq!(
+        n[0].untrusted.other_path.as_deref(),
+        Some("src/billing/invoice.rs")
+    );
+    // Once.
+    assert!(r
+        .notices_for("ada", "a-1", &NoticeAsk::default())
+        .await
+        .is_empty());
+
+    // A notice read (and a land, which asks the same way) finds it too.
+    let mut c = declare("c-1", "Something else");
+    c.task_key = Some("BILL-42".into());
+    r.declare_session_with("cy", c, None).await.unwrap();
+    let n = r.notices_for("ada", "a-1", &NoticeAsk::default()).await;
+    assert_eq!(levels(&n), ["possible_duplicate"]);
+    assert_eq!(n[0].principal.as_deref(), Some("cy"));
+
+    // ada restarted under a new key: told of the others, never of itself.
+    let mut again = declare("a-2", "Fix rounding of invoice totals");
+    again.task_key = Some("BILL-42".into());
+    r.declare_session_with("ada", again, None).await.unwrap();
+    let n = r.notices_for("ada", "a-2", &NoticeAsk::default()).await;
+    assert_eq!(levels(&n), ["possible_duplicate", "possible_duplicate"]);
+    assert!(
+        n.iter().all(|n| n.principal.as_deref() != Some("ada")),
+        "{n:?}"
+    );
+}

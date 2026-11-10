@@ -1810,8 +1810,9 @@ a second kind of mutable state beside refs, behind its own trait,
   carry at most three notices for the caller's session, highest level
   first: `landed` (a changeset touching its paths landed on its target
   ref since its base, found by walking at most 64 first parents),
-  `possible_duplicate` (same task key, or a declared title and approach at
-  least 60% alike by trigrams), `claimed`, `same_file` and `near` (one
+  `possible_duplicate` (same task key, looked for on every answer, or a
+  declared title and approach at least 60% alike by trigrams, compared on
+  declarations), `claimed`, `same_file` and `near` (one
   `CoordStore::near_paths` call: exact probes plus capped range scans on
   `(repo_id, path)`, claims and exact rows first). Each other session is
   one notice at its highest level, said once per session for 30 minutes

@@ -120,7 +120,9 @@ keys follow in a fenced `untrusted` block, one row per notice, under the
 same fixed line, with C1 controls, line separators and bidirectional controls
 escaped. Structured results also get a `notices` list. Each MCP server
 asks with a 3 s timeout, and a notice it was given is not given again. Notices are advisory: they never change what a
-tool did. Duplicates are found by task key or by similar wording only.
+tool did. Duplicates are found by task key (on every answer, so the first
+of a pair hears of the second too) or by similar wording (when a session
+is declared) only.
 
 Data tools return JSON as text and as `structuredContent`; file and diff
 tools return plain text. Failures (bad arguments, 401, 403, 404, unreachable

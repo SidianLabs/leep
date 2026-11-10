@@ -78,8 +78,9 @@ reads history, not the coordination store, so it holds across servers
 and restarts; the land path itself is unchanged.
 
 **Duplicates** are flagged when a session is declared (start or update):
-live sessions with the same `task_key` (an indexed lookup, at most 20),
-and, among the 200 newest active declared sessions (`SessionFilter.origin`),
+live sessions with the same `task_key` (an indexed lookup, at most 20;
+since the amendments below, on every answer that carries notices), and,
+among the 200 newest active declared sessions (`SessionFilter.origin`),
 those whose title and approach are at least 60% alike by trigram Jaccard
 similarity, with the search index's trigram extraction
 (`search::trigram::extract`) over the lowercased words. Intents shorter
@@ -224,3 +225,21 @@ new shapes (as ADR 0095 notes for sessions).
   out until a measured case needs it.
 - **A stored minimum level per session.** It needs a migration; the
   header gives each client the choice without one.
+
+## Amendments
+
+### The first of a duplicate pair is told too (2026-11-10)
+Duplicates were looked for only when a session was declared, so only the
+second of a pair heard of the first: in the phase 1 demo dee, who started
+`BILL-42` first, heard eli only as `same_file` with no task key, in the
+answer of the call that had already landed. The task-key part now runs on
+every answer that carries notices (changeset creates, lands, `GET
+/v1/notices`, listings, declarations): one indexed listing of live
+sessions with the session's task key, at most 20, within the same 150 ms
+as the other parts, and nothing at all for a session without a key. It is
+said once like any notice, and a session already told about at a lower
+level (`same_file`) is told again because `possible_duplicate` is higher.
+The same principal with the same key is still its own earlier session
+and never flagged. Duplicates by wording still wait for a declaration:
+they read 200 sessions, and inferred titles are not compared.
+

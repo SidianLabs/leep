@@ -63,9 +63,9 @@ The demo is also a check on how the notices read. Things to look at:
   Work met only on a file the task turned up (a co-change) is marked
   "a file related to your task" and listed last (fay's pack names ada so
   on `keys.rs`).
-- The first agent of a duplicate pair is not told it is one: duplicates are
-  flagged on declarations only, so dee hears eli as `same_file` (with no
-  task key), and only in the answer of the call that already landed.
+- Both agents of a duplicate pair are told: eli at `leep_task_start`, dee
+  on its next answer (the task-key lookup runs on creates, lands and notice
+  reads too), as `possible_duplicate` by task key.
 - `leep_commit_and_land` creates and lands in one call, so an MCP agent
   hears of overlaps on its commit after it has landed.
 - Packs repeat the same owners and last change for every co-changed file.
