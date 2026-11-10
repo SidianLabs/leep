@@ -336,10 +336,11 @@ impl CoordStore for Slow {
 }
 
 /// A slow store costs an answer its notices, never more than the bound.
-#[tokio::test]
+/// On a paused clock: the bound is measured, not raced against the host.
+#[tokio::test(start_paused = true)]
 async fn a_slow_store_leaves_notices_out_within_the_bound() {
     let r = repo().with_coord(Some(Arc::new(Slow(MemoryCoordStore::new()))));
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let (_, n) = commit(&r, "ada", "a-1", &[], &["x/a"]).await;
     assert!(n.is_empty());
     let mut d = declare("b-1", "a long enough title to compare");
@@ -351,8 +352,9 @@ async fn a_slow_store_leaves_notices_out_within_the_bound() {
         .notices_for("ada", "a-1", &NoticeAsk::default())
         .await
         .is_empty());
+    // Three answers, each waiting at most the bound.
     assert!(
-        started.elapsed() < 3 * NOTICE_BOUND + Duration::from_millis(500),
+        started.elapsed() <= 3 * NOTICE_BOUND,
         "{:?}",
         started.elapsed()
     );
