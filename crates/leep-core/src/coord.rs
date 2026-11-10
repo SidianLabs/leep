@@ -488,7 +488,8 @@ fn sorted(v: &[String]) -> Vec<String> {
 
 /// The session `u` makes of `old` (absent: a new one with id `id`). A
 /// session that had ended is revived: active again, with no head, landed
-/// copy or touched paths, and an inferred one also loses its title. Stores
+/// copy, touched paths, task key or target ref, and an inferred one also
+/// loses its title. Stores
 /// call this under their row lock, so concurrent upserts never lose each
 /// other's paths.
 pub fn apply_update(old: Option<&Session>, u: &SessionUpdate, id: u64) -> Session {
@@ -523,6 +524,11 @@ pub fn apply_update(old: Option<&Session>, u: &SessionUpdate, id: u64) -> Sessio
         s.head = None;
         s.base = None;
         s.touched.clear();
+        // New work after a land: the old task and ref are not known to be
+        // its; this update (a declaration, or a commit's `Leep-Target-Ref`)
+        // says them again.
+        s.task_key = None;
+        s.target_ref = None;
         if s.origin == SessionOrigin::Inferred {
             s.title.clear();
         }
@@ -552,11 +558,13 @@ pub fn apply_update(old: Option<&Session>, u: &SessionUpdate, id: u64) -> Sessio
     set(&mut s.approach, &u.approach, declared, e);
     let e = s.task_key.is_none();
     set(&mut s.task_key, &u.task_key.clone().map(Some), declared, e);
+    // The ref a commit names replaces the last one while nobody declared
+    // the session: an inferred session follows the client's working copy.
     let e = s.target_ref.is_none();
     set(
         &mut s.target_ref,
         &u.target_ref.clone().map(Some),
-        declared,
+        declared || s.origin == SessionOrigin::Inferred,
         e,
     );
     let e = s.base.is_none();
@@ -985,6 +993,42 @@ mod tests {
         assert_eq!(s.state, SessionState::Active);
         assert!(s.touched.is_empty() && s.head.is_none() && s.ended.is_none());
         assert!(s.title.is_empty(), "an inferred title went with the work");
+    }
+
+    /// A revived session forgets its task key and target ref, and an
+    /// inferred one follows the ref each commit names; a declared target
+    /// stays.
+    #[test]
+    fn a_revived_session_forgets_its_task_and_ref() {
+        let mut d = SessionUpdate::new("ada", "sess-1", SessionOrigin::Declared, 10);
+        d.task_key = Some("BILL-42".into());
+        d.target_ref = Some("review/a".into());
+        let mut s = apply_update(None, &d, 1);
+        s.state = SessionState::Landed;
+        s.ended = Some(11);
+        let s = apply_update(Some(&s), &update(12), 0);
+        assert_eq!(
+            (s.task_key.as_deref(), s.target_ref.as_deref()),
+            (None, None)
+        );
+        let mut i = update(13);
+        i.target_ref = Some("review/b".into());
+        let s = apply_update(Some(&s), &i, 0);
+        assert_eq!(s.target_ref.as_deref(), Some("review/b"));
+        // Inferred: the next commit's ref replaces it.
+        let mut i = update(14);
+        i.target_ref = Some("review/c".into());
+        let mut inferred = apply_update(None, &update(1), 2);
+        inferred = apply_update(Some(&inferred), &i, 0);
+        assert_eq!(inferred.origin, SessionOrigin::Inferred);
+        i.target_ref = Some("review/d".into());
+        inferred = apply_update(Some(&inferred), &i, 0);
+        assert_eq!(inferred.target_ref.as_deref(), Some("review/d"));
+        // Declared: kept.
+        let mut s = apply_update(None, &d, 3);
+        i.target_ref = Some("review/e".into());
+        s = apply_update(Some(&s), &i, 0);
+        assert_eq!(s.target_ref.as_deref(), Some("review/a"));
     }
 
     #[test]

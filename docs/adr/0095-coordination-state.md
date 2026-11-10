@@ -333,8 +333,12 @@ friction list. A client now names where the work is meant to land on
 `POST /v1/changesets` with the request header `Leep-Target-Ref: <ref>`;
 the CLI sends its working copy's target ref, `leep-mcp`'s
 `leep_commit_and_land` its `target_ref`. Inference records it as the
-session's target ref like any inferred value: only when the session has
-none, never over a declared one. A bad ref name is ignored, never refused,
+session's target ref: over the last one while the session is inferred
+(it follows the client's working copy from `review/a` to `review/b`),
+never over a declared one. A revived session (a commit after its land)
+also forgets its task key and target ref, as it forgets its head and
+touched paths: the new work says them again, so an old task key never
+makes a later land look like a duplicate's. A bad ref name is ignored, never refused,
 as a bad `Leep-Session` is, and a server that does not know the header
 ignores it. The changeset, its hash and the create's answer are
 unchanged. A session with no target ref at all (an older client) is taken
