@@ -393,6 +393,7 @@ mod tests {
                     count: None,
                     by: None,
                     similarity: None,
+                    via: None,
                     untrusted: NoticeText {
                         title: evil.into(),
                         path: Some(evil.into()),

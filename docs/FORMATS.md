@@ -1023,6 +1023,16 @@ Added:
   client shows a section, `why` or reason it does not know as it is.
 - Same request on the same state, same bytes.
 
+## Notice and pack refinements (additive API, ADR 0095, 0096 and 0097 amendments)
+
+No table, column, index or stored encoding changed; nothing is persisted.
+Added:
+
+- `Notice.via?` (omitted when absent, default absent): `related` on a
+  context pack's `in_flight` item met only on a file related to the task,
+  never on one of the agent's own paths; `untrusted.path` then names that
+  file. A client shows a `via` it does not know as it is.
+
 ## Index leases and bounded queries (additive, ADR 0058)
 
 No table, column or stored encoding changed.

@@ -870,3 +870,90 @@ async fn history_names_the_creator_of_a_rebased_land() {
     assert_eq!(h.created_by.as_deref(), Some("bo"));
     assert_eq!(h.untrusted.agent_model.as_deref(), Some("model-b"));
 }
+
+fn scoped(key: &str, title: &str, scope: &str) -> DeclareSessionRequest {
+    DeclareSessionRequest {
+        session: key.into(),
+        title: Some(title.into()),
+        target_ref: Some("main".into()),
+        scope: Some(vec![scope.into()]),
+        ..Default::default()
+    }
+}
+
+/// Live work is ranked by the agent's own paths: a session in the same
+/// directory as my file is `near`, as the notice says, even when it also
+/// works on a file that changed with mine; a session met only on such a
+/// related file is marked `via: related`, names that file, and ranks below
+/// every overlap on my own paths (the demo's rex, sol and bo).
+#[tokio::test]
+async fn related_files_never_outrank_my_own() {
+    let r = repo();
+    land(
+        &r,
+        "maint",
+        "m",
+        "seed",
+        &[
+            ("src/api/routes.rs", "r\n"),
+            ("src/api/handlers.rs", "h\n"),
+            ("src/billing/tax.rs", "t\n"),
+        ],
+    )
+    .await;
+    for (who, key, title, scope) in [
+        (
+            "sol",
+            "sol-1",
+            "Return 422 for bad JSON",
+            "src/api/handlers.rs",
+        ),
+        ("ada", "ada-1", "Round the tax", "src/billing/tax.rs"),
+        ("rex", "rex-1", "Version the routes", "src/api/routes.rs"),
+    ] {
+        r.declare_session_with(who, scoped(key, title, scope), None)
+            .await
+            .unwrap();
+    }
+    let mut a = ask("rex", "Version the routes", &["src/api/routes.rs"]);
+    a.req.session = Some("rex-1".into());
+    let p = r.context_pack(&a).await.unwrap();
+    assert!(paths_of(&p).contains(&"src/billing/tax.rs".to_string()));
+    let seen: Vec<(&str, &str, Option<&str>, Option<&str>)> = p
+        .in_flight
+        .iter()
+        .map(|w| {
+            (
+                w.notice.principal.as_deref().unwrap(),
+                w.notice.level.as_str(),
+                w.notice.via.as_deref(),
+                w.notice.untrusted.path.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("sol", "near", None, Some("src/api/routes.rs")),
+            (
+                "ada",
+                "same_file",
+                Some("related"),
+                Some("src/billing/tax.rs")
+            ),
+        ]
+    );
+    // The notice for the same session agrees with the pack.
+    let near = NoticeAsk {
+        min: leep_core::coord::NoticeLevel::Near,
+        ..Default::default()
+    };
+    let n = r.notices_for("rex", "rex-1", &near).await;
+    let sol: Vec<_> = n
+        .iter()
+        .filter(|n| n.principal.as_deref() == Some("sol"))
+        .collect();
+    assert_eq!(sol.len(), 1, "{n:?}");
+    assert_eq!(sol[0].level, p.in_flight[0].notice.level);
+    assert!(n.iter().all(|n| n.via.is_none()), "{n:?}");
+}

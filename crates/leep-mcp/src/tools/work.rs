@@ -166,18 +166,28 @@ fn work_line(w: &ContextWork) -> String {
     if let Some(pct) = n.similarity {
         line.push_str(&format!(" ({pct}% alike)"));
     }
+    if n.via.as_deref() == Some("related") {
+        line.push_str(" on a file related to your task, not yours");
+    }
     line
 }
 
 fn work_row(w: &ContextWork) -> Value {
     let t = &w.notice.untrusted;
-    json!({
+    // A file related to the task is not the agent's own: say so in the key.
+    let mine = if w.notice.via.as_deref() == Some("related") {
+        "related_path"
+    } else {
+        "your_path"
+    };
+    let mut row = json!({
         "id": w.id,
         "title": t.title,
-        "your_path": t.path,
         "their_path": t.other_path,
         "task_key": t.task_key,
-    })
+    });
+    row[mine] = json!(t.path);
+    row
 }
 
 /// A pack as an agent reads it: per section, one line per item with what
@@ -680,6 +690,7 @@ mod tests {
                     count: None,
                     by: None,
                     similarity: None,
+                    via: None,
                     untrusted: NoticeText {
                         title: evil.into(),
                         path: Some(evil.into()),

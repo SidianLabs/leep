@@ -1831,7 +1831,9 @@ a second kind of mutable state beside refs, behind its own trait,
   that changed with the paths in their newest 200 path-history changesets),
   owners and `carry` directives, the last change per file with its creator
   and model, in-flight work and duplicates (ADR 0096's overlap functions,
-  marking nothing said) and the ref's green, red and suspects touching the
+  marking nothing said; levels ranked by the request's and the session's
+  own paths, work met only on a related file marked `via: related` and
+  listed after) and the ref's green, red and suspects touching the
   files. Each section within 1 s and the call within 2 s; a section that
   fails or runs out of time is listed as omitted and the rest still comes.
   Items carry ids and exact sizes and are cut to the byte budget by

@@ -40,7 +40,7 @@ Each section reuses a query the server already answers:
 | `files` | the request's `paths` (`seed`); a literal code search for identifiers in the task (`search`): words in backticks, `snake_case`, `camelCase` and `HTTPServer`-like words, at most 4, 50 matching lines each, 32 MiB scanned each, through the search index with stale answers allowed (ADR 0058); files changed by the same changesets as the seeds (`co_change`) in the seeds' newest path-history entries, 200 changesets in all over at most 8 seeds, each counted once, changesets of more than 1,000 paths left out | 64 files; 32 from search, 32 from co-change |
 | `owners` | `OwnersResolver` at the ref's head: owners, the `OWNERS` files they come from, and the `carry` directive with its file (ADR 0092) | the first 32 files |
 | `history` | `last-change` per file (path-history index, stale answers allowed), with the changeset's creator (`created-by-v1`, ADR 0086), author, title, `agent.model` and `agent.session` | the first 32 files; 8 reads at once |
-| `in_flight` | the path and `landed` parts of ADR 0096's overlaps for the caller's session, probing the pack's files first and then the session's own paths; each other session once, at its highest level | 50 (`MAX_OVERLAPS`) |
+| `in_flight` | the path and `landed` parts of ADR 0096's overlaps for the caller's session, probing the request's paths and the session's own first, then the pack's other files (`via: related`, ranked below; see Amendments); each other session once, at its highest level | 50 (`MAX_OVERLAPS`) |
 | `ref_health` | `ref_checks` (ADR 0091): head, `green/<ref>`, `behind`, `red`, the required checks; when red, the suspects (`culprits`) whose paths meet the pack's files, with only those paths | 5 suspects, 8 paths each |
 | `duplicates` | ADR 0096's duplicate part: live sessions with the same task key, or a declared title and approach at least 60% alike to the task | 20 |
 
@@ -190,3 +190,27 @@ section, wait for a measured need.
   not change what later answers say.
 - **Cut by item count.** Items vary from 100 bytes to several KB (a
   suspect with paths); a byte budget is what a context window spends.
+
+## Amendments
+
+### Levels come from the agent's own paths (2026-11-10)
+The phase 1 demo (docs/DEMO-COORDINATION.md) showed packs contradicting
+notices: the pack probed co-changed and searched files as if they were the
+agent's own, so rex's pack called sol `same_file` on `handlers.rs` "(your
+`src/api/handlers.rs`)" while the notice in the same output said `near`,
+and bo was told ada works on "your `keys.rs`", a file that only changed
+with bo's. Now an overlap's level is ranked first by the request's paths
+and the session's own (scope, claims, touched): another session met on
+one of those takes the best level there, whatever it also meets on a
+related file. A session met only on a related file (a `co_change` or
+`search` file of the pack) keeps the level it has there but carries
+`via: "related"` (a new optional `Notice` field, absent otherwise), its
+`untrusted.path` is that related file, and it ranks below every overlap on
+the agent's own paths whatever the levels. A related file never makes a
+crowded-path count. Notices never carry `via`: they probe only the
+session's and the request's own paths, so pack and notice now agree on
+every session they both name. The CLI prints such an item as "(a file
+related to your task: ...)" instead of "(your ...)"; the MCP tools add "on
+a file related to your task, not yours" and key the fenced path
+`related_path` instead of `your_path`.
+

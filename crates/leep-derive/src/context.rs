@@ -451,7 +451,7 @@ impl Repo {
                 section_until(),
                 self.context_history(head, &detail)
             ),
-            self.context_in_flight(&me, &paths, section_until()),
+            self.context_in_flight(&me, &c.paths, &paths, section_until()),
             bounded(
                 "ref_health",
                 section_until(),
@@ -867,24 +867,26 @@ impl Repo {
         Ok(out)
     }
 
-    /// Live work overlapping the pack's files (and the session's own
-    /// paths), each other session once at its highest level, plus lands
-    /// on the target ref since the session's base. Nothing is marked
-    /// said. The path and `landed` parts are bounded together.
+    /// Live work overlapping the request's paths and the session's own,
+    /// each other session once at its highest level, then work met only on
+    /// the pack's other files (`via: related`), plus lands on the target
+    /// ref since the session's base. Nothing is marked said. The path and
+    /// `landed` parts are bounded together.
     async fn context_in_flight(
         &self,
         s: &Session,
-        paths: &[String],
+        own: &[String],
+        related: &[String],
         until: Instant,
     ) -> Part<Vec<ContextWork>> {
         if self.coord.is_none() {
             return Err(Omit::Off);
         }
         let work = async {
-            let (p, l) = tokio::join!(self.path_overlaps(s, paths), self.landed_overlaps(s));
+            let (p, l) = tokio::join!(self.path_overlaps(s, own, related), self.landed_overlaps(s));
             let mut found = p?;
             found.extend(l?);
-            found.sort_by_key(|f| std::cmp::Reverse(f.level));
+            found.sort_by_key(|f| std::cmp::Reverse(crate::notices::rank(f)));
             Ok(one_per_session(found))
         };
         let found = bounded("in_flight", until, work).await?;
@@ -1076,6 +1078,7 @@ mod tests {
                 count: None,
                 by: None,
                 similarity: None,
+                via: None,
                 untrusted: Default::default(),
             },
         );

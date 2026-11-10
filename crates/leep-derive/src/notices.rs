@@ -347,6 +347,7 @@ fn notice(level: NoticeLevel, other: Option<&Session>) -> Notice {
         count: None,
         by: None,
         similarity: None,
+        via: None,
         untrusted: NoticeText {
             title: other.map_or_else(String::new, |o| cut(&o.title, NOTICE_TITLE_BYTES)),
             ..Default::default()
@@ -354,10 +355,21 @@ fn notice(level: NoticeLevel, other: Option<&Session>) -> Notice {
     }
 }
 
-/// The session's paths to probe: `focus` first, then claims, scope and
-/// touched paths, each once, at most [`MAX_PROBED_PATHS`]. Each with
-/// whether the session declared it.
-fn probed(s: &Session, focus: &[String]) -> Vec<(String, bool)> {
+/// One path probed for overlaps.
+#[derive(Clone, Debug)]
+struct Probe {
+    path: String,
+    /// The session declared it (scope or claim).
+    declared: bool,
+    /// Only related to the task (a context pack's co-change or search
+    /// file), not the session's or the request's own.
+    related: bool,
+}
+
+/// The session's paths to probe: `focus` (the request's own paths) first,
+/// then claims, scope and touched paths, then `related` paths, each once,
+/// at most [`MAX_PROBED_PATHS`].
+fn probed(s: &Session, focus: &[String], related: &[String]) -> Vec<Probe> {
     let declared: BTreeSet<&str> = s
         .scope
         .iter()
@@ -366,20 +378,31 @@ fn probed(s: &Session, focus: &[String]) -> Vec<(String, bool)> {
         .collect();
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
-    let all = focus
+    let own = focus
         .iter()
         .chain(&s.claims)
         .chain(&s.scope)
-        .chain(&s.touched);
-    for p in all {
+        .chain(&s.touched)
+        .map(|p| (p, false));
+    for (p, related) in own.chain(related.iter().map(|p| (p, true))) {
         if out.len() >= MAX_PROBED_PATHS {
             break;
         }
         if seen.insert(p.as_str()) {
-            out.push((p.clone(), declared.contains(p.as_str())));
+            out.push(Probe {
+                path: p.clone(),
+                declared: declared.contains(p.as_str()),
+                related,
+            });
         }
     }
     out
+}
+
+/// How a found overlap ranks: on my own paths above one found only through
+/// related files, then by level. Higher first.
+pub(crate) fn rank(f: &Found) -> (bool, NoticeLevel) {
+    (f.notice.via.is_none(), f.level)
 }
 
 /// The level of another session's path `theirs` (of `kind`) against mine.
@@ -543,7 +566,7 @@ impl Repo {
             }
         };
         let (paths, landed, dups) = tokio::join!(
-            part(bound, self.path_overlaps(s, focus)),
+            part(bound, self.path_overlaps(s, focus, &[])),
             part(bound, self.landed_overlaps(s)),
             dups,
         );
@@ -551,20 +574,29 @@ impl Repo {
         found.extend(landed);
         found.extend(dups);
         // Stable: within a level, the order each part found them in.
-        found.sort_by_key(|f| std::cmp::Reverse(f.level));
+        found.sort_by_key(|f| std::cmp::Reverse(rank(f)));
         one_per_session(found)
     }
 
-    pub(crate) async fn path_overlaps(&self, s: &Session, focus: &[String]) -> Result<Vec<Found>> {
+    /// Path levels of other live sessions against `s`'s paths, `focus`
+    /// (the request's own) first. A session met only on a `related` path
+    /// is marked `via: related` and ranks below every one met on mine:
+    /// its level says how it meets a file related to the task, never mine.
+    pub(crate) async fn path_overlaps(
+        &self,
+        s: &Session,
+        focus: &[String],
+        related: &[String],
+    ) -> Result<Vec<Found>> {
         let Some(coord) = self.coord.as_ref() else {
             return Ok(Vec::new());
         };
-        let mine = probed(s, focus);
+        let mine = probed(s, focus, related);
         if mine.is_empty() {
             return Ok(Vec::new());
         }
         let q = NearQuery {
-            paths: mine.iter().map(|(p, _)| p.clone()).collect(),
+            paths: mine.iter().map(|p| p.path.clone()).collect(),
             siblings: true,
             exclude: Some(s.id),
             per_range: PER_RANGE,
@@ -583,13 +615,14 @@ impl Repo {
             {
                 continue;
             }
+            // My own paths first, whatever a related file's level.
             let best = mine
                 .iter()
                 .enumerate()
-                .filter_map(|(i, (p, _))| path_level(p, &r.path, r.kind).map(|l| (l, i)))
-                .max_by_key(|(l, i)| (*l, std::cmp::Reverse(*i)));
+                .filter_map(|(i, p)| path_level(&p.path, &r.path, r.kind).map(|l| (l, i)))
+                .max_by_key(|(l, i)| (!mine[*i].related, *l, std::cmp::Reverse(*i)));
             let Some((level, i)) = best else { continue };
-            if level >= NoticeLevel::SameFile {
+            if level >= NoticeLevel::SameFile && !mine[i].related {
                 let e = crowd.entry(r.path.as_str()).or_insert((i, BTreeSet::new()));
                 e.1.insert(r.session.id);
             }
@@ -599,16 +632,16 @@ impl Repo {
         let mut hot: BTreeSet<&str> = BTreeSet::new();
         for (theirs, (i, ids)) in &crowd {
             if ids.len() > HOT_SESSIONS {
-                let (p, declared) = &mine[*i];
+                let p = &mine[*i];
                 let mut n = notice(NoticeLevel::SameFile, None);
                 n.count = Some(ids.len() as u64);
-                n.untrusted.path = Some(p.clone());
+                n.untrusted.path = Some(p.path.clone());
                 n.untrusted.other_path = Some(theirs.to_string());
                 out.push(Found {
                     level: NoticeLevel::SameFile,
                     key: format!("hot:{theirs}"),
                     notice: n,
-                    mine: Some((p.clone(), *declared)),
+                    mine: Some((p.path.clone(), p.declared)),
                 });
                 hot.insert(theirs);
             }
@@ -616,29 +649,34 @@ impl Repo {
         // The best (level, my path, their path) per other session, leaving
         // out its rows on crowded paths (their count) unless they claim:
         // a session that also meets me on an uncrowded path is named there.
-        type Best = (NoticeLevel, usize, String);
+        // A row on one of my paths beats any on a related file.
+        type Best = ((bool, NoticeLevel), usize, String);
         let mut best: BTreeMap<u64, (&Session, Best)> = BTreeMap::new();
         for (r, level, i) in met {
             if hot.contains(r.path.as_str()) && level < NoticeLevel::Claimed {
                 continue;
             }
+            let at = (!mine[i].related, level);
             let e = best
                 .entry(r.session.id)
-                .or_insert_with(|| (&r.session, (level, i, r.path.clone())));
-            if level > e.1 .0 {
-                e.1 = (level, i, r.path.clone());
+                .or_insert_with(|| (&r.session, (at, i, r.path.clone())));
+            if at > e.1 .0 {
+                e.1 = (at, i, r.path.clone());
             }
         }
-        for (id, (o, (level, i, theirs))) in best.into_iter().rev() {
-            let (p, declared) = &mine[i];
+        for (id, (o, ((_, level), i, theirs))) in best.into_iter().rev() {
+            let p = &mine[i];
             let mut n = notice(level, Some(o));
-            n.untrusted.path = Some(p.clone());
+            n.untrusted.path = Some(p.path.clone());
             n.untrusted.other_path = Some(theirs);
+            if p.related {
+                n.via = Some("related".into());
+            }
             out.push(Found {
                 level,
                 key: format!("session:{id}"),
                 notice: n,
-                mine: Some((p.clone(), *declared)),
+                mine: Some((p.path.clone(), p.declared)),
             });
         }
         Ok(out)
@@ -682,7 +720,7 @@ impl Repo {
                 }
             }
         };
-        let mine = probed(s, &[]);
+        let mine = probed(s, &[], &[]);
         let mut reader = ChainReader::new();
         while let Some(id) = w.at {
             if w.walked >= LANDED_WINDOW || w.bases.contains(&id) || w.own.contains(&id) {
@@ -693,9 +731,9 @@ impl Repo {
             w.walked += 1;
             w.at = cs.parents.first().copied();
             if !self.is_own(s, id, &cs).await? {
-                let hit = mine
-                    .iter()
-                    .find_map(|(p, d)| changed_near(&cs, p).map(|c| (p, *d, c.to_string())));
+                let hit = mine.iter().find_map(|p| {
+                    changed_near(&cs, &p.path).map(|c| (&p.path, p.declared, c.to_string()))
+                });
                 if let Some((p, declared, theirs)) = hit {
                     let mut n = notice(NoticeLevel::Landed, None);
                     n.changeset = Some(id);

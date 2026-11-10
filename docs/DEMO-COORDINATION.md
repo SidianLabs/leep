@@ -58,10 +58,11 @@ ref is red with bo's land as a suspect.
 
 The demo is also a check on how the notices read. Things to look at:
 
-- A pack's "work in flight" probes the files the task turned up (co-changes
-  and search hits), not only the agent's own, and reports overlaps there
-  as `same_file` "(your ...)": rex's pack calls sol `same_file` on
-  `handlers.rs` while the notice in the same output says `near`.
+- A pack's "work in flight" ranks levels by the agent's own paths, so it
+  agrees with the notices: rex's pack and notice both call sol `near`.
+  Work met only on a file the task turned up (a co-change) is marked
+  "a file related to your task" and listed last (fay's pack names ada so
+  on `keys.rs`).
 - The first agent of a duplicate pair is not told it is one: duplicates are
   flagged on declarations only, so dee hears eli as `same_file` (with no
   task key), and only in the answer of the call that already landed.

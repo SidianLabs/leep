@@ -1235,6 +1235,12 @@ pub struct Notice {
     /// and approaches, in percent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub similarity: Option<u32>,
+    /// `related` when the overlap is only on a file related to the task (a
+    /// context pack's co-change or search file), not on one of yours:
+    /// `untrusted.path` is then that file. Such an overlap never ranks above
+    /// one on your own paths. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
     #[serde(default)]
     pub untrusted: NoticeText,
 }
@@ -3326,6 +3332,7 @@ mod tests {
                 count: None,
                 by: None,
                 similarity: None,
+                via: None,
                 untrusted: NoticeText {
                     title: "t".into(),
                     path: Some("src/a.rs".into()),
@@ -3339,11 +3346,12 @@ mod tests {
                 &["level", "session", "principal", "untrusted"],
                 "Notice",
             );
-            for absent in ["changeset", "count", "by", "similarity"] {
+            for absent in ["changeset", "count", "by", "similarity", "via"] {
                 assert!(v.get(absent).is_none(), "{absent}");
             }
             let small: Notice = serde_json::from_value(json!({ "level": "near" })).unwrap();
             assert!(small.session.is_none() && small.untrusted.title.is_empty());
+            assert!(small.via.is_none(), "an old body has no `via`");
             let land = LandAnswer {
                 answer: LandResponse::Landed {
                     landed: id,
@@ -3484,6 +3492,7 @@ mod tests {
                         count: None,
                         by: None,
                         similarity: None,
+                        via: None,
                         untrusted: NoticeText::default(),
                     },
                 }],
