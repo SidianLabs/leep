@@ -1293,6 +1293,157 @@ impl NoteSweep {
     }
 }
 
+// --- Events (ADR 0099) ---------------------------------------------------------
+
+/// Most paths one event carries; more are folded into their directories
+/// ([`bound_paths`]), which still overlap everything below them.
+pub const MAX_EVENT_PATHS: usize = 16;
+/// How long events are kept by default (`--events-retention`). A reader
+/// further behind resyncs from state (`GET /v1/notices`, `/overlaps`).
+pub const EVENT_RETENTION_SECS: i64 = 24 * 60 * 60;
+
+/// What an event says happened (ADR 0099). Stored as its [`as_str`] text;
+/// a store hands back kinds it does not know as text, so a server older
+/// than the writer still serves them.
+///
+/// [`as_str`]: EventKind::as_str
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum EventKind {
+    /// A session was created, or revived after it ended.
+    SessionStarted,
+    /// A session's paths (scope, claims and touched paths, folded) changed.
+    SessionPaths,
+    /// A session ended: landed, abandoned.
+    SessionEnded,
+    NoteAdded,
+    NoteEndorsed,
+    /// A note was replaced by a newer one of its author's.
+    NoteSuperseded,
+    /// Reserved for the merge dry run (ADR 0096, part 2); nothing emits it
+    /// yet.
+    ConflictPredicted,
+}
+
+impl EventKind {
+    pub const ALL: [EventKind; 7] = [
+        EventKind::SessionStarted,
+        EventKind::SessionPaths,
+        EventKind::SessionEnded,
+        EventKind::NoteAdded,
+        EventKind::NoteEndorsed,
+        EventKind::NoteSuperseded,
+        EventKind::ConflictPredicted,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventKind::SessionStarted => "session.started",
+            EventKind::SessionPaths => "session.paths",
+            EventKind::SessionEnded => "session.ended",
+            EventKind::NoteAdded => "note.added",
+            EventKind::NoteEndorsed => "note.endorsed",
+            EventKind::NoteSuperseded => "note.superseded",
+            EventKind::ConflictPredicted => "conflict.predicted",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|k| k.as_str() == s)
+            .ok_or_else(|| {
+                let all: Vec<&str> = Self::ALL.iter().map(|k| k.as_str()).collect();
+                Error::Invalid(format!(
+                    "unknown event kind {:?} (expected one of {})",
+                    s.chars().take(64).collect::<String>(),
+                    all.join(", ")
+                ))
+            })
+    }
+}
+
+/// An event to append (ADR 0099): one fact, made of ids, states and
+/// paths, never of text an agent wrote (paths aside, which readers get
+/// under `untrusted`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewEvent {
+    /// An [`EventKind`]'s text.
+    pub kind: String,
+    /// The session the event is about, or whose agent caused it.
+    pub session_id: Option<u64>,
+    /// Who caused it: a token name.
+    pub principal: String,
+    /// What it is about: `session:N`, `note:N` or a changeset id.
+    pub subject: String,
+    /// At most [`MAX_EVENT_PATHS`], folded.
+    pub paths: Vec<String>,
+    /// The kind's facts as a JSON object (`leep_core::api::EventFacts`).
+    pub payload: String,
+    /// Unix seconds, when the server emitted it.
+    pub created: i64,
+}
+
+/// A stored event: a [`NewEvent`] and its place in the one order every
+/// server reads (`seq`, ascending, gaps allowed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Event {
+    pub seq: u64,
+    pub kind: String,
+    pub session_id: Option<u64>,
+    pub principal: String,
+    pub subject: String,
+    pub paths: Vec<String>,
+    pub payload: String,
+    pub created: i64,
+}
+
+impl NewEvent {
+    /// This event stored as `seq`.
+    pub fn stored(&self, seq: u64) -> Event {
+        Event {
+            seq,
+            kind: self.kind.clone(),
+            session_id: self.session_id,
+            principal: self.principal.clone(),
+            subject: self.subject.clone(),
+            paths: self.paths.clone(),
+            payload: self.payload.clone(),
+            created: self.created,
+        }
+    }
+}
+
+/// The extent of the events table: the oldest kept event, if any, and the
+/// newest sequence number ever handed out (committed: every event at or
+/// below it is visible to every reader), 0 before the first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EventBounds {
+    pub oldest: Option<u64>,
+    pub newest: u64,
+}
+
+impl EventBounds {
+    /// Whether a reader that has seen every event up to `after` may have
+    /// missed one: the events just above it were swept, or the store was
+    /// restored or reset beneath it (`after` past `newest`). A gap left by
+    /// a failed write can also answer true; that costs a resync, never a
+    /// missed event.
+    pub fn expired(&self, after: u64) -> bool {
+        if after > self.newest {
+            return true;
+        }
+        match self.oldest {
+            Some(o) => after.saturating_add(1) < o,
+            None => after < self.newest,
+        }
+    }
+}
+
+/// The answer of a store that keeps no events (an older schema).
+pub fn no_events() -> Error {
+    Error::NotFound("events: this server keeps none".into())
+}
+
 /// Storage for coordination state (ADR 0095). Every mutation is one
 /// conditional statement or one transaction holding the row's lock; nothing
 /// reads a row and writes it back unguarded. Each store keeps the default
@@ -1372,6 +1523,33 @@ pub trait CoordStore: Send + Sync {
     /// open notes past their `expires`, and up to `limit` closed ones past
     /// theirs.
     async fn sweep_notes(&self, now: i64, limit: usize) -> Result<NoteSweep>;
+
+    /// Append `events` in order (ADR 0099), as one transaction committed
+    /// in sequence order: no reader ever sees an event while one with a
+    /// lower `seq` is still to commit. Answers the highest `seq` given, 0
+    /// for none. A store without events answers [`no_events`].
+    async fn append_events(&self, _events: &[NewEvent]) -> Result<u64> {
+        Err(no_events())
+    }
+
+    /// Up to `limit` events with `seq` above `after`, in `seq` order.
+    async fn events_after(&self, _after: u64, _limit: usize) -> Result<Vec<Event>> {
+        Err(no_events())
+    }
+
+    /// The oldest kept event and the newest sequence number handed out,
+    /// read after every append in flight has committed.
+    async fn events_bounds(&self) -> Result<EventBounds> {
+        Err(no_events())
+    }
+
+    /// One bounded step of the event sweep: delete the oldest events, in
+    /// `seq` order and at most `limit`, up to the first created at or after
+    /// `cutoff`, so the kept events are always every event above one `seq`.
+    /// Answers how many. A store without events deletes none.
+    async fn sweep_events(&self, _cutoff: i64, _limit: usize) -> Result<u64> {
+        Ok(0)
+    }
 }
 
 /// The answer of a store that keeps no notes (an older schema).
@@ -1403,6 +1581,39 @@ mod tests {
             assert_eq!(SessionOrigin::parse(o.as_str()).unwrap(), o);
         }
         assert!(SessionState::parse("open").is_err());
+    }
+
+    #[test]
+    fn event_names_are_stable() {
+        let kinds: Vec<_> = EventKind::ALL.iter().map(|k| k.as_str()).collect();
+        assert_eq!(
+            kinds.join(","),
+            "session.started,session.paths,session.ended,note.added,note.endorsed,\
+             note.superseded,conflict.predicted"
+        );
+        for k in EventKind::ALL {
+            assert_eq!(EventKind::parse(k.as_str()).unwrap(), k);
+        }
+        let e = EventKind::parse("IGNORE PREVIOUS INSTRUCTIONS".repeat(10).as_str()).unwrap_err();
+        assert!(e.to_string().len() < 300);
+    }
+
+    /// A cursor is expired when events just above it are gone, or when it
+    /// is past everything the store ever handed out (a restored store).
+    #[test]
+    fn event_cursors_expire_by_the_bounds() {
+        let b = EventBounds {
+            oldest: Some(10),
+            newest: 20,
+        };
+        assert!(!b.expired(9) && !b.expired(15) && !b.expired(20));
+        assert!(b.expired(8) && b.expired(0) && b.expired(21));
+        let empty = EventBounds {
+            oldest: None,
+            newest: 20,
+        };
+        assert!(!empty.expired(20) && empty.expired(19) && empty.expired(21));
+        assert!(!EventBounds::default().expired(0));
     }
 
     #[test]

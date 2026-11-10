@@ -619,6 +619,7 @@ fn full_schema() -> BTreeSet<String> {
         "notes_expires",
         "notes_reported",
         "notes_open",
+        "events",
     ]
     .map(String::from)
     .into()
@@ -1018,7 +1019,8 @@ async fn upgrade_from_v4_adds_land_ids() {
                 "changeset_stored_at",
                 "review_requests",
                 "sessions",
-                "notes"
+                "notes",
+                "events"
             ],
             "{kind}"
         );
@@ -1079,7 +1081,8 @@ async fn upgrade_from_v6_adds_stored_at() {
                 "changeset_stored_at",
                 "review_requests",
                 "sessions",
-                "notes"
+                "notes",
+                "events"
             ],
             "{kind}"
         );
@@ -1161,7 +1164,7 @@ async fn upgrade_from_v7_adds_review_requests() {
         assert_eq!(plan.from, 7, "{kind}");
         assert_eq!(
             plan.pending.iter().map(|m| m.name).collect::<Vec<_>>(),
-            ["review_requests", "sessions", "notes"],
+            ["review_requests", "sessions", "notes", "events"],
             "{kind}"
         );
         db.migrate(db.compiled(), false).await.unwrap();
@@ -1249,7 +1252,7 @@ async fn upgrade_from_v8_adds_sessions() {
         assert_eq!(plan.from, 8, "{kind}");
         assert_eq!(
             plan.pending.iter().map(|m| m.name).collect::<Vec<_>>(),
-            ["sessions", "notes"],
+            ["sessions", "notes", "events"],
             "{kind}"
         );
         db.migrate(db.compiled(), false).await.unwrap();
@@ -1340,7 +1343,7 @@ async fn upgrade_from_v9_adds_notes() {
         assert_eq!(plan.from, 9, "{kind}");
         assert_eq!(
             plan.pending.iter().map(|m| m.name).collect::<Vec<_>>(),
-            ["notes"],
+            ["notes", "events"],
             "{kind}"
         );
         db.migrate(db.compiled(), false).await.unwrap();
@@ -1416,6 +1419,125 @@ async fn upgrade_from_v9_adds_notes() {
             .unwrap();
         assert_eq!(n.state, NoteState::Open, "{kind}");
         assert_eq!(coord.list_notes(&all).await.unwrap(), [n], "{kind}");
+        assert_eq!(db.objects().await, full_schema(), "{kind}");
+        drop((s, coord));
+        db.cleanup().await;
+    }
+}
+
+/// A database at v10 upgrades to events (ADR 0099) beside a v10 server
+/// that keeps running: its notes and sessions read back, it keeps working
+/// on the new schema (it never names the table), and the table starts
+/// empty, at `seq` 0, and takes events in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upgrade_from_v10_adds_events() {
+    use leep_core::coord::{
+        AnchorType, EventBounds, NewEvent, NewNote, NoteFilter, NoteKind, NoteSweep, NoteTrust,
+        SessionEnd, SessionOrigin, SessionState, SessionUpdate, SweepReport,
+    };
+    for db in dbs("fromv10").await {
+        let kind = db.kind();
+        let d = data();
+        let old = db
+            .open(&db.compiled()[..10], SchemaMode::Migrate)
+            .await
+            .unwrap();
+        load(&db, &STAGES[1], &d).await;
+        let old_coord = old.coord_store().expect("sessions at v10");
+        let u = SessionUpdate::new("ada", "s-10", SessionOrigin::Declared, 1_700_000_400);
+        let (session, _) = old_coord.upsert_session(&u).await.unwrap();
+        let note = NewNote {
+            kind: NoteKind::Finding,
+            anchor_type: AnchorType::Path,
+            anchor: "src/f1.rs".into(),
+            at_changeset: None,
+            at_blob: None,
+            lines: None,
+            title: "before the upgrade".into(),
+            body: String::new(),
+            principal: "ada".into(),
+            agent_model: None,
+            session_id: Some(session.id),
+            trust: NoteTrust::Agent,
+            supersedes: None,
+            created: 1_700_000_450,
+            expires: None,
+            max_open: 10,
+            max_per_hour: 10,
+            max_per_day: 10,
+        };
+        let n = old_coord.add_note(&note).await.unwrap();
+        assert!(old_coord.events_bounds().await.is_err(), "{kind}");
+        assert!(old_coord.append_events(&[]).await.is_err(), "{kind}");
+        assert_eq!(old_coord.sweep_events(i64::MAX, 10).await.unwrap(), 0);
+        let plan = db.report(db.compiled()).await;
+        assert_eq!(plan.from, 10, "{kind}");
+        assert_eq!(
+            plan.pending.iter().map(|m| m.name).collect::<Vec<_>>(),
+            ["events"],
+            "{kind}"
+        );
+        db.migrate(db.compiled(), false).await.unwrap();
+        let s = db
+            .open(db.compiled(), SchemaMode::RequireCurrent)
+            .await
+            .unwrap();
+        let coord = s.coord_store().expect("events after 0011");
+        assert_eq!(
+            coord.get_session(session.id).await.unwrap(),
+            Some(session.clone())
+        );
+        let all = NoteFilter {
+            limit: 10,
+            ..Default::default()
+        };
+        assert_eq!(coord.list_notes(&all).await.unwrap(), [n.clone()], "{kind}");
+        assert_eq!(
+            coord.events_bounds().await.unwrap(),
+            EventBounds::default(),
+            "{kind}"
+        );
+        // The contract runs on an empty store: forget that session and note.
+        let end = SessionEnd {
+            state: SessionState::Abandoned,
+            at: 1_700_000_401,
+            landed_as: None,
+            principal: None,
+            if_head: None,
+        };
+        assert!(coord.end_session(session.id, &end).await.unwrap());
+        while coord.sweep_sessions(1_800_000_000, 100).await.unwrap() != SweepReport::default() {}
+        assert_eq!(coord.revoke_notes("ada", 1_700_000_402).await.unwrap(), 1);
+        while coord.sweep_notes(1_900_000_000, 100).await.unwrap() != NoteSweep::default() {}
+        verify(&*s, &STAGES[1], &d, LATEST as u64).await;
+        // The v10 server still stores, moves refs and keeps sessions.
+        let late = old.put_changeset(&crate::tests::cs(101010)).await.unwrap();
+        let head = old.get_ref("feature/x").await.unwrap();
+        assert!(
+            old.cas_ref("feature/x", head, Some(late)).await.unwrap(),
+            "{kind}"
+        );
+        let mut again = SessionUpdate::new("ada", "s-11", SessionOrigin::Inferred, 1_900_000_500);
+        again.head = Some(late);
+        let (revived, _) = old_coord.upsert_session(&again).await.unwrap();
+        assert_eq!(coord.get_session(revived.id).await.unwrap(), Some(revived));
+        drop((old, old_coord));
+        let e = |n: u64| NewEvent {
+            kind: "note.added".into(),
+            session_id: Some(session.id),
+            principal: "ada".into(),
+            subject: format!("note:{n}"),
+            paths: vec!["src/f1.rs".into()],
+            payload: format!("{{\"note\":{n}}}"),
+            created: 1_700_000_600,
+        };
+        let top = coord.append_events(&[e(n.id), e(n.id + 1)]).await.unwrap();
+        let got = coord.events_after(0, 10).await.unwrap();
+        assert_eq!(
+            got,
+            [e(n.id).stored(top - 1), e(n.id + 1).stored(top)],
+            "{kind}"
+        );
         assert_eq!(db.objects().await, full_schema(), "{kind}");
         drop((s, coord));
         db.cleanup().await;

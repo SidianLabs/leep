@@ -2579,6 +2579,7 @@ dependencies = [
  "leep-core",
  "leep-testkit",
  "metrics",
+ "serde_json",
  "sqlx",
  "tempfile",
  "tokio",

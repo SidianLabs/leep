@@ -75,6 +75,31 @@ async fn a_schema_before_notes_keeps_no_notes() {
     assert_eq!(c.sweep_notes(1, 10).await.unwrap(), NoteSweep::default());
 }
 
+/// A store opened with the schema of migration 0010 keeps notes but no
+/// events (ADR 0099): event reads and appends answer 404, the sweep does
+/// nothing.
+#[tokio::test]
+async fn a_schema_before_events_keeps_no_events() {
+    let migs = &SQLITE_MIGRATIONS[..10];
+    let s = SqliteMetaStore::connect_with_migrations("sqlite::memory:", SchemaMode::Migrate, migs)
+        .await
+        .unwrap();
+    let c = s.coord_store().unwrap();
+    assert!(matches!(
+        c.events_after(0, 10).await,
+        Err(leep_core::Error::NotFound(_))
+    ));
+    assert!(matches!(
+        c.events_bounds().await,
+        Err(leep_core::Error::NotFound(_))
+    ));
+    assert!(matches!(
+        c.append_events(&[]).await,
+        Err(leep_core::Error::NotFound(_))
+    ));
+    assert_eq!(c.sweep_events(i64::MAX, 10).await.unwrap(), 0);
+}
+
 /// Paths compare bytewise on Postgres too: a directory's range scan holds
 /// what is below it and nothing beside it, whatever the database's
 /// collation would say about `/`, `-` and `.`.

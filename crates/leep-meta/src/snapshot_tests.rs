@@ -136,6 +136,17 @@ async fn populate(store: &dyn MetaStore) {
         .change_note(human.id, &by, 1_700_000_400)
         .await
         .unwrap());
+    // Events (ADR 0099) are never in a snapshot.
+    let e = leep_core::coord::NewEvent {
+        kind: "note.added".into(),
+        session_id: None,
+        principal: "rhea".into(),
+        subject: format!("note:{}", human.id),
+        paths: Vec::new(),
+        payload: "{}".into(),
+        created: 1_700_000_300,
+    };
+    assert!(coord.append_events(&[e.clone(), e]).await.unwrap() > 0);
 }
 
 type Dump = (
@@ -521,7 +532,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // From an un-versioned database (before ADR 0023): adopted, then restored.
     let older = edit(
         "older.db",
-        "DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+        "DROP TABLE events; DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
          DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP TABLE schema_migrations; DROP TABLE changeset_dicts; DROP TABLE store_features; \
          DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; \
@@ -546,7 +557,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // SQLite) and 3: migrated on the scratch copy, then restored.
     let v1 = edit(
         "v1.db",
-        "DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+        "DROP TABLE events; DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
          DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP TABLE changeset_dicts; DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 1",
@@ -571,7 +582,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // the scratch copy, empty, and the plain rows restore as they were.
     let v2 = edit(
         "v2.db",
-        "DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+        "DROP TABLE events; DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
          DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP TABLE changeset_dicts; DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 2",
@@ -596,7 +607,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // copy; the source had no dictionary, so it names no feature.
     let v3 = edit(
         "v3.db",
-        "DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+        "DROP TABLE events; DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
          DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 3",
@@ -622,7 +633,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // scratch copy, and every restored entry has none.
     let v4 = edit(
         "v4.db",
-        "DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+        "DROP TABLE events; DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
          DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; DROP TABLE leases; \
          ALTER TABLE changesets DROP COLUMN stored_at; \
@@ -651,7 +662,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // migration ran.
     let v6 = edit(
         "v6.db",
-        "DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+        "DROP TABLE events; DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
          DROP TABLE review_requests; DROP TABLE review_request_reviewers; ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 6",
     )
@@ -678,7 +689,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // the scratch copy, empty, and everything else restores as it was.
     let v7 = edit(
         "v7.db",
-        "DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+        "DROP TABLE events; DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
          DROP TABLE review_requests; DROP TABLE review_request_reviewers; \
          DELETE FROM schema_migrations WHERE version > 7",
     )
@@ -703,7 +714,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // scratch copy, empty, and everything else restores as it was.
     let v8 = edit(
         "v8.db",
-        "DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+        "DROP TABLE events; DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
          DELETE FROM schema_migrations WHERE version > 8",
     )
     .await;
@@ -725,7 +736,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // scratch copy, empty, and everything else restores as it was.
     let v9 = edit(
         "v9.db",
-        "DROP TABLE notes; DELETE FROM schema_migrations WHERE version > 9",
+        "DROP TABLE events; DROP TABLE notes; DELETE FROM schema_migrations WHERE version > 9",
     )
     .await;
     assert_eq!(snapshot_schema_version(&v9).await.unwrap(), 9);
@@ -743,6 +754,37 @@ async fn schema_version_rules_follow_adr_0023() {
     let mut want = src_dump;
     want.7.clear();
     assert_eq!(d, want);
+
+    // From v10, before events (ADR 0099): the table is created on the
+    // scratch copy, and everything restores as it was; events are never
+    // in a snapshot.
+    let v10 = edit(
+        "v10.db",
+        "DROP TABLE events; DELETE FROM schema_migrations WHERE version > 10",
+    )
+    .await;
+    assert_eq!(snapshot_schema_version(&v10).await.unwrap(), 10);
+    let dest_url = sqlite_url(dir.path(), "d12.db");
+    import_snapshot(&v10, &dest_url, false, SchemaMode::Migrate)
+        .await
+        .unwrap();
+    let d12 = open_meta_store(&dest_url).await.unwrap();
+    assert_eq!(
+        d12.schema_version().await.unwrap(),
+        Some(latest_schema_version())
+    );
+    assert_eq!(dump(&*d12).await, dump(&*src).await);
+    let c = d12.coord_store().unwrap();
+    assert_eq!(c.events_bounds().await.unwrap().newest, 0);
+    assert!(
+        src.coord_store()
+            .unwrap()
+            .events_after(0, 10)
+            .await
+            .unwrap()
+            .len()
+            == 2
+    );
 
     // Not a snapshot at all.
     let junk = dir.path().join("junk.db");

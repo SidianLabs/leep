@@ -3,6 +3,10 @@
 //! paths as `session_paths` rows, and when it was last heard from in the
 //! narrow `session_beats` table, so a heartbeat never rewrites the wide row.
 //!
+//! Events (ADR 0099) are `events` rows, appended in batches that commit in
+//! `seq` order (a Postgres advisory lock; SQLite has one writer), so a
+//! reader paging by `seq` never passes an event that commits later.
+//!
 //! Notes (ADR 0098) are `notes` rows: one per note, its state changed only
 //! by conditional updates, added in one transaction that checks the
 //! principal's caps under a per-principal lock (Postgres advisory lock,
@@ -19,12 +23,13 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use leep_core::coord::{
-    ancestors, apply_update, check_end, check_supersede, no_notes, notes_per_day, notes_per_hour,
-    reports_per_hour, too_many_notes, AnchorType, Beat, CoordStore, NearQuery, NearRow, NewNote,
-    Note, NoteChange, NoteFilter, NoteKind, NoteState, NoteSweep, NoteTrust, PathKind, Session,
-    SessionEnd, SessionFilter, SessionOrigin, SessionState, SessionUpdate, SweepReport,
-    AGENT_NOTE_TTL_SECS, CLOSED_NOTE_RETENTION_SECS, EXPIRE_AFTER_SECS, NOTE_DAY_WINDOW_SECS,
-    NOTE_RATE_WINDOW_SECS, PATHS_RETENTION_SECS, SESSION_RETENTION_SECS, TOO_MANY_SESSIONS_MARKER,
+    ancestors, apply_update, check_end, check_supersede, no_events, no_notes, notes_per_day,
+    notes_per_hour, reports_per_hour, too_many_notes, AnchorType, Beat, CoordStore, Event,
+    EventBounds, NearQuery, NearRow, NewEvent, NewNote, Note, NoteChange, NoteFilter, NoteKind,
+    NoteState, NoteSweep, NoteTrust, PathKind, Session, SessionEnd, SessionFilter, SessionOrigin,
+    SessionState, SessionUpdate, SweepReport, AGENT_NOTE_TTL_SECS, CLOSED_NOTE_RETENTION_SECS,
+    EXPIRE_AFTER_SECS, NOTE_DAY_WINDOW_SECS, NOTE_RATE_WINDOW_SECS, PATHS_RETENTION_SECS,
+    SESSION_RETENTION_SECS, TOO_MANY_SESSIONS_MARKER,
 };
 use leep_core::{ChangesetId, Error, Result};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Sqlite, SqlitePool};
@@ -35,6 +40,20 @@ use crate::{storage, to_id};
 pub(crate) const SESSIONS_SCHEMA_VERSION: i64 = 9;
 /// The schema version that added `notes` (ADR 0098).
 pub(crate) const NOTES_SCHEMA_VERSION: i64 = 10;
+
+/// The schema version that added `events` (ADR 0099).
+pub(crate) const EVENTS_SCHEMA_VERSION: i64 = 11;
+
+/// The first key of the Postgres advisory lock an events append takes
+/// (exclusive) and a bounds read waits on (shared), with the repository
+/// id as the second: appends commit one at a time, in `seq` order.
+pub(crate) const EVENTS_LOCK: i32 = 0x4c45_5654;
+
+/// Events per `INSERT`, under each backend's bind limit.
+const PG_EVENTS_PER_INSERT: usize = 1000;
+const SQLITE_EVENTS_PER_INSERT: usize = 100;
+
+const EVENT_COLUMNS: &str = "seq, kind, session_id, principal, subject, paths, payload, created";
 
 /// The first key of the Postgres advisory lock a note write takes, with
 /// the principal's hash as the second: one writer per principal at a time,
@@ -185,6 +204,59 @@ macro_rules! note_row {
 }
 note_row!(sqlx::postgres::PgRow);
 note_row!(sqlx::sqlite::SqliteRow);
+
+trait EventRow {
+    fn event(&self) -> Result<Event>;
+}
+
+macro_rules! event_row {
+    ($row:ty) => {
+        impl EventRow for $row {
+            fn event(&self) -> Result<Event> {
+                let paths: String = self.try_get("paths").map_err(storage)?;
+                let session: Option<i64> = self.try_get("session_id").map_err(storage)?;
+                Ok(Event {
+                    seq: to_u64(self.try_get("seq").map_err(storage)?)?,
+                    kind: self.try_get("kind").map_err(storage)?,
+                    session_id: session.map(to_u64).transpose()?,
+                    principal: self.try_get("principal").map_err(storage)?,
+                    subject: self.try_get("subject").map_err(storage)?,
+                    paths: serde_json::from_str(&paths).map_err(storage)?,
+                    payload: self.try_get("payload").map_err(storage)?,
+                    created: self.try_get("created").map_err(storage)?,
+                })
+            }
+        }
+    };
+}
+event_row!(sqlx::postgres::PgRow);
+event_row!(sqlx::sqlite::SqliteRow);
+
+macro_rules! insert_events {
+    ($db:ty, $events:expr) => {{
+        let mut q = QueryBuilder::<$db>::new(
+            "INSERT INTO events (kind, session_id, principal, subject, paths, payload, created) ",
+        );
+        q.push_values($events, |mut b, e: &NewEvent| {
+            b.push_bind(e.kind.clone())
+                .push_bind(e.session_id.map(to_i64))
+                .push_bind(e.principal.clone())
+                .push_bind(e.subject.clone())
+                .push_bind(serde_json::to_string(&e.paths).unwrap_or_else(|_| "[]".into()))
+                .push_bind(e.payload.clone())
+                .push_bind(e.created);
+        });
+        q.push(" RETURNING seq");
+        q
+    }};
+}
+
+/// How many of `rows` (seq, created), oldest first, the sweep deletes at
+/// `cutoff`: the prefix created before it, and the last `seq` of it.
+fn sweep_prefix(rows: &[(i64, i64)], cutoff: i64) -> Option<(usize, i64)> {
+    let n = rows.iter().take_while(|(_, at)| *at < cutoff).count();
+    (n > 0).then(|| (n, rows[n - 1].0))
+}
 
 /// The note `n` stored as `id`.
 fn stored(n: &NewNote, id: u64) -> Note {
@@ -436,6 +508,8 @@ pub struct PgCoordStore {
     pub(crate) pool: PgPool,
     /// Whether the schema has `notes` (migration 0010).
     pub(crate) notes: bool,
+    /// Whether the schema has `events` (migration 0011).
+    pub(crate) events: bool,
 }
 
 impl PgCoordStore {
@@ -1097,6 +1171,97 @@ impl CoordStore for PgCoordStore {
         }
         Ok(r)
     }
+
+    async fn append_events(&self, events: &[NewEvent]) -> Result<u64> {
+        if !self.events {
+            return Err(no_events());
+        }
+        if events.is_empty() {
+            return Ok(0);
+        }
+        // The lock makes the transactions that hand out `seq` commit one at
+        // a time, in that order: a reader that has seen `seq` N has seen
+        // every committed event below it, and none below it commits later.
+        let mut tx = self.pool("events_append").begin().await.map_err(storage)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1, 1)")
+            .bind(EVENTS_LOCK)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+        let mut top = 0;
+        for chunk in events.chunks(PG_EVENTS_PER_INSERT) {
+            let seqs: Vec<i64> = insert_events!(Postgres, chunk)
+                .build_query_scalar()
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(storage)?;
+            top = top.max(seqs.into_iter().max().unwrap_or(0));
+        }
+        tx.commit().await.map_err(storage)?;
+        to_u64(top)
+    }
+
+    async fn events_after(&self, after: u64, limit: usize) -> Result<Vec<Event>> {
+        if !self.events {
+            return Err(no_events());
+        }
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {EVENT_COLUMNS} FROM events WHERE seq > $1 ORDER BY seq LIMIT $2"
+        )))
+        .bind(to_i64(after))
+        .bind(to_i64(limit as u64))
+        .fetch_all(self.pool("events_after"))
+        .await
+        .map_err(storage)?;
+        rows.iter().map(EventRow::event).collect()
+    }
+
+    async fn events_bounds(&self) -> Result<EventBounds> {
+        if !self.events {
+            return Err(no_events());
+        }
+        // Shared, so it waits for an append in flight: the sequence's value
+        // read after it is committed, never a `seq` still to commit.
+        let mut tx = self.pool("events_bounds").begin().await.map_err(storage)?;
+        sqlx::query("SELECT pg_advisory_xact_lock_shared($1, 1)")
+            .bind(EVENTS_LOCK)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+        let (oldest, newest): (Option<i64>, i64) = sqlx::query_as(
+            "SELECT (SELECT MIN(seq) FROM events), \
+             (SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM events_seq_seq)",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(storage)?;
+        tx.commit().await.map_err(storage)?;
+        Ok(EventBounds {
+            oldest: oldest.map(to_u64).transpose()?,
+            newest: to_u64(newest)?,
+        })
+    }
+
+    async fn sweep_events(&self, cutoff: i64, limit: usize) -> Result<u64> {
+        if !self.events {
+            return Ok(0);
+        }
+        let rows: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT seq, created FROM events ORDER BY seq LIMIT $1")
+                .bind(to_i64(limit as u64))
+                .fetch_all(self.pool("events_sweep"))
+                .await
+                .map_err(storage)?;
+        let Some((_, last)) = sweep_prefix(&rows, cutoff) else {
+            return Ok(0);
+        };
+        Ok(sqlx::query("DELETE FROM events WHERE seq <= $1")
+            .bind(last)
+            .execute(self.pool("events_sweep"))
+            .await
+            .map_err(storage)?
+            .rows_affected())
+    }
 }
 
 /// `near_paths` rows, each once.
@@ -1124,6 +1289,8 @@ pub struct SqliteCoordStore {
     pub(crate) pool: SqlitePool,
     /// Whether the schema has `notes` (migration 0010).
     pub(crate) notes: bool,
+    /// Whether the schema has `events` (migration 0011).
+    pub(crate) events: bool,
 }
 
 impl SqliteCoordStore {
@@ -1822,5 +1989,86 @@ impl CoordStore for SqliteCoordStore {
             .rows_affected();
         }
         Ok(r)
+    }
+
+    async fn append_events(&self, events: &[NewEvent]) -> Result<u64> {
+        if !self.events {
+            return Err(no_events());
+        }
+        if events.is_empty() {
+            return Ok(0);
+        }
+        // One writer at a time (IMMEDIATE), so `seq` order is commit order.
+        let mut tx = self
+            .pool("events_append")
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(storage)?;
+        let mut top = 0;
+        for chunk in events.chunks(SQLITE_EVENTS_PER_INSERT) {
+            let seqs: Vec<i64> = insert_events!(Sqlite, chunk)
+                .build_query_scalar()
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(storage)?;
+            top = top.max(seqs.into_iter().max().unwrap_or(0));
+        }
+        tx.commit().await.map_err(storage)?;
+        to_u64(top)
+    }
+
+    async fn events_after(&self, after: u64, limit: usize) -> Result<Vec<Event>> {
+        if !self.events {
+            return Err(no_events());
+        }
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {EVENT_COLUMNS} FROM events WHERE seq > ? ORDER BY seq LIMIT ?"
+        )))
+        .bind(to_i64(after))
+        .bind(to_i64(limit as u64))
+        .fetch_all(self.pool("events_after"))
+        .await
+        .map_err(storage)?;
+        rows.iter().map(EventRow::event).collect()
+    }
+
+    async fn events_bounds(&self) -> Result<EventBounds> {
+        if !self.events {
+            return Err(no_events());
+        }
+        // `sqlite_sequence` keeps the largest `seq` handed out even when
+        // the sweep has emptied the table.
+        let (oldest, newest): (Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT (SELECT MIN(seq) FROM events), \
+             (SELECT seq FROM sqlite_sequence WHERE name = 'events')",
+        )
+        .fetch_one(self.pool("events_bounds"))
+        .await
+        .map_err(storage)?;
+        Ok(EventBounds {
+            oldest: oldest.map(to_u64).transpose()?,
+            newest: to_u64(newest.unwrap_or(0))?,
+        })
+    }
+
+    async fn sweep_events(&self, cutoff: i64, limit: usize) -> Result<u64> {
+        if !self.events {
+            return Ok(0);
+        }
+        let rows: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT seq, created FROM events ORDER BY seq LIMIT ?")
+                .bind(to_i64(limit as u64))
+                .fetch_all(self.pool("events_sweep"))
+                .await
+                .map_err(storage)?;
+        let Some((_, last)) = sweep_prefix(&rows, cutoff) else {
+            return Ok(0);
+        };
+        Ok(sqlx::query("DELETE FROM events WHERE seq <= ?")
+            .bind(last)
+            .execute(self.pool("events_sweep"))
+            .await
+            .map_err(storage)?
+            .rows_affected())
     }
 }
