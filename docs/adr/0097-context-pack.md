@@ -45,9 +45,13 @@ Each section reuses a query the server already answers:
 | `duplicates` | ADR 0096's duplicate part: live sessions with the same task key, or a declared title and approach at least 60% alike to the task | 20 |
 
 Without a session, the pack stands one in for the request (id 0, never
-stored): the task as its title and approach, `task_key`, the ref as its
-target, the pack's files probed. It is left out of nothing and has no base,
-so there is no `landed` part.
+stored): the caller's principal and session key, the task as its title and
+approach, `task_key`, the ref as its target, the pack's files probed. It
+has no base, so there is no `landed` part. Rows of the caller's own key are
+left out of overlaps and duplicates, so a session the lookup missed (it
+failed or ran out of time) is never its own duplicate. The request's
+`task` and `task_key`, when given, stand for the task over the session's
+own.
 
 Required checks come from the server's checks policy as the request began;
 without one, red is judged on every check name the server knows, as `GET
@@ -71,10 +75,18 @@ prefix; `ref:` for the ref. The items together stay within
 first takes the longest ranked prefix of its items that fits its quota
 (files 25%, owners 10%, history 20%, in-flight 20%, ref health 5%,
 duplicates 20%), then the budget left over is offered, in that order, to
-in-flight work, duplicates, ref health, files, history and owners: what
-only the server knows before what an agent can find itself. A section is
-always a ranked prefix, so cutting never reorders. `cut` lists, per
-section, how many items and bytes were left out; `bytes` is what was kept.
+ref health, in-flight work, duplicates, files, history and owners: what
+only the server knows before what an agent can find itself, and first the
+one small item that says whether the ref is red. When the ref health item
+does not fit, its suspects are dropped, oldest first, until it does
+(`cut` section `suspects`), so the red state is the last thing to go. A
+section is always a ranked prefix, so cutting never reorders. `cut` lists,
+per section, how many items and bytes were left out; `bytes` is what was
+kept. A session that is both a possible duplicate and live work on the
+pack's files is listed once, under `duplicates`, with the paths, so it is
+never charged twice. Agent-written names (models, session keys, owner
+names) are cut to 80 bytes and an owners item lists at most 16 names and
+16 `OWNERS` files, so one long value cannot take a section's quota.
 The envelope (ref, head, `cut`, `omitted`) is outside the budget and
 bounded by the number of sections.
 

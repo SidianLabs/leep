@@ -827,5 +827,10 @@ async fn a_full_search_class_sheds_a_context_pack() {
     assert_refused(&send(&r.app, context()).await);
     assert_eq!(read(held).await.status, StatusCode::OK);
     let ok = send(&r.app, context()).await;
-    assert_eq!(ok.status, StatusCode::OK, "{}", String::from_utf8_lossy(&ok.body));
+    assert_eq!(
+        ok.status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&ok.body)
+    );
 }

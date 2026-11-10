@@ -461,6 +461,14 @@ pub fn alike(a: &Intent, b: &Intent) -> u32 {
 /// itself.
 fn same_agent_and_task(s: &Session, o: &Session) -> bool {
     s.task_key.is_some() && o.task_key == s.task_key && o.principal == s.principal
+        || same_session(s, o)
+}
+
+/// `o` is `s` itself, by key rather than id: a context pack whose lookup of
+/// the caller's session gave up stands one in (id 0) under the same
+/// principal and key, and must not find the caller as its own overlap.
+fn same_session(s: &Session, o: &Session) -> bool {
+    !s.agent_session.is_empty() && o.agent_session == s.agent_session && o.principal == s.principal
 }
 
 /// Jaccard similarity of two sorted trigram sets, in percent.

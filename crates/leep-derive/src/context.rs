@@ -85,9 +85,13 @@ pub const SECTIONS: [(&str, u64); 6] = [
     ("duplicates", 20),
 ];
 /// Which sections take unused budget first: what only the server knows
-/// (live work, duplicates, ref health) before what a client can find
-/// itself.
-const SPARE_ORDER: [usize; 6] = [3, 5, 4, 0, 2, 1];
+/// (ref health, a single small item that says whether the ref is red;
+/// live work; duplicates) before what a client can find itself.
+const SPARE_ORDER: [usize; 6] = [4, 3, 5, 0, 2, 1];
+/// Most owner names, and `OWNERS` files, an owners item lists.
+pub const MAX_OWNERS: usize = 16;
+/// Longest agent-written name (model, session key, owner) an item repeats.
+pub const NAME_BYTES: usize = 80;
 
 /// A context request as the server hands it over: the caller, and the
 /// checks policy that names required checks (server configuration).
@@ -155,7 +159,10 @@ fn item_id(kind: &str, key: &str) -> String {
 /// The size of `item`'s JSON once `set` has written that size into it.
 fn sized<T: Serialize>(mut item: T, set: impl Fn(&mut T, u64)) -> T {
     set(&mut item, 0);
-    let base = serde_json::to_vec(&item).map_or(0, |v| v.len() as u64) - 1;
+    // The JSON with a one-digit size, less that digit.
+    let base = serde_json::to_vec(&item)
+        .map_or(0, |v| v.len() as u64)
+        .saturating_sub(1);
     let digits = |n: u64| n.to_string().len() as u64;
     let mut n = base + 1;
     // A fixed point: the size counts its own digits.
@@ -431,7 +438,7 @@ impl Repo {
         } else {
             c.task.clone()
         };
-        let me = self.context_session(ask, &c, session.clone(), &task_text);
+        let me = self.context_session(ask, &c, session.clone(), session_key, &task_text);
         let section_until = || deadline.min(Instant::now() + SECTION_BOUND);
         let (owners, history, in_flight, health, dups) = tokio::join!(
             bounded(
@@ -456,6 +463,7 @@ impl Repo {
         let history = take(&mut omitted, "history", history);
         let in_flight = take(&mut omitted, "in_flight", in_flight);
         let duplicates = take(&mut omitted, "duplicates", dups);
+        let (in_flight, duplicates) = merge_duplicates(in_flight, duplicates);
         let ref_health: Vec<ContextRefHealth> = match health {
             Ok(h) => vec![h],
             Err(o) => {
@@ -509,15 +517,39 @@ impl Repo {
             omitted: Vec::new(),
         };
         let mut ref_health = ref_health;
-        let sizes = [
-            pack.files.iter().map(|i| i.bytes).collect(),
-            pack.owners.iter().map(|i| i.bytes).collect(),
-            pack.history.iter().map(|i| i.bytes).collect(),
-            pack.in_flight.iter().map(|i| i.bytes).collect(),
-            ref_health.iter().map(|i| i.bytes).collect(),
-            pack.duplicates.iter().map(|i| i.bytes).collect(),
-        ];
-        let kept = keep_within(&sizes, c.budget);
+        // Suspects dropped, newest kept, so that the ref's state (red or
+        // not) fits rather than the whole item going.
+        let (mut suspects_cut, mut suspect_bytes) = (0u64, 0u64);
+        let (sizes, kept) = loop {
+            let sizes: [Vec<u64>; 6] = [
+                pack.files.iter().map(|i| i.bytes).collect(),
+                pack.owners.iter().map(|i| i.bytes).collect(),
+                pack.history.iter().map(|i| i.bytes).collect(),
+                pack.in_flight.iter().map(|i| i.bytes).collect(),
+                ref_health.iter().map(|i| i.bytes).collect(),
+                pack.duplicates.iter().map(|i| i.bytes).collect(),
+            ];
+            let kept = keep_within(&sizes, c.budget);
+            match ref_health.first_mut() {
+                Some(h) if kept[4] == 0 && !h.suspects.is_empty() => {
+                    let before = h.bytes;
+                    h.suspects.pop();
+                    *h = sized(h.clone(), |i, n| i.bytes = n);
+                    suspects_cut += 1;
+                    suspect_bytes += before.saturating_sub(h.bytes);
+                }
+                _ => break (sizes, kept),
+            }
+        };
+        if suspects_cut > 0 {
+            metrics::counter!("leep_context_items_cut_total", "section" => "suspects")
+                .increment(suspects_cut);
+            pack.cut.push(ContextCut {
+                section: "suspects".to_string(),
+                items: suspects_cut,
+                bytes: suspect_bytes,
+            });
+        }
         for (i, (name, _)) in SECTIONS.iter().enumerate() {
             let dropped = &sizes[i][kept[i]..];
             if !dropped.is_empty() {
@@ -593,14 +625,18 @@ impl Repo {
         ask: &ContextAsk,
         c: &Checked,
         session: Option<Session>,
+        key: Option<&str>,
         task: &str,
     ) -> Session {
         let now = unix_now();
         let (title, approach) = task_intent(task);
+        // The stand-in carries the caller's key, so a session of the caller
+        // the lookup missed (it gave up, or the store is slow) is still
+        // never its own overlap or duplicate.
         let mut s = session.unwrap_or_else(|| Session {
             id: 0,
             principal: ask.principal.clone(),
-            agent_session: String::new(),
+            agent_session: key.unwrap_or_default().to_string(),
             agent_model: None,
             title: String::new(),
             approach: String::new(),
@@ -623,14 +659,15 @@ impl Repo {
             s.approach = approach;
             s.origin = SessionOrigin::Declared;
         }
-        if s.task_key.is_none() {
-            s.task_key = ask
-                .req
-                .task_key
-                .as_deref()
-                .map(str::trim)
-                .filter(|k| !k.is_empty())
-                .map(str::to_string);
+        // The request's task key wins, as its task text does.
+        let asked = ask
+            .req
+            .task_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty());
+        if let Some(k) = asked {
+            s.task_key = Some(k.to_string());
         }
         s
     }
@@ -760,8 +797,12 @@ impl Repo {
                     carry,
                     untrusted: ContextText {
                         path: Some(p.clone()),
-                        owners: owners.into_iter().collect(),
-                        owners_files: files,
+                        owners: owners
+                            .iter()
+                            .take(MAX_OWNERS)
+                            .map(|o| cut(o, NAME_BYTES))
+                            .collect(),
+                        owners_files: files.iter().take(MAX_OWNERS).cloned().collect(),
                         carry_file,
                         ..Default::default()
                     },
@@ -812,8 +853,11 @@ impl Repo {
                         path: Some(p),
                         title: Some(cut(&title, NOTICE_TITLE_BYTES)),
                         author: Some(cut(&cs.author, NOTICE_TITLE_BYTES)),
-                        agent_model: cs.extra.get(EXTRA_AGENT_MODEL).cloned(),
-                        agent_session: cs.extra.get(EXTRA_AGENT_SESSION).cloned(),
+                        agent_model: cs.extra.get(EXTRA_AGENT_MODEL).map(|m| cut(m, NAME_BYTES)),
+                        agent_session: cs
+                            .extra
+                            .get(EXTRA_AGENT_SESSION)
+                            .map(|k| cut(k, NAME_BYTES)),
                         ..Default::default()
                     },
                 },
@@ -897,7 +941,7 @@ impl Repo {
                     untrusted: ContextText {
                         title: Some(cut(&s.title, NOTICE_TITLE_BYTES)),
                         author: Some(cut(&s.author, NOTICE_TITLE_BYTES)),
-                        agent_model: s.agent_model,
+                        agent_model: s.agent_model.map(|m| cut(&m, NAME_BYTES)),
                         paths: hit,
                         ..Default::default()
                     },
@@ -925,6 +969,45 @@ impl Repo {
             |i, n| i.bytes = n,
         ))
     }
+}
+
+/// Each other session once: a session that is a possible duplicate and
+/// also works on the pack's files is listed under `duplicates` only,
+/// taking the paths its in-flight item named when it has none (as one
+/// notice is, ADR 0096), so it is never charged to the budget twice.
+fn merge_duplicates(
+    in_flight: Vec<ContextWork>,
+    duplicates: Vec<ContextWork>,
+) -> (Vec<ContextWork>, Vec<ContextWork>) {
+    let mut paths: BTreeMap<u64, (Option<String>, Option<String>)> = BTreeMap::new();
+    let dup_ids: BTreeSet<u64> = duplicates.iter().filter_map(|d| d.notice.session).collect();
+    let in_flight: Vec<ContextWork> = in_flight
+        .into_iter()
+        .filter(|w| match w.notice.session {
+            Some(id) if dup_ids.contains(&id) => {
+                let t = &w.notice.untrusted;
+                paths.insert(id, (t.path.clone(), t.other_path.clone()));
+                false
+            }
+            _ => true,
+        })
+        .collect();
+    let duplicates = duplicates
+        .into_iter()
+        .map(|d| {
+            let Some((path, other)) = d.notice.session.and_then(|id| paths.remove(&id)) else {
+                return d;
+            };
+            if d.notice.untrusted.path.is_some() {
+                return d;
+            }
+            let mut notice = d.notice;
+            notice.untrusted.path = path;
+            notice.untrusted.other_path = other;
+            work(d.id, notice)
+        })
+        .collect();
+    (in_flight, duplicates)
 }
 
 /// Found overlaps as pack items, at most `max`, with ids that name what

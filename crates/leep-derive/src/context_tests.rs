@@ -204,9 +204,13 @@ async fn a_pack_holds_files_owners_history_live_work_and_duplicates() {
         .unwrap();
     assert_eq!(mod_rs.created_by.as_deref(), Some("ada"));
 
-    // Live work: cy's session on the file; and it may be the same task.
-    assert_eq!(p.in_flight.len(), 1, "{:?}", p.in_flight);
-    let w = &p.in_flight[0];
+    // Live work: cy's session on the file, which may be the same task:
+    // listed once, as a duplicate, with the path it works on.
+    let mut a = a.clone();
+    a.req.task_key = None;
+    let other = r.context_pack(&a).await.unwrap();
+    assert_eq!(other.in_flight.len(), 1, "{:?}", other.in_flight);
+    let w = &other.in_flight[0];
     assert_eq!(w.notice.level, "same_file");
     assert_eq!(w.notice.principal.as_deref(), Some("cy"));
     assert!(w.id.starts_with("session:"));
@@ -214,8 +218,16 @@ async fn a_pack_holds_files_owners_history_live_work_and_duplicates() {
         w.notice.untrusted.other_path.as_deref(),
         Some("src/auth/token.rs")
     );
+    assert!(p.in_flight.is_empty(), "{:?}", p.in_flight);
     assert_eq!(p.duplicates.len(), 1);
-    assert_eq!(p.duplicates[0].notice.by.as_deref(), Some("task_key"));
+    let d = &p.duplicates[0];
+    assert_eq!(d.id, w.id);
+    assert_eq!(d.notice.by.as_deref(), Some("task_key"));
+    assert_eq!(
+        d.notice.untrusted.other_path.as_deref(),
+        Some("src/auth/token.rs")
+    );
+    assert_eq!(d.bytes, serde_json::to_vec(d).unwrap().len() as u64);
 
     // Ref health: no checks policy, so nothing is red.
     let h = p.ref_health.as_ref().unwrap();
@@ -560,7 +572,9 @@ async fn agent_text_appears_only_under_untrusted() {
     let mut a = ask("dee", "Fix evil_fn PWNED-TASK", &["src/other.rs"]);
     a.req.task_key = Some("PWNED-KEY".into());
     let p = r.context_pack(&a).await.unwrap();
-    assert!(!p.in_flight.is_empty() && !p.duplicates.is_empty() && !p.owners.is_empty());
+    // cy is a duplicate (the task key) on the file: listed once.
+    assert!(!p.duplicates.is_empty() && !p.owners.is_empty());
+    assert!(p.duplicates[0].notice.untrusted.other_path.is_some());
     assert!(!p.history.is_empty());
     let mut v = serde_json::to_value(&p).unwrap();
     let all = v.to_string();
@@ -622,4 +636,183 @@ async fn a_red_head_names_the_suspects_touching_the_files() {
     assert_eq!(s.untrusted.paths, ["src/a.rs"]);
     assert_eq!(s.created_by.as_deref(), Some("bo"));
     assert_eq!(s.untrusted.agent_model.as_deref(), Some("model-b"));
+}
+
+/// A store whose lookup of one session by key fails, while every other
+/// listing answers.
+struct NoLookup(MemoryCoordStore);
+
+#[async_trait]
+impl CoordStore for NoLookup {
+    async fn upsert_session(&self, u: &SessionUpdate) -> Result<(Session, bool)> {
+        self.0.upsert_session(u).await
+    }
+    async fn get_session(&self, id: u64) -> Result<Option<Session>> {
+        self.0.get_session(id).await
+    }
+    async fn list_sessions(&self, f: &SessionFilter) -> Result<Vec<Session>> {
+        if f.agent_session.is_some() {
+            return Err(Error::Storage("lookup failed".into()));
+        }
+        self.0.list_sessions(f).await
+    }
+    async fn end_session(&self, id: u64, e: &SessionEnd) -> Result<bool> {
+        self.0.end_session(id, e).await
+    }
+    async fn beat_sessions(&self, b: &[Beat]) -> Result<u64> {
+        self.0.beat_sessions(b).await
+    }
+    async fn sweep_sessions(&self, now: i64, limit: usize) -> Result<SweepReport> {
+        self.0.sweep_sessions(now, limit).await
+    }
+    async fn count_sessions(&self, s: SessionState, cap: usize) -> Result<u64> {
+        self.0.count_sessions(s, cap).await
+    }
+    async fn near_paths(&self, q: &NearQuery) -> Result<Vec<NearRow>> {
+        self.0.near_paths(q).await
+    }
+}
+
+/// When the caller's session cannot be looked up, the pack stands one in
+/// under the caller's key: the caller is still never its own duplicate or
+/// overlap.
+#[tokio::test]
+async fn a_missed_lookup_never_makes_the_caller_its_own_duplicate() {
+    let r = repo().with_coord(Some(Arc::new(NoLookup(MemoryCoordStore::new()))));
+    land(
+        &r,
+        "ada",
+        "m",
+        "seed",
+        &[("src/a.rs", "fn some_thing() {}\n")],
+    )
+    .await;
+    let task = "Rewrite some_thing in the parser module for speed";
+    r.declare_session_with(
+        "dee",
+        DeclareSessionRequest {
+            session: "d-1".into(),
+            title: Some(task.into()),
+            target_ref: Some("main".into()),
+            scope: Some(vec!["src/a.rs".into()]),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let mut a = ask("dee", task, &["src/a.rs"]);
+    a.req.session = Some("d-1".into());
+    let p = r.context_pack(&a).await.unwrap();
+    assert!(p.session.is_none(), "the lookup failed");
+    assert!(p.duplicates.is_empty(), "{:?}", p.duplicates);
+    assert!(p.in_flight.is_empty(), "{:?}", p.in_flight);
+    // Another principal's session of the same key is someone else.
+    let mut a = a.clone();
+    a.principal = "eve".into();
+    let p = r.context_pack(&a).await.unwrap();
+    assert_eq!(p.duplicates.len(), 1);
+}
+
+/// The request's task key is the one compared, even when the caller's
+/// session carries another.
+#[tokio::test]
+async fn the_requests_task_key_wins() {
+    let r = repo();
+    busy_repo(&r).await;
+    r.declare_session_with(
+        "dee",
+        DeclareSessionRequest {
+            session: "d-1".into(),
+            title: Some("Other work entirely".into()),
+            task_key: Some("OTHER".into()),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let mut a = ask("dee", "x", &[]);
+    a.req.session = Some("d-1".into());
+    a.req.task_key = Some("T-9".into());
+    let p = r.context_pack(&a).await.unwrap();
+    assert_eq!(p.duplicates.len(), 1, "{:?}", p.duplicates);
+    assert_eq!(p.duplicates[0].notice.principal.as_deref(), Some("cy"));
+}
+
+/// An agent-written model or key of any length is cut, so one change
+/// cannot fill the history section's budget by itself; owners are capped.
+#[tokio::test]
+async fn long_names_are_cut_and_owners_capped() {
+    let r = repo();
+    let owners: String = (0..40).map(|i| format!("owner-{i:02}\n")).collect();
+    land(
+        &r,
+        "ada",
+        &"m".repeat(10_000),
+        "seed",
+        &[("OWNERS", owners.as_str()), ("src/a.rs", "a\n")],
+    )
+    .await;
+    let p = r
+        .context_pack(&ask("dee", "fix it", &["src/a.rs"]))
+        .await
+        .unwrap();
+    let h = &p.history[0];
+    assert_eq!(h.untrusted.agent_model.as_deref().unwrap().len(), 80);
+    assert!(h.bytes < 1024, "{}", h.bytes);
+    assert_eq!(p.owners[0].untrusted.owners.len(), 16);
+}
+
+/// Under a tight budget a red ref keeps its item, and so its red state:
+/// suspects go first, and are reported as cut.
+#[tokio::test]
+async fn a_tight_budget_keeps_a_red_ref_and_drops_its_suspects() {
+    use leep_core::check::{Check, Outcome};
+    let r = repo();
+    land(&r, "ada", "m", "seed", &[("src/a.rs", "a\n")]).await;
+    let green = r.meta().get_ref("main").await.unwrap().unwrap();
+    let check = |outcome| Check {
+        check: "test".into(),
+        outcome,
+        by: "ci".into(),
+        url: String::new(),
+        summary: String::new(),
+        timestamp: 1,
+    };
+    r.put_check(green, &check(Outcome::Pass)).await.unwrap();
+    r.promote_green(
+        "main",
+        green,
+        &["test".into()],
+        &leep_core::RefUpdateContext::new("promote"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut head = green;
+    for i in 0..5 {
+        head = land(
+            &r,
+            "bo",
+            &"model-".repeat(13),
+            &format!("{} {i}", "touch a, at length".repeat(4)),
+            &[("src/a.rs", &format!("a{i}\n"))],
+        )
+        .await;
+    }
+    r.put_check(head, &check(Outcome::Fail)).await.unwrap();
+    let mut a = ask("dee", "fix the failing test", &["src/a.rs"]);
+    a.required_checks = vec!["test".into()];
+    let full = r.context_pack(&a).await.unwrap();
+    assert_eq!(full.ref_health.as_ref().unwrap().suspects.len(), 5);
+    a.req.budget_bytes = Some(1024);
+    let p = r.context_pack(&a).await.unwrap();
+    let h = p.ref_health.as_ref().expect("the red ref is kept");
+    assert_eq!(h.red.as_ref().unwrap().check, "test");
+    assert!(h.suspects.len() < 5);
+    assert_eq!(h.bytes, serde_json::to_vec(h).unwrap().len() as u64);
+    let cut = p.cut.iter().find(|c| c.section == "suspects").unwrap();
+    assert_eq!(cut.items as usize, 5 - h.suspects.len());
+    assert!(p.bytes <= 1024, "{}", p.bytes);
 }

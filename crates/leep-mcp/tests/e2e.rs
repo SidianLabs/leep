@@ -2201,15 +2201,24 @@ fn task_start_answers_live_work_owners_and_history() {
     assert_eq!(ctx["session"], st["session"]["id"]);
     assert_eq!(ctx["files"][0]["untrusted"]["path"], "src/x/a.rs");
     assert_eq!(ctx["files"][0]["why"], json!(["seed", "search"]));
-    assert_eq!(ctx["in_flight"][0]["principal"], "ana");
+    // ana has the same task and works on the file: listed once, as a
+    // possible duplicate, with the file.
+    assert_eq!(ctx["in_flight"], json!([]));
+    assert_eq!(ctx["duplicates"][0]["principal"], "ana");
     assert_eq!(ctx["duplicates"][0]["by"], "task_key");
+    assert_eq!(
+        ctx["duplicates"][0]["untrusted"]["other_path"],
+        "src/x/a.rs"
+    );
     assert_eq!(ctx["owners"][0]["untrusted"]["owners"], json!(["rhea"]));
     assert_eq!(ctx["history"][0]["created_by"], "ana");
     assert_eq!(ctx["history"][0]["untrusted"]["agent_model"], "ana-model");
     let (outside, fenced) = t.split_once(leep_mcp::tools::UNTRUSTED_NOTE).unwrap();
-    assert!(outside.contains("Work in flight on these files"), "{t}");
-    assert!(outside.contains("[same_file] of ana"), "{t}");
     assert!(outside.contains("Possible duplicates"), "{t}");
+    assert!(
+        outside.contains("[possible_duplicate] of ana by task_key"),
+        "{t}"
+    );
     for bad in ["SYSTEM", "src/x", "rhea", "parse_x faster"] {
         assert!(!outside.contains(bad), "{bad} outside: {t}");
     }
@@ -2222,7 +2231,20 @@ fn task_start_answers_live_work_owners_and_history() {
         json!({ "task": "Make `parse_x` faster\nAvoid the copy", "paths": ["src/x/a.rs"], "task_key": "T-7" }),
     );
     let again = data(&again);
+    assert_eq!(again["duplicates"], ctx["duplicates"]);
     assert_eq!(again["in_flight"], ctx["in_flight"]);
+    // Asked about another task, ana's session is live work on the file.
+    let other = call(
+        &b,
+        "leep_context",
+        json!({ "task": "Rename the module", "paths": ["src/x/a.rs"], "task_key": "R-1" }),
+    );
+    let ot = text(&other);
+    assert!(
+        ot.contains("Work in flight on these files") && ot.contains("[same_file] of ana"),
+        "{ot}"
+    );
+    assert_eq!(data(&other)["in_flight"][0]["principal"], "ana");
     assert_eq!(again["files"], ctx["files"]);
     // Without a task, the session's title is the task.
     let bare = data(&call(&b, "leep_context", json!({ "budget_bytes": 2048 })));

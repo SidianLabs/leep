@@ -1015,7 +1015,9 @@ Added:
   green?, behind?, red?, required_checks?, suspects?}` with
   `ContextSuspect {changeset, seq, actor?, time, created_by?, untrusted}`.
 - `cut: [{section, items, bytes}]` (what the budget left out) and
-  `omitted: [{section, reason}]` (`section` is `search`, `co_change`,
+  `omitted: [{section, reason}]` (in `cut`, `section` may also be
+  `suspects`: suspects dropped so that the ref health item fits; in
+  `omitted`, `section` is `search`, `co_change`,
   `owners`, `history`, `in_flight`, `ref_health` or `duplicates`;
   `reason` is `timeout`, `error` or `off`), both omitted when empty. A
   client shows a section, `why` or reason it does not know as it is.
