@@ -15,6 +15,7 @@ pub mod integrate;
 pub mod keygen;
 pub mod land;
 pub mod merge;
+pub mod note;
 pub mod pick;
 pub mod rebase;
 pub mod reflog;
