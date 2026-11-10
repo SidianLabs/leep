@@ -110,6 +110,8 @@ pub struct Agent {
     wc: PathBuf,
     level: Option<&'static str>,
     pub heard: Mutex<Vec<Heard>>,
+    /// Every command's stdout and tool call's text, as (what, output).
+    pub said: Mutex<Vec<(String, String)>>,
     mcp: Mutex<Option<Mcp>>,
 }
 
@@ -188,6 +190,7 @@ impl Agent {
             wc,
             level,
             heard: Mutex::new(Vec::new()),
+            said: Mutex::new(Vec::new()),
             mcp: Mutex::new(None),
         }
     }
@@ -239,6 +242,10 @@ impl Agent {
             stderr: stderr(&out),
         };
         let cmdline = args.iter().map(|a| quote_arg(a)).collect::<Vec<_>>();
+        self.said.lock().unwrap().push((
+            format!("leep {}", cmdline.join(" ")),
+            format!("{}{}", o.stdout, o.stderr),
+        ));
         self.note(
             &format!("leep {}", cmdline.join(" ")),
             cli_notices(&o.stderr),
@@ -343,6 +350,10 @@ impl Agent {
             text,
         };
         self.note(tool, mcp_notices(&o.text));
+        self.said
+            .lock()
+            .unwrap()
+            .push((tool.to_string(), o.text.clone()));
         log.push_str(&format!(
             "{}\n````text\n> {tool} {args}\n{}{}\n````\n\n",
             self.header(),
@@ -895,11 +906,23 @@ pub fn run(stores: &Stores, root: &Path, n: &Narrator) -> Report {
                 .as_u64()
         };
         let (bo_id, cy_id) = (id_of(bo), id_of(cy));
+        // By a notice, or by the pack of the same `work start`, which then
+        // leaves the notice out rather than say it twice.
         let warned = |agent: &Agent, other: Option<u64>| {
             let other = other?;
-            agent.heard_matching(|h| {
-                (h.level == "same_file" || h.level == "claimed")
-                    && h.line.contains(&format!("session #{other} "))
+            let about = |l: &str| {
+                (l.contains("[same_file]") || l.contains("[claimed]"))
+                    && l.contains(&format!("session #{other} "))
+            };
+            agent.heard_matching(|h| about(&h.line)).or_else(|| {
+                agent.said.lock().unwrap().iter().find_map(|(during, out)| {
+                    let line = out.lines().find(|l| l.starts_with("  [") && about(l))?;
+                    Some(Heard {
+                        level: "pack".into(),
+                        line: format!("pack:{line}"),
+                        during: during.clone(),
+                    })
+                })
             })
         };
         let bo_warned = until(
@@ -1162,6 +1185,87 @@ pub fn run(stores: &Stores, root: &Path, n: &Narrator) -> Report {
         } else {
             solo_evidence.join("; ")
         },
+    });
+
+    // ---- Claims 7 to 9: what the demo's first run found wrong reads right.
+    let said = |name: &str, what: &str| -> Vec<String> {
+        a(name)
+            .said
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(w, _)| w.starts_with(what))
+            .map(|(_, t)| t.clone())
+            .collect()
+    };
+    // 7: a pack and the notice in the same output agree, and a co-changed
+    // file is never called the agent's own.
+    // rex and sol start concurrently, so whichever starts second sees the
+    // other in its pack: every pack line naming the other must say `near`,
+    // as their notices do.
+    let rex_start = said("rex", "leep work start").join("\n");
+    let sol_start = said("sol", "leep_task_start").join("\n");
+    let mut pair: Vec<String> = rex_start
+        .lines()
+        .filter(|l| l.starts_with("  [") && l.contains("of \"sol\""))
+        .chain(
+            sol_start
+                .lines()
+                .filter(|l| l.starts_with("- session:") && l.ends_with("of rex")),
+        )
+        .map(|l| l.trim().to_string())
+        .collect();
+    pair.dedup();
+    let agree = pair.iter().all(|l| l.contains("[near]"));
+    let bo_start = said("bo", "leep work start").join("\n");
+    let bo_mislabelled = bo_start.contains("(your \"src/auth/keys.rs\")");
+    claims.push(Claim {
+        n: 7,
+        what: "a pack ranks live work by the agent's own files, as its notices do",
+        pass: agree && !bo_mislabelled,
+        evidence: format!(
+            "rex/sol pack lines about each other: {pair:?}; bo's pack calls keys.rs bo's own: \
+             {bo_mislabelled}"
+        ),
+    });
+    // 8: both of a duplicate pair are told, and the twin's land says so.
+    let dee_told = a("dee").heard_matching(|h| {
+        h.level == "possible_duplicate" && h.line.contains("of eli by task_key")
+    });
+    let eli_twin_landed = a("eli").heard_matching(|h| {
+        h.level == "landed" && h.line.contains("by task_key") && h.line.contains("your duplicate")
+    });
+    claims.push(Claim {
+        n: 8,
+        what:
+            "the first of a duplicate pair is told too, and its twin hears that it landed the task",
+        pass: dee_told.is_some() && eli_twin_landed.is_some(),
+        evidence: format!(
+            "dee during `{}`: {}\neli during `{}`: {}",
+            dee_told.as_ref().map_or("-", |h| &h.during),
+            dee_told.as_ref().map_or("(none)", |h| &h.line),
+            eli_twin_landed.as_ref().map_or("-", |h| &h.during),
+            eli_twin_landed.as_ref().map_or("(none)", |h| &h.line),
+        ),
+    });
+    // 9: nothing in one answer is said twice.
+    let eli_start = said("eli", "leep_task_start").join("\n");
+    let eli_dup_lines = eli_start
+        .lines()
+        .filter(|l| l.contains("[possible_duplicate]") && l.contains("of dee"))
+        .count();
+    let dee_start = said("dee", "leep_task_start").join("\n");
+    let explained = dee_start
+        .matches("re-request review after a rebase")
+        .count();
+    claims.push(Claim {
+        n: 9,
+        what: "a task start says each thing once: one duplicate line, one policy explanation",
+        pass: eli_dup_lines == 1 && explained <= 1,
+        evidence: format!(
+            "eli's task start names dee as a duplicate {eli_dup_lines} time(s); dee's pack \
+             explains `carry identical` {explained} time(s)"
+        ),
     });
 
     // ---- Counts.
