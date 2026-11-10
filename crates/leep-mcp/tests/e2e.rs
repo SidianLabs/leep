@@ -2044,12 +2044,24 @@ fn sessions_show_who_works_where() {
 /// change to its file, and other agents' words stay in the fence.
 #[test]
 fn notices_ride_on_tool_results() {
-    let url = start_server();
-    let mut a_cfg = config(&url);
-    a_cfg.agent_session = Some("n-a".into());
-    let mut b_cfg = config(&url);
-    b_cfg.agent_session = Some("n-b".into());
-    let (a, b) = (Server::new(a_cfg), Server::new(b_cfg));
+    // Three principals: one agent's own sessions are never notices to it.
+    let list: Vec<Value> = ["ana", "ben", "cyd"]
+        .iter()
+        .map(|n| json!({ "name": n, "role": "write", "hash": auth::hash_token(&format!("{n}-t")) }))
+        .collect();
+    let tokens = json!({ "tokens": list });
+    let url = serve(leep_server::router_with_auth(
+        common::repo(),
+        leep_server::DEFAULT_MAX_BODY_BYTES,
+        Some(Auth::parse(&tokens.to_string()).unwrap()),
+    ));
+    let agent = |name: &str, key: &str| {
+        let mut c = config(&url);
+        c.token = Some(format!("{name}-t"));
+        c.agent_session = Some(key.into());
+        Server::new(c)
+    };
+    let (a, b) = (agent("ana", "n-a"), agent("ben", "n-b"));
     let seed = call(
         &a,
         "leep_commit_and_land",
@@ -2103,10 +2115,20 @@ fn notices_ride_on_tool_results() {
     if let Some(m) = main {
         assert!(t.contains(&m), "names the landed changeset: {t}");
     }
-    // Said once.
-    std::thread::sleep(std::time::Duration::from_millis(10));
-    let again = call(&b, "leep_refs", json!({}));
-    assert!(!text(&again).contains("[landed]"));
+    // Said once, by the server. A third agent starts on the file; then a
+    // restarted MCP server for b, which has not asked yet, asks on its
+    // first call: it hears of the new agent, and not of the land again.
+    let c = agent("cyd", "n-c");
+    let c_start = call(
+        &c,
+        "leep_session_start",
+        json!({ "title": "Profile the parser", "scope": ["src/x/a.rs"], "base": "main" }),
+    );
+    assert_eq!(c_start["isError"], false, "{c_start}");
+    let b2 = agent("ben", "n-b");
+    let again = text(&call(&b2, "leep_refs", json!({})));
+    assert!(again.contains("[same_file]"), "{again}");
+    assert!(!again.contains("[landed]"), "{again}");
     // Asked for, everything is listed: the land, not a's session, which
     // the land ended.
     let o = call(&b, "leep_overlaps", json!({}));
