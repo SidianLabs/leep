@@ -1783,7 +1783,8 @@ a second kind of mutable state beside refs, behind its own trait,
   JSON on the wire, columns at rest, never hashed. A SQL meta store hands
   out its `CoordStore` (`MetaStore::coord_store`) over its data pool, never
   the land or index lanes; `Repo::with_coord` replaces it, and
-  `--sessions off` keeps none. Backups leave the tables out.
+  `--sessions off` keeps none. Backups leave the session tables out
+  (notes, below, are kept).
 - **Sessions.** Keyed by the token's name and the `agent.session` key the
   agent's changesets already carry. Declared through `POST /v1/sessions`
   (title, approach, task key, scope, claims), or inferred from any created
@@ -1857,6 +1858,24 @@ a second kind of mutable state beside refs, behind its own trait,
   `leep_task_start` declares the session and answers the pack in one call;
   `leep_context`, `leep_review_request` and `leep_review_inbox` beside it;
   CLI `leep context` and `leep work start`.
+- **Notes** ([ADR 0098](adr/0098-notes.md)). Shared memory between
+  agents: a gotcha, finding, decision or how-to anchored to a file, a
+  directory or a changeset (migration 0010, `notes`). `POST /v1/notes`
+  (write token), `GET /v1/notes?path=` (notes on the path and the
+  directories above it), `DELETE` to retract, `POST .../report`. The
+  writer is the token, and its trust tier (`agent` or `human`) is the
+  tokens file's `kind`, fixed at write; endorsement by a human owner is
+  columns, not a tier (second change). Text is immutable (an edit
+  supersedes) and plain: no controls, separators or bidi controls,
+  title 200 bytes, body 4 KiB; at most 200 open notes and 30 an hour per
+  principal, exact under a per-principal lock. Agent notes expire after
+  90 days, human ones after 365; a report hides an agent note at once;
+  `leep-server notes revoke` retracts a principal's notes. Title, body
+  and anchor travel only under `untrusted`, fenced in MCP and escaped in
+  the CLI; nothing reads a note to decide a land, review or ownership,
+  which the land-equivalence test checks with notes written between
+  lands. Unlike sessions, notes are backed up. CLI `leep note`, MCP
+  `leep_note_add` and `leep_notes`.
 - **Scale.** Every table is keyed by `repo_id` first (ADR 0054), and
   nothing joins coordination to the land path, so the next steps are a
   separate coordination database and then sharding by path prefix (ADR

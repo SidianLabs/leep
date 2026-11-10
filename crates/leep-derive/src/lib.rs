@@ -37,6 +37,7 @@ mod land_fast;
 mod land_stage;
 pub mod lazy_tree;
 mod merge;
+pub mod notes;
 pub mod notices;
 pub mod owners;
 pub mod pack_order;

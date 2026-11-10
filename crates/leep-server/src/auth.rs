@@ -14,8 +14,10 @@
 //! An entry may also carry request limits (`rate`, `burst`, `concurrency`,
 //! `max_body`; ADR 0020), see [`crate::limits`], `expires`, an RFC 3339
 //! time after which the token is refused, `"review": false`, which takes
-//! a write token out of the reviewers (ADR 0011), and `"checks": [...]`, the
-//! check names the token may post results for (ADR 0091; absent means none).
+//! a write token out of the reviewers (ADR 0011), `"checks": [...]`, the
+//! check names the token may post results for (ADR 0091; absent means none),
+//! and `"kind": "human"` or `"agent"` (absent means agent), who holds it:
+//! a note written with a human token is trusted as a person's (ADR 0098).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -69,6 +71,46 @@ impl Role {
     }
 }
 
+/// Who holds a token: a person or an agent (ADR 0098). Absent from the
+/// tokens file means [`TokenKind::Agent`], the least trust.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenKind {
+    #[default]
+    Agent,
+    Human,
+}
+
+impl std::str::FromStr for TokenKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "agent" => Ok(TokenKind::Agent),
+            "human" => Ok(TokenKind::Human),
+            _ => Err(format!(
+                "unknown token kind {s:?} (expected agent or human)"
+            )),
+        }
+    }
+}
+
+impl TokenKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TokenKind::Agent => "agent",
+            TokenKind::Human => "human",
+        }
+    }
+
+    /// The trust tier of a note this token writes.
+    pub fn note_trust(self) -> leep_core::coord::NoteTrust {
+        match self {
+            TokenKind::Agent => leep_core::coord::NoteTrust::Agent,
+            TokenKind::Human => leep_core::coord::NoteTrust::Human,
+        }
+    }
+}
+
 /// Who made a request, set by [`require_token`] for the handlers behind it.
 /// Handlers that record or filter by identity read it; the name is always the
 /// token's, never anything the request says.
@@ -85,6 +127,8 @@ pub struct Principal {
     pub review_for: bool,
     /// Check names the token may post results for (ADR 0091), sorted.
     pub checks: Vec<String>,
+    /// A person's token or an agent's (ADR 0098).
+    pub kind: TokenKind,
 }
 
 /// The request's [`Principal`], or `None` when authentication is off.
@@ -137,6 +181,11 @@ pub struct TokenEntry {
     /// means none: agent tokens must not attest their own changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checks: Option<Vec<String>>,
+    /// Who holds the token, `human` or `agent` (ADR 0098). Absent means
+    /// `agent`, the least trust. The file refuses unknown fields, so every
+    /// server must understand this one before a file uses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<TokenKind>,
 }
 
 /// How far ahead `leep_tokens_expiring_soon` looks.
@@ -158,6 +207,7 @@ struct Known {
     review: bool,
     review_for: bool,
     checks: Vec<String>,
+    kind: TokenKind,
 }
 
 impl Known {
@@ -199,6 +249,8 @@ pub struct AuthChange {
     pub review_changed: Vec<String>,
     /// Gained or lost check names it may post results for.
     pub checks_changed: Vec<String>,
+    /// Became a person's token or an agent's (ADR 0098).
+    pub kind_changed: Vec<String>,
 }
 
 impl AuthChange {
@@ -239,6 +291,7 @@ pub fn generate(name: &str, role: Role) -> Result<(String, TokenEntry), String> 
         review: None,
         review_for: None,
         checks: None,
+        kind: None,
     };
     Ok((token, entry))
 }
@@ -324,6 +377,7 @@ impl Auth {
                 review: t.review.unwrap_or(true),
                 review_for: t.review_for.unwrap_or(false),
                 checks,
+                kind: t.kind.unwrap_or_default(),
             });
         }
         Ok(Auth { tokens })
@@ -439,6 +493,14 @@ impl Auth {
                 c.str(&k.name).set("checks", &k.checks);
             }
         }
+        let humans: Vec<&String> = all
+            .iter()
+            .filter(|k| k.kind == TokenKind::Human)
+            .map(|k| &k.name)
+            .collect();
+        if !humans.is_empty() {
+            c.set("token-human", humans);
+        }
     }
 
     /// What `newer` changes relative to `self`, each list sorted by name.
@@ -470,6 +532,9 @@ impl Auth {
             if o.checks != k.checks {
                 c.checks_changed.push(name.to_string());
             }
+            if o.kind != k.kind {
+                c.kind_changed.push(name.to_string());
+            }
         }
         c.removed = old
             .keys()
@@ -485,6 +550,7 @@ impl Auth {
             &mut c.expiry_changed,
             &mut c.review_changed,
             &mut c.checks_changed,
+            &mut c.kind_changed,
         ] {
             list.sort();
         }
@@ -579,6 +645,7 @@ pub async fn require_token(mut req: Request, next: Next) -> Response {
         review,
         review_for,
         checks,
+        kind,
         ..
     } = known;
     let role = *role;
@@ -598,6 +665,7 @@ pub async fn require_token(mut req: Request, next: Next) -> Response {
         review: *review,
         review_for: *review_for,
         checks: checks.clone(),
+        kind: *kind,
     });
     next.run(req).instrument(span).await
 }
@@ -724,6 +792,43 @@ mod tests {
         assert!(e.contains("bad check name"), "{e}");
         let e = parse(r#", "checks": ["test"]"#, "read").err().unwrap();
         assert!(e.contains("needs role write"), "{e}");
+    }
+
+    /// `kind` (ADR 0098): absent is `agent`; `human` marks a person; any
+    /// other value refuses the file; a change shows in the diff and the
+    /// fingerprint, and a file without it keeps the fingerprint it had.
+    #[test]
+    fn kind_defaults_to_agent_and_changes_the_fingerprint() {
+        let parse = |extra: &str| {
+            Auth::parse(&format!(
+                r#"{{ "tokens": [{{ "name": "h", "role": "write", "hash": "{}" {extra} }}] }}"#,
+                hash_token("h")
+            ))
+        };
+        let plain = parse("").unwrap();
+        let agent = parse(r#", "kind": "agent""#).unwrap();
+        let human = parse(r#", "kind": "human""#).unwrap();
+        assert_eq!(plain.lookup("h").unwrap().kind, TokenKind::Agent);
+        assert_eq!(agent.lookup("h").unwrap().kind, TokenKind::Agent);
+        assert_eq!(human.lookup("h").unwrap().kind, TokenKind::Human);
+        assert!(parse(r#", "kind": "robot""#).is_err());
+        assert!(parse(r#", "kind": "Human""#).is_err());
+        assert_eq!(plain.diff(&human).kind_changed, ["h"]);
+        assert!(plain.diff(&agent).is_empty());
+        let print = |a: &Auth| {
+            let mut c = crate::fingerprint::Canon::new();
+            a.fingerprint_into(&mut c);
+            c.finish()
+        };
+        assert_ne!(print(&plain), print(&human));
+        assert_eq!(print(&plain), print(&agent));
+        assert_eq!(
+            TokenKind::Human.note_trust(),
+            leep_core::coord::NoteTrust::Human
+        );
+        // The entry `gen-token` writes says nothing of the kind unless asked.
+        let (_, e) = generate("x", Role::Write).unwrap();
+        assert!(!serde_json::to_string(&e).unwrap().contains("kind"));
     }
 
     #[test]

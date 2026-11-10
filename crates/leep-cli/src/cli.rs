@@ -12,8 +12,8 @@ use crate::cache::Cache;
 use crate::client::Client;
 use crate::commands::{
     amend, bisect, branch, checkout, checks, commit, config, context, diff, history, init, keygen,
-    land, merge, pick, rebase, reflog, reset, resolve, restore, review, search, session, stash,
-    status, Ctx, Remote,
+    land, merge, note, pick, rebase, reflog, reset, resolve, restore, review, search, session,
+    stash, status, Ctx, Remote,
 };
 use crate::error::{CliError, ErrorKind, Result};
 use crate::help;
@@ -152,6 +152,10 @@ pub enum Command {
     /// Show who is working on or near a path, before anything lands.
     #[command(after_help = help::WHO)]
     Who(session::WhoArgs),
+    /// Write and read notes other agents should know about a file, a
+    /// directory or a changeset.
+    #[command(subcommand, after_help = help::NOTE)]
+    Note(note::NoteCmd),
     /// Show what the server knows that bears on a task: files, owners,
     /// last changes, work in flight, ref health, possible duplicates.
     #[command(after_help = help::CONTEXT)]
@@ -357,8 +361,11 @@ fn run_with(cli: Cli, sink: &Arc<Mutex<Vec<Notice>>>) -> Result<i32> {
 
     // Sessions work in a working copy or, with LEEP_AGENT_SESSION, outside
     // one; `start` keeps the key it makes in the working copy.
-    if let Command::Session(_) | Command::Who(_) | Command::Context(_) | Command::Work(_) =
-        &cli.command
+    if let Command::Session(_)
+    | Command::Who(_)
+    | Command::Note(_)
+    | Command::Context(_)
+    | Command::Work(_) = &cli.command
     {
         let mut wc = wc.ok();
         let token = resolve_token(
@@ -382,6 +389,7 @@ fn run_with(cli: Cli, sink: &Arc<Mutex<Vec<Notice>>>) -> Result<i32> {
         return match &cli.command {
             Command::Session(c) => session::run(&remote, c, wc.as_mut()),
             Command::Who(a) => session::who(&remote, a, wc.as_ref()),
+            Command::Note(c) => note::run(&remote, c),
             Command::Context(a) => context::context(&remote, a),
             Command::Work(c) => context::run(&remote, c, wc.as_mut()),
             _ => unreachable!("matched above"),

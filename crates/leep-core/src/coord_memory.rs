@@ -7,9 +7,12 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::coord::{
-    apply_update, check_end, Beat, CoordStore, NearQuery, NearRow, PathKind, Session, SessionEnd,
-    SessionFilter, SessionOrigin, SessionState, SessionUpdate, SweepReport, EXPIRE_AFTER_SECS,
-    MAX_TOUCHED_PATHS, PATHS_RETENTION_SECS, SESSION_RETENTION_SECS, TOO_MANY_SESSIONS_MARKER,
+    apply_update, check_end, check_supersede, closed_expiry, notes_per_hour, reports_per_hour,
+    too_many_notes, Beat, CoordStore, NearQuery, NearRow, NewNote, Note, NoteChange, NoteFilter,
+    NoteState, NoteSweep, NoteTrust, PathKind, Session, SessionEnd, SessionFilter, SessionOrigin,
+    SessionState, SessionUpdate, SweepReport, CLOSED_NOTE_RETENTION_SECS, EXPIRE_AFTER_SECS,
+    MAX_TOUCHED_PATHS, NOTE_RATE_WINDOW_SECS, PATHS_RETENTION_SECS, SESSION_RETENTION_SECS,
+    TOO_MANY_SESSIONS_MARKER,
 };
 use crate::{ChangesetId, Error, Hash, Result};
 
@@ -17,6 +20,8 @@ use crate::{ChangesetId, Error, Hash, Result};
 struct Rows {
     next: u64,
     sessions: BTreeMap<u64, Session>,
+    next_note: u64,
+    notes: BTreeMap<u64, Note>,
 }
 
 /// Sessions in memory, for tests and `mem://` servers. One lock over every
@@ -30,6 +35,34 @@ impl MemoryCoordStore {
     pub fn new() -> Self {
         Self::default()
     }
+}
+
+/// `n` after `change` at `at`, if it applies.
+pub(crate) fn changed_note(n: &Note, change: &NoteChange, at: i64) -> Option<Note> {
+    if n.state != NoteState::Open {
+        return None;
+    }
+    let mut n = n.clone();
+    let close = |n: &mut Note, state| {
+        n.state = state;
+        n.expires = closed_expiry(n.expires, at);
+    };
+    match change {
+        NoteChange::Retract { by } if *by == n.principal => close(&mut n, NoteState::Retracted),
+        NoteChange::Report { by, .. } if n.trust == NoteTrust::Agent && n.endorsed_by.is_none() => {
+            close(&mut n, NoteState::Reported);
+            n.reported_by = Some(by.clone());
+            n.reported_at = Some(at);
+        }
+        NoteChange::Revoke => close(&mut n, NoteState::Retracted),
+        NoteChange::Endorse { by } if n.endorsed_by.is_none() => {
+            n.endorsed_by = Some(by.clone());
+            n.endorsed_at = Some(at);
+            n.expires = None;
+        }
+        _ => return None,
+    }
+    Some(n)
 }
 
 /// The refusal for a principal at its active session limit.
@@ -233,6 +266,189 @@ impl CoordStore for MemoryCoordStore {
         NearQuery::order(&exact, &mut out);
         out.truncate(q.limit);
         Ok(out)
+    }
+
+    async fn add_note(&self, n: &NewNote) -> Result<Note> {
+        n.check()?;
+        let mut rows = self.rows.lock().unwrap();
+        if let Some(old) = n.supersedes {
+            let found = rows
+                .notes
+                .get(&old)
+                .map(|o| (o.principal.as_str(), o.state));
+            check_supersede(old, found, &n.principal)?;
+        }
+        let mine = || rows.notes.values().filter(|o| o.principal == n.principal);
+        let open = mine()
+            .filter(|o| o.state == NoteState::Open)
+            .count()
+            .saturating_sub(usize::from(n.supersedes.is_some()));
+        if open >= n.max_open {
+            return Err(too_many_notes(&n.principal, n.max_open));
+        }
+        let recent = mine()
+            .filter(|o| o.created > n.created - NOTE_RATE_WINDOW_SECS)
+            .count();
+        if recent >= n.max_per_hour {
+            return Err(notes_per_hour(&n.principal, n.max_per_hour));
+        }
+        let today = mine()
+            .filter(|o| o.created > n.created - crate::coord::NOTE_DAY_WINDOW_SECS)
+            .count();
+        if today >= n.max_per_day {
+            return Err(crate::coord::notes_per_day(&n.principal, n.max_per_day));
+        }
+        rows.next_note += 1;
+        let id = rows.next_note;
+        let note = Note {
+            id,
+            kind: n.kind,
+            anchor_type: n.anchor_type,
+            anchor: n.anchor.clone(),
+            at_changeset: n.at_changeset,
+            at_blob: n.at_blob,
+            lines: n.lines,
+            title: n.title.clone(),
+            body: n.body.clone(),
+            principal: n.principal.clone(),
+            agent_model: n.agent_model.clone(),
+            session_id: n.session_id,
+            trust: n.trust,
+            endorsed_by: None,
+            endorsed_at: None,
+            state: NoteState::Open,
+            superseded_by: None,
+            reported_by: None,
+            reported_at: None,
+            created: n.created,
+            expires: n.expires,
+        };
+        if let Some(old) = n.supersedes.and_then(|o| rows.notes.get_mut(&o)) {
+            old.state = NoteState::Superseded;
+            old.superseded_by = Some(id);
+            old.expires = closed_expiry(old.expires, n.created);
+        }
+        rows.notes.insert(id, note.clone());
+        Ok(note)
+    }
+
+    async fn get_note(&self, id: u64) -> Result<Option<Note>> {
+        Ok(self.rows.lock().unwrap().notes.get(&id).cloned())
+    }
+
+    async fn list_notes(&self, f: &NoteFilter) -> Result<Vec<Note>> {
+        f.check()?;
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .notes
+            .values()
+            .rev()
+            .filter(|n| f.matches(n))
+            .take(f.limit)
+            .cloned()
+            .collect())
+    }
+
+    async fn notes_at(&self, anchors: &[String], cap: usize) -> Result<Vec<Note>> {
+        crate::coord::check_anchor_probe(anchors)?;
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .notes
+            .values()
+            .rev()
+            .filter(|n| {
+                n.state == NoteState::Open
+                    && n.anchor_type == crate::coord::AnchorType::Path
+                    && anchors.contains(&n.anchor)
+            })
+            .take(cap)
+            .cloned()
+            .collect())
+    }
+
+    async fn change_note(&self, id: u64, change: &NoteChange, at: i64) -> Result<bool> {
+        let mut rows = self.rows.lock().unwrap();
+        if let NoteChange::Report { by, max_per_hour } = change {
+            let hid = rows
+                .notes
+                .values()
+                .filter(|n| {
+                    n.reported_by.as_ref() == Some(by)
+                        && n.reported_at
+                            .is_some_and(|t| t > at - NOTE_RATE_WINDOW_SECS)
+                })
+                .count();
+            if hid >= *max_per_hour {
+                return Err(reports_per_hour(by, *max_per_hour));
+            }
+        }
+        let Some(n) = rows.notes.get_mut(&id) else {
+            return Ok(false);
+        };
+        match changed_note(n, change, at) {
+            Some(new) => {
+                *n = new;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn revoke_notes(&self, principal: &str, at: i64) -> Result<u64> {
+        let mut rows = self.rows.lock().unwrap();
+        let mut count = 0;
+        for n in rows.notes.values_mut() {
+            if n.principal == principal {
+                if let Some(new) = changed_note(n, &NoteChange::Revoke, at) {
+                    *n = new;
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    async fn unreport_notes(&self, id: Option<u64>, reporter: Option<&str>) -> Result<u64> {
+        let mut rows = self.rows.lock().unwrap();
+        let mut count = 0;
+        for n in rows.notes.values_mut() {
+            let picked = id.is_some_and(|i| i == n.id)
+                || reporter.is_some_and(|r| n.reported_by.as_deref() == Some(r));
+            if picked && n.state == NoteState::Reported {
+                n.state = NoteState::Open;
+                n.reported_by = None;
+                n.reported_at = None;
+                n.expires = Some(n.created + crate::coord::AGENT_NOTE_TTL_SECS);
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    async fn sweep_notes(&self, now: i64, limit: usize) -> Result<NoteSweep> {
+        let mut rows = self.rows.lock().unwrap();
+        let due = |open: bool| -> Vec<u64> {
+            rows.notes
+                .values()
+                .filter(|n| (n.state == NoteState::Open) == open)
+                .filter(|n| n.expires.is_some_and(|e| e < now))
+                .map(|n| n.id)
+                .take(limit)
+                .collect()
+        };
+        let (open, closed) = (due(true), due(false));
+        let r = NoteSweep {
+            expired: open.len() as u64,
+            closed: closed.len() as u64,
+        };
+        for id in open.into_iter().chain(closed) {
+            rows.notes.remove(&id);
+        }
+        Ok(r)
     }
 }
 
@@ -587,6 +803,7 @@ pub async fn check_coord_contract(store: &dyn CoordStore) {
     assert_eq!(store.get_session(a.id).await.unwrap(), None);
 
     check_near_contract(store, end_of_days).await;
+    check_notes_contract(store).await;
 }
 
 /// [`CoordStore::near_paths`] (ADR 0096): the rows of other active
@@ -762,6 +979,396 @@ async fn check_near_contract(store: &dyn CoordStore, t0: i64) {
         ..Default::default()
     };
     assert!(store.list_sessions(&every).await.unwrap().is_empty());
+}
+
+/// The notes part of the contract (ADR 0098): writes checked and capped in
+/// one transaction, one winner among concurrent supersessions, listings by
+/// anchor, conditional state changes and a bounded sweep. Leaves no note.
+pub async fn check_notes_contract(store: &dyn CoordStore) {
+    use crate::coord::{
+        AnchorType, NoteKind, AGENT_NOTE_TTL_SECS, MAX_NOTES_PER_HOUR,
+        MAX_OPEN_NOTES_PER_PRINCIPAL, NOTES_PER_DAY_MARKER, NOTES_PER_HOUR_MARKER,
+        REPORTS_PER_HOUR_MARKER, TOO_MANY_NOTES_MARKER,
+    };
+    let t0: i64 = 1_700_000_000;
+    let cs = |s: &str| ChangesetId(Hash::of_blob(s.as_bytes()));
+    let note = |who: &str, anchor: &str, title: &str| NewNote {
+        kind: NoteKind::Finding,
+        anchor_type: AnchorType::Path,
+        anchor: anchor.into(),
+        at_changeset: Some(cs("at")),
+        at_blob: Some(Hash::of_blob(b"blob")),
+        lines: None,
+        title: title.into(),
+        body: String::new(),
+        principal: who.into(),
+        agent_model: None,
+        session_id: None,
+        trust: NoteTrust::Agent,
+        supersedes: None,
+        created: t0,
+        expires: Some(t0 + AGENT_NOTE_TTL_SECS),
+        max_open: MAX_OPEN_NOTES_PER_PRINCIPAL,
+        max_per_hour: 1000,
+        max_per_day: 1000,
+    };
+
+    // Write and read back every column.
+    let mut n = note("ada", "src/auth/token.rs", "Refresh races the cache");
+    n.kind = NoteKind::Gotcha;
+    n.lines = Some((10, 20));
+    n.body = "Take the lock first.\nThen refresh.".into();
+    n.agent_model = Some("model-a".into());
+    n.session_id = Some(42);
+    let a = store.add_note(&n).await.unwrap();
+    assert_eq!(
+        (a.kind, a.anchor_type, a.anchor.as_str()),
+        (NoteKind::Gotcha, AnchorType::Path, "src/auth/token.rs")
+    );
+    assert_eq!((a.at_changeset, a.at_blob), (n.at_changeset, n.at_blob));
+    assert_eq!(a.lines, Some((10, 20)));
+    assert_eq!(a.title, "Refresh races the cache");
+    assert_eq!(a.body, "Take the lock first.\nThen refresh.");
+    assert_eq!(
+        (a.principal.as_str(), a.agent_model.as_deref(), a.session_id),
+        ("ada", Some("model-a"), Some(42))
+    );
+    assert_eq!((a.trust, a.state), (NoteTrust::Agent, NoteState::Open));
+    assert_eq!((a.endorsed_by.as_deref(), a.endorsed_at), (None, None));
+    assert_eq!((a.superseded_by, a.created), (None, t0));
+    assert_eq!(a.expires, Some(t0 + AGENT_NOTE_TTL_SECS));
+    assert_eq!(store.get_note(a.id).await.unwrap(), Some(a.clone()));
+    assert_eq!(store.get_note(u64::MAX / 2).await.unwrap(), None);
+    // A bad note stores nothing.
+    let mut bad = note("ada", "src/x", "two\nlines");
+    assert!(store.add_note(&bad).await.is_err());
+    bad.title = "ok".into();
+    bad.anchor = "/abs".into();
+    assert!(store.add_note(&bad).await.is_err());
+
+    let mut h = note("hugo", "src/auth", "Auth is owned by the platform team");
+    h.trust = NoteTrust::Human;
+    h.expires = None;
+    let dir = store.add_note(&h).await.unwrap();
+    assert_eq!((dir.trust, dir.expires), (NoteTrust::Human, None));
+    let mut c = note("bo", "", "This change broke the nightly");
+    c.anchor_type = AnchorType::Changeset;
+    c.anchor = cs("broke").to_string();
+    c.at_changeset = Some(cs("broke"));
+    c.at_blob = None;
+    let on_cs = store.add_note(&c).await.unwrap();
+    let sib = store
+        .add_note(&note("bo", "src/authx/a.rs", "not under src/auth"))
+        .await
+        .unwrap();
+    let below = store
+        .add_note(&note("bo", "src/auth/token.rs/x", "below a file"))
+        .await
+        .unwrap();
+    assert!(a.id < dir.id && dir.id < on_cs.id && on_cs.id < sib.id);
+
+    // Listing: newest first, by path (the path and directories above it),
+    // changeset, principal, state, and paged.
+    let all = NoteFilter {
+        limit: 100,
+        ..Default::default()
+    };
+    let ids = |v: Vec<Note>| v.into_iter().map(|n| n.id).collect::<Vec<_>>();
+    let list = |f: NoteFilter| async move { ids(store.list_notes(&f).await.unwrap()) };
+    assert_eq!(
+        list(all.clone()).await,
+        [below.id, sib.id, on_cs.id, dir.id, a.id]
+    );
+    let at = |p: &str| NoteFilter {
+        path: Some(p.into()),
+        ..all.clone()
+    };
+    assert_eq!(list(at("src/auth/token.rs")).await, [dir.id, a.id]);
+    assert_eq!(list(at("src/auth")).await, [dir.id]);
+    assert_eq!(list(at("src/auth/other.rs")).await, [dir.id]);
+    assert_eq!(list(at("src/authx/a.rs")).await, [sib.id]);
+    assert!(list(at("src")).await.is_empty(), "nothing below is listed");
+    let on = NoteFilter {
+        changeset: Some(cs("broke").to_string()),
+        ..all.clone()
+    };
+    assert_eq!(list(on).await, [on_cs.id]);
+    let by = NoteFilter {
+        principal: Some("bo".into()),
+        ..all.clone()
+    };
+    assert_eq!(list(by).await, [below.id, sib.id, on_cs.id]);
+    let page = NoteFilter {
+        before: Some(on_cs.id),
+        limit: 1,
+        ..all.clone()
+    };
+    assert_eq!(list(page).await, [dir.id]);
+    assert!(list(NoteFilter {
+        limit: 0,
+        ..all.clone()
+    })
+    .await
+    .is_empty());
+    // Probes are bounded: a path past MAX_PATH_BYTES, or too many anchors.
+    let long = NoteFilter {
+        path: Some("a/".repeat(200)),
+        ..all.clone()
+    };
+    assert!(store.list_notes(&long).await.is_err());
+    let many: Vec<String> = (0..=crate::coord::MAX_NOTE_ANCHORS)
+        .map(|i| format!("p{i}"))
+        .collect();
+    assert!(store.notes_at(&many, 1).await.is_err());
+    // Exact anchors, open only, capped.
+    let anchors = ["src/auth/token.rs".to_string(), "src/auth".to_string()];
+    assert_eq!(
+        ids(store.notes_at(&anchors, 10).await.unwrap()),
+        [dir.id, a.id]
+    );
+    assert_eq!(ids(store.notes_at(&anchors, 1).await.unwrap()), [dir.id]);
+    assert!(store.notes_at(&[], 10).await.unwrap().is_empty());
+
+    // Supersede: only the principal's own open note, once.
+    let mut s = note("bo", "src/auth/token.rs", "edit");
+    s.supersedes = Some(a.id);
+    assert!(matches!(store.add_note(&s).await, Err(Error::Policy(_))));
+    s.principal = "ada".into();
+    s.supersedes = Some(u64::MAX / 2);
+    assert!(matches!(store.add_note(&s).await, Err(Error::NotFound(_))));
+    s.supersedes = Some(a.id);
+    let a2 = store.add_note(&s).await.unwrap();
+    let old = store.get_note(a.id).await.unwrap().unwrap();
+    assert_eq!(
+        (old.state, old.superseded_by),
+        (NoteState::Superseded, Some(a2.id))
+    );
+    assert_eq!(old.expires, Some(t0 + CLOSED_NOTE_RETENTION_SECS));
+    let before = list(all.clone()).await.len();
+    assert!(matches!(store.add_note(&s).await, Err(Error::Conflict(_))));
+    assert_eq!(list(all.clone()).await.len(), before, "nothing stored");
+    assert_eq!(
+        ids(store.notes_at(&anchors, 10).await.unwrap()),
+        [a2.id, dir.id]
+    );
+    let open = NoteFilter {
+        states: vec![NoteState::Open],
+        ..at("src/auth/token.rs")
+    };
+    assert_eq!(list(open).await, [a2.id, dir.id]);
+    let closed = NoteFilter {
+        states: vec![NoteState::Superseded, NoteState::Retracted],
+        ..all.clone()
+    };
+    assert_eq!(list(closed).await, [a.id]);
+
+    // Concurrent supersessions of one note: one winner, the rest refused
+    // and stored nothing.
+    let target = store
+        .add_note(&note("eve", "race/a.rs", "v0"))
+        .await
+        .unwrap();
+    let tasks = (0..16).map(|i| {
+        let mut n = note("eve", "race/a.rs", &format!("v{}", i + 1));
+        n.supersedes = Some(target.id);
+        async move { store.add_note(&n).await }
+    });
+    let results = futures_util::future::join_all(tasks).await;
+    let won: Vec<&Note> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+    assert_eq!(won.len(), 1, "one winner");
+    for r in &results {
+        if let Err(e) = r {
+            assert!(matches!(e, Error::Conflict(_)), "{e}");
+        }
+    }
+    let eve = NoteFilter {
+        principal: Some("eve".into()),
+        ..all.clone()
+    };
+    assert_eq!(list(eve.clone()).await, [won[0].id, target.id]);
+
+    // Caps: open notes per principal, and notes per hour.
+    let mut capped = note("cap", "cap/a", "one");
+    capped.max_open = 2;
+    let c1 = store.add_note(&capped).await.unwrap();
+    store.add_note(&capped).await.unwrap();
+    match store.add_note(&capped).await {
+        Err(Error::Invalid(m)) => assert!(m.contains(TOO_MANY_NOTES_MARKER), "{m}"),
+        other => panic!("expected the open cap, got {other:?}"),
+    }
+    // Superseding at the cap replaces one open note with another.
+    capped.supersedes = Some(c1.id);
+    store.add_note(&capped).await.unwrap();
+    let mut rated = note("rate", "rate/a", "one");
+    rated.max_per_hour = 2;
+    store.add_note(&rated).await.unwrap();
+    rated.created = t0 + 10;
+    let r2 = store.add_note(&rated).await.unwrap();
+    // Closing notes does not give back the hour's writes.
+    assert!(store
+        .change_note(r2.id, &NoteChange::Retract { by: "rate".into() }, t0 + 11)
+        .await
+        .unwrap());
+    rated.created = t0 + 20;
+    match store.add_note(&rated).await {
+        Err(Error::Invalid(m)) => assert!(m.contains(NOTES_PER_HOUR_MARKER), "{m}"),
+        other => panic!("expected the hourly cap, got {other:?}"),
+    }
+    rated.created = t0 + NOTE_RATE_WINDOW_SECS + 11;
+    store.add_note(&rated).await.unwrap();
+    assert_eq!(MAX_NOTES_PER_HOUR, 30);
+    // And per day: hours apart, the day's cap still holds.
+    let mut daily = note("day", "day/a", "one");
+    daily.max_per_day = 2;
+    store.add_note(&daily).await.unwrap();
+    daily.created = t0 + 2 * NOTE_RATE_WINDOW_SECS;
+    store.add_note(&daily).await.unwrap();
+    daily.created = t0 + 4 * NOTE_RATE_WINDOW_SECS;
+    match store.add_note(&daily).await {
+        Err(Error::Invalid(m)) => assert!(m.contains(NOTES_PER_DAY_MARKER), "{m}"),
+        other => panic!("expected the daily cap, got {other:?}"),
+    }
+    daily.created = t0 + crate::coord::NOTE_DAY_WINDOW_SECS + 1;
+    store.add_note(&daily).await.unwrap();
+
+    // Changes are conditional, and close a note for 30 days.
+    let at1 = t0 + 100;
+    let retract = |by: &str| NoteChange::Retract { by: by.into() };
+    assert!(!store.change_note(a2.id, &retract("bo"), at1).await.unwrap());
+    assert!(store
+        .change_note(a2.id, &retract("ada"), at1)
+        .await
+        .unwrap());
+    assert!(!store
+        .change_note(a2.id, &retract("ada"), at1)
+        .await
+        .unwrap());
+    let gone = store.get_note(a2.id).await.unwrap().unwrap();
+    assert_eq!(
+        (gone.state, gone.expires),
+        (NoteState::Retracted, Some(at1 + CLOSED_NOTE_RETENTION_SECS))
+    );
+    assert!(!store
+        .change_note(u64::MAX / 2, &NoteChange::Revoke, at1)
+        .await
+        .unwrap());
+    // A report hides an agent note; a human one stays.
+    let report = NoteChange::Report {
+        by: "rex".into(),
+        max_per_hour: 2,
+    };
+    assert!(!store.change_note(dir.id, &report, at1).await.unwrap());
+    assert_eq!(
+        store.get_note(dir.id).await.unwrap().unwrap().state,
+        NoteState::Open
+    );
+    assert!(store.change_note(sib.id, &report, at1).await.unwrap());
+    let hid = store.get_note(sib.id).await.unwrap().unwrap();
+    assert_eq!(
+        (hid.state, hid.reported_by.as_deref(), hid.reported_at),
+        (NoteState::Reported, Some("rex"), Some(at1))
+    );
+    // A reporter may hide at most `max_per_hour` notes an hour; past it
+    // every report of theirs is refused, and nothing changes.
+    let spare = store.add_note(&note("bo", "rep/a", "spare")).await.unwrap();
+    let spare2 = store
+        .add_note(&note("bo", "rep/b", "spare 2"))
+        .await
+        .unwrap();
+    assert!(store.change_note(spare.id, &report, at1 + 1).await.unwrap());
+    match store.change_note(spare2.id, &report, at1 + 2).await {
+        Err(Error::Invalid(m)) => assert!(m.contains(REPORTS_PER_HOUR_MARKER), "{m}"),
+        other => panic!("expected the report cap, got {other:?}"),
+    }
+    assert_eq!(
+        store.get_note(spare2.id).await.unwrap().unwrap().state,
+        NoteState::Open
+    );
+    // An operator undoes reports: one note, or every note of a reporter.
+    // The note is open again with an agent note's life.
+    assert_eq!(store.unreport_notes(Some(spare.id), None).await.unwrap(), 1);
+    let back = store.get_note(spare.id).await.unwrap().unwrap();
+    assert_eq!(
+        (back.state, back.reported_by, back.expires),
+        (NoteState::Open, None, Some(t0 + AGENT_NOTE_TTL_SECS))
+    );
+    assert_eq!(store.unreport_notes(None, Some("rex")).await.unwrap(), 1);
+    assert_eq!(
+        store.get_note(sib.id).await.unwrap().unwrap().state,
+        NoteState::Open
+    );
+    assert_eq!(store.unreport_notes(None, Some("rex")).await.unwrap(), 0);
+    // Closing never lengthens a life: a note past its end, not yet swept,
+    // keeps that end when reported.
+    let mut dying = note("bo", "rep/c", "short");
+    dying.expires = Some(at1 - 1);
+    let dying = store.add_note(&dying).await.unwrap();
+    let other = NoteChange::Report {
+        by: "rae".into(),
+        max_per_hour: 5,
+    };
+    assert!(store.change_note(dying.id, &other, at1).await.unwrap());
+    assert_eq!(
+        store.get_note(dying.id).await.unwrap().unwrap().expires,
+        Some(at1 - 1)
+    );
+    // Endorsement: once, and the note no longer expires; a report then
+    // only counts.
+    let endorse = NoteChange::Endorse { by: "hugo".into() };
+    assert!(store.change_note(below.id, &endorse, at1).await.unwrap());
+    assert!(!store.change_note(below.id, &endorse, at1).await.unwrap());
+    let e = store.get_note(below.id).await.unwrap().unwrap();
+    assert_eq!(
+        (e.endorsed_by.as_deref(), e.endorsed_at, e.expires),
+        (Some("hugo"), Some(at1), None)
+    );
+    assert!(!store.change_note(below.id, &other, at1).await.unwrap());
+    // An operator's mass revoke: every open note of one principal.
+    assert_eq!(store.revoke_notes("eve", at1).await.unwrap(), 1);
+    assert_eq!(store.revoke_notes("eve", at1).await.unwrap(), 0);
+    assert!(list(NoteFilter {
+        states: vec![NoteState::Open],
+        ..eve
+    })
+    .await
+    .is_empty());
+
+    // The sweep: open notes past their life, closed ones 30 days on, in
+    // bounded steps.
+    // Only the reported note whose life had already ended is due.
+    let r = store.sweep_notes(at1, 1000).await.unwrap();
+    assert_eq!((r.expired, r.closed), (0, 1));
+    assert_eq!(store.get_note(dying.id).await.unwrap(), None);
+    let mut short = note("ada", "sweep/a", "short-lived");
+    short.expires = Some(at1 + 5);
+    let short = store.add_note(&short).await.unwrap();
+    let r = store.sweep_notes(at1 + 6, 1000).await.unwrap();
+    assert_eq!((r.expired, r.closed), (1, 0));
+    assert_eq!(store.get_note(short.id).await.unwrap(), None);
+    assert!(store.get_note(a2.id).await.unwrap().is_some());
+    let end = t0 + NOTE_RATE_WINDOW_SECS + AGENT_NOTE_TTL_SECS + 1000;
+    let mut swept = NoteSweep::default();
+    loop {
+        let r = store.sweep_notes(end, 1).await.unwrap();
+        assert!(r.expired <= 1 && r.closed <= 1, "{r:?}");
+        swept.expired += r.expired;
+        swept.closed += r.closed;
+        if r == NoteSweep::default() {
+            break;
+        }
+    }
+    assert!(swept.closed >= 4 && swept.expired >= 4, "{swept:?}");
+    // Left: the human note and the endorsed one, which never expire.
+    assert_eq!(list(all.clone()).await, [below.id, dir.id]);
+    for id in [below.id, dir.id] {
+        assert!(store
+            .change_note(id, &NoteChange::Revoke, end)
+            .await
+            .unwrap());
+    }
+    let after = end + CLOSED_NOTE_RETENTION_SECS + 1;
+    while store.sweep_notes(after, 1000).await.unwrap() != NoteSweep::default() {}
+    assert!(list(all).await.is_empty());
 }
 
 #[cfg(test)]

@@ -625,14 +625,64 @@ impl leep_core::coord::CoordStore for Hanging {
     ) -> leep_core::Result<Vec<leep_core::coord::NearRow>> {
         std::future::pending().await
     }
+    async fn add_note(
+        &self,
+        _: &leep_core::coord::NewNote,
+    ) -> leep_core::Result<leep_core::coord::Note> {
+        std::future::pending().await
+    }
+    async fn get_note(&self, _: u64) -> leep_core::Result<Option<leep_core::coord::Note>> {
+        std::future::pending().await
+    }
+    async fn list_notes(
+        &self,
+        _: &leep_core::coord::NoteFilter,
+    ) -> leep_core::Result<Vec<leep_core::coord::Note>> {
+        std::future::pending().await
+    }
+    async fn notes_at(
+        &self,
+        _: &[String],
+        _: usize,
+    ) -> leep_core::Result<Vec<leep_core::coord::Note>> {
+        std::future::pending().await
+    }
+    async fn change_note(
+        &self,
+        _: u64,
+        _: &leep_core::coord::NoteChange,
+        _: i64,
+    ) -> leep_core::Result<bool> {
+        std::future::pending().await
+    }
+    async fn revoke_notes(&self, _: &str, _: i64) -> leep_core::Result<u64> {
+        std::future::pending().await
+    }
+    async fn sweep_notes(
+        &self,
+        _: i64,
+        _: usize,
+    ) -> leep_core::Result<leep_core::coord::NoteSweep> {
+        std::future::pending().await
+    }
+    async fn unreport_notes(&self, _: Option<u64>, _: Option<&str>) -> leep_core::Result<u64> {
+        std::future::pending().await
+    }
 }
 
-/// A coordination store that hangs costs a create at most its 250 ms
-/// bound, and changes neither the land's answer nor the ref log (ADR
-/// 0095): the same commits and lands on a server without sessions answer
-/// the same.
+/// A coordination store that hangs changes neither the land's answer nor
+/// the ref log (ADR 0095): the same commits and lands on a server without
+/// sessions answer the same. Only liveness is timed here, generously; the
+/// 250 ms bound on a create is tested on a paused clock beside the hook
+/// (`leep-server`'s `sessions::tests`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hanging_coordination_store_changes_no_answer() {
+    tokio::time::timeout(Duration::from_secs(10), hanging_store_answers_the_same())
+        .await
+        .expect("a hanging store never holds a request for long");
+}
+
+async fn hanging_store_answers_the_same() {
     let fresh = || {
         Repo::new(
             Arc::new(MemoryBlobStore::new()),
@@ -644,10 +694,7 @@ async fn a_hanging_coordination_store_changes_no_answer() {
     let mut answers = Vec::new();
     let mut logs = Vec::new();
     for api in [&hung, &none] {
-        let started = std::time::Instant::now();
         let first = api.commit("alice", "a-1", &[], &["src/a.rs"]).await;
-        let took = started.elapsed();
-        assert!(took < Duration::from_millis(300), "create took {took:?}");
         let second = api.commit("bob", "b-1", &[], &["web/b.ts"]).await;
         let t = token("alice");
         let mut got = Vec::new();

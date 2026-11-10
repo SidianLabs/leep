@@ -80,6 +80,62 @@ async fn populate(store: &dyn MetaStore) {
         )
         .await
         .unwrap());
+    // Notes (ADR 0098): an open agent note with every column set, an
+    // endorsed human one on a changeset, and a superseded one.
+    use leep_core::coord::{AnchorType, NewNote, NoteChange, NoteKind, NoteTrust};
+    let coord = store.coord_store().expect("notes");
+    let mut n = NewNote {
+        kind: NoteKind::Gotcha,
+        anchor_type: AnchorType::Path,
+        anchor: "src/a.rs".into(),
+        at_changeset: Some(cs(1).id()),
+        at_blob: Some(Hash::of_blob(b"a")),
+        lines: Some((3, 9)),
+        title: "Refresh races the cache".into(),
+        body: "Take the lock.\nThen refresh.".into(),
+        principal: "alice".into(),
+        agent_model: Some("model-a".into()),
+        session_id: Some(7),
+        trust: NoteTrust::Agent,
+        supersedes: None,
+        created: 1_700_000_200,
+        expires: Some(1_800_000_000),
+        max_open: 10,
+        max_per_hour: 10,
+        max_per_day: 10,
+    };
+    let first = coord.add_note(&n).await.unwrap();
+    n.supersedes = Some(first.id);
+    n.title = "Refresh races the cache (fixed in 1)".into();
+    coord.add_note(&n).await.unwrap();
+    let human = coord
+        .add_note(&NewNote {
+            kind: NoteKind::Decision,
+            anchor_type: AnchorType::Changeset,
+            anchor: side.to_string(),
+            at_changeset: Some(side),
+            at_blob: None,
+            lines: None,
+            title: "Kept for the audit".into(),
+            body: String::new(),
+            principal: "rhea".into(),
+            agent_model: None,
+            session_id: None,
+            trust: NoteTrust::Human,
+            supersedes: None,
+            created: 1_700_000_300,
+            expires: Some(1_900_000_000),
+            max_open: 10,
+            max_per_hour: 10,
+            max_per_day: 10,
+        })
+        .await
+        .unwrap();
+    let by = NoteChange::Endorse { by: "bo".into() };
+    assert!(coord
+        .change_note(human.id, &by, 1_700_000_400)
+        .await
+        .unwrap());
 }
 
 type Dump = (
@@ -89,6 +145,7 @@ type Dump = (
     Vec<String>,
     Vec<String>,
     Vec<Option<u64>>,
+    Vec<String>,
     Vec<String>,
 );
 
@@ -164,7 +221,53 @@ async fn dump(store: &dyn MetaStore) -> Dump {
         .into_iter()
         .map(|r| format!("{r:?}"))
         .collect();
-    (ids, refs, log, derived, lands, stored, requests)
+    let all = leep_core::coord::NoteFilter {
+        limit: 1000,
+        ..Default::default()
+    };
+    let notes = match store.coord_store() {
+        Some(c) => c.list_notes(&all).await.unwrap(),
+        None => Vec::new(),
+    }
+    .into_iter()
+    .map(|n| format!("{n:?}"))
+    .collect();
+    (ids, refs, log, derived, lands, stored, requests, notes)
+}
+
+/// A restored store gives its next note a higher id than any it restored.
+async fn next_note_id_is_fresh(store: &dyn MetaStore) {
+    use leep_core::coord::{AnchorType, NewNote, NoteFilter, NoteKind, NoteTrust};
+    let coord = store.coord_store().unwrap();
+    let f = NoteFilter {
+        limit: 1,
+        ..Default::default()
+    };
+    let top = coord.list_notes(&f).await.unwrap()[0].id;
+    let next = coord
+        .add_note(&NewNote {
+            kind: NoteKind::Finding,
+            anchor_type: AnchorType::Path,
+            anchor: "late".into(),
+            at_changeset: None,
+            at_blob: None,
+            lines: None,
+            title: "late".into(),
+            body: String::new(),
+            principal: "late".into(),
+            agent_model: None,
+            session_id: None,
+            trust: NoteTrust::Agent,
+            supersedes: None,
+            created: 1,
+            expires: None,
+            max_open: 10,
+            max_per_hour: 10,
+            max_per_day: 10,
+        })
+        .await
+        .unwrap();
+    assert!(next.id > top, "{} after {top}", next.id);
 }
 
 /// A restored store gives its next review request a higher id than any it
@@ -236,6 +339,7 @@ async fn sqlite_round_trip_keeps_everything_and_the_ref_log_sequence() {
     assert_eq!(info.changesets, 26);
     assert_eq!(info.refs.len(), 2);
     assert_eq!(info.derived, 26);
+    assert_eq!(info.notes, 3, "notes are backed up (ADR 0098)");
     assert_eq!(info.schema_version, latest_schema_version());
     assert_eq!(info.ref_log_last_seq, last as u64);
     assert!(info.ref_log < last as u64);
@@ -268,6 +372,7 @@ async fn sqlite_round_trip_keeps_everything_and_the_ref_log_sequence() {
         last as u64 + 1
     );
     next_request_id_is_fresh(&*dest).await;
+    next_note_id_is_fresh(&*dest).await;
 }
 
 #[tokio::test]
@@ -416,7 +521,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // From an un-versioned database (before ADR 0023): adopted, then restored.
     let older = edit(
         "older.db",
-        "DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+        "DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
          DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP TABLE schema_migrations; DROP TABLE changeset_dicts; DROP TABLE store_features; \
          DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; \
@@ -441,7 +546,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // SQLite) and 3: migrated on the scratch copy, then restored.
     let v1 = edit(
         "v1.db",
-        "DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+        "DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
          DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP TABLE changeset_dicts; DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 1",
@@ -466,7 +571,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // the scratch copy, empty, and the plain rows restore as they were.
     let v2 = edit(
         "v2.db",
-        "DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+        "DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
          DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP TABLE changeset_dicts; DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 2",
@@ -491,7 +596,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // copy; the source had no dictionary, so it names no feature.
     let v3 = edit(
         "v3.db",
-        "DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+        "DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
          DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP TABLE store_features; DROP TABLE leases; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 3",
@@ -517,7 +622,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // scratch copy, and every restored entry has none.
     let v4 = edit(
         "v4.db",
-        "DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+        "DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
          DROP TABLE review_requests; DROP TABLE review_request_reviewers; DROP INDEX ref_log_land_id; ALTER TABLE ref_log DROP COLUMN land_changeset; \
          ALTER TABLE ref_log DROP COLUMN land_id; DROP TABLE leases; \
          ALTER TABLE changesets DROP COLUMN stored_at; \
@@ -546,7 +651,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // migration ran.
     let v6 = edit(
         "v6.db",
-        "DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+        "DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
          DROP TABLE review_requests; DROP TABLE review_request_reviewers; ALTER TABLE changesets DROP COLUMN stored_at; \
          DELETE FROM schema_migrations WHERE version > 6",
     )
@@ -573,7 +678,7 @@ async fn schema_version_rules_follow_adr_0023() {
     // the scratch copy, empty, and everything else restores as it was.
     let v7 = edit(
         "v7.db",
-        "DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+        "DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
          DROP TABLE review_requests; DROP TABLE review_request_reviewers; \
          DELETE FROM schema_migrations WHERE version > 7",
     )
@@ -591,13 +696,14 @@ async fn schema_version_rules_follow_adr_0023() {
     let (d, mut src_dump) = (dump(&*d9).await, dump(&*src).await);
     assert!(d.6.is_empty() && !src_dump.6.is_empty());
     src_dump.6.clear();
+    src_dump.7.clear();
     assert_eq!(d, src_dump);
 
     // From v8, before sessions (ADR 0095): the tables are created on the
     // scratch copy, empty, and everything else restores as it was.
     let v8 = edit(
         "v8.db",
-        "DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
+        "DROP TABLE notes; DROP TABLE sessions; DROP TABLE session_paths; DROP TABLE session_beats; \
          DELETE FROM schema_migrations WHERE version > 8",
     )
     .await;
@@ -611,7 +717,32 @@ async fn schema_version_rules_follow_adr_0023() {
         d10.schema_version().await.unwrap(),
         Some(latest_schema_version())
     );
-    assert_eq!(dump(&*d10).await, dump(&*src).await);
+    let mut src_dump = dump(&*src).await;
+    src_dump.7.clear();
+    assert_eq!(dump(&*d10).await, src_dump);
+
+    // From v9, before notes (ADR 0098): the table is created on the
+    // scratch copy, empty, and everything else restores as it was.
+    let v9 = edit(
+        "v9.db",
+        "DROP TABLE notes; DELETE FROM schema_migrations WHERE version > 9",
+    )
+    .await;
+    assert_eq!(snapshot_schema_version(&v9).await.unwrap(), 9);
+    let dest_url = sqlite_url(dir.path(), "d11.db");
+    import_snapshot(&v9, &dest_url, false, SchemaMode::Migrate)
+        .await
+        .unwrap();
+    let d11 = open_meta_store(&dest_url).await.unwrap();
+    assert_eq!(
+        d11.schema_version().await.unwrap(),
+        Some(latest_schema_version())
+    );
+    let (d, src_dump) = (dump(&*d11).await, dump(&*src).await);
+    assert!(d.7.is_empty() && src_dump.7.len() == 3, "{:?}", src_dump.7);
+    let mut want = src_dump;
+    want.7.clear();
+    assert_eq!(d, want);
 
     // Not a snapshot at all.
     let junk = dir.path().join("junk.db");
@@ -752,6 +883,7 @@ async fn postgres_to_sqlite_to_postgres() {
     assert!(dest.cas_ref("fresh", None, Some(id)).await.unwrap());
     assert_eq!(dest.ref_log(None, None, 1).await.unwrap()[0].seq, last + 1);
     next_request_id_is_fresh(&*dest).await;
+    next_note_id_is_fresh(&*dest).await;
     // A second import into the now non-empty database is refused; forced, it replaces.
     assert!(import_snapshot(&snap, &b.url, false, SchemaMode::Migrate)
         .await

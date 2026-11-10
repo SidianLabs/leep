@@ -953,6 +953,35 @@ impl Client {
         self.json(self.http.delete(self.url(&format!("/v1/sessions/{id}"))))
     }
 
+    /// `POST /v1/notes` (ADR 0098).
+    pub fn add_note(&self, req: &AddNoteRequest) -> Result<NoteEntry> {
+        self.json(self.http.post(self.url("/v1/notes")).json(req))
+    }
+
+    /// `GET /v1/notes` with `query` as its filters.
+    pub fn notes(&self, query: &[(&str, String)]) -> Result<NotesResponse> {
+        self.json(self.http.get(self.url("/v1/notes")).query(query))
+    }
+
+    /// `GET /v1/notes/{id}`.
+    pub fn note(&self, id: u64) -> Result<NoteEntry> {
+        self.json(self.http.get(self.url(&format!("/v1/notes/{id}"))))
+    }
+
+    /// `DELETE /v1/notes/{id}`: retract it.
+    pub fn retract_note(&self, id: u64) -> Result<NoteEntry> {
+        self.json(self.http.delete(self.url(&format!("/v1/notes/{id}"))))
+    }
+
+    /// `POST /v1/notes/{id}/report`.
+    pub fn report_note(&self, id: u64) -> Result<ReportNoteResponse> {
+        self.json(
+            self.http
+                .post(self.url(&format!("/v1/notes/{id}/report")))
+                .json(&serde_json::json!({})),
+        )
+    }
+
     pub fn whoami(&self) -> Result<WhoAmIResponse> {
         self.json(self.http.get(self.url("/v1/whoami")))
     }

@@ -53,6 +53,8 @@ libc = "0.2"
 
 [dev-dependencies]
 leep-testkit.workspace = true
+# Paused clocks in tests, so no bound is measured on the wall.
+tokio = { workspace = true, features = ["test-util"] }
 base64.workspace = true
 tempfile = "3"
 bytes.workspace = true

@@ -581,6 +581,28 @@ session_paths_path: INDEX ON session_paths(repo_id, path)
 session_beats(session_id BIGINT PRIMARY KEY,                   -- migration 0009; UNLOGGED on Postgres
               at BIGINT NOT NULL)                               -- unix seconds the session was last heard from
 session_beats_at: INDEX ON session_beats(at)
+notes(id BIGSERIAL PRIMARY KEY,                                -- migration 0010; SQLite: INTEGER PRIMARY KEY AUTOINCREMENT
+      repo_id BIGINT NOT NULL DEFAULT 1,                        -- SQLite: INTEGER (and below)
+      kind TEXT NOT NULL,                                       -- 'finding', 'gotcha', 'decision' or 'howto'
+      anchor_type TEXT NOT NULL,                                -- 'path' or 'changeset'
+      anchor TEXT COLLATE "C" NOT NULL,                         -- a repository path, or a changeset id in hex
+      at_changeset BYTEA, at_blob BYTEA,                        -- where a path anchor was resolved, and its file's content there
+      line_start INT, line_end INT,                             -- lines of a file anchor, from 1; both or neither
+      title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',       -- agent-written plain text
+      principal TEXT NOT NULL,                                  -- a token name, or 'anonymous'
+      agent_model TEXT, session_id BIGINT,                      -- informational: may name a session long gone
+      trust TEXT NOT NULL DEFAULT 'agent',                      -- 'agent' or 'human', fixed at write
+      endorsed_by TEXT, endorsed_at BIGINT,
+      state TEXT NOT NULL DEFAULT 'open',                       -- 'open', 'superseded', 'retracted' or 'reported'
+      superseded_by BIGINT,
+      reported_by TEXT, reported_at BIGINT,                     -- who hid it by a report, and when
+      created BIGINT NOT NULL,                                  -- unix seconds, the server's clock
+      expires BIGINT)                                           -- when the sweep deletes it; NULL once endorsed
+notes_anchor: INDEX ON notes(repo_id, anchor_type, anchor, id)
+notes_principal: INDEX ON notes(repo_id, principal, created)
+notes_open: INDEX ON notes(repo_id, principal) WHERE state = 'open'
+notes_expires: INDEX ON notes(expires)
+notes_reported: INDEX ON notes(reported_by, reported_at) WHERE reported_by IS NOT NULL
 ```
 
 `ref_log` (ADR 0018) is appended in the transaction of every ref create, move
@@ -1054,6 +1076,65 @@ Added:
   files, with `untrusted.path` its first file (and the id of that file)
   and `untrusted.paths` every file it covers, that one first, when more
   than one. An older client reading only `path` sees the first file.
+
+## Notes (new table, store trait, API, tokens file field, ADR 0098)
+
+No changeset, tree or hash changed. Notes are coordination state, never
+read by a land. Added:
+
+- The `notes` table above (migration 0010). A note's text (`title`,
+  `body`, `anchor`) is never rewritten; `state`, `superseded_by`,
+  `endorsed_by`, `endorsed_at` and `expires` change only by conditional
+  `UPDATE ... WHERE state = 'open'`. Stored words are fixed: `kind`
+  `finding`, `gotcha`, `decision`, `howto`; `anchor_type` `path`,
+  `changeset`; `trust` `agent`, `human`; `state` `open`, `superseded`,
+  `retracted`, `reported`. `expires` is the end of an open note's life
+  (90 days after `created` for `agent`, 365 for `human`, `NULL` once
+  endorsed) and 30 days after a note closed; the sweep deletes rows past
+  it. `at_changeset` is set for every note the server wrote (the
+  changeset anchor itself, or the revision a path anchor was resolved
+  at); `at_blob` only for a file anchor. Limits: `title` one line of 1 to
+  200 bytes, `body` at most 4096 bytes, `agent_model` at most 128 bytes,
+  none with a C0 or C1 control
+  (a body may hold `\n`), U+061C, U+180E, U+200B to U+200F, U+2028 to
+  U+202E, U+2060 to U+206F, U+FEFF, U+FFF9 to U+FFFB or U+E0000 to
+  U+E007F; `anchor` a repository path of at most 256 bytes under the
+  same rule, or a full changeset id; `lines` need a file anchor, `1 <=
+  start <= end <= 10,000,000`; at most 200 open notes, 30 written in the
+  last hour and 100 in the last day per principal. Backups (ADR 0026) copy every row with its
+  id; a restore into Postgres moves the id sequence past them.
+- `CoordStore::add_note`, `get_note`, `list_notes(NoteFilter {path,
+  changeset, principal, states, before, limit})`, `notes_at(anchors,
+  cap)`, `change_note(id, NoteChange {Retract{by} | Report{by, max_per_hour} |
+  Revoke | Endorse{by}}, at)`, `revoke_notes(principal, at)`,
+  `unreport_notes(id?, reporter?)` and
+  `sweep_notes(now, limit) -> NoteSweep {expired, closed}`, checked by
+  `check_notes_contract` (part of `check_coord_contract`). A store whose
+  schema predates 0010 answers `NotFound`.
+- `POST /v1/notes` (`AddNoteRequest {kind, anchor: {type, value}, at?,
+  lines?: [start, end], title, body?, supersedes?, agent_model?}` →
+  `NoteEntry`), `GET /v1/notes` (filters `path`, `changeset`, `principal`,
+  `mine`, `state`, `all`, `before`, `limit` → `NotesResponse {notes,
+  next?}`), `GET /v1/notes/{id}` and `DELETE /v1/notes/{id}` (→
+  `NoteEntry`), `POST /v1/notes/{id}/report` (→ `ReportNoteResponse
+  {note, hidden}`). An entry is `{id, kind, trust, endorsed_by?, state,
+  principal, anchor_type, at?, lines?, session?, created, expires?,
+  superseded_by?, reported_by?, bytes, untrusted: {title, body?, anchor,
+  agent_model?}}`:
+  text an agent wrote is only under `untrusted`; `kind`, `trust` and
+  `state` are strings a client shows as they are when it does not know
+  them (`state` may be `expired`: open, past `expires`, not yet swept).
+  Every field a client may omit has a default, and every optional answer
+  field is omitted when absent. A server without notes answers the routes
+  404.
+- Error code `too_many_notes` (400). Past the hourly limit the answer is
+  429 `rate_limited` with `Retry-After`, as it is for a report from a
+  principal that hid 30 notes in the last hour. Superseding another principal's
+  note is 403, one no longer open 409.
+- Tokens file: an optional `"kind": "agent" | "human"` per token (absent
+  is `agent`). The file refuses unknown fields, so a server older than
+  this change refuses a file that uses it. `WhoAmIResponse.kind?`
+  (omitted when authentication is off).
 
 ## Index leases and bounded queries (additive, ADR 0058)
 
@@ -1683,7 +1764,9 @@ new response header `Leep-Refused: <reason>`.
 - Values: `read-class` (an expensive read whose class is full),
   `admission` (a land refused because its ref's queue is full, see
   [Land admission](#land-admission-additive-header-value-adr-0060)) and
-  `body-budget` (the in-flight body budget's `503`, `--max-inflight-bytes`).
+  `body-budget` (the in-flight body budget's `503`, `--max-inflight-bytes`)
+  and `note-lock` (a note write or report that waited 2 s for another of
+  the same principal, ADR 0098).
   Clients should treat any value as "refused before any work" and must
   not depend on the list being closed.
 - A follower that relays a forwarded land's answer (ADR 0056) copies
@@ -1761,10 +1844,11 @@ client treats an unknown or absent code by its HTTP status.
 | 400 | `cursor_unrepresentable` | a paged `GET /v1/files` or `/v1/diff` whose page would end at a path too long for a cursor (added with file and diff paging): repeat the request without `limit` |
 | 400 | `too_many_review_requests` | a review request from a principal that already has 100 open ones (ADR 0086) |
 | 400 | `too_many_sessions` | a session declared by a principal that already has 1000 active ones (ADR 0095) |
+| 400 | `too_many_notes` | a note from a principal that already has 200 open ones (ADR 0098); past 30 notes in an hour the answer is 429 `rate_limited` |
 | 400 | `invalid` | any other bad request (also `405`) |
 | 401 | `unauthorized` | no token, or an unknown one |
 | 401 | `token_expired` | a known token past its `expires` (ADR 0007): fetch a new one; retrying will not help |
-| 403 | `forbidden` | a `read` token on a write, or a `"review": false` token posting a review |
+| 403 | `forbidden` | a `read` token on a write, a `"review": false` token posting a review, or a session or note changed by a principal not its own |
 | 404 | `ref_missing` | a land onto a missing ref with `create: false` (ADR 0036) |
 | 404 | `not_found` | anything else that does not exist |
 | 408 | `timeout` | the request timeout ran out; the request may or may not have applied |

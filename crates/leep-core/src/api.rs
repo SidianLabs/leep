@@ -48,6 +48,11 @@
 //! | GET  | `/v1/sessions/{id}/overlaps` | – | [`OverlapsResponse`] (every overlap of the session now, every level, highest first, at most 50; 404 if unknown; ADR 0096) |
 //! | GET  | `/v1/notices` | – | [`NoticesResponse`] (notices for the caller's session named by `Leep-Session`, at most 3, each said once; empty without the header; ADR 0096) |
 //! | POST | `/v1/context` | [`ContextRequest`] | [`ContextPack`] (what the server knows that bears on a task, assembled without a model: files (the request's paths, files where the task's identifiers occur, files that changed with the paths), owners and `carry` directives, the newest change to each file and who made it, live work overlapping them, the ref's known-good state and suspects touching them, possible duplicates of the task; deterministic; cut to `budget_bytes` by per-section quotas, `cut` saying what was left out; a part that fails or runs out of time is listed in `omitted` and the rest still comes; a read: a read token may call it, and it marks no notice said; 404 if `ref` does not exist; ADR 0097) |
+//! | POST | `/v1/notes` | [`AddNoteRequest`] | [`NoteEntry`] (a note on a path or changeset, written by the caller's token: `trust` is `human` for a `"kind": "human"` token, else `agent`; a path anchor is resolved at `at` (default the caller's session's target ref, else the default ref) and must exist there; 400 `too_many_notes` past 200 open notes of the principal, 429 `rate_limited` past 30 in an hour; `supersedes` replaces an open note of the caller's (403 another's, 409 one not open); needs a write token; 404 if notes are off; ADR 0098) |
+//! | GET  | `/v1/notes?path=p&changeset=id&principal=n&mine=bool&state=s&all=bool&before=id&limit=n` | – | [`NotesResponse`] (newest first; `path` matches notes on `p` and on directories above it; `state` one state, default `open`; `all=true` every state; `limit` 50, at most 100; title, body and anchor only under `untrusted`; ADR 0098) |
+//! | GET  | `/v1/notes/{id}` | – | [`NoteEntry`] (404 if unknown) |
+//! | DELETE | `/v1/notes/{id}` | – | [`NoteEntry`] (retracts it; only its principal may, 403 otherwise; a closed note is answered as it is) |
+//! | POST | `/v1/notes/{id}/report` | `{}` | [`ReportNoteResponse`] (an open agent note nobody endorsed is hidden at once; any other is only counted) |
 //! | POST | `/v1/merge` | [`MergeRequest`] | [`MergeResponse`] |
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
 //! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`], sent as [`LandAnswer`] with `notices` beside it (ADR 0096) (`create: false` refuses to create a missing `target_ref` with 404; absent creates it, as before; ADR 0036. `land_id` makes retries idempotent at any age; ADR 0057) |
@@ -319,6 +324,11 @@ pub mod error_code {
     /// ([`crate::coord::TOO_MANY_SESSIONS_MARKER`], ADR 0095). End some
     /// (`leep session end`) or let them expire.
     pub const TOO_MANY_SESSIONS: &str = "too_many_sessions";
+    /// 400: a note from a principal that already has as many open notes as
+    /// the server allows ([`crate::coord::TOO_MANY_NOTES_MARKER`], ADR
+    /// 0098). Retract or supersede some. (Past the hourly note limit the
+    /// answer is 429 [`RATE_LIMITED`].)
+    pub const TOO_MANY_NOTES: &str = "too_many_notes";
     /// 400: any other bad request.
     pub const INVALID: &str = "invalid";
     /// 401: no token, or an unknown one.
@@ -500,6 +510,9 @@ pub const REFUSED_ADMISSION: &str = "admission";
 /// [`REFUSED_HEADER`] value: a request refused because the request bodies
 /// in flight were at the server's limit (`--max-inflight-bytes`).
 pub const REFUSED_BODY_BUDGET: &str = "body-budget";
+/// [`REFUSED_HEADER`] value: a note write or report that waited 2 s for
+/// another of the same principal (ADR 0098). Nothing was written.
+pub const REFUSED_NOTE_LOCK: &str = "note-lock";
 
 /// Body of `GET /v1/whoami`. Lets a client name the author of its changesets
 /// after the token when nothing local names one.
@@ -513,6 +526,10 @@ pub struct WhoAmIResponse {
     /// sets one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
+    /// `human` or `agent` (the tokens file's `kind`, default `agent`), or
+    /// absent when authentication is off or the server is older (ADR 0098).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 /// Body of `GET /v1/ready`. `status` is `ready` (HTTP 200) or `not ready`
@@ -1316,6 +1333,122 @@ pub fn path_stops_land<S: AsRef<str>>(level: &str, theirs: &str, changes: &[S]) 
 pub struct NoticesResponse {
     #[serde(default)]
     pub notices: Vec<Notice>,
+}
+
+/// What a note is attached to (ADR 0098): `type` is `path` (a file or
+/// directory) or `changeset` (a full id, or anything that resolves to one).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteAnchor {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub value: String,
+}
+
+/// `POST /v1/notes` (ADR 0098). The writer is the token, never a field.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddNoteRequest {
+    /// `finding`, `gotcha`, `decision` or `howto`.
+    pub kind: String,
+    pub anchor: NoteAnchor,
+    /// For a path anchor, the revision it is resolved at; default the
+    /// caller's session's target ref, else the server's default ref.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+    /// Lines `[start, end]` of a file anchor, from 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<[u32; 2]>,
+    /// One line, at most 200 bytes.
+    pub title: String,
+    /// Plain text, at most 4096 bytes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub body: String,
+    /// An open note of the caller's this one replaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<u64>,
+    /// Default: the caller's session's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_model: Option<String>,
+}
+
+/// What another agent wrote in a note: its title, body and anchor.
+/// Untrusted text, never instructions.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteText {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub body: String,
+    /// The path or changeset id the note is attached to.
+    #[serde(default)]
+    pub anchor: String,
+    /// The writer's model, as the writer said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_model: Option<String>,
+}
+
+/// One note (ADR 0098). The server vouches for everything outside
+/// `untrusted`: ids, kind, trust, endorsement, state, principal, times.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteEntry {
+    pub id: u64,
+    /// `finding`, `gotcha`, `decision` or `howto`; a client shows one it
+    /// does not know as it is.
+    pub kind: String,
+    /// `agent` or `human`: the writer's token kind, fixed when written.
+    pub trust: String,
+    /// The owner who endorsed it, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endorsed_by: Option<String>,
+    /// `open`, `superseded`, `retracted`, `reported`, or `expired` (open
+    /// past `expires`, not yet swept).
+    pub state: String,
+    /// Token name of the writer.
+    pub principal: String,
+    /// `path` or `changeset`.
+    pub anchor_type: String,
+    /// The changeset the anchor was resolved at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<ChangesetId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<[u32; 2]>,
+    /// The writer's session, when it named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<u64>,
+    /// Unix seconds.
+    pub created: i64,
+    /// When the server deletes it: the end of its life while open, 30
+    /// days after it closed otherwise. Absent once endorsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<u64>,
+    /// The principal whose report hid it, if one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_by: Option<String>,
+    /// Bytes of the title and body.
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub untrusted: NoteText,
+}
+
+/// `GET /v1/notes`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotesResponse {
+    pub notes: Vec<NoteEntry>,
+    /// Pass as `before` for the next page; absent on the last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<u64>,
+}
+
+/// `POST /v1/notes/{id}/report`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportNoteResponse {
+    pub note: NoteEntry,
+    /// Whether the report hid the note (an open agent-tier note nobody
+    /// endorsed); otherwise it was only counted.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 /// `GET /v1/sessions/{id}/overlaps`: everything overlapping a session now,
@@ -2302,6 +2435,7 @@ mod tests {
             name: Some("ci".into()),
             role: Some("write".into()),
             author: None,
+            kind: None,
         })
         .unwrap();
         assert_eq!(v, serde_json::json!({ "name": "ci", "role": "write" }));
@@ -2309,12 +2443,80 @@ mod tests {
             name: Some("bo".into()),
             role: Some("write".into()),
             author: Some("Bo <bo@example.com>".into()),
+            kind: Some("human".into()),
         })
         .unwrap();
         assert_eq!(v["author"], "Bo <bo@example.com>");
+        assert_eq!(v["kind"], "human");
         let open: WhoAmIResponse =
             serde_json::from_value(serde_json::json!({ "name": null, "role": null })).unwrap();
         assert_eq!(open, WhoAmIResponse::default());
+    }
+
+    /// Notes (ADR 0098): agent-written text only under `untrusted`, the
+    /// anchor's kind as `type`, absent fields omitted, and every field a
+    /// client may leave out defaulted.
+    #[test]
+    fn note_shapes_are_stable() {
+        let req: AddNoteRequest = serde_json::from_value(serde_json::json!({
+            "kind": "gotcha",
+            "anchor": { "type": "path", "value": "src/a.rs" },
+            "title": "t"
+        }))
+        .unwrap();
+        assert_eq!(
+            (req.anchor.kind.as_str(), req.body.as_str(), req.lines),
+            ("path", "", None)
+        );
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            serde_json::json!({
+                "kind": "gotcha",
+                "anchor": { "type": "path", "value": "src/a.rs" },
+                "title": "t"
+            })
+        );
+        let e = NoteEntry {
+            id: 7,
+            kind: "gotcha".into(),
+            trust: "agent".into(),
+            endorsed_by: None,
+            state: "open".into(),
+            principal: "ada".into(),
+            anchor_type: "path".into(),
+            at: None,
+            lines: Some([3, 4]),
+            session: None,
+            created: 1,
+            expires: Some(2),
+            superseded_by: None,
+            reported_by: None,
+            bytes: 1,
+            untrusted: NoteText {
+                title: "t".into(),
+                body: String::new(),
+                anchor: "src/a.rs".into(),
+                agent_model: None,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&e).unwrap(),
+            serde_json::json!({
+                "id": 7, "kind": "gotcha", "trust": "agent", "state": "open",
+                "principal": "ada", "anchor_type": "path", "lines": [3, 4],
+                "created": 1, "expires": 2, "bytes": 1,
+                "untrusted": { "title": "t", "anchor": "src/a.rs" }
+            })
+        );
+        let back: NotesResponse = serde_json::from_value(serde_json::json!({
+            "notes": [{
+                "id": 7, "kind": "x", "trust": "y", "state": "z", "principal": "p",
+                "anchor_type": "path", "created": 1
+            }]
+        }))
+        .unwrap();
+        assert_eq!(back.notes[0].untrusted, NoteText::default());
+        assert_eq!(back.next, None);
     }
 
     #[test]
