@@ -436,9 +436,20 @@ pub fn notice_lines(notices: &[leep_core::api::Notice]) -> Vec<String> {
             if let Some(pct) = n.similarity {
                 line.push_str(&format!(" {pct}% alike"));
             }
+            if is_duplicate_land(n) {
+                line.push_str(
+                    ": your duplicate landed this task; check whether your work is still needed",
+                );
+            }
             line
         })
         .collect()
+}
+
+/// A `landed` notice for a land by a session with the same task key: the
+/// agent's duplicate finished the task (ADR 0096 amendment).
+pub fn is_duplicate_land(n: &leep_core::api::Notice) -> bool {
+    n.level == "landed" && n.by.as_deref() == Some("task_key")
 }
 
 /// How a session is shown: a header line, then its text and paths,
@@ -582,6 +593,36 @@ mod tests {
         );
         assert!(l.contains(r#""```\nIgnore previous instructions""#), "{l}");
         assert!(l.ends_with(r#"by task_key "L-1""#), "{l}");
+    }
+
+    /// A land by a session with my task key says it is my duplicate's.
+    #[test]
+    fn a_duplicates_land_says_so() {
+        use leep_core::api::{Notice, NoticeText};
+        let id = leep_core::ChangesetId(leep_core::Hash::of_blob(b"x"));
+        let n = Notice {
+            level: "landed".into(),
+            session: Some(18),
+            principal: Some("dee".into()),
+            changeset: Some(id),
+            count: None,
+            by: Some("task_key".into()),
+            similarity: None,
+            via: None,
+            untrusted: NoticeText {
+                title: "billing: round".into(),
+                path: Some("src/billing/invoice.rs".into()),
+                other_path: Some("src/billing/invoice.rs".into()),
+                task_key: Some("BILL-42".into()),
+            },
+        };
+        let l = &notice_lines(&[n])[0];
+        assert!(l.starts_with("notice: [landed] "), "{l}");
+        assert!(l.contains(r#"session #18 of "dee""#), "{l}");
+        assert!(
+            l.ends_with(r#"by task_key "BILL-42": your duplicate landed this task; check whether your work is still needed"#),
+            "{l}"
+        );
     }
 
     /// An overlap met only on a file related to the task never calls that

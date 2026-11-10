@@ -169,6 +169,7 @@ fn work_line(w: &ContextWork) -> String {
     if n.via.as_deref() == Some("related") {
         line.push_str(" on a file related to your task, not yours");
     }
+    line.push_str(super::session::duplicate_land_hint(n));
     line
 }
 

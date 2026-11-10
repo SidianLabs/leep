@@ -1811,7 +1811,8 @@ a second kind of mutable state beside refs, behind its own trait,
   Answers to changeset creates, lands, session declarations and listings
   carry at most three notices for the caller's session, highest level
   first: `landed` (a changeset touching its paths landed on its target
-  ref since its base, found by walking at most 64 first parents),
+  ref since its base, found by walking at most 64 first parents; `by
+  task_key` when a session with the same task key landed it),
   `possible_duplicate` (same task key, looked for on every answer, or a
   declared title and approach at least 60% alike by trigrams, compared on
   declarations), `claimed`, `same_file` and `near` (one

@@ -1041,6 +1041,9 @@ Added:
   The CLI sends its working copy's target ref, `leep-mcp` the
   `target_ref` of `leep_commit_and_land`. Nothing else changes; older
   servers ignore it.
+- `Notice.by` may be `task_key` on a `landed` notice too: the changeset
+  was landed by a session with the caller's task key, which `session`,
+  `principal` and `untrusted.task_key` then name. No shape changed.
 
 ## Index leases and bounded queries (additive, ADR 0058)
 

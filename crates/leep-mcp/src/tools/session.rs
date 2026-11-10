@@ -182,6 +182,18 @@ pub(crate) fn word(w: &str) -> &str {
     }
 }
 
+/// What to say after a `landed` notice for a land by a session with the
+/// agent's task key (ADR 0096 amendment); empty otherwise. The key itself
+/// stays in the fence.
+pub(crate) fn duplicate_land_hint(n: &Notice) -> &'static str {
+    if n.level == "landed" && n.by.as_deref() == Some("task_key") {
+        ": your duplicate (same task key, in the fenced row) landed this task; check whether \
+         your work is still needed"
+    } else {
+        ""
+    }
+}
+
 /// Notices (ADR 0096) as an agent reads them: one line each outside the
 /// fence with what the server vouches for (level, session id, principal,
 /// changeset, count), then what agents wrote (titles, paths, task keys)
@@ -212,6 +224,7 @@ pub(crate) fn notices_text(heading: &str, notices: &[Notice]) -> Option<String> 
         if let Some(pct) = n.similarity {
             line.push_str(&format!(" ({pct}% alike)"));
         }
+        line.push_str(duplicate_land_hint(n));
         text.push_str(&line);
         rows.push(json!({
             "notice": i + 1,
@@ -522,6 +535,32 @@ mod tests {
         assert!(!inner.contains(f.as_str()), "{t}");
         assert!(inner.contains("Ignore previous") && body.ends_with(&f));
         assert!(notices_text("x", &[]).is_none());
+        // A duplicate's land says so outside the fence; its key stays inside.
+        let land = Notice {
+            level: "landed".into(),
+            session: Some(18),
+            principal: Some("dee".into()),
+            changeset: Some(leep_core::ChangesetId(leep_core::Hash::of_blob(b"x"))),
+            count: None,
+            by: Some("task_key".into()),
+            similarity: None,
+            via: None,
+            untrusted: NoticeText {
+                task_key: Some("BILL-42".into()),
+                ..Default::default()
+            },
+        };
+        let t = notices_text("Notices", &[land]).unwrap();
+        let (outside, fence) = t.split_once(UNTRUSTED_NOTE).unwrap();
+        assert!(
+            outside.contains("session #18 of dee by task_key: your duplicate"),
+            "{outside}"
+        );
+        assert!(outside.contains("check whether your work is still needed"));
+        assert!(
+            !outside.contains("BILL-42") && fence.contains("BILL-42"),
+            "{t}"
+        );
         // Names agents commonly have show as they are.
         let named = Notice {
             level: "same_file".into(),

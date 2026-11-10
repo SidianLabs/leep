@@ -66,6 +66,8 @@ The demo is also a check on how the notices read. Things to look at:
 - Both agents of a duplicate pair are told: eli at `leep_task_start`, dee
   on its next answer (the task-key lookup runs on creates, lands and notice
   reads too), as `possible_duplicate` by task key.
+- eli's `landed` notice for dee's land is tagged `by task_key`, naming dee
+  and telling eli its duplicate landed the task.
 - `leep_commit_and_land` creates and lands in one call, so an MCP agent
   hears of overlaps on its commit after it has landed.
 - Packs repeat the same owners and last change for every co-changed file.

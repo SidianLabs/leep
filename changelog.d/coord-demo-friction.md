@@ -14,3 +14,7 @@
   send the new request header `Leep-Target-Ref` on changeset creates, the
   inferred session records it, and a session with no target ref is taken
   to land on `main` (ADR 0095 and 0096 amendments).
+- **Changed.** A `landed` notice for a land by a session with your task
+  key says so: `by: task_key`, naming that session and the key, and the
+  CLI and MCP tools add "your duplicate landed this task; check whether
+  your work is still needed" (ADR 0096 amendment).

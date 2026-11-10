@@ -114,7 +114,8 @@ at most three per answer, each said once, highest level first (`landed`,
 a session, the MCP server asks the Leep server for them at most every 30
 seconds. Each notice is a numbered line outside the fence with what the
 server vouches for (level, session id, principal, landed changeset id,
-count, `by` and similarity); a level or name that is not a word of
+count, `by` and similarity; a `landed` notice `by task_key` adds that
+your duplicate landed the task, keeping the key in the fence); a level or name that is not a word of
 letters, digits, `_`, `-` and `.` shows as `?`. Titles, paths and task
 keys follow in a fenced `untrusted` block, one row per notice, under the
 same fixed line, with C1 controls, line separators and bidirectional controls

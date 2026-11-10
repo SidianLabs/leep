@@ -236,7 +236,9 @@ or a directory holding it), `claimed` (another session claimed it),
 `possible_duplicate` (same task key, told to both sessions on their next
 answer, or a declared title and approach much like yours; also `N%
 alike`) and `landed` (a change touching your paths
-landed on your target ref since your base: sync before you land). A
+landed on your target ref since your base: sync before you land; `by
+task_key` when a session with your task key landed it, with a hint to
+check whether your work is still needed). A
 crowded path is one line with a count. `commit`, `land`, `session
 start|update`, `who` and `status` show them; `--json` output on stdout also
 carries them where the answer does. Titles, paths and names are quoted and

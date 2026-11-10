@@ -709,3 +709,74 @@ async fn an_undeclared_session_hears_of_lands() {
         .unwrap();
     assert_eq!(s.target_ref.as_deref(), Some("main"));
 }
+
+/// A land by a session with my task key is my duplicate's: its `landed`
+/// notice says `by: task_key` and names that session and the key; a land
+/// by anyone else is a plain `landed` (the demo's eli was told only that a
+/// changeset landed).
+#[tokio::test]
+async fn a_duplicates_land_is_named_as_such() {
+    let r = repo();
+    let (seed, _) = commit(&r, "root", "r-0", &[], &["README"]).await;
+    let LandResponse::Landed { landed: base, .. } =
+        r.land_as(seed, "main", Some("root")).await.unwrap()
+    else {
+        panic!()
+    };
+    let mut ids = Vec::new();
+    for (who, key) in [("dee", "d-1"), ("eli", "e-1")] {
+        let mut d = declare(key, "Fix invoice totals");
+        d.task_key = Some("BILL-42".into());
+        d.base = Some(base);
+        d.scope = Some(vec!["src/billing".into()]);
+        ids.push(
+            r.declare_session_with(who, d, None)
+                .await
+                .unwrap()
+                .session
+                .id,
+        );
+    }
+    // Someone else lands in billing first: plain.
+    let (other, _) = commit(&r, "bo", "b-1", &[base], &["src/billing/tax.rs"]).await;
+    let LandResponse::Landed { landed: l1, .. } =
+        r.land_as(other, "main", Some("bo")).await.unwrap()
+    else {
+        panic!()
+    };
+    r.note_landed(other, l1, Some("bo")).await.unwrap();
+    // dee lands its fix (rebased by the server onto bo's).
+    let (mine, _) = commit(&r, "dee", "d-1", &[base], &["src/billing/invoice.rs"]).await;
+    let LandResponse::Landed { landed: l2, .. } =
+        r.land_as(mine, "main", Some("dee")).await.unwrap()
+    else {
+        panic!()
+    };
+    r.note_landed(mine, l2, Some("dee")).await.unwrap();
+    let dee = ids[0];
+    let n = r.notices_for("eli", "e-1", &NoticeAsk::default()).await;
+    assert_eq!(levels(&n), ["landed", "landed"], "{n:?}");
+    let twin = n.iter().find(|n| n.changeset == Some(l2)).unwrap();
+    assert_eq!(twin.by.as_deref(), Some("task_key"));
+    assert_eq!(twin.session, Some(dee));
+    assert_eq!(twin.principal.as_deref(), Some("dee"));
+    assert_eq!(twin.untrusted.task_key.as_deref(), Some("BILL-42"));
+    let plain = n.iter().find(|n| n.changeset == Some(l1)).unwrap();
+    assert!(plain.by.is_none() && plain.session.is_none(), "{plain:?}");
+
+    // A pack lists the same land, tagged, as a land of its own.
+    let mut a = crate::context::ContextAsk {
+        principal: "eli".into(),
+        ..Default::default()
+    };
+    a.req.task = "Fix invoice totals".into();
+    a.req.session = Some("e-1".into());
+    let p = r.context_pack(&a).await.unwrap();
+    let w = p
+        .in_flight
+        .iter()
+        .find(|w| w.notice.changeset == Some(l2))
+        .unwrap_or_else(|| panic!("{:?}", p.in_flight));
+    assert!(w.id.starts_with("landed:"), "{}", w.id);
+    assert_eq!(w.notice.by.as_deref(), Some("task_key"));
+}

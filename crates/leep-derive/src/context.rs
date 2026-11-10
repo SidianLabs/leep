@@ -883,9 +883,15 @@ impl Repo {
             return Err(Omit::Off);
         }
         let work = async {
-            let (p, l) = tokio::join!(self.path_overlaps(s, own, related), self.landed_overlaps(s));
+            let (p, l, keyed) = tokio::join!(
+                self.path_overlaps(s, own, related),
+                self.landed_overlaps(s),
+                self.key_sessions(s)
+            );
+            let mut landed = l?;
+            crate::notices::tag_duplicate_lands(s, &mut landed, &keyed?);
             let mut found = p?;
-            found.extend(l?);
+            found.extend(landed);
             found.sort_by_key(|f| std::cmp::Reverse(crate::notices::rank(f)));
             Ok(one_per_session(found))
         };
@@ -986,7 +992,8 @@ fn merge_duplicates(
     let in_flight: Vec<ContextWork> = in_flight
         .into_iter()
         .filter(|w| match w.notice.session {
-            Some(id) if dup_ids.contains(&id) => {
+            // A duplicate's land stays a land of its own.
+            Some(id) if dup_ids.contains(&id) && w.notice.changeset.is_none() => {
                 let t = &w.notice.untrusted;
                 paths.insert(id, (t.path.clone(), t.other_path.clone()));
                 false
@@ -1020,8 +1027,8 @@ fn works(found: Vec<Found>, max: usize) -> Vec<ContextWork> {
         .take(max)
         .map(|f| {
             let id = match (&f.notice.session, &f.notice.changeset) {
-                (Some(s), _) => format!("session:{s}"),
-                (None, Some(c)) => format!("landed:{}", &c.to_string()[..12]),
+                (_, Some(c)) => format!("landed:{}", &c.to_string()[..12]),
+                (Some(s), None) => format!("session:{s}"),
                 _ => item_id("crowd", &f.key),
             };
             work(id, f.notice)

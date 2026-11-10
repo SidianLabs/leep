@@ -63,6 +63,8 @@ pub const LANDED_WINDOW: usize = 64;
 pub const OWN_WALK: usize = 32;
 /// Most recent active declared sessions compared for a similar intent.
 pub const DUPLICATE_CANDIDATES: usize = 200;
+/// Sessions of one task key read per answer, live and landed.
+pub const KEY_SESSIONS: usize = 64;
 /// Most sessions of one task key flagged.
 pub const DUPLICATE_BY_KEY: usize = 20;
 /// Trigram similarity (percent) of two intents from which they are flagged.
@@ -127,6 +129,10 @@ pub struct Found {
     /// My path it is about, and whether I declared it (scope or claim),
     /// so a later scope change can be counted as following it.
     pub mine: Option<(String, bool)>,
+    /// `landed`: the landed changeset's `agent.session` and the principal
+    /// that created it (through server rebases), when known, to tell a
+    /// duplicate's land.
+    pub landed_by: Option<(String, Option<String>)>,
 }
 
 /// A session's `landed` walk, as far as it got: of the target ref at
@@ -287,6 +293,68 @@ impl NoticeState {
     }
 }
 
+/// Live sessions of `keyed` (sessions with `s`'s task key) as duplicates,
+/// at most [`DUPLICATE_BY_KEY`]. The same principal under the same key is
+/// `s`'s own earlier session, never flagged.
+pub(crate) fn key_duplicates(s: &Session, keyed: &[Session]) -> Vec<Found> {
+    let Some(k) = &s.task_key else {
+        return Vec::new();
+    };
+    let now = unix_now();
+    keyed
+        .iter()
+        .filter(|o| {
+            o.id != s.id
+                && !o.state.is_ended()
+                && o.state_at(now) != SessionState::Expired
+                && o.task_key.as_ref() == Some(k)
+                && !same_agent_and_task(s, o)
+        })
+        .take(DUPLICATE_BY_KEY)
+        .map(|o| {
+            let mut n = notice(NoticeLevel::PossibleDuplicate, Some(o));
+            n.by = Some("task_key".into());
+            n.untrusted.task_key = Some(k.clone());
+            Found {
+                level: NoticeLevel::PossibleDuplicate,
+                key: format!("session:{}", o.id),
+                notice: n,
+                mine: None,
+                landed_by: None,
+            }
+        })
+        .collect()
+}
+
+/// Mark each `landed` overlap that a session with `s`'s task key landed
+/// (of `keyed`): `by: task_key`, naming that session and the key, so the
+/// agent reads it as its duplicate's land of the task. Matched by the
+/// changeset's `agent.session` and, when the server recorded one, its
+/// creator; never `s`'s own principal (its own restart).
+pub(crate) fn tag_duplicate_lands(s: &Session, landed: &mut [Found], keyed: &[Session]) {
+    let Some(k) = &s.task_key else {
+        return;
+    };
+    for f in landed.iter_mut() {
+        let Some((key, creator)) = &f.landed_by else {
+            continue;
+        };
+        let twin = keyed.iter().find(|o| {
+            o.id != s.id
+                && &o.agent_session == key
+                && o.task_key.as_ref() == Some(k)
+                && o.principal != s.principal
+                && creator.as_ref().is_none_or(|c| c == &o.principal)
+        });
+        if let Some(o) = twin {
+            f.notice.by = Some("task_key".into());
+            f.notice.session = Some(o.id);
+            f.notice.principal = Some(o.principal.clone());
+            f.notice.untrusted.task_key = Some(k.clone());
+        }
+    }
+}
+
 /// Each other session once, at its highest level (`found` is ranked),
 /// taking the paths a lower level of it named when the highest has none:
 /// a duplicate that also claims my file is one notice, not two.
@@ -318,20 +386,17 @@ pub(crate) fn one_per_session(found: Vec<Found>) -> Vec<Found> {
 
 /// One part of the overlaps, within `bound`; nothing (counted) if it
 /// fails or runs out of time.
-async fn part(
-    bound: Duration,
-    f: impl std::future::Future<Output = Result<Vec<Found>>>,
-) -> Vec<Found> {
+async fn part<T: Default>(bound: Duration, f: impl std::future::Future<Output = Result<T>>) -> T {
     match tokio::time::timeout(bound, f).await {
         Ok(Ok(found)) => found,
         Ok(Err(e)) => {
             metrics::counter!("leep_notices_omitted_total", "reason" => "error").increment(1);
             tracing::debug!(error = %e, "computing notices failed");
-            Vec::new()
+            T::default()
         }
         Err(_) => {
             metrics::counter!("leep_notices_omitted_total", "reason" => "timeout").increment(1);
-            Vec::new()
+            T::default()
         }
     }
 }
@@ -572,17 +637,18 @@ impl Repo {
                 Vec::new()
             }
         };
-        let (paths, landed, keyed, similar) = tokio::join!(
+        let (paths, mut landed, keyed, similar) = tokio::join!(
             part(bound, self.path_overlaps(s, focus, &[])),
             part(bound, self.landed_overlaps(s)),
-            part(bound, self.key_duplicates(s)),
+            part(bound, self.key_sessions(s)),
             similar,
         );
+        tag_duplicate_lands(s, &mut landed, &keyed);
         let mut found = paths;
         found.extend(landed);
         // By key before by wording: one session flagged both ways is one
         // notice, `by: task_key`.
-        found.extend(keyed);
+        found.extend(key_duplicates(s, &keyed));
         found.extend(similar);
         // Stable: within a level, the order each part found them in.
         found.sort_by_key(|f| std::cmp::Reverse(rank(f)));
@@ -653,6 +719,7 @@ impl Repo {
                     key: format!("hot:{theirs}"),
                     notice: n,
                     mine: Some((p.path.clone(), p.declared)),
+                    landed_by: None,
                 });
                 hot.insert(theirs);
             }
@@ -688,6 +755,7 @@ impl Repo {
                 key: format!("session:{id}"),
                 notice: n,
                 mine: Some((p.path.clone(), p.declared)),
+                landed_by: None,
             });
         }
         Ok(out)
@@ -746,6 +814,19 @@ impl Repo {
                     changed_near(&cs, &p.path).map(|c| (&p.path, p.declared, c.to_string()))
                 });
                 if let Some((p, declared, theirs)) = hit {
+                    // Who landed it, to tell a duplicate's land (read only
+                    // for a hit; kept with the walk).
+                    let landed_by = match cs.extra.get(EXTRA_AGENT_SESSION) {
+                        Some(k) => Some((
+                            k.clone(),
+                            self.created_by_through_rebases(id)
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|c| c.principal),
+                        )),
+                        None => None,
+                    };
                     let mut n = notice(NoticeLevel::Landed, None);
                     n.changeset = Some(id);
                     n.untrusted.title =
@@ -757,6 +838,7 @@ impl Repo {
                         key: format!("landed:{id}"),
                         notice: n,
                         mine: Some((p.clone(), declared)),
+                        landed_by,
                     });
                 }
             }
@@ -841,7 +923,7 @@ impl Repo {
     /// trigrams among the [`DUPLICATE_CANDIDATES`] newest active sessions
     /// (declared ones only, on both sides).
     pub(crate) async fn duplicates(&self, s: &Session) -> Result<Vec<Found>> {
-        let mut out = self.key_duplicates(s).await?;
+        let mut out = key_duplicates(s, &self.key_sessions(s).await?);
         let flagged: BTreeSet<u64> = out.iter().filter_map(|f| f.notice.session).collect();
         out.extend(
             self.similar_duplicates(s)
@@ -852,41 +934,22 @@ impl Repo {
         Ok(out)
     }
 
-    /// Live sessions with `s`'s task key (at most [`DUPLICATE_BY_KEY`]),
-    /// from one indexed listing: none without a key. The same principal
-    /// under the same key is `s`'s own earlier session, never flagged.
-    pub(crate) async fn key_duplicates(&self, s: &Session) -> Result<Vec<Found>> {
-        let Some(coord) = self.coord.as_ref() else {
+    /// Sessions with `s`'s task key, live or landed, newest first, at
+    /// most [`KEY_SESSIONS`]: one indexed listing, none without a key.
+    /// Live ones are duplicates; landed ones tell a duplicate's land.
+    pub(crate) async fn key_sessions(&self, s: &Session) -> Result<Vec<Session>> {
+        let (Some(coord), Some(k)) = (self.coord.as_ref(), &s.task_key) else {
             return Ok(Vec::new());
         };
-        let now = unix_now();
-        let live = |o: &Session| {
-            o.id != s.id && o.state_at(now) != SessionState::Expired && !same_agent_and_task(s, o)
-        };
-        let mut out = Vec::new();
-        if let Some(k) = &s.task_key {
-            let same = coord
-                .list_sessions(&SessionFilter {
-                    task_key: Some(k.clone()),
-                    states: vec![SessionState::Active],
-                    limit: DUPLICATE_BY_KEY + 1,
-                    skip_paths: true,
-                    ..Default::default()
-                })
-                .await?;
-            for o in same.iter().filter(|o| live(o)).take(DUPLICATE_BY_KEY) {
-                let mut n = notice(NoticeLevel::PossibleDuplicate, Some(o));
-                n.by = Some("task_key".into());
-                n.untrusted.task_key = Some(k.clone());
-                out.push(Found {
-                    level: NoticeLevel::PossibleDuplicate,
-                    key: format!("session:{}", o.id),
-                    notice: n,
-                    mine: None,
-                });
-            }
-        }
-        Ok(out)
+        coord
+            .list_sessions(&SessionFilter {
+                task_key: Some(k.clone()),
+                states: vec![SessionState::Active, SessionState::Landed],
+                limit: KEY_SESSIONS,
+                skip_paths: true,
+                ..Default::default()
+            })
+            .await
     }
 
     /// Live declared sessions whose title and approach are at least
@@ -932,6 +995,7 @@ impl Repo {
                 key: format!("session:{}", o.id),
                 notice: n,
                 mine: None,
+                landed_by: None,
             });
         }
         Ok(out)
@@ -1086,6 +1150,7 @@ mod tests {
             key: key.into(),
             notice: notice(level, None),
             mine: Some(("src/a.rs".into(), true)),
+            landed_by: None,
         }
     }
 

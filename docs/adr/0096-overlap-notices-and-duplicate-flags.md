@@ -250,3 +250,22 @@ now name it on creates (`Leep-Target-Ref`, ADR 0095 amendment), and a
 session that still has none (an older client) is walked against `main`,
 the ref clients land on by default. A session whose work lands elsewhere
 and says so is never walked against `main`.
+
+### A duplicate's land says so (2026-11-10)
+In the demo eli heard "[landed] changeset ... landed on your target ref"
+when dee, its duplicate on `BILL-42`, landed the task, and nothing said
+whose land it was. The task-key listing of the first amendment now reads
+sessions with the key that are live or landed (at most 64, still one
+indexed listing; the live ones are the duplicates), and the `landed` walk
+keeps, for each changeset it reports, its `agent.session` and its creator
+(through server rebases). A landed changeset whose `agent.session` is that
+of a session with my task key, created by that session's principal when
+the server recorded one, and not of my own principal (my own restart), is
+tagged: `by: task_key`, `session` and `principal` of that session, and
+`untrusted.task_key`. It is still keyed by the changeset for saying once,
+and it replaces that session's `possible_duplicate` (one notice per
+session, the higher level). Clients add a hint: the CLI ends the line with
+"your duplicate landed this task; check whether your work is still
+needed", the MCP tools say the same outside the fence and keep the task
+key in the fenced row. A context pack tags its `landed` items the same way
+and keeps them as lands (`landed:` ids), never folded into the duplicate.
