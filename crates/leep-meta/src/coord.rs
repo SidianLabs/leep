@@ -910,6 +910,7 @@ impl CoordStore for PgCoordStore {
         if !self.notes {
             return Err(no_notes());
         }
+        f.check()?;
         if f.limit == 0 {
             return Ok(Vec::new());
         }
@@ -925,6 +926,7 @@ impl CoordStore for PgCoordStore {
         if !self.notes {
             return Err(no_notes());
         }
+        leep_core::coord::check_anchor_probe(anchors)?;
         if anchors.is_empty() || cap == 0 {
             return Ok(Vec::new());
         }
@@ -1562,6 +1564,7 @@ impl CoordStore for SqliteCoordStore {
         if !self.notes {
             return Err(no_notes());
         }
+        f.check()?;
         if f.limit == 0 {
             return Ok(Vec::new());
         }
@@ -1577,6 +1580,7 @@ impl CoordStore for SqliteCoordStore {
         if !self.notes {
             return Err(no_notes());
         }
+        leep_core::coord::check_anchor_probe(anchors)?;
         if anchors.is_empty() || cap == 0 {
             return Ok(Vec::new());
         }

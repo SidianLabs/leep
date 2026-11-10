@@ -1162,7 +1162,43 @@ pub struct NoteFilter {
     pub limit: usize,
 }
 
+/// Most anchors one [`CoordStore::notes_at`] call probes.
+pub const MAX_NOTE_ANCHORS: usize = 512;
+
+/// A probe of the anchor index: each anchor at most [`MAX_PATH_BYTES`]
+/// (a changeset id is 64), and at most [`MAX_NOTE_ANCHORS`] of them, so one
+/// call binds a bounded number of values.
+pub fn check_anchor_probe(anchors: &[String]) -> Result<()> {
+    if anchors.len() > MAX_NOTE_ANCHORS {
+        return Err(Error::Invalid(format!(
+            "at most {MAX_NOTE_ANCHORS} note anchors at once, got {}",
+            anchors.len()
+        )));
+    }
+    if anchors.iter().any(|a| a.len() > MAX_PATH_BYTES) {
+        return Err(Error::Invalid(format!(
+            "a note anchor is at most {MAX_PATH_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
 impl NoteFilter {
+    /// Refuse a filter whose probes are not bounded: a path longer than
+    /// [`MAX_PATH_BYTES`] (at most 128 ancestors then) or a changeset that is
+    /// not a 64-digit id. Every store calls it.
+    pub fn check(&self) -> Result<()> {
+        if self.path.as_ref().is_some_and(|p| p.len() > MAX_PATH_BYTES) {
+            return Err(Error::Invalid(format!(
+                "a note path is at most {MAX_PATH_BYTES} bytes"
+            )));
+        }
+        if self.changeset.as_ref().is_some_and(|c| c.len() > 64) {
+            return Err(Error::Invalid("a note changeset is a 64-digit id".into()));
+        }
+        Ok(())
+    }
+
     /// Whether `n` passes, for stores that filter in memory.
     pub fn matches(&self, n: &Note) -> bool {
         self.path.as_ref().is_none_or(|p| {

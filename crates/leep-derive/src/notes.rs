@@ -15,7 +15,7 @@ use leep_core::coord::{
     check_anchor, check_key, normalize_path, AnchorType, CoordStore, NewNote, Note, NoteChange,
     NoteFilter, NoteKind, NoteState, NoteSweep, NoteTrust, SessionFilter, SessionState,
     AGENT_NOTE_TTL_SECS, HUMAN_NOTE_TTL_SECS, MAX_NOTES_PER_HOUR, MAX_OPEN_NOTES_PER_PRINCIPAL,
-    NOTES_PER_HOUR_MARKER, TOO_MANY_NOTES_MARKER,
+    MAX_PATH_BYTES, NOTES_PER_HOUR_MARKER, TOO_MANY_NOTES_MARKER,
 };
 use leep_core::store::unix_now;
 use leep_core::{Error, Result, TreeEntry};
@@ -231,6 +231,11 @@ impl Repo {
             .unwrap_or(DEFAULT_NOTE_LIMIT)
             .clamp(1, MAX_NOTE_LIMIT);
         let path = match q.path.as_deref().map(normalize_path) {
+            Some(p) if p.len() > MAX_PATH_BYTES => {
+                return Err(Error::Invalid(format!(
+                    "a note path is at most {MAX_PATH_BYTES} bytes"
+                )))
+            }
             Some(p) if !p.is_empty() => {
                 leep_core::RepoPath::new(p.clone())?;
                 Some(p)
@@ -647,6 +652,35 @@ mod tests {
         // An operator revokes every open note of a principal.
         assert_eq!(r.revoke_notes("hugo").await.unwrap(), 1);
         assert_eq!(r.note(h.id).await.unwrap().state, "retracted");
+    }
+
+    /// A listing's path is bounded like a stored one, so a long path cannot
+    /// make the store bind one value per ancestor (a 64 KiB `a/a/...` would
+    /// be 32,768 of them).
+    #[tokio::test]
+    async fn a_listing_path_is_bounded() {
+        let r = repo();
+        let long = "a/".repeat(32 * 1024) + "b";
+        let q = NoteQuery {
+            path: Some(long),
+            ..Default::default()
+        };
+        assert!(matches!(r.notes(&q).await, Err(Error::Invalid(_))));
+        let at_limit = format!("a/{}", "b".repeat(leep_core::coord::MAX_PATH_BYTES - 2));
+        let q = NoteQuery {
+            path: Some(at_limit),
+            ..Default::default()
+        };
+        assert!(r.notes(&q).await.is_ok());
+        // The store refuses too, whoever calls it.
+        let f = leep_core::coord::NoteFilter {
+            path: Some("a/".repeat(200)),
+            limit: 1,
+            ..Default::default()
+        };
+        assert!(r.coord().unwrap().list_notes(&f).await.is_err());
+        let many: Vec<String> = (0..10_000).map(|i| format!("p{i}")).collect();
+        assert!(r.coord().unwrap().notes_at(&many, 10).await.is_err());
     }
 
     #[tokio::test]

@@ -326,6 +326,7 @@ impl CoordStore for MemoryCoordStore {
     }
 
     async fn list_notes(&self, f: &NoteFilter) -> Result<Vec<Note>> {
+        f.check()?;
         Ok(self
             .rows
             .lock()
@@ -340,6 +341,7 @@ impl CoordStore for MemoryCoordStore {
     }
 
     async fn notes_at(&self, anchors: &[String], cap: usize) -> Result<Vec<Note>> {
+        crate::coord::check_anchor_probe(anchors)?;
         Ok(self
             .rows
             .lock()
@@ -1064,6 +1066,16 @@ pub async fn check_notes_contract(store: &dyn CoordStore) {
     })
     .await
     .is_empty());
+    // Probes are bounded: a path past MAX_PATH_BYTES, or too many anchors.
+    let long = NoteFilter {
+        path: Some("a/".repeat(200)),
+        ..all.clone()
+    };
+    assert!(store.list_notes(&long).await.is_err());
+    let many: Vec<String> = (0..=crate::coord::MAX_NOTE_ANCHORS)
+        .map(|i| format!("p{i}"))
+        .collect();
+    assert!(store.notes_at(&many, 1).await.is_err());
     // Exact anchors, open only, capped.
     let anchors = ["src/auth/token.rs".to_string(), "src/auth".to_string()];
     assert_eq!(
