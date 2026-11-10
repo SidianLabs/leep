@@ -253,7 +253,9 @@ async fn notes_chatter(r: &Repo, rng: &mut Rng, agent: usize) {
         .await;
     match rng.below(4) {
         0 => {
-            let _ = r.report_note(n.id, "rex").await;
+            let _ = r
+                .report_note(n.id, &crate::notes::NoteActor::agent("rex"))
+                .await;
         }
         1 => {
             let _ = r.retract_note(n.id, who).await;

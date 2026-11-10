@@ -22,9 +22,9 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use leep_core::api::{
-    ContextChange, ContextCut, ContextFile, ContextOmitted, ContextOwners, ContextPack,
-    ContextRefHealth, ContextRequest, ContextSuspect, ContextText, ContextWork, Notice,
-    CONTEXT_DEFAULT_BUDGET, CONTEXT_MAX_BUDGET, CONTEXT_MAX_PATHS, CONTEXT_MAX_TASK_BYTES,
+    ContextChange, ContextCut, ContextFile, ContextNote, ContextOmitted, ContextOwners,
+    ContextPack, ContextRefHealth, ContextRequest, ContextSuspect, ContextText, ContextWork,
+    Notice, CONTEXT_DEFAULT_BUDGET, CONTEXT_MAX_BUDGET, CONTEXT_MAX_PATHS, CONTEXT_MAX_TASK_BYTES,
     CONTEXT_MIN_BUDGET,
 };
 use leep_core::changeset::{EXTRA_AGENT_MODEL, EXTRA_AGENT_SESSION};
@@ -38,6 +38,7 @@ use serde::Serialize;
 use tokio::time::Instant;
 
 use crate::indexing::Freshness;
+use crate::notes_view::{pack_notes, NoteBudget, NoteSelect, PACK_NOTES_CHECKED};
 use crate::notices::{cut, one_per_session, Found, MAX_OVERLAPS, NOTICE_TITLE_BYTES};
 use crate::owners::{CarryDirective, OwnersResolver};
 use crate::{LogParams, Repo, SearchQuery};
@@ -76,18 +77,19 @@ const HISTORY_CONCURRENCY: usize = 8;
 /// The sections, in the order the pack lists them, each with its share of
 /// the budget in percent. A section that needs less leaves the rest to the
 /// others, in [`SPARE_ORDER`].
-pub const SECTIONS: [(&str, u64); 6] = [
-    ("files", 25),
+pub const SECTIONS: [(&str, u64); 7] = [
+    ("files", 20),
     ("owners", 10),
-    ("history", 20),
+    ("history", 15),
     ("in_flight", 20),
     ("ref_health", 5),
     ("duplicates", 20),
+    ("notes", 10),
 ];
 /// Which sections take unused budget first: what only the server knows
 /// (ref health, a single small item that says whether the ref is red;
-/// live work; duplicates) before what a client can find itself.
-const SPARE_ORDER: [usize; 6] = [4, 3, 5, 0, 2, 1];
+/// live work; duplicates; notes) before what a client can find itself.
+const SPARE_ORDER: [usize; 7] = [4, 3, 5, 6, 0, 2, 1];
 /// Most owner names, and `OWNERS` files, an owners item lists.
 pub const MAX_OWNERS: usize = 16;
 /// Longest agent-written name (model, session key, owner) an item repeats.
@@ -111,6 +113,9 @@ enum Omit {
     Timeout,
     Error,
     Off,
+    /// Part of a section was left out by a bound on its work (notes: the
+    /// probe's row cap, or notes past the check budget); the rest came.
+    Bound,
 }
 
 impl Omit {
@@ -119,6 +124,7 @@ impl Omit {
             Omit::Timeout => "timeout",
             Omit::Error => "error",
             Omit::Off => "off",
+            Omit::Bound => "bound",
         }
     }
 }
@@ -157,7 +163,7 @@ fn item_id(kind: &str, key: &str) -> String {
 }
 
 /// The size of `item`'s JSON once `set` has written that size into it.
-fn sized<T: Serialize>(mut item: T, set: impl Fn(&mut T, u64)) -> T {
+pub(crate) fn sized<T: Serialize>(mut item: T, set: impl Fn(&mut T, u64)) -> T {
     set(&mut item, 0);
     // The JSON with a one-digit size, less that digit.
     let base = serde_json::to_vec(&item)
@@ -346,9 +352,9 @@ impl Files {
 /// `budget`: first each takes a prefix within its quota, then the budget
 /// left is offered, in [`SPARE_ORDER`], to the next items of each.
 /// Answers how many of each to keep.
-pub fn keep_within(sizes: &[Vec<u64>; 6], budget: u64) -> [usize; 6] {
-    let mut kept = [0usize; 6];
-    let mut used = [0u64; 6];
+pub fn keep_within(sizes: &[Vec<u64>; 7], budget: u64) -> [usize; 7] {
+    let mut kept = [0usize; 7];
+    let mut used = [0u64; 7];
     for (i, (_, pct)) in SECTIONS.iter().enumerate() {
         let quota = budget * pct / 100;
         for b in &sizes[i] {
@@ -440,7 +446,7 @@ impl Repo {
         };
         let me = self.context_session(ask, &c, session.clone(), session_key, &task_text);
         let section_until = || deadline.min(Instant::now() + SECTION_BOUND);
-        let (owners, history, (in_flight, dups), health) = tokio::join!(
+        let (owners, history, (in_flight, dups), health, notes) = tokio::join!(
             bounded(
                 "owners",
                 section_until(),
@@ -457,11 +463,22 @@ impl Repo {
                 section_until(),
                 self.context_ref_health(ask, &c.target_ref, &paths)
             ),
+            self.context_notes(head, &detail, section_until()),
         );
         let owners = take(&mut omitted, "owners", owners);
         let history = take(&mut omitted, "history", history);
         let in_flight = take(&mut omitted, "in_flight", in_flight);
         let duplicates = take(&mut omitted, "duplicates", dups);
+        let notes = match notes {
+            Ok((items, partial)) => {
+                omitted.extend(partial.into_iter().map(|o| ("notes", o)));
+                items
+            }
+            Err(o) => {
+                omitted.push(("notes", o));
+                Vec::new()
+            }
+        };
         let (in_flight, duplicates) = merge_duplicates(in_flight, duplicates);
         let ref_health: Vec<ContextRefHealth> = match health {
             Ok(h) => vec![h],
@@ -512,6 +529,7 @@ impl Repo {
             in_flight,
             ref_health: None,
             duplicates,
+            notes,
             cut: Vec::new(),
             omitted: Vec::new(),
         };
@@ -520,13 +538,14 @@ impl Repo {
         // not) fits rather than the whole item going.
         let (mut suspects_cut, mut suspect_bytes) = (0u64, 0u64);
         let (sizes, kept) = loop {
-            let sizes: [Vec<u64>; 6] = [
+            let sizes: [Vec<u64>; 7] = [
                 pack.files.iter().map(|i| i.bytes).collect(),
                 pack.owners.iter().map(|i| i.bytes).collect(),
                 pack.history.iter().map(|i| i.bytes).collect(),
                 pack.in_flight.iter().map(|i| i.bytes).collect(),
                 ref_health.iter().map(|i| i.bytes).collect(),
                 pack.duplicates.iter().map(|i| i.bytes).collect(),
+                pack.notes.iter().map(|i| i.bytes).collect(),
             ];
             let kept = keep_within(&sizes, c.budget);
             match ref_health.first_mut() {
@@ -569,6 +588,17 @@ impl Repo {
         ref_health.truncate(kept[4]);
         pack.ref_health = ref_health.pop();
         pack.duplicates.truncate(kept[5]);
+        pack.notes.truncate(kept[6]);
+        for n in &pack.notes {
+            let tier = if n.endorsed_by.is_some() {
+                "endorsed"
+            } else if n.trust == "human" {
+                "human"
+            } else {
+                "agent"
+            };
+            metrics::counter!("leep_context_notes_total", "trust" => tier).increment(1);
+        }
         // In section order, so the same failures read the same.
         omitted.sort_by_key(|(name, _)| {
             ["search", "co_change"]
@@ -938,6 +968,58 @@ impl Repo {
         (in_flight, duplicates)
     }
 
+    /// Notes on `paths` and the directories above them, as
+    /// [`Repo::notes_for`] ranks them for `GET /v1/notes` too, staleness
+    /// judged at `head`; stale agent notes left out (counted). Answers the
+    /// items and why the section is partial, if it is: `bound` when the
+    /// probe hit its row cap or notes went unchecked past the check budget,
+    /// `timeout` when checks ran out of time (those notes are unknown, so
+    /// none of them is served as endorsed). A store whose schema predates
+    /// notes is `off`, as without a coordination store.
+    async fn context_notes(
+        &self,
+        head: ChangesetId,
+        paths: &[String],
+        until: Instant,
+    ) -> Part<(Vec<ContextNote>, Vec<Omit>)> {
+        if self.coord.is_none() {
+            return Err(Omit::Off);
+        }
+        // Staleness checks stop first, so the lookup is never lost to them.
+        let checks = until.min(Instant::now() + SECTION_BOUND / 2);
+        let budget = NoteBudget {
+            checked: PACK_NOTES_CHECKED,
+            until: checks,
+        };
+        let found = tokio::time::timeout_at(
+            until,
+            self.notes_for(NoteSelect::Paths(paths), Some(head), budget, unix_now()),
+        )
+        .await;
+        let view = match found {
+            Ok(Ok(v)) => v,
+            // Only `no_notes` answers NotFound here: a schema before 0010.
+            Ok(Err(Error::NotFound(_))) => return Err(Omit::Off),
+            Ok(Err(e)) => {
+                tracing::debug!(section = "notes", error = %e, "context section failed");
+                return Err(Omit::Error);
+            }
+            Err(_) => return Err(Omit::Timeout),
+        };
+        let mut partial = Vec::new();
+        if view.capped || view.unchecked > 0 {
+            partial.push(Omit::Bound);
+        }
+        if view.timed_out > 0 {
+            partial.push(Omit::Timeout);
+        }
+        let (items, suppressed) = pack_notes(view.notes, paths);
+        if suppressed > 0 {
+            metrics::counter!("leep_notes_stale_suppressed_total").increment(suppressed);
+        }
+        Ok((items, partial))
+    }
+
     /// The ref's known-good state and red, and the suspects of a red head
     /// that touch `paths`.
     async fn context_ref_health(
@@ -1155,13 +1237,15 @@ mod tests {
             vec![100; 5],  // in_flight: 200 → 2
             vec![],
             vec![100; 1], // duplicates: fits its 200
+            vec![60; 4],  // notes: 10% = 100 → 1
         ];
         let kept = keep_within(&sizes, 1000);
-        // Quotas: 2 + 1 + 0 + 2 + 0 + 1 = 550 bytes; 450 spare goes to
-        // in_flight first (3 more), then files (1 more); history's 300
-        // never fits what is left.
-        assert_eq!(kept, [3, 1, 0, 5, 0, 1]);
-        let total: u64 = (0..6)
+        // Quotas: files 20% = 200 → 2, history 15% = 150 < 300, notes
+        // 10% = 100 → 1; 610 bytes in all. The 390 spare goes to in_flight
+        // first (3 more, 90 left), then notes (1 more, 30 left); files'
+        // and history's next items never fit.
+        assert_eq!(kept, [2, 1, 0, 5, 0, 1, 2]);
+        let total: u64 = (0..7)
             .map(|i| sizes[i][..kept[i]].iter().sum::<u64>())
             .sum();
         assert!(total <= 1000);
@@ -1169,7 +1253,15 @@ mod tests {
         // in its section is kept, so a section stays a ranked prefix.
         assert_eq!(
             keep_within(
-                &[vec![5000, 1], vec![], vec![], vec![], vec![], vec![]],
+                &[
+                    vec![5000, 1],
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![]
+                ],
                 1024
             )[0],
             0

@@ -1875,7 +1875,23 @@ a second kind of mutable state beside refs, behind its own trait,
   the CLI; nothing reads a note to decide a land, review or ownership,
   which the land-equivalence test checks with notes written between
   lands. Unlike sessions, notes are backed up. CLI `leep note`, MCP
-  `leep_note_add` and `leep_notes`.
+  `leep_note_add` and `leep_notes`. Readers see each note through one
+  function, `Repo::notes_for` (`leep-derive/src/notes_view.rs`), which
+  answers both `GET /v1/notes` and the context pack's `notes` section:
+  staleness is a tree lookup at the ref's head against the content the
+  note was written against (`at_blob`), bounded (32 notes per pack, 100
+  per listing page, 8 at once, inside the section bound) and never an
+  error (unknown instead: `at_changeset` is no GC root). Only a human
+  owner endorses (`POST /v1/notes/{id}/endorse`, CLI `leep note endorse`,
+  no MCP tool): a `kind: human` token that may review and that `OWNERS`
+  names for the anchor at the default ref's head, never the writer. An
+  endorsement gives the note a renewable year and holds only while it is
+  fresh (`leep-server notes unendorse` undoes a person's endorsements);
+  an owner's report hides a human or endorsed note. In packs notes rank
+  endorsed, human, agent, then fresh before stale, nearest anchor, newest;
+  stale agent notes are left out, agent notes carry only a title, and
+  every word stays under `untrusted` (the pack's last section, fenced in
+  MCP).
 - **Scale.** Every table is keyed by `repo_id` first (ADR 0054), and
   nothing joins coordination to the land path, so the next steps are a
   separate coordination database and then sharding by path prefix (ADR

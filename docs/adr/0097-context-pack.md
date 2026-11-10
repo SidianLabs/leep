@@ -234,3 +234,16 @@ lists (`ContextPack::shows`: an in-flight or duplicate item about the
 same session or landed changeset at the same level), so eli's duplicate
 is said once. The notice is still marked said, which is right: it was
 shown.
+
+### A seventh section: notes (2026-11-10)
+ADR 0098's second change adds `notes`, the pack's last section: notes on
+the pack's first 32 files and the directories above them, from the same
+function as `GET /v1/notes` (ADR 0098, section 12), ranked endorsed,
+human, agent, then fresh before stale, nearest anchor, newest. Its quota
+is 10%, taken from files (25 to 20%) and history (20 to 15%); spare
+budget goes to ref health, in-flight work, duplicates, notes, files,
+history and owners, in that order, so notes never displace ref health.
+Items are `note:N`, sized exactly like the others, and every word of a
+note is under `untrusted`. A server without notes lists the section in
+`omitted` as `off`; a lookup past the section bound, as `timeout`. The
+determinism, budget and injection tests run with notes present.

@@ -71,6 +71,18 @@ fn tools_list_schemas_are_sane() {
     ] {
         assert!(names.contains(&expected), "missing {expected}");
     }
+    // Endorsing a note is a person's act (ADR 0098): no tool may offer it
+    // to an agent, by name or by description.
+    for t in tools {
+        let all = t.to_string().to_lowercase();
+        assert!(
+            !t["name"].as_str().unwrap().contains("endorse")
+                && !all.contains("/endorse")
+                && !all.contains("note endorse"),
+            "{}",
+            t["name"]
+        );
+    }
     for t in tools {
         assert!(!t["description"].as_str().unwrap().is_empty());
         let schema = &t["inputSchema"];
