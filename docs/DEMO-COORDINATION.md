@@ -28,6 +28,7 @@ of retries of a command, so a loaded machine makes it slower, not flaky.
 | Agents | Via | Work |
 |---|---|---|
 | ada, bo, cy | `leep` | `src/auth/`: ada rotates keys in `keys.rs`; bo claims `token.rs`, cy scopes it; both edit it |
+| (maintainer) | `leep` | starts documenting token refresh in `docs/auth.md` before fay arrives |
 | dee, eli | `leep-mcp` | both handed issue `BILL-42` (`src/billing/invoice.rs`), worded differently |
 | fay | `leep-mcp` | arrives last, to add refresh tokens to `parse_token` |
 | gus ... tess (14) | 12 `leep`, 2 `leep-mcp` | one file each in their own area, concurrently with everything else; rex and sol share `src/api/` and ask for `near` notices |
@@ -53,14 +54,18 @@ ref is red with bo's land as a suspect.
    it (cy) and the red ref with bo's land as the suspect touching it.
 6. The fourteen solo agents all land, and hear nothing about each other
    but `near` (rex and sol, who asked for it).
-7. A pack ranks live work by the agent's own files, as notices do: rex's
-   and sol's packs call each other `near`, and bo's pack never calls
-   `keys.rs` (ada's file, a co-change of bo's) bo's own.
+7. A pack ranks live work by the agent's own files, as notices do: the
+   pack of rex or sol names the other, and as `near` (sol starts first and
+   lands only after rex has started, so this never depends on
+   scheduling); fay's pack lists the maintainer's live work on
+   `docs/auth.md`, which changed with `token.rs`, as on "a file related to
+   your task", after cy's work on fay's own file.
 8. dee, the first of the `BILL-42` pair, is told `possible_duplicate` of
    eli by task key, and eli's `landed` notice for dee's land says its
    duplicate landed the task.
 9. A task start says each thing once: eli's names dee as a duplicate on
-   one line, and dee's pack explains `carry identical` once.
+   exactly one line, and dee's pack explains `carry identical` exactly
+   once.
 
 ## Reading the transcript critically
 

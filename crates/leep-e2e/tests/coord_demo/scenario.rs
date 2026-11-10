@@ -119,6 +119,10 @@ pub struct Agent {
 struct World<'a> {
     client: Client,
     n: &'a Narrator,
+    /// rex and sol, in one directory, take turns: sol starts, then rex
+    /// (its pack sees sol), then sol lands. So one pack names the other,
+    /// whatever the scheduling (claim 7).
+    api_turns: [Barrier; 2],
 }
 
 fn quote_arg(a: &str) -> String {
@@ -550,7 +554,6 @@ const SEED: &[(&str, &[(&str, &str)])] = &[
         &[
             ("README.md", "# shop\n\nA small web shop.\n"),
             ("OWNERS", "maint\n"),
-            ("docs/auth.md", "# Auth\n\nTokens are signed with rotating keys.\n"),
             ("docs/billing.md", "# Billing\n\nInvoices sum their lines.\n"),
             ("docs/api.md", "# API\n\nJSON over HTTP.\n"),
         ],
@@ -566,6 +569,8 @@ const SEED: &[(&str, &[(&str, &str)])] = &[
             ),
             ("src/auth/session.rs", "pub fn new_session() {}\n"),
             ("src/auth/keys.rs", "pub fn current_key() -> Key {\n    Key::load()\n}\n"),
+            // Written with the code, so it changes with token.rs.
+            ("docs/auth.md", "# Auth\n\nTokens are signed with rotating keys.\n"),
         ],
     ),
     (
@@ -689,6 +694,7 @@ pub fn run(stores: &Stores, root: &Path, n: &Narrator) -> Report {
     let w = World {
         client: Client::new(&server.url, &root.join("cache")),
         n,
+        api_turns: [Barrier::new(2), Barrier::new(2)],
     };
     let model = |i: usize| ["demo-model-a", "demo-model-b", "demo-model-c"][i % 3];
     let mut agents: BTreeMap<&str, Agent> = BTreeMap::new();
@@ -783,7 +789,7 @@ pub fn run(stores: &Stores, root: &Path, n: &Narrator) -> Report {
     }
 
     // ---- The fourteen solo agents work concurrently with acts 1 to 3.
-    n.say("## 1. Fourteen agents work alone, concurrently\n\nThese fourteen run in parallel with sections 2 and 3; their transcripts follow in section 6. Each starts its task, edits one file of its own, commits and lands. rex and sol both work in `src/api/` (different files) and ask for notices down to `near`; the rest keep the default (`same_file` and up).\n\n");
+    n.say("## 1. Fourteen agents work alone, concurrently\n\nThese fourteen run in parallel with sections 2 and 3; their transcripts follow in section 6. Each starts its task, edits one file of its own, commits and lands. rex and sol both work in `src/api/` (different files) and ask for notices down to `near`; sol starts first and lands after rex has started; the rest keep the default (`same_file` and up).\n\n");
     let barrier = Barrier::new(SOLOS.len() + 1);
     let solo_logs: Mutex<Vec<(usize, String, bool)>> = Mutex::new(Vec::new());
     let mut claims = Vec::new();
@@ -929,10 +935,10 @@ pub fn run(stores: &Stores, root: &Path, n: &Narrator) -> Report {
             || warned(bo, cy_id),
             || drop(bo.leep_quiet(&w, &["status"])),
         );
-        let cy_warned = until(
-            || warned(cy, bo_id),
-            || drop(cy.leep_quiet(&w, &["status"])),
-        );
+        // cy declares after bo's claim: its `work start` pack lists bo,
+        // and that pack (not a later answer) must be what warned it.
+        let cy_warned = warned(cy, bo_id)
+            .filter(|h| h.line.starts_with("pack:") && h.during.starts_with("leep work start"));
         claims.push(Claim {
             n: 2,
             what: "two agents editing one file are warned before either lands",
@@ -956,6 +962,27 @@ pub fn run(stores: &Stores, root: &Path, n: &Narrator) -> Report {
                     "task_key": "BILL-42", "paths": ["src/billing/invoice.rs"] }),
         );
         assert!(!d.is_error, "{}", d.text);
+        // A pack shed on a busy server (one search permit) is asked again:
+        // claim 9 reads dee's pack.
+        for _ in 0..5 {
+            if d.text.contains("Context for ref")
+                || dee
+                    .said
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(w, t)| w == "leep_context" && t.contains("Context for ref"))
+            {
+                break;
+            }
+            std::thread::sleep(PAUSE);
+            dee.tool(
+                &w,
+                "leep_context",
+                json!({ "task": "Fix rounding of invoice totals\nRound half to even when summing line items",
+                        "task_key": "BILL-42", "paths": ["src/billing/invoice.rs"] }),
+            );
+        }
         let eli = a("eli");
         let e = eli.tool(
             &w,
@@ -1035,6 +1062,19 @@ pub fn run(stores: &Stores, root: &Path, n: &Narrator) -> Report {
 
     // ---- Act 5: a new agent's first call.
     n.say("## 5. A new agent's first call\n\nfay is new, and is asked to add refresh tokens to `parse_token`. Its first call is `leep_task_start`; nothing else has told it anything.\n\n");
+    // The maintainer starts documenting token refresh in `docs/auth.md`, a
+    // file that changes with `token.rs` but is not fay's.
+    maint.leep_ok(
+        &w,
+        &[
+            "work",
+            "start",
+            "-t",
+            "Document token refresh",
+            "--scope",
+            "docs/auth.md",
+        ],
+    );
     let fay = a("fay");
     let task = json!({ "task": "Add refresh tokens to `parse_token`\nIssue a refresh token beside each access token in src/auth/token.rs",
                        "task_key": "AUTH-12", "paths": ["src/auth/token.rs"] });
@@ -1044,7 +1084,7 @@ pub fn run(stores: &Stores, root: &Path, n: &Narrator) -> Report {
     // A section the server could not make in time is listed as omitted;
     // ask again (a pack is a read and marks nothing said).
     for _ in 0..5 {
-        if pack["omitted"].as_array().is_none_or(|o| o.is_empty()) {
+        if pack.is_object() && pack["omitted"].as_array().is_none_or(|o| o.is_empty()) {
             break;
         }
         std::thread::sleep(PAUSE);
@@ -1086,6 +1126,7 @@ pub fn run(stores: &Stores, root: &Path, n: &Narrator) -> Report {
         })
         .unwrap_or_default();
     let live_ok = live.iter().any(|l| l.starts_with("cy:"));
+    let fay_pack_text = f.text.clone();
     let health = pack["ref_health"].clone();
     let health_ok = health["red"]["check"] == "test"
         && health["suspects"]
@@ -1198,11 +1239,12 @@ pub fn run(stores: &Stores, root: &Path, n: &Narrator) -> Report {
             .map(|(_, t)| t.clone())
             .collect()
     };
-    // 7: a pack and the notice in the same output agree, and a co-changed
-    // file is never called the agent's own.
-    // rex and sol start concurrently, so whichever starts second sees the
-    // other in its pack: every pack line naming the other must say `near`,
-    // as their notices do.
+    // 7: a pack and the notice in the same output agree, and a file
+    // related to the task is never called the agent's own. rex and sol
+    // start concurrently, so whichever starts second sees the other in its
+    // pack: there is such a line, and every one says `near`, as their
+    // notices do. fay's pack lists the maintainer's work on `docs/auth.md`
+    // as on a file related to its task, after the work on its own file.
     let rex_start = said("rex", "leep work start").join("\n");
     let sol_start = said("sol", "leep_task_start").join("\n");
     let mut pair: Vec<String> = rex_start
@@ -1211,21 +1253,29 @@ pub fn run(stores: &Stores, root: &Path, n: &Narrator) -> Report {
         .chain(
             sol_start
                 .lines()
-                .filter(|l| l.starts_with("- session:") && l.ends_with("of rex")),
+                .filter(|l| l.starts_with("- session:") && l.contains("] of rex")),
         )
         .map(|l| l.trim().to_string())
         .collect();
     pair.dedup();
-    let agree = pair.iter().all(|l| l.contains("[near]"));
-    let bo_start = said("bo", "leep work start").join("\n");
-    let bo_mislabelled = bo_start.contains("(your \"src/auth/keys.rs\")");
+    let agree = !pair.is_empty() && pair.iter().all(|l| l.contains("[near]"));
+    let in_flight: Vec<&str> = fay_pack_text
+        .lines()
+        .skip_while(|l| !l.starts_with("Work in flight"))
+        .skip(1)
+        .take_while(|l| l.starts_with("- session:") || l.starts_with("- landed:"))
+        .collect();
+    let related = in_flight.iter().position(|l| {
+        l.contains("of maint") && l.ends_with("on a file related to your task, not yours")
+    });
+    let own = in_flight.iter().position(|l| l.contains("of cy"));
+    let related_ok = matches!((own, related), (Some(o), Some(r)) if o < r);
     claims.push(Claim {
         n: 7,
         what: "a pack ranks live work by the agent's own files, as its notices do",
-        pass: agree && !bo_mislabelled,
+        pass: agree && related_ok,
         evidence: format!(
-            "rex/sol pack lines about each other: {pair:?}; bo's pack calls keys.rs bo's own: \
-             {bo_mislabelled}"
+            "rex/sol pack lines about each other: {pair:?}; fay's work in flight: {in_flight:?}"
         ),
     });
     // 8: both of a duplicate pair are told, and the twin's land says so.
@@ -1254,14 +1304,23 @@ pub fn run(stores: &Stores, root: &Path, n: &Narrator) -> Report {
         .lines()
         .filter(|l| l.contains("[possible_duplicate]") && l.contains("of dee"))
         .count();
-    let dee_start = said("dee", "leep_task_start").join("\n");
-    let explained = dee_start
-        .matches("re-request review after a rebase")
-        .count();
+    // dee's first pack (its task start's, or the one asked again if that
+    // was shed).
+    let dee_pack = a("dee")
+        .said
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(w, t)| {
+            (w == "leep_task_start" || w == "leep_context") && t.contains("Context for ref")
+        })
+        .map(|(_, t)| t.clone())
+        .unwrap_or_default();
+    let explained = dee_pack.matches("re-request review after a rebase").count();
     claims.push(Claim {
         n: 9,
         what: "a task start says each thing once: one duplicate line, one policy explanation",
-        pass: eli_dup_lines == 1 && explained <= 1,
+        pass: eli_dup_lines == 1 && explained == 1,
         evidence: format!(
             "eli's task start names dee as a duplicate {eli_dup_lines} time(s); dee's pack \
              explains `carry identical` {explained} time(s)"
@@ -1348,7 +1407,13 @@ fn run_solo(w: &World, agent: &Agent, s: &Solo, log: &mut String) -> bool {
             let args = [
                 "work", "start", "-t", s.title, "--scope", s.path, "--task", s.key,
             ];
+            if s.name == "rex" {
+                w.api_turns[0].wait();
+            }
             let o = agent.leep_logged(w, log, &args);
+            if s.name == "rex" {
+                w.api_turns[1].wait();
+            }
             if o.code != Some(0) {
                 return false;
             }
@@ -1372,6 +1437,10 @@ fn run_solo(w: &World, agent: &Agent, s: &Solo, log: &mut String) -> bool {
                 "leep_task_start",
                 json!({ "task": s.title, "task_key": s.key, "paths": [s.path] }),
             );
+            if s.name == "sol" {
+                w.api_turns[0].wait();
+                w.api_turns[1].wait();
+            }
             if o.is_error {
                 return false;
             }

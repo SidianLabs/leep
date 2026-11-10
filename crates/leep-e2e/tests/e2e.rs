@@ -3070,10 +3070,6 @@ fn run_two_agents_notices(stores: &Stores, root: &Path) {
         a_commit.contains("notice: [possible_duplicate]"),
         "{a_commit}"
     );
-    let warned = [&b_commit, &a_commit, &second]
-        .iter()
-        .any(|e| e.contains("notice: [same_file]") || e.contains("notice: [possible_duplicate]"));
-    assert!(warned, "b: {b_commit}\na: {a_commit}\nstart: {second}");
     for e in [&first, &second, &b_commit, &a_commit] {
         assert!(!e.chars().any(|c| c.is_control() && c != '\n'), "{e:?}");
     }
@@ -3149,7 +3145,16 @@ fn an_undeclared_agent_hears_of_a_land_on_its_file() {
         .as_str()
         .unwrap()
         .to_string();
-    let status = run_b(&["status"]);
+    // The land hook and notices are advisory and asynchronous: ask a
+    // bounded number of times, never against a clock.
+    let mut status = String::new();
+    for _ in 0..100 {
+        status = run_b(&["status"]);
+        if status.contains("notice: [landed]") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     assert!(status.contains("notice: [landed]"), "{status}");
     assert!(status.contains(&head[..12]), "{status}");
     drop(server);
