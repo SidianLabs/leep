@@ -3097,3 +3097,174 @@ fn run_two_agents_notices(stores: &Stores, root: &Path) {
     assert!(!run(&a, &["status"]).contains("[landed]"));
     drop(server);
 }
+
+/// Context packs (ADR 0097) through the real binaries: the second agent's
+/// `leep context` and `leep work start` show the first agent's live work
+/// on the file, its owners, and who changed it last with which model, and
+/// flag the shared task. Agent-written text is printed quoted.
+#[test]
+fn a_second_agent_sees_live_work_owners_and_history_in_its_context() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let stores = Stores::sqlite(&tmp.path().join("data"));
+    run_two_agents_context(&stores, tmp.path());
+}
+
+#[test]
+fn a_second_agent_sees_live_work_owners_and_history_in_its_context_postgres() {
+    let _g = serial();
+    let Some(db) = PgDb::create("leep_e2e") else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let stores = Stores::with_meta(&tmp.path().join("data"), db.url.clone());
+    run_two_agents_context(&stores, tmp.path());
+}
+
+fn run_two_agents_context(stores: &Stores, root: &Path) {
+    let (ada_t, ada_e) = gen_token("ada", "write");
+    let (bo_t, bo_e) = gen_token("bo", "write");
+    let tokens = root.join("tokens.json");
+    fs::write(
+        &tokens,
+        serde_json::json!({ "tokens": [ada_e, bo_e] }).to_string(),
+    )
+    .unwrap();
+    let server = Server::start_with(
+        free_port(),
+        stores,
+        root,
+        &["--tokens-file", tokens.to_str().unwrap()],
+    );
+    let client = Client::new(&server.url, &root.join("cache"));
+    let (a, b) = (root.join("a"), root.join("b"));
+    let run = |wc: &Path, args: &[&str]| {
+        let t = if wc == b.as_path() { &bo_t } else { &ada_t };
+        let out = client
+            .cmd(wc)
+            .env("LEEP_TOKEN", t)
+            .env(
+                "LEEP_AGENT_MODEL",
+                if wc == b.as_path() {
+                    "model-b"
+                } else {
+                    "model-a"
+                },
+            )
+            .args(args)
+            .output()
+            .unwrap();
+        assert_ok(&out, &format!("leep {args:?}"));
+        let text = stdout(&out);
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        text
+    };
+    for wc in [&a, &b] {
+        run(root, &["init", wc.to_str().unwrap()]);
+    }
+    write(&a, "OWNERS", "rhea\n");
+    write(&a, "src/auth/token.rs", "pub fn parse_token() {}\n");
+    write(&a, "src/auth/mod.rs", "mod token;\n");
+    run(&a, &["commit", "-m", "auth: parse tokens"]);
+    run(&a, &["land"]);
+
+    // a starts work on the file and commits without landing: live work.
+    let started = run(
+        &a,
+        &[
+            "work",
+            "start",
+            "-t",
+            "Speed up parse_token",
+            "--scope",
+            "src/auth/token.rs",
+            "--task",
+            "T-3",
+        ],
+    );
+    assert!(started.contains("context for \"main\""), "{started}");
+    write(
+        &a,
+        "src/auth/token.rs",
+        "pub fn parse_token() { /* fast */ }\n",
+    );
+    run(&a, &["commit", "-m", "auth: faster parse_token"]);
+
+    // b asks before it starts.
+    run(&b, &["sync"]);
+    let text = run(
+        &b,
+        &[
+            "context",
+            "--task",
+            "Make `parse_token` faster",
+            "src/auth/token.rs",
+        ],
+    );
+    assert!(text.contains("work in flight:"), "{text}");
+    assert!(text.contains("of \"ada\""), "{text}");
+    assert!(text.contains("\"src/auth/token.rs\": \"rhea\""), "{text}");
+    assert!(
+        text.contains("from \"ada\"") && text.contains("model \"model-a\""),
+        "{text}"
+    );
+    let pack = {
+        let out = client
+            .cmd(&b)
+            .env("LEEP_TOKEN", &bo_t)
+            .args([
+                "--json",
+                "context",
+                "-t",
+                "Make `parse_token` faster",
+                "src/auth/token.rs",
+            ])
+            .output()
+            .unwrap();
+        assert_ok(&out, "leep --json context");
+        serde_json::from_str::<serde_json::Value>(&stdout(&out)).unwrap()
+    };
+    assert_eq!(pack["in_flight"][0]["principal"], "ada", "{pack}");
+    assert_eq!(pack["in_flight"][0]["level"], "same_file");
+    assert_eq!(
+        pack["owners"][0]["untrusted"]["owners"],
+        serde_json::json!(["rhea"])
+    );
+    let token = pack["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["untrusted"]["path"] == "src/auth/token.rs")
+        .unwrap();
+    assert_eq!(token["created_by"], "ada");
+    assert_eq!(token["untrusted"]["agent_model"], "model-a");
+    assert!(
+        pack["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["untrusted"]["path"] == "src/auth/mod.rs"),
+        "co-changed: {pack}"
+    );
+
+    // b starts the same task: told it may be a duplicate of a's.
+    let text = run(
+        &b,
+        &[
+            "work",
+            "start",
+            "-t",
+            "Make parse_token faster",
+            "--scope",
+            "src/auth/token.rs",
+            "--task",
+            "T-3",
+        ],
+    );
+    assert!(text.contains("possible duplicates:"), "{text}");
+    assert!(text.contains("by task_key \"T-3\""), "{text}");
+    drop(server);
+}
