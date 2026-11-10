@@ -605,13 +605,15 @@ notes_expires: INDEX ON notes(expires)
 notes_reported: INDEX ON notes(reported_by, reported_at) WHERE reported_by IS NOT NULL
 events(seq BIGSERIAL PRIMARY KEY,                              -- migration 0011; SQLite: INTEGER PRIMARY KEY AUTOINCREMENT; logged
        repo_id BIGINT NOT NULL DEFAULT 1,                       -- SQLite: INTEGER (and below)
-       kind TEXT NOT NULL,                                      -- 'session.started', 'session.paths', 'session.ended', 'note.added', 'note.endorsed', 'note.superseded', 'conflict.predicted'
+       kind TEXT NOT NULL,                                      -- 'session.started', 'session.paths', 'session.ended', 'ref.landed', 'note.added', 'note.endorsed', 'note.superseded', 'conflict.predicted'
        session_id BIGINT,                                       -- the session it is about or came from
        principal TEXT NOT NULL,                                 -- a token name, or 'anonymous'
        subject TEXT NOT NULL,                                   -- 'session:N', 'note:N' or a changeset id in hex
        paths TEXT NOT NULL DEFAULT '[]',                        -- JSON array of at most 16 repository paths
        payload TEXT NOT NULL DEFAULT '{}',                      -- JSON object: the event's facts (EventFacts)
        created BIGINT NOT NULL)                                 -- unix seconds, the emitting server's clock
+events_epoch(id INT PRIMARY KEY CHECK (id = 1),                -- migration 0011; one row
+             epoch TEXT NOT NULL)                               -- random, 16 hex digits; new on a restore
 ```
 
 `ref_log` (ADR 0018) is appended in the transaction of every ref create, move
@@ -1155,13 +1157,15 @@ read by a land. Added:
   order (on Postgres under `pg_advisory_xact_lock(0x4c455654, 1)`; SQLite
   has one writer), gaps allowed, never reused (`AUTOINCREMENT` on SQLite).
   `paths` is a JSON array of at most 16 repository paths, folded into
-  directories past that; `payload` a JSON object of `EventFacts`. No text
+  directories past that; `payload` a JSON object of `EventFacts`, plus
+  `ref` for `ref.landed` (served under `untrusted`). The sequence is
+  `CACHE 1` (Postgres), which the commit order relies on. No text
   an agent wrote is stored, paths aside. Kept 24 hours by default; the
   sweep deletes a prefix in `seq` order. Not backed up (ADR 0026): a
   restore clears the table.
 - `CoordStore::append_events(&[NewEvent]) -> u64` (the highest `seq`
   given), `events_after(after, limit) -> Vec<Event>` (ascending),
-  `events_bounds() -> EventBounds {oldest?, newest}` (`newest` the
+  `events_bounds() -> EventBounds {oldest?, newest, epoch}` (`newest` the
   highest `seq` handed out and committed; 0 before the first) and
   `sweep_events(cutoff, limit) -> u64`, checked by `check_events_contract`
   (part of `check_coord_contract`). The calls have default bodies that
@@ -1169,14 +1173,15 @@ read by a land. Added:
   0011.
 - `GET /v1/events?after=&session=&paths=&kinds=&wait=` →
   `EventsResponse {events: [EventEntry], next, more}`. `after` and `next`
-  are opaque cursors (`e<seq>` today); no `after` answers `next` at the
+  are opaque cursors (`e<epoch>.<seq>` today; `e<seq>` is accepted); no
+  `after` answers `next` at the
   tail and no events. `paths` and `kinds` repeat or take comma-separated
   values (at most 16 paths; an unknown kind is 400). `wait` is seconds,
   clamped to 0 to 30. At most 500 events or 256 KiB per answer; `more`
   says more are there now. An entry is `{cursor, kind, subject,
   principal, session?, created, facts: {state?, landed_as?, origin?,
   task?, note?, note_kind?, trust?, anchor_type?, superseded_by?},
-  untrusted: {paths?}}`; `task` is the first 16 hex digits of the blake3
+  untrusted: {paths?, ref?}}`; `ref` only on `ref.landed`; `task` is the first 16 hex digits of the blake3
   hash of the session's task key. `kind` and every string in `facts` are
   words a client shows as they are when it does not know them, and new
   facts may come. A server without events answers 404.
@@ -1189,7 +1194,8 @@ read by a land. Added:
   `Last-Event-ID` resumes, and wins over `after`.
 - 410 `cursor_expired`: `CursorExpiredResponse`, an `ErrorResponse` with
   `oldest`, the cursor to read on from after resyncing. A cursor past the
-  newest `seq` (a restored or reset store) is answered the same.
+  newest `seq`, or of another epoch (a restored or reset store), is
+  answered the same.
 - `Leep-Refused: events`: a waiting read (`wait` above 0, or a stream)
   past 10,000 waiters per server or 64 per principal (503, `Retry-After:
   1`).

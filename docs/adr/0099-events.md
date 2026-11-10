@@ -40,7 +40,9 @@ events(seq BIGSERIAL PRIMARY KEY,         -- SQLite: INTEGER PRIMARY KEY AUTOINC
 
 - **One row per fact.** Kinds: `session.started` (created or revived),
   `session.paths` (its folded path set changed), `session.ended` (`state`
-  `landed` with `landed_as`, or `abandoned`), `note.added`,
+  `landed` with `landed_as`, or `abandoned`), `ref.landed` (every land,
+  whatever its changesets carry: `landed_as`, the paths the land changed,
+  and the ref under `untrusted`), `note.added`,
   `note.endorsed`, `note.superseded`, and `conflict.predicted`, reserved
   for the merge dry run (ADR 0096, part 2); nothing emits it yet.
 - **No prose.** An event holds ids, states, enum names, principals (token
@@ -53,6 +55,15 @@ events(seq BIGSERIAL PRIMARY KEY,         -- SQLite: INTEGER PRIMARY KEY AUTOINC
 - **Logged**, unlike `session_beats`. Since Postgres 15 a sequence owned by
   an unlogged table is unlogged too: a crash would reset `seq`, and every
   cursor would point past the end.
+- **One value at a time.** The sequence is `CACHE 1` (set explicitly):
+  with a cache, a connection could hand out a `seq` below one another
+  connection already committed, and the append lock (section 3) would no
+  longer make commit order `seq` order. Within one append the rows take
+  ascending values in the order given; nothing depends on more than that
+  they all commit together.
+- **An epoch.** `events_epoch` holds one random value, made by the
+  migration and again when a restore clears the events. Cursors carry it
+  (section 3).
 - **No secondary index.** The sweep walks the primary key (section 4).
   The design's `events_created` index would only serve a sweep by time,
   which can leave holes (below).
@@ -73,7 +84,12 @@ the land-equivalence test runs with an `append_events` that always fails.
 Lands become events from the post-land hook, not the ref log. That gives
 one cursor space for every kind, at the price of losing the event of a
 land whose hook failed; ADR 0096's history walk stays the truth for
-`landed` notices.
+`landed` notices. Every land is a `ref.landed`, whether or not a session
+ended with it (a changeset without `agent.session`, a person's `leep
+land`, a stack whose head was not a session's): its paths are the diff
+from the ref's head before the land (its ref log entry; else the landed
+changeset's first parent), at most 1,000 read and folded to 16, and the
+top-level names that changed for a larger land.
 
 `session.paths` is sent when the folded set (scope, claims and touched
 paths, at most 16) differs from the one this server last sent for the
@@ -86,22 +102,28 @@ bulk without naming them, and an expired session's paths are already
 silent. A reader that needs it reads `GET /v1/sessions`.
 
 ### 3. Order and cursors
-The cursor is `seq`, sent as an opaque string `e<seq>` so its shape can
-change.
+The cursor is the store's epoch and `seq`, sent as an opaque string
+`e<epoch>.<seq>` so its shape can change; `e<seq>` (no epoch) is accepted
+and checked by `seq` alone. A cursor of another epoch (another store, a
+restore, a new database) is expired, whatever its `seq`.
 
 The hazard: Postgres assigns `seq` from a sequence before commit. A
 reader can see 11, move its cursor past it, and miss 10 when 10 commits a
 moment later. So each append is one transaction that takes
 `pg_advisory_xact_lock(EVENTS_LOCK, repo_id)` before it inserts:
-appends commit one at a time, in `seq` order, and a reader that has seen
+appends commit one at a time, in `seq` order (each waits at most 2 s for
+the lock, `lock_timeout`, and then fails and is counted, so a stuck
+appender never holds others' data-pool connections), and a reader that has seen
 `seq` N has seen every event below it that will ever exist. SQLite has one
 writer (`BEGIN IMMEDIATE`) and is ordered already; `AUTOINCREMENT` keeps
 `seq` from being handed out twice after the sweep empties the table.
 Gaps (a failed append) are allowed.
 
 `events_bounds` answers the oldest kept `seq` and the newest handed out.
-On Postgres it takes the same lock shared, so the sequence's value it
-reads is committed. A cursor `c` has expired when the events just above
+On Postgres it takes the same lock shared (also within 2 s, else it
+fails), so the sequence's value it reads is committed. The ring (section
+6) answers only cursors it holds everything after; a cursor past what it
+has read goes to the store, so a cursor from elsewhere is still 410. A cursor `c` has expired when the events just above
 it are gone (`c + 1 < oldest`, or nothing is kept and `c < newest`), or
 when it is past `newest` (a restored or reset store). An expired cursor is
 410 `cursor_expired` with `oldest`, the cursor to read on from after
@@ -110,9 +132,13 @@ just above a cursor can also answer 410: that costs a resync, never a
 missed event. No `after` answers the current tail and no events.
 
 ### 4. Retention
-24 hours (`--events-retention`), not the design's 7 days: a reader
-further behind is better resynced from state. Every server sweeps in its
-per-minute coordination sweep, in steps of 1,000: it reads the oldest
+24 hours (`--events-retention`, at least a minute and at most a day: an
+event names a session's paths, which are deleted a day after it ends), not
+the design's 7 days: a reader further behind is better resynced from
+state. Every server sweeps in its per-minute coordination sweep, in steps
+of 1,000 for up to 5 seconds (at most 600 steps), and sets
+`leep_events_oldest_age_seconds`, which grows past the retention when the
+sweep falls behind: it reads the oldest
 1,000 rows by `seq` and deletes the prefix created before the cutoff,
 stopping at the first younger one. Deleting by `created` alone could
 delete 10 and keep 9 (servers' clocks and buffers differ), leaving a hole
@@ -129,13 +155,16 @@ events "everything above one `seq`".
   sessions only (another principal's key resolves to nothing) and keeps
   the events of other sessions on the session's paths, or of sessions on
   its task. Events expose nothing that `GET /v1/sessions` does not.
-- **Long-poll.** `wait` is clamped to 0 to 30 seconds; the answer comes as
-  soon as something matches. `EventsResponse {events, next, more}`, at
+- **Long-poll.** `wait` is clamped to 0 to 30 seconds, and below nine
+  tenths of the request timeout; the answer comes as soon as something
+  matches. A read that matches nothing scans at most 8 store pages before
+  it answers `more`. `EventsResponse {events, next, more}`, at
   most 500 events or 256 KiB; `more` says there is more now.
 - **SSE.** The same route with `Accept: text/event-stream`. `id:` is the
   cursor and `Last-Event-ID` resumes; a page that matched nothing still
   moves the reader's id (an `id:` line alone, which is not dispatched). A
-  comment goes out every 15 s, and the stream closes after 10 minutes
+  comment goes out every 15 s, `session=KEY` is resolved again as often
+  (the session's new paths count), and the stream closes after 10 minutes
   (the client reconnects, which checks its token again).
 
 ### 6. Fan-out on read
@@ -149,8 +178,10 @@ check), reads one bounded page from the store, plus the bounds when the
 page does not start right after the cursor.
 
 ### 7. Backpressure
-- A waiter (a long-poll with `wait` above 0, or a stream) is admitted by
-  its own class, at most 10,000 per server and 64 per principal, else 503
+- A waiter (a long-poll with `wait` above 0, or a stream; one parse of
+  the request decides, the same in the limits middleware and the
+  handler, the last `wait` winning) takes its place first, before any
+  store read. It is admitted by its own class, at most 10,000 per server and 64 per principal, else 503
   `Leep-Refused: events`. It does not hold its token's ADR 0020
   concurrency permit: a 30-second wait would otherwise starve the token's
   other requests. The token's rate limit still applies.
@@ -165,13 +196,16 @@ page does not start right after the cursor.
   event, paths quoted.
 - MCP: no new tool. On each tool call `leep-mcp` reads
   `GET /v1/events?session=K&after=C&wait=0` and asks `GET /v1/notices`
-  only when something matched (or the cursor expired, or on its first
-  call). It replaces the 30-second notice throttle; against a server
-  without events it falls back to it.
+  when something matched (or the cursor expired, or on its first call),
+  and in any case at least every 30 seconds, also when the events read
+  fails: events are lossy, and a server whose events keep failing must
+  not silence notices. Against a server without events it asks every 30
+  seconds.
 
 ### 9. Metrics
 `leep_events_appended_total{kind}`, `leep_events_dropped_total{reason}`
 (`full`, `error`, `off`), `leep_event_waiters`,
+`leep_events_oldest_age_seconds`,
 `leep_events_refused_total{reason}` (`server`, `principal`, and `lagged`
 for a reset stream), `leep_events_cursor_expired_total`.
 
@@ -190,6 +224,6 @@ for a reset stream), `leep_events_cursor_expired_total`.
 
 ## Rollback
 The table is new and nothing but events reads it. Roll back by stopping
-the new servers, then `DROP TABLE events;` and
+the new servers, then `DROP TABLE events; DROP TABLE events_epoch;` and
 `DELETE FROM schema_migrations WHERE version = 11;`, then starting the
 v10 servers (OPERATIONS.md, "Upgrading", migration 11).

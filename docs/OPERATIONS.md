@@ -168,6 +168,7 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_events_dropped_total` | counter | `reason` = `full`, `error`, `off` | Events lost before they were stored: the server's buffer of 10,000 was full (`full`), the append failed (`error`, logged as `appending events failed`), or the store keeps no events (`off`). No answer was affected; readers miss those events and resync from state. A steady `error` rate means the coordination store is failing. |
 | `leep_event_waiters` | gauge | – | Long-polls and streams of `GET /v1/events` waiting on this server. At most 10,000 (64 per principal). |
 | `leep_events_refused_total` | counter | `reason` = `server`, `principal`, `lagged` | Waiting event reads refused with 503 `Leep-Refused: events` because the server (`server`) or the principal (`principal`) had as many waiting as it allows, and streams reset because their reader fell 64 events behind (`lagged`). |
+| `leep_events_oldest_age_seconds` | gauge | – | Age of the oldest event kept, set by each sweep. Above `--events-retention` plus a few minutes, the sweep is falling behind the appends (it deletes for up to 5 s a minute per server). |
 | `leep_events_cursor_expired_total` | counter | – | Event reads answered 410 `cursor_expired`: the reader was more than `--events-retention` behind, or its cursor came from another store (a restore). Each costs that reader a resync. |
 | `leep_context_packs_total` | counter | none | Context packs answered (`POST /v1/context`, ADR 0097). Against `leep_sessions_started_total{origin="declared"}`, roughly packs per session. |
 | `leep_context_bytes_total` | counter | none | Bytes of items those packs returned (the envelope aside). Divided by `leep_context_packs_total`, the average pack. |
@@ -1539,8 +1540,8 @@ an hour (429 past it). `leep-server notes unreport --reporter NAME` opens
 again every note that token hid (`--id N` for one note); the notes get an
 agent note's life from their creation back, so one past it is swept.
 
-**Migration 11 (`events`, ADR 0099).** Creates one new, empty table
-(`events`) and touches no existing table, so it may run beside v10
+**Migration 11 (`events`, ADR 0099).** Creates two new tables (`events`,
+empty, and `events_epoch`, one random row) and touches no existing table, so it may run beside v10
 servers, which never read it. Events are kept only by upgraded servers;
 `--sessions off` keeps none (`GET /v1/events` answers 404). The table is
 logged (not `UNLOGGED`): its sequence must survive a crash, or cursors
@@ -1550,15 +1551,20 @@ only while it has long-poll or stream readers, so the load is a few
 statements a second per server.
 
 **Event retention.** Events are kept 24 hours (`--events-retention`,
-`LEEP_EVENTS_RETENTION`, a duration such as `6h` or `2d`) and swept by
-every server's per-minute coordination sweep, oldest first, at most
-16,000 rows a minute per server. A reader further behind gets 410
+`LEEP_EVENTS_RETENTION`, a duration from `1m` to `24h`; longer is refused
+at startup, since an event names session paths that are deleted a day
+after the session ends) and swept by every server's per-minute
+coordination sweep, oldest first, in steps of 1,000 for up to 5 s a
+minute per server, enough for tens of thousands of events a second;
+watch `leep_events_oldest_age_seconds`. A reader further behind gets 410
 `cursor_expired` and resyncs from state (`GET /v1/notices`,
 `/v1/sessions`); a longer retention only helps readers that stop for
 longer than a day. At about 300 bytes a row, a day of 100 events a
 second is about 2.5 GiB; lower the retention if that is too much. Events
 are **not** in backups, like sessions: a restore starts the table empty,
-and every reader's old cursor is answered 410.
+and every reader's old cursor is answered 410 (a restore gives the store
+a new events epoch). An append or bounds read waits at most 2 s for the
+events lock on Postgres, then fails (counted as dropped).
 
 **Waiting readers** (`GET /v1/events` with `wait` above 0, and streams)
 are admitted by their own class, at most 10,000 per server and 64 per
@@ -1574,6 +1580,7 @@ the table (losing only events):
 ```sql
 BEGIN;
 DROP TABLE events;
+DROP TABLE events_epoch;
 DELETE FROM schema_migrations WHERE version = 11;
 COMMIT;
 ```

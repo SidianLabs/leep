@@ -293,7 +293,8 @@ after a year. Against a server without notes the commands say so.
 `leep watch` prints coordination events as they happen
 ([ADR 0099](adr/0099-events.md)): sessions starting, changing their paths
 and ending (landed, with the changeset the ref moved to, or abandoned),
-and notes added, endorsed or superseded. For an orchestrator or a person
+every land (`ref.landed`, with the ref and the paths it changed), and
+notes added, endorsed or superseded. For an orchestrator or a person
 following many agents.
 
 | Command | Effect |

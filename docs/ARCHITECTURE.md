@@ -1879,14 +1879,16 @@ a second kind of mutable state beside refs, behind its own trait,
 - **Events** ([ADR 0099](adr/0099-events.md)). An ordered log of
   coordination facts (migration 0011, `events`): `session.started`,
   `session.paths` (the folded path set changed), `session.ended` (landed
-  with `landed_as`, from the post-land hook, or abandoned), `note.added`,
+  with `landed_as`, from the post-land hook, or abandoned), `ref.landed`
+  (every land, with the paths it changed), `note.added`,
   `note.endorsed`, `note.superseded`; `conflict.predicted` is reserved.
   Ids, states and paths only, never agent-written text (paths under
   `untrusted`; a task key as a digest). Hooks push into a per-server
   buffer of 10,000 flushed every 250 ms; a failed append is counted,
   never returned, and the land-equivalence test fails every append. The
-  cursor is `seq`, sent as `e<seq>`; on Postgres each append holds an
-  advisory lock so commit order is `seq` order, and SQLite has one
+  cursor is the store's random epoch and `seq`, sent as `e<epoch>.<seq>`;
+  on Postgres each append holds an advisory lock (2 s lock timeout,
+  sequence `CACHE 1`) so commit order is `seq` order, and SQLite has one
   writer, so a cursor from one server resumes on any other with no loss
   or duplicate. Kept 24 hours (`--events-retention`), swept as a prefix
   in `seq` order; an older cursor, or one past the newest `seq` (a
@@ -1897,8 +1899,9 @@ a second kind of mutable state beside refs, behind its own trait,
   principal. One tailer per server fills a ring of 10,000 while it has
   waiters; waiters have their own admission class (10,000 per server, 64
   per principal, 503 `Leep-Refused: events`) instead of the token's
-  concurrency permit. Not backed up. CLI `leep watch`; MCP asks for
-  notices on a tool call only when an event bore on its session.
+  concurrency permit, taken before any store read. Not backed up. CLI
+  `leep watch`; MCP asks for notices on a tool call when an event bore on
+  its session, and at least every 30 s.
 - **Scale.** Every table is keyed by `repo_id` first (ADR 0054), and
   nothing joins coordination to the land path, so the next steps are a
   separate coordination database and then sharding by path prefix (ADR
