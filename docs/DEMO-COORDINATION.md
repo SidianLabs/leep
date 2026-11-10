@@ -97,9 +97,11 @@ The demo is also a check on how the notices read. Things to look at:
   changeset lands only with `force`, so a blind retry is stopped again,
   never landed. The solo agents' commits, which meet nothing louder than
   `near`, land in one call as before.
-- Known limit, left to the maintainer: `leep-mcp` asks for notices at most
-  every 30 s when a tool's answers carry none, so a `landed` notice can
-  take up to 30 s to reach an MCP agent that is only reading.
+- `leep-mcp` reads the events bearing on its session on every tool call
+  (ADR 0099) and asks for notices when one matched, so a `landed` notice
+  reaches an MCP agent that is only reading on its next tool call, about
+  250 ms after the land, instead of up to 30 s later (the known limit
+  this closed).
 - Packs list owners and last changes once per distinct answer, naming the
   files each covers, and `leep_task_start` does not repeat as a notice
   what its pack shows.

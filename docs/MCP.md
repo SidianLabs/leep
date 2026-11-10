@@ -140,9 +140,17 @@ Every tool result, error results included, ends with the notices of other
 agents' work near this agent's session that the call's answers carried:
 at most three per answer, each said once, highest level first (`landed`,
 `possible_duplicate`, `claimed`, `same_file`; `near` only with
-`LEEP_NOTICE_LEVEL=near`). When the answers carried none and the agent has
-a session, the MCP server asks the Leep server for them at most every 30
-seconds. Each notice is a numbered line outside the fence with what the
+`LEEP_NOTICE_LEVEL=near`). When the agent has a session, every tool call
+also reads the events after its cursor that bear on the session
+(`GET /v1/events?session=KEY&after=CURSOR&wait=0`, [ADR 0099](adr/0099-events.md)):
+another session's work on its paths or task, a land there. It asks the
+Leep server for the session's notices when one matched (every land is an
+event, `ref.landed`, whoever made it), on its first call, or when its
+cursor expired, so a land on the agent's file is said on its next tool
+call (once the server has appended the event, about 250 ms after the
+land); otherwise at most every 30 seconds, also when the events read
+fails, since events are lossy. Against a server without events it asks
+every 30 seconds. Each notice is a numbered line outside the fence with what the
 server vouches for (level, session id, principal, landed changeset id,
 count, `by` and similarity; a `landed` notice `by task_key` adds that
 your duplicate landed the task, keeping the key in the fence); a level or name that is not a word of

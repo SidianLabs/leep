@@ -8,7 +8,8 @@
 //! always appear together. Because it is an ordinary Leep metadata database,
 //! `verify` and the server open it unchanged, and it restores into either
 //! backend. Leases and sessions (ADR 0095) are left out: both describe the
-//! live servers and agents of the old store, not its history. Notes (ADR
+//! live servers and agents of the old store, not its history; so are
+//! events (ADR 0099), which only point at sessions and notes. Notes (ADR
 //! 0098) are kept: an endorsed note is long-lived shared memory.
 
 use std::collections::BTreeMap;
@@ -839,12 +840,21 @@ impl Sink for SqliteSink {
             "sessions",
             "session_paths",
             "session_beats",
+            // Events (ADR 0099) describe the old store's live agents too:
+            // never backed up. The sequence goes on, so a cursor from
+            // before the restore is answered as expired.
+            "events",
         ] {
             sqlx::query(AssertSqlSafe(format!("DELETE FROM {t}")))
                 .execute(&mut *self.0)
                 .await
                 .map_err(storage)?;
         }
+        // A new epoch: cursors from before the restore are answered 410.
+        sqlx::query("UPDATE events_epoch SET epoch = lower(hex(randomblob(8))) WHERE id = 1")
+            .execute(&mut *self.0)
+            .await
+            .map_err(storage)?;
         Ok(())
     }
 
@@ -1221,12 +1231,21 @@ impl Sink for PgSink {
             "sessions",
             "session_paths",
             "session_beats",
+            // Events (ADR 0099) describe the old store's live agents too:
+            // never backed up. The sequence goes on, so a cursor from
+            // before the restore is answered as expired.
+            "events",
         ] {
             sqlx::query(AssertSqlSafe(format!("DELETE FROM {t}")))
                 .execute(&mut *self.0)
                 .await
                 .map_err(storage)?;
         }
+        // A new epoch: cursors from before the restore are answered 410.
+        sqlx::query("UPDATE events_epoch SET epoch = substr(md5(random()::text || clock_timestamp()::text), 1, 16) WHERE id = 1")
+            .execute(&mut *self.0)
+            .await
+            .map_err(storage)?;
         Ok(())
     }
 

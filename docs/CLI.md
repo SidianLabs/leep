@@ -15,7 +15,7 @@ command's options with examples for the common ones.
 | Branches | `branch`, `switch`, `tag`, `merge`, `rebase`, `cherry-pick`, `revert` |
 | History | `log`, `show`, `bisect`, `cat`, `blame`, `last-change`, `search`, `provenance`, `refs`, `reflog` |
 | Review | `review` (`approve`, `reject`, `withdraw`, `status`, `list`, `request`, `inbox`, `cancel`, `show`), `reviews`, `checks` (`post`, `status`, `ref`, `culprits`) |
-| Coordinate | `work` (`start`), `session` (`start`, `update`, `end`, `show`), `who`, `note` (`add`, `list`, `show`, `retract`, `report`, `endorse`), `context` |
+| Coordinate | `work` (`start`), `session` (`start`, `update`, `end`, `show`), `who`, `note` (`add`, `list`, `show`, `retract`, `report`, `endorse`), `watch`, `context` |
 | Admin | `undo`, `keygen`, `config` |
 
 Global options, accepted by every command and listed only in `leep --help`:
@@ -288,6 +288,25 @@ controls or invisible characters such as zero-width spaces). One principal may h
 `server_code: "too_many_notes"`) and write at most 30 an hour and 100 a day (exit 1,
 `rate_limited`, retry later). Agent notes expire after 90 days, human ones
 after a year. Against a server without notes the commands say so.
+
+### Watching events
+
+`leep watch` prints coordination events as they happen
+([ADR 0099](adr/0099-events.md)): sessions starting, changing their paths
+and ending (landed, with the changeset the ref moved to, or abandoned),
+every land (`ref.landed`, with the ref and the paths it changed), and
+notes added, endorsed or superseded. For an orchestrator or a person
+following many agents.
+
+| Command | Effect |
+|---|---|
+| `leep watch [PATH...] [--kind KIND]... [--after CURSOR] [--once]` | Long-poll the server from now (or after `CURSOR`) and print one line per event on or around the paths (at most 16): `CURSOR TIME KIND SUBJECT PRINCIPAL FACTS ["PATHS"]`, for example `e812  2026-11-10 14:03:05  session.ended  session:41  ada  landed as 3f2a9c01b7e4  ["src/auth"]`. `--kind` keeps one kind (repeatable). `--once` prints what is there now and stops. With `--json`, one `EventEntry` object per line, whose `cursor` `--after` takes. Ctrl-C stops. |
+
+Events never carry what agents wrote; the paths are agent-chosen names,
+printed quoted and escaped. The server keeps a day of events
+(`--events-retention`): a `--after` older than that, or a watch that fell
+that far behind, says some were missed and goes on from the oldest kept.
+Against a server without events the command says so.
 
 ## CI checks
 

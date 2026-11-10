@@ -18,7 +18,10 @@ use crate::store::{
 };
 use crate::{BlobStore, Changeset, ChangesetId, Hash, MetaStore, Result};
 
-pub use crate::coord_memory::{check_coord_contract, check_notes_contract, MemoryCoordStore};
+pub use crate::coord_memory::{
+    check_coord_contract, check_events_contract, check_notes_contract, CoordFaults,
+    MemoryCoordStore,
+};
 
 /// Unix seconds now, for blob modification times.
 fn now_secs() -> i64 {

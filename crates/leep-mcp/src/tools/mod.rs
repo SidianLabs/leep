@@ -15,7 +15,8 @@ pub(crate) use commit::StoppedLands;
 pub(crate) use resolve::Conflicts;
 pub use session::UNTRUSTED_NOTE;
 
-use leep_cli::error::CliError;
+use leep_cli::client::EventsRead;
+use leep_cli::error::{CliError, ErrorKind};
 use leep_core::ChangesetId;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -171,25 +172,88 @@ pub fn truncate(s: &str, max: usize) -> (&str, bool) {
     (&s[..end], true)
 }
 
-/// How often a tool call whose own answers carried no notices asks the
-/// server for the session's notices (ADR 0096).
+/// How often a tool call asks the server for the session's notices when
+/// the server keeps no events (older than ADR 0099, or sessions off).
 pub const NOTICE_POLL_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// When to ask for notices (ADR 0096): on each tool call the server reads
+/// the events after its cursor that bear on its session
+/// (`GET /v1/events?session=K&after=C&wait=0`, ADR 0099) and asks only
+/// when one matched. Against a server without events it falls back to
+/// asking at most every [`NOTICE_POLL_EVERY`].
+#[derive(Debug, Default)]
+pub struct NoticeWatch {
+    /// The events cursor; `None` before the first read.
+    cursor: Option<String>,
+    /// The server keeps no events.
+    no_events: bool,
+    /// When notices were last asked for.
+    pub(crate) last: Option<std::time::Instant>,
+}
+
 impl Server {
+    /// Whether to ask for the session's notices now: something bearing on
+    /// `key` happened since the last call (another session's work on its
+    /// paths or task, any land there), the cursor expired, this is the
+    /// first call, or nothing was asked for [`NOTICE_POLL_EVERY`]. The
+    /// last is a floor: events are lossy (an overflow, a failed append), and
+    /// a server whose events keep failing must not silence notices. Moves
+    /// the cursor on; a failed read keeps it.
+    fn notices_due(&self, key: &str) -> bool {
+        let mut w = self.notice_poll.lock().unwrap();
+        let floor = w.last.is_none_or(|t| t.elapsed() >= NOTICE_POLL_EVERY);
+        if w.no_events {
+            return floor;
+        }
+        let mut q = vec![("session", key.to_string())];
+        if let Some(c) = &w.cursor {
+            q.push(("after", c.clone()));
+        }
+        let first = w.cursor.is_none();
+        match self.client.events(&q, std::time::Duration::ZERO) {
+            Ok(EventsRead::Page(p)) => {
+                w.cursor = Some(p.next);
+                first || floor || !p.events.is_empty()
+            }
+            Ok(EventsRead::Expired(e)) => {
+                // Too far behind to know: ask, and read on from the oldest.
+                w.cursor = Some(e.oldest);
+                true
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                w.no_events = true;
+                floor
+            }
+            Err(_) => first || floor,
+        }
+    }
+
+    /// Make the last notices read `by` older, as if that much time had
+    /// passed: for tests of the [`NOTICE_POLL_EVERY`] floor.
+    #[doc(hidden)]
+    pub fn age_notice_poll(&self, by: std::time::Duration) {
+        let mut w = self.notice_poll.lock().unwrap();
+        w.last = w.last.and_then(|t| t.checked_sub(by));
+    }
+
     /// `out` with the notices the call's answers carried, fenced (ADR
-    /// 0096). When they carried none and the agent has a session, asks
-    /// the server at most every [`NOTICE_POLL_EVERY`]; a failed ask is
+    /// 0096), and the ones the server has for the session when an event
+    /// says something bears on it ([`NoticeWatch`]); a failed ask is
     /// ignored. Structured output gains a `notices` list.
     pub(crate) fn with_notices(&self, tool: &str, mut out: ToolOutput) -> ToolOutput {
         let mut notices = self.client.take_notices();
-        let polls = tool != "leep_overlaps" && self.agent_session().is_some();
-        if notices.is_empty() && polls {
-            let mut last = self.notice_poll.lock().unwrap();
-            if last.is_none_or(|t| t.elapsed() >= NOTICE_POLL_EVERY) {
-                *last = Some(std::time::Instant::now());
-                drop(last);
+        let key = (tool != "leep_overlaps")
+            .then(|| self.agent_session())
+            .flatten();
+        if let Some(key) = key {
+            if self.notices_due(&key) {
+                self.notice_poll.lock().unwrap().last = Some(std::time::Instant::now());
                 let _ = self.client.notices_now();
-                notices = self.client.take_notices();
+                for n in self.client.take_notices() {
+                    if !notices.contains(&n) {
+                        notices.push(n);
+                    }
+                }
             }
         }
         if let Some(text) = session::notices_text(

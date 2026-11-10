@@ -13,7 +13,7 @@ use crate::client::Client;
 use crate::commands::{
     amend, bisect, branch, checkout, checks, commit, config, context, diff, history, init, keygen,
     land, merge, note, pick, rebase, reflog, reset, resolve, restore, review, search, session,
-    stash, status, Ctx, Remote,
+    stash, status, watch, Ctx, Remote,
 };
 use crate::error::{CliError, ErrorKind, Result};
 use crate::help;
@@ -156,6 +156,10 @@ pub enum Command {
     /// directory or a changeset.
     #[command(subcommand, after_help = help::NOTE)]
     Note(note::NoteCmd),
+    /// Print coordination events as they happen: sessions starting,
+    /// changing paths and ending, notes added, on or around paths.
+    #[command(after_help = help::WATCH)]
+    Watch(watch::WatchArgs),
     /// Show what the server knows that bears on a task: files, owners,
     /// last changes, work in flight, ref health, possible duplicates.
     #[command(after_help = help::CONTEXT)]
@@ -364,6 +368,7 @@ fn run_with(cli: Cli, sink: &Arc<Mutex<Vec<Notice>>>) -> Result<i32> {
     if let Command::Session(_)
     | Command::Who(_)
     | Command::Note(_)
+    | Command::Watch(_)
     | Command::Context(_)
     | Command::Work(_) = &cli.command
     {
@@ -390,6 +395,7 @@ fn run_with(cli: Cli, sink: &Arc<Mutex<Vec<Notice>>>) -> Result<i32> {
             Command::Session(c) => session::run(&remote, c, wc.as_mut()),
             Command::Who(a) => session::who(&remote, a, wc.as_ref()),
             Command::Note(c) => note::run(&remote, c),
+            Command::Watch(a) => watch::watch(&remote, a),
             Command::Context(a) => context::context(&remote, a),
             Command::Work(c) => context::run(&remote, c, wc.as_mut()),
             _ => unreachable!("matched above"),

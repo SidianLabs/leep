@@ -85,6 +85,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/sqlite/0010_notes.sql"),
         satisfied_by: &[],
     },
+    Migration {
+        version: 11,
+        name: "events",
+        sql: include_str!("../migrations/sqlite/0011_events.sql"),
+        satisfied_by: &[],
+    },
 ];
 
 pub struct SqliteMetaStore {
@@ -331,6 +337,9 @@ impl SqliteMetaStore {
                     notes: migrations
                         .iter()
                         .any(|m| m.version >= crate::coord::NOTES_SCHEMA_VERSION),
+                    events: migrations
+                        .iter()
+                        .any(|m| m.version >= crate::coord::EVENTS_SCHEMA_VERSION),
                 }) as std::sync::Arc<dyn leep_core::coord::CoordStore>
             });
         Self {

@@ -515,6 +515,40 @@ async fn concurrency_limit_answers_429_while_a_request_is_in_flight() {
     assert_eq!(get(&r.app, A).await.status, StatusCode::OK);
 }
 
+/// A waiting `GET /v1/events` (ADR 0099) holds no concurrency permit: it
+/// is admitted by the events waiter class, so a token limited to one
+/// request at a time still gets its other answers while it waits.
+#[tokio::test(start_paused = true)]
+async fn a_waiting_event_read_holds_no_concurrency_permit() {
+    let r = rig_with(&one_at_a_time());
+    let tail: leep_core::api::EventsResponse = serde_json::from_slice(
+        &send(&r.app, request(Method::GET, "/v1/events", A, Body::empty()))
+            .await
+            .body,
+    )
+    .unwrap();
+    let uri = format!("/v1/events?after={}&wait=30", tail.next);
+    let waiting = spawn_request(&r.app, request(Method::GET, &uri, A, Body::empty()));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!waiting.is_finished());
+    assert_eq!(get(&r.app, A).await.status, StatusCode::OK);
+    // A request that does not wait is an ordinary one.
+    let (tx, req) = held_put(A);
+    let held = spawn_request(&r.app, req);
+    until_busy(&r.app, A).await;
+    let now = format!("/v1/events?after={}", tail.next);
+    let busy = send(&r.app, request(Method::GET, &now, A, Body::empty())).await;
+    assert_eq!(busy.status, StatusCode::TOO_MANY_REQUESTS);
+    // The last `wait` decides, as in the handler: `wait=1&wait=0` does not
+    // wait, so it needs the permit.
+    let twice = format!("/v1/events?after={}&wait=1&wait=0", tail.next);
+    let busy = send(&r.app, request(Method::GET, &twice, A, Body::empty())).await;
+    assert_eq!(busy.status, StatusCode::TOO_MANY_REQUESTS);
+    drop(tx);
+    held.await.unwrap();
+    assert_eq!(waiting.await.unwrap().status, StatusCode::OK);
+}
+
 #[tokio::test]
 async fn permit_is_released_when_the_client_cancels() {
     let r = rig_with(&one_at_a_time());

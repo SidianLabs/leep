@@ -23,6 +23,7 @@ mod comments;
 pub mod context;
 mod cursor;
 pub mod derived;
+pub mod events;
 mod filter_log;
 pub mod gc;
 pub mod gc_lease;
@@ -73,6 +74,8 @@ mod criss_cross_tests;
 mod deep_blame_tests;
 #[cfg(test)]
 mod derive_walk_tests;
+#[cfg(test)]
+mod events_tests;
 #[cfg(test)]
 mod fault_tests;
 #[cfg(test)]

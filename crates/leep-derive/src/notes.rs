@@ -110,11 +110,13 @@ impl Repo {
         session_key: Option<&str>,
         req: AddNoteRequest,
     ) -> Result<NoteEntry> {
+        let supersedes = req.supersedes;
         let r = self
             .add_note_inner(principal, trust, session_key, req)
             .await;
         match &r {
             Ok(e) => {
+                self.note_added_events(e, supersedes);
                 metrics::counter!("leep_notes_added_total", "trust" => e.trust.clone(), "kind" => e.kind.clone())
                     .increment(1);
             }
@@ -390,9 +392,10 @@ impl Repo {
     pub async fn endorse_note(&self, id: u64, actor: &NoteActor<'_>) -> Result<NoteEntry> {
         let r = self.endorse_inner(id, actor).await;
         match &r {
-            Ok((_, true)) => {
+            Ok((e, true)) => {
                 tracing::info!(note = id, by = actor.name, "note endorsed");
                 metrics::counter!("leep_notes_endorsed_total").increment(1);
+                self.note_endorsed_event(e, actor.name);
             }
             Ok(_) => {}
             Err(e) => {

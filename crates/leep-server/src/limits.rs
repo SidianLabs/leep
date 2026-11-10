@@ -682,7 +682,10 @@ async fn limit_principal(req: Request, next: Next, route_cap: usize) -> Response
     // permit there; counting it again here would cap a shared token's lands
     // at one server's permits for every server that forwards them.
     let from_peer = req.extensions().get::<crate::coord::FromPeer>().is_some();
-    let guard = if from_peer {
+    // A waiting event read (ADR 0099) is admitted by its own class, which
+    // caps waiters per server and per principal: holding a permit for its
+    // whole wait would starve the token's other requests.
+    let guard = if from_peer || crate::events::is_waiter(&req) {
         None
     } else {
         let Some(guard) = InFlight::enter(&slot) else {

@@ -155,7 +155,7 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_sessions_ended_total` | counter | `state` = `landed`, `expired` | Sessions ended by a land of their head, or by the expiry sweep. |
 | `leep_sessions_refused_total` | counter | none | Sessions not inferred because their principal already had 1000 active (`MAX_ACTIVE_PER_PRINCIPAL`). |
 | `leep_session_beats_dropped_total` | counter | `reason` = `full`, `principal` | Heartbeats of new keys not held because this server already holds 100,000 sessions' beats (`full`) or 2,000 of that principal's (`principal`, a token sending made-up keys); those sessions only look idle sooner. |
-| `leep_session_hook_errors_total` | counter | `hook` = `created`, `landed`, `beats`, `sweep`, `notes_sweep`; `reason` = `error`, `timeout`, `busy` | Session updates that failed, timed out or were skipped. The answer they followed was not affected (ADR 0095); a steady rate means the coordination writes are failing and `leep who` is going stale. |
+| `leep_session_hook_errors_total` | counter | `hook` = `created`, `landed`, `beats`, `sweep`, `notes_sweep`, `events_sweep`, `events_tail`; `reason` = `error`, `timeout`, `busy` | Session updates that failed, timed out or were skipped. The answer they followed was not affected (ADR 0095); a steady rate means the coordination writes are failing and `leep who` is going stale. |
 | `leep_overlap_notices_total` | counter | `level` = `near`, `same_file`, `claimed`, `possible_duplicate`, `landed` | Notices put in answers (ADR 0096), each counted once when said. |
 | `leep_duplicate_sessions_flagged_total` | counter | `by` = `task_key`, `similar` | `possible_duplicate` notices said: the same task key, or a declared title and approach at least 60% alike. |
 | `leep_notices_followed_total` | counter | `level` | Notices followed within 10 minutes: the session's declared scope and claims stopped covering the path the notice was about, or the session ended. Against `leep_overlap_notices_total` it is the share of notices agents act on; a level that is almost never followed is noise (design F.3). |
@@ -167,6 +167,12 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_notes_stale_suppressed_total` | counter | none | Stale agent notes left out of context packs: their file changed since they were written. Steadily high means agents leave notes on fast-moving files; they are still listed by `GET /v1/notes` with `stale: true`. |
 | `leep_context_notes_total` | counter | `trust` = `endorsed`, `human`, `agent` | Notes context packs carried, after the budget cut. Against `leep_context_packs_total`, notes per pack; `endorsed` near zero means owners are not endorsing. |
 | `leep_notes_swept_total` | counter | `reason` = `expired`, `closed` | Notes deleted by the per-minute sweep: open ones past their life (90 days for agents, 365 for humans), and superseded, retracted or reported ones 30 days after they closed. |
+| `leep_events_appended_total` | counter | `kind` = `session.started`, `session.paths`, `session.ended`, `note.added`, `note.endorsed`, `note.superseded` | Coordination events appended (ADR 0099), by the server that emitted them, every 250 ms. |
+| `leep_events_dropped_total` | counter | `reason` = `full`, `error`, `off` | Events lost before they were stored: the server's buffer of 10,000 was full (`full`), the append failed (`error`, logged as `appending events failed`), or the store keeps no events (`off`). No answer was affected; readers miss those events and resync from state. A steady `error` rate means the coordination store is failing. |
+| `leep_event_waiters` | gauge | – | Long-polls and streams of `GET /v1/events` waiting on this server. At most 10,000 (64 per principal). |
+| `leep_events_refused_total` | counter | `reason` = `server`, `principal`, `lagged` | Waiting event reads refused with 503 `Leep-Refused: events` because the server (`server`) or the principal (`principal`) had as many waiting as it allows, and streams reset because their reader fell 64 events behind (`lagged`). |
+| `leep_events_oldest_age_seconds` | gauge | – | Age of the oldest event kept, set by each sweep. Above `--events-retention` plus a few minutes, the sweep is falling behind the appends (it deletes for up to 5 s a minute per server). |
+| `leep_events_cursor_expired_total` | counter | – | Event reads answered 410 `cursor_expired`: the reader was more than `--events-retention` behind, or its cursor came from another store (a restore). Each costs that reader a resync. |
 | `leep_context_packs_total` | counter | none | Context packs answered (`POST /v1/context`, ADR 0097). Against `leep_sessions_started_total{origin="declared"}`, roughly packs per session. |
 | `leep_context_bytes_total` | counter | none | Bytes of items those packs returned (the envelope aside). Divided by `leep_context_packs_total`, the average pack. |
 | `leep_context_items_cut_total` | counter | `section` = `files`, `owners`, `history`, `in_flight`, `ref_health`, `duplicates`, `notes`, `suspects` | Items left out to keep packs within their budget. A section cut on most packs at the default budget is a sign its quota is too small. |
@@ -1545,6 +1551,51 @@ its endorsements stay until their notes go stale: undo them with
 unendorsed life from its creation back, so one past it is swept.
 Endorsements are logged (`note endorsed`, with `note` and `by`).
 
+**Migration 11 (`events`, ADR 0099).** Creates two new tables (`events`,
+empty, and `events_epoch`, one random row) and touches no existing table, so it may run beside v10
+servers, which never read it. Events are kept only by upgraded servers;
+`--sessions off` keeps none (`GET /v1/events` answers 404). The table is
+logged (not `UNLOGGED`): its sequence must survive a crash, or cursors
+would point past the end. Each server appends its events every 250 ms in
+one transaction under an advisory lock, and reads new ones every 250 ms
+only while it has long-poll or stream readers, so the load is a few
+statements a second per server.
+
+**Event retention.** Events are kept 24 hours (`--events-retention`,
+`LEEP_EVENTS_RETENTION`, a duration from `1m` to `24h`; longer is refused
+at startup, since an event names session paths that are deleted a day
+after the session ends) and swept by every server's per-minute
+coordination sweep, oldest first, in steps of 1,000 for up to 5 s a
+minute per server, enough for tens of thousands of events a second;
+watch `leep_events_oldest_age_seconds`. A reader further behind gets 410
+`cursor_expired` and resyncs from state (`GET /v1/notices`,
+`/v1/sessions`); a longer retention only helps readers that stop for
+longer than a day. At about 300 bytes a row, a day of 100 events a
+second is about 2.5 GiB; lower the retention if that is too much. Events
+are **not** in backups, like sessions: a restore starts the table empty,
+and every reader's old cursor is answered 410 (a restore gives the store
+a new events epoch). An append or bounds read waits at most 2 s for the
+events lock on Postgres, then fails (counted as dropped).
+
+**Waiting readers** (`GET /v1/events` with `wait` above 0, and streams)
+are admitted by their own class, at most 10,000 per server and 64 per
+principal (503 `Leep-Refused: events`), and hold no slot of their
+token's `concurrency` limit (ADR 0020); the token's rate still applies.
+A long-poll waits at most 30 s; a stream closes after 10 minutes, so
+every reader re-checks its token at least that often. Shutdown answers
+every waiter at once and appends the events still held.
+
+To go back to v10 without restoring a backup, stop every server and drop
+the table (losing only events):
+
+```sql
+BEGIN;
+DROP TABLE events;
+DROP TABLE events_epoch;
+DELETE FROM schema_migrations WHERE version = 11;
+COMMIT;
+```
+
 **Open review requests per requester** are capped at 100
 (`MAX_OPEN_REQUESTS`, a constant): one more is refused with 400 and code
 `too_many_review_requests`. An agent that hits it should cancel requests it
@@ -2816,7 +2867,7 @@ procedure, not an extra.
 
 | What | Where it lives | How |
 |---|---|---|
-| Metadata: changesets and their compression dictionaries, refs, ref log, signatures, reviews, review requests, notes, derived data (not leases or sessions, which describe live servers and agents) | SQLite file or Postgres database (`--meta`) | `leep-server backup` |
+| Metadata: changesets and their compression dictionaries, refs, ref log, signatures, reviews, review requests, notes, derived data (not leases, sessions or events, which describe live servers and agents) | SQLite file or Postgres database (`--meta`) | `leep-server backup` |
 | Blobs: file contents and tree nodes | filesystem directory or S3 bucket (`--blobs`) | `leep-server backup` |
 | Configuration: tokens file, signing keys file, review policy file, TLS/proxy config | wherever you keep it | your configuration management; **not in the stores and not in the backup** |
 

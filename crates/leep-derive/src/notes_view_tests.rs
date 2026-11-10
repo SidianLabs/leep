@@ -320,6 +320,29 @@ async fn only_a_human_owner_endorses() {
     assert_eq!((before.endorsed_by, before.endorsed), (None, false));
 
     let e = r.endorse_note(n.id, &human("hugo")).await.unwrap();
+    // One `note.endorsed` event (ADR 0099), by the endorser, on the path;
+    // none for the refused attempts above.
+    r.flush_events().await.unwrap();
+    let all = r
+        .events_read(
+            &leep_core::api::EventCursor {
+                epoch: None,
+                seq: 0,
+            },
+            &crate::events::EventFilter {
+                kinds: vec!["note.endorsed".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let crate::events::EventsAnswer::Page(p) = all else {
+        panic!("{all:?}")
+    };
+    assert_eq!(p.events.len(), 1);
+    assert_eq!(p.events[0].principal, "hugo");
+    assert_eq!(p.events[0].subject, format!("note:{}", n.id));
+    assert_eq!(p.events[0].paths, ["src/a.rs"]);
     let at = e.endorsed_at.expect("endorsed_at");
     assert_eq!(
         (e.endorsed_by.as_deref(), e.endorsed, e.stale, e.expires),

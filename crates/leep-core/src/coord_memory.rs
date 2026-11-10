@@ -8,11 +8,11 @@ use async_trait::async_trait;
 
 use crate::coord::{
     apply_update, check_end, check_supersede, closed_expiry, notes_per_hour, reports_per_hour,
-    too_many_notes, Beat, CoordStore, NearQuery, NearRow, NewNote, Note, NoteChange, NoteFilter,
-    NoteState, NoteSweep, NoteTrust, PathKind, Session, SessionEnd, SessionFilter, SessionOrigin,
-    SessionState, SessionUpdate, SweepReport, CLOSED_NOTE_RETENTION_SECS, EXPIRE_AFTER_SECS,
-    MAX_TOUCHED_PATHS, NOTE_RATE_WINDOW_SECS, PATHS_RETENTION_SECS, SESSION_RETENTION_SECS,
-    TOO_MANY_SESSIONS_MARKER,
+    too_many_notes, Beat, CoordStore, Event, EventBounds, NearQuery, NearRow, NewEvent, NewNote,
+    Note, NoteChange, NoteFilter, NoteState, NoteSweep, NoteTrust, PathKind, Session, SessionEnd,
+    SessionFilter, SessionOrigin, SessionState, SessionUpdate, SweepReport,
+    CLOSED_NOTE_RETENTION_SECS, EXPIRE_AFTER_SECS, MAX_TOUCHED_PATHS, NOTE_RATE_WINDOW_SECS,
+    PATHS_RETENTION_SECS, SESSION_RETENTION_SECS, TOO_MANY_SESSIONS_MARKER,
 };
 use crate::{ChangesetId, Error, Hash, Result};
 
@@ -22,18 +22,38 @@ struct Rows {
     sessions: BTreeMap<u64, Session>,
     next_note: u64,
     notes: BTreeMap<u64, Note>,
+    /// The last event `seq` handed out.
+    last_event: u64,
+    events: BTreeMap<u64, Event>,
 }
 
 /// Sessions in memory, for tests and `mem://` servers. One lock over every
 /// row, so each call is atomic.
-#[derive(Default)]
 pub struct MemoryCoordStore {
     rows: Mutex<Rows>,
+    /// The events epoch: random per store.
+    epoch: String,
+}
+
+impl Default for MemoryCoordStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MemoryCoordStore {
     pub fn new() -> Self {
-        Self::default()
+        static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seed = format!(
+            "{:?} {} {n}",
+            std::time::SystemTime::now(),
+            std::process::id()
+        );
+        MemoryCoordStore {
+            rows: Mutex::default(),
+            epoch: Hash::of_blob(seed.as_bytes()).to_string()[..16].to_string(),
+        }
     }
 }
 
@@ -486,6 +506,159 @@ impl CoordStore for MemoryCoordStore {
         }
         Ok(r)
     }
+
+    async fn append_events(&self, events: &[NewEvent]) -> Result<u64> {
+        let mut rows = self.rows.lock().unwrap();
+        for e in events {
+            rows.last_event += 1;
+            let seq = rows.last_event;
+            rows.events.insert(seq, e.stored(seq));
+        }
+        Ok(if events.is_empty() {
+            0
+        } else {
+            rows.last_event
+        })
+    }
+
+    async fn events_after(&self, after: u64, limit: usize) -> Result<Vec<Event>> {
+        let rows = self.rows.lock().unwrap();
+        Ok(rows
+            .events
+            .range(after.saturating_add(1)..)
+            .take(limit)
+            .map(|(_, e)| e.clone())
+            .collect())
+    }
+
+    async fn events_bounds(&self) -> Result<EventBounds> {
+        let rows = self.rows.lock().unwrap();
+        Ok(EventBounds {
+            oldest: rows.events.keys().next().copied(),
+            newest: rows.last_event,
+            epoch: self.epoch.clone(),
+        })
+    }
+
+    async fn sweep_events(&self, cutoff: i64, limit: usize) -> Result<u64> {
+        let mut rows = self.rows.lock().unwrap();
+        let due: Vec<u64> = rows
+            .events
+            .values()
+            .take(limit)
+            .take_while(|e| e.created < cutoff)
+            .map(|e| e.seq)
+            .collect();
+        for seq in &due {
+            rows.events.remove(seq);
+        }
+        Ok(due.len() as u64)
+    }
+}
+
+/// A [`CoordStore`] that passes every call to `inner` except the ones a
+/// test makes fail or hang: for the land-equivalence test (appends that
+/// always fail on an otherwise working store) and for admission tests
+/// (reads that never answer).
+pub struct CoordFaults {
+    pub inner: std::sync::Arc<dyn CoordStore>,
+    /// `append_events` fails.
+    pub fail_appends: std::sync::atomic::AtomicBool,
+    /// `events_bounds` and `list_sessions` never answer.
+    pub hang_reads: std::sync::atomic::AtomicBool,
+    /// Appends asked for, failed or not.
+    pub appends: std::sync::atomic::AtomicUsize,
+}
+
+impl CoordFaults {
+    pub fn new(inner: std::sync::Arc<dyn CoordStore>) -> Self {
+        CoordFaults {
+            inner,
+            fail_appends: Default::default(),
+            hang_reads: Default::default(),
+            appends: Default::default(),
+        }
+    }
+
+    async fn hang(&self) {
+        if self.hang_reads.load(std::sync::atomic::Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[async_trait]
+impl CoordStore for CoordFaults {
+    async fn upsert_session(&self, u: &SessionUpdate) -> Result<(Session, bool)> {
+        self.inner.upsert_session(u).await
+    }
+    async fn get_session(&self, id: u64) -> Result<Option<Session>> {
+        self.inner.get_session(id).await
+    }
+    async fn list_sessions(&self, f: &SessionFilter) -> Result<Vec<Session>> {
+        self.hang().await;
+        self.inner.list_sessions(f).await
+    }
+    async fn end_session(&self, id: u64, end: &SessionEnd) -> Result<bool> {
+        self.inner.end_session(id, end).await
+    }
+    async fn beat_sessions(&self, beats: &[Beat]) -> Result<u64> {
+        self.inner.beat_sessions(beats).await
+    }
+    async fn sweep_sessions(&self, now: i64, limit: usize) -> Result<SweepReport> {
+        self.inner.sweep_sessions(now, limit).await
+    }
+    async fn count_sessions(&self, state: SessionState, cap: usize) -> Result<u64> {
+        self.inner.count_sessions(state, cap).await
+    }
+    async fn near_paths(&self, q: &NearQuery) -> Result<Vec<NearRow>> {
+        self.inner.near_paths(q).await
+    }
+    async fn add_note(&self, n: &NewNote) -> Result<Note> {
+        self.inner.add_note(n).await
+    }
+    async fn get_note(&self, id: u64) -> Result<Option<Note>> {
+        self.inner.get_note(id).await
+    }
+    async fn list_notes(&self, f: &NoteFilter) -> Result<Vec<Note>> {
+        self.inner.list_notes(f).await
+    }
+    async fn notes_at(&self, anchors: &[String], cap: usize) -> Result<Vec<Note>> {
+        self.inner.notes_at(anchors, cap).await
+    }
+    async fn change_note(&self, id: u64, change: &NoteChange, at: i64) -> Result<bool> {
+        self.inner.change_note(id, change, at).await
+    }
+    async fn revoke_notes(&self, principal: &str, at: i64) -> Result<u64> {
+        self.inner.revoke_notes(principal, at).await
+    }
+    async fn unreport_notes(&self, id: Option<u64>, reporter: Option<&str>) -> Result<u64> {
+        self.inner.unreport_notes(id, reporter).await
+    }
+    async fn sweep_notes(&self, now: i64, limit: usize) -> Result<NoteSweep> {
+        self.inner.sweep_notes(now, limit).await
+    }
+    async fn unendorse_notes(&self, id: Option<u64>, endorser: Option<&str>) -> Result<u64> {
+        self.inner.unendorse_notes(id, endorser).await
+    }
+    async fn append_events(&self, events: &[NewEvent]) -> Result<u64> {
+        self.appends
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_appends.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::Storage("appending events failed (injected)".into()));
+        }
+        self.inner.append_events(events).await
+    }
+    async fn events_after(&self, after: u64, limit: usize) -> Result<Vec<Event>> {
+        self.inner.events_after(after, limit).await
+    }
+    async fn events_bounds(&self) -> Result<EventBounds> {
+        self.hang().await;
+        self.inner.events_bounds().await
+    }
+    async fn sweep_events(&self, cutoff: i64, limit: usize) -> Result<u64> {
+        self.inner.sweep_events(cutoff, limit).await
+    }
 }
 
 /// Assert the [`CoordStore`] contract. Run it on an empty store: the sweep
@@ -840,6 +1013,7 @@ pub async fn check_coord_contract(store: &dyn CoordStore) {
 
     check_near_contract(store, end_of_days).await;
     check_notes_contract(store).await;
+    check_events_contract(store).await;
 }
 
 /// [`CoordStore::near_paths`] (ADR 0096): the rows of other active
@@ -1509,6 +1683,205 @@ pub async fn check_notes_contract(store: &dyn CoordStore) {
     }
     while store.sweep_notes(after, 1000).await.unwrap() != NoteSweep::default() {}
     assert!(list(all).await.is_empty());
+}
+
+/// Assert the events part of the [`CoordStore`] contract (ADR 0099) on an
+/// empty store: `seq` ascends in append order, pages are bounded and
+/// ordered, the bounds follow appends and sweeps, and the sweep deletes a
+/// bounded prefix in `seq` order, stopping at the first young event.
+pub async fn check_events_contract(store: &dyn CoordStore) {
+    let t0 = 1_700_000_000;
+    let ev = |n: usize, at: i64| NewEvent {
+        kind: "session.started".into(),
+        session_id: Some(n as u64),
+        principal: format!("p{}", n % 3),
+        subject: format!("session:{n}"),
+        paths: vec![format!("src/m{n}"), "docs".into()],
+        payload: format!("{{\"origin\":\"declared\",\"n\":{n}}}"),
+        created: at,
+    };
+    let fresh = store.events_bounds().await.unwrap();
+    assert_eq!((fresh.oldest, fresh.newest), (None, 0));
+    let epoch = fresh.epoch.clone();
+    assert!(
+        (8..=64).contains(&epoch.len()) && epoch.bytes().all(|b| b.is_ascii_alphanumeric()),
+        "{epoch:?}"
+    );
+    assert!(!fresh.expired(0));
+    assert_eq!(store.append_events(&[]).await.unwrap(), 0);
+    assert!(store.events_after(0, 10).await.unwrap().is_empty());
+
+    // Appends keep their order, within a call and across calls; a call
+    // larger than any statement's bind limit is still one ordered append.
+    let first: Vec<NewEvent> = (0..5).map(|n| ev(n, t0)).collect();
+    let top = store.append_events(&first).await.unwrap();
+    let big: Vec<NewEvent> = (5..2505).map(|n| ev(n, t0 + 10)).collect();
+    let top2 = store.append_events(&big).await.unwrap();
+    assert!(top2 > top);
+    let mut all = Vec::new();
+    let mut after = 0;
+    loop {
+        let page = store.events_after(after, 700).await.unwrap();
+        assert!(page.len() <= 700);
+        let Some(last) = page.last() else { break };
+        after = last.seq;
+        all.extend(page);
+    }
+    assert_eq!(all.len(), 2505);
+    assert!(all.windows(2).all(|w| w[0].seq < w[1].seq), "seq ascends");
+    assert_eq!(all.last().unwrap().seq, top2);
+    for (n, e) in all.iter().enumerate() {
+        assert_eq!(e, &ev(n, e.created).stored(e.seq), "event {n} reads back");
+    }
+    assert_eq!(all[4].seq, top);
+    let b = store.events_bounds().await.unwrap();
+    assert_eq!(b.oldest, Some(all[0].seq));
+    assert_eq!(b.newest, top2);
+    assert!(!b.expired(all[0].seq - 1));
+    assert!(!b.expired(top2));
+    assert!(
+        b.expired(top2 + 1),
+        "a cursor past the newest is from another store"
+    );
+    let mid = all[1000].seq;
+    let page = store.events_after(mid, 3).await.unwrap();
+    assert_eq!(
+        page.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        all[1001..1004].iter().map(|e| e.seq).collect::<Vec<_>>()
+    );
+
+    // The sweep is bounded, takes the oldest first, and stops at the first
+    // event created at or after the cutoff, even when older ones follow.
+    let late = store.append_events(&[ev(9000, t0 + 500)]).await.unwrap();
+    let old_again = store.append_events(&[ev(9001, t0)]).await.unwrap();
+    assert_eq!(store.sweep_events(t0 + 5, 3).await.unwrap(), 3);
+    assert_eq!(
+        store.events_bounds().await.unwrap().oldest,
+        Some(all[3].seq)
+    );
+    assert!(store.events_bounds().await.unwrap().expired(all[1].seq));
+    assert!(!store.events_bounds().await.unwrap().expired(all[2].seq));
+    assert_eq!(store.sweep_events(t0 + 5, 100).await.unwrap(), 2);
+    assert_eq!(
+        store.events_bounds().await.unwrap().oldest,
+        Some(all[5].seq)
+    );
+    let mut swept = 0;
+    loop {
+        let n = store.sweep_events(t0 + 100, 1000).await.unwrap();
+        assert!(n <= 1000);
+        if n == 0 {
+            break;
+        }
+        swept += n;
+    }
+    assert_eq!(swept, 2500);
+    let b = store.events_bounds().await.unwrap();
+    assert_eq!(b.oldest, Some(late), "stopped at the young event");
+    assert_eq!(b.newest, old_again);
+    assert_eq!(
+        store
+            .events_after(0, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect::<Vec<_>>(),
+        [late, old_again]
+    );
+    while store.sweep_events(t0 + 1000, 1000).await.unwrap() > 0 {}
+    // Empty again: the sequence goes on, so old cursors are expired and
+    // the newest is not.
+    let b = store.events_bounds().await.unwrap();
+    assert_eq!(b.oldest, None);
+    assert_eq!(b.newest, old_again);
+    assert!(b.expired(late));
+    assert!(!b.expired(old_again));
+    assert_eq!(b.epoch, epoch, "the epoch is fixed");
+    let next = store.append_events(&[ev(1, t0 + 2000)]).await.unwrap();
+    assert!(next > old_again, "seq never goes back after a sweep");
+    while store.sweep_events(t0 + 3000, 1000).await.unwrap() > 0 {}
+    check_event_order(store).await;
+}
+
+/// Let the other futures of a `join` run.
+async fn yield_once() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
+/// Concurrent appends seen by a reader that pages by cursor while they
+/// run: it ends with every event exactly once. A store that let a reader
+/// see `seq` 11 before 10 committed would lose 10 here (ADR 0099).
+async fn check_event_order(store: &dyn CoordStore) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const WRITERS: usize = 6;
+    const BATCHES: usize = 40;
+    let start = store.events_bounds().await.unwrap().newest;
+    let done = AtomicUsize::new(0);
+    let write = |w: usize| {
+        let done = &done;
+        async move {
+            for b in 0..BATCHES {
+                let batch: Vec<NewEvent> = (0..1 + (w + b) % 4)
+                    .map(|i| NewEvent {
+                        kind: "note.added".into(),
+                        session_id: None,
+                        principal: format!("w{w}"),
+                        subject: format!("note:{}", w * 10_000 + b * 10 + i),
+                        paths: Vec::new(),
+                        payload: "{}".into(),
+                        created: 1,
+                    })
+                    .collect();
+                store.append_events(&batch).await.unwrap();
+                yield_once().await;
+            }
+            done.fetch_add(1, Ordering::SeqCst);
+        }
+    };
+    let read = async {
+        let mut seen = Vec::new();
+        let mut after = start;
+        loop {
+            let finished = done.load(Ordering::SeqCst) == WRITERS;
+            let page = store.events_after(after, 37).await.unwrap();
+            if let Some(last) = page.last() {
+                after = last.seq;
+            }
+            let empty = page.is_empty();
+            seen.extend(page.into_iter().map(|e| e.subject));
+            if finished && empty {
+                return seen;
+            }
+            yield_once().await;
+        }
+    };
+    let writers = futures_util::future::join_all((0..WRITERS).map(write));
+    let (_, seen) = futures_util::future::join(writers, read).await;
+    let mut want: Vec<String> = (0..WRITERS)
+        .flat_map(|w| {
+            (0..BATCHES).flat_map(move |b| {
+                (0..1 + (w + b) % 4).map(move |i| format!("note:{}", w * 10_000 + b * 10 + i))
+            })
+        })
+        .collect();
+    let mut got = seen.clone();
+    got.sort();
+    got.dedup();
+    assert_eq!(got.len(), seen.len(), "no event read twice");
+    want.sort();
+    assert_eq!(got, want, "no event missed");
+    while store.sweep_events(2, 1000).await.unwrap() > 0 {}
 }
 
 #[cfg(test)]

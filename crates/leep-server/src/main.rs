@@ -458,6 +458,11 @@ struct Args {
     /// conflicts per 1,000 lands with and without them.
     #[arg(long, env = "LEEP_NOTICES", value_enum, default_value_t = Switch::On)]
     notices: Switch,
+    /// How long coordination events (`GET /v1/events`, ADR 0099) are kept
+    /// before the sweep deletes them. A reader further behind is answered
+    /// 410 and resyncs from state.
+    #[arg(long, env = "LEEP_EVENTS_RETENTION", default_value = "24h", value_parser = parse_grace)]
+    events_retention: std::time::Duration,
     /// The ref work lands on when it names none: a session that never said
     /// its target ref (an inferred session from an older client) hears of
     /// lands here (ADR 0096).
@@ -1081,6 +1086,22 @@ fn parse_expires_in(s: &str) -> Result<std::time::Duration, String> {
         return Err("must be greater than zero, e.g. 30d".into());
     }
     Ok(d)
+}
+
+/// `--events-retention` is at most a day: an event names paths of a
+/// session, which are deleted a day after it ends
+/// (`PATHS_RETENTION_SECS`), so an older event would point a reader at
+/// state that is gone; and at least a minute, the sweep's period.
+fn check_events_retention(d: std::time::Duration) -> Result<(), String> {
+    let most = leep_core::coord::PATHS_RETENTION_SECS as u64;
+    if d.as_secs() > most || d.as_secs() < 60 {
+        return Err(format!(
+            "--events-retention must be between 1m and {}h (got {}s)",
+            most / 3600,
+            d.as_secs()
+        ));
+    }
+    Ok(())
 }
 
 fn parse_grace(s: &str) -> Result<std::time::Duration, String> {
@@ -2035,7 +2056,10 @@ async fn run() -> anyhow::Result<()> {
     if args.sessions == Switch::Off {
         repo = repo.with_coord(None);
     }
-    repo = repo.with_notices(args.notices == Switch::On);
+    check_events_retention(args.events_retention).map_err(anyhow::Error::msg)?;
+    repo = repo
+        .with_notices(args.notices == Switch::On)
+        .with_events_retention(args.events_retention.as_secs() as i64);
     leep_core::refname::validate(&args.default_ref)
         .map_err(|e| anyhow::anyhow!("--default-ref: {e}"))?;
     repo = repo.with_default_ref(&args.default_ref);
@@ -2189,6 +2213,7 @@ async fn run() -> anyhow::Result<()> {
         lazy_create_trees = repo.lazy_create_trees(),
         "creates' tree nodes (ADR 0069)"
     );
+    let events = repo.clone();
     let mut app = leep_server::router_with_read_classes(
         repo,
         args.max_body_bytes,
@@ -2233,6 +2258,7 @@ async fn run() -> anyhow::Result<()> {
             app,
             async move {
                 shutdown_signal().await;
+                leep_server::sessions::stop_events(&events).await;
                 if let Some(l) = releasing {
                     l.shutdown().await;
                 }
@@ -2250,6 +2276,7 @@ async fn run() -> anyhow::Result<()> {
         app,
         async move {
             shutdown_signal().await;
+            leep_server::sessions::stop_events(&events).await;
             stopping.shutdown().await;
             if let Some(l) = releasing {
                 l.shutdown().await;
@@ -2683,6 +2710,16 @@ mod tests {
         assert!(gc.contains("--meta") && gc.contains("--request-timeout"));
         let top = cmd.render_long_help().to_string();
         assert!(top.contains("--meta") && top.contains("--listen"));
+    }
+
+    #[test]
+    fn events_retention_is_a_minute_to_a_day() {
+        use std::time::Duration;
+        assert!(check_events_retention(Duration::from_secs(24 * 3600)).is_ok());
+        assert!(check_events_retention(Duration::from_secs(3600)).is_ok());
+        assert!(check_events_retention(Duration::from_secs(24 * 3600 + 1)).is_err());
+        assert!(check_events_retention(Duration::from_secs(7 * 24 * 3600)).is_err());
+        assert!(check_events_retention(Duration::from_secs(0)).is_err());
     }
 
     /// deploy/leep-server.env.example lists exactly the variables the

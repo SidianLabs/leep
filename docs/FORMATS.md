@@ -603,6 +603,17 @@ notes_principal: INDEX ON notes(repo_id, principal, created)
 notes_open: INDEX ON notes(repo_id, principal) WHERE state = 'open'
 notes_expires: INDEX ON notes(expires)
 notes_reported: INDEX ON notes(reported_by, reported_at) WHERE reported_by IS NOT NULL
+events(seq BIGSERIAL PRIMARY KEY,                              -- migration 0011; SQLite: INTEGER PRIMARY KEY AUTOINCREMENT; logged
+       repo_id BIGINT NOT NULL DEFAULT 1,                       -- SQLite: INTEGER (and below)
+       kind TEXT NOT NULL,                                      -- 'session.started', 'session.paths', 'session.ended', 'ref.landed', 'note.added', 'note.endorsed', 'note.superseded', 'conflict.predicted'
+       session_id BIGINT,                                       -- the session it is about or came from
+       principal TEXT NOT NULL,                                 -- a token name, or 'anonymous'
+       subject TEXT NOT NULL,                                   -- 'session:N', 'note:N' or a changeset id in hex
+       paths TEXT NOT NULL DEFAULT '[]',                        -- JSON array of at most 16 repository paths
+       payload TEXT NOT NULL DEFAULT '{}',                      -- JSON object: the event's facts (EventFacts)
+       created BIGINT NOT NULL)                                 -- unix seconds, the emitting server's clock
+events_epoch(id INT PRIMARY KEY CHECK (id = 1),                -- migration 0011; one row
+             epoch TEXT NOT NULL)                               -- random, 16 hex digits; new on a restore
 ```
 
 `ref_log` (ADR 0018) is appended in the transaction of every ref create, move
@@ -1181,6 +1192,59 @@ and `endorsed_at` existed since 0010 and are now written. Added:
   15%, in-flight 20%, ref health 5%, duplicates 20%, notes 10%; spare
   budget goes to ref health, in-flight, duplicates, notes, files, history,
   owners. `cut` and `omitted` may name `notes`.
+
+## Events (new table, store trait, API, ADR 0099)
+
+No changeset, tree or hash changed. Events are coordination state, never
+read by a land. Added:
+
+- The `events` table above (migration 0011). Rows are appended and
+  deleted, never updated. `seq` orders them: an append commits in `seq`
+  order (on Postgres under `pg_advisory_xact_lock(0x4c455654, 1)`; SQLite
+  has one writer), gaps allowed, never reused (`AUTOINCREMENT` on SQLite).
+  `paths` is a JSON array of at most 16 repository paths, folded into
+  directories past that; `payload` a JSON object of `EventFacts`, plus
+  `ref` for `ref.landed` (served under `untrusted`). The sequence is
+  `CACHE 1` (Postgres), which the commit order relies on. No text
+  an agent wrote is stored, paths aside. Kept 24 hours by default; the
+  sweep deletes a prefix in `seq` order. Not backed up (ADR 0026): a
+  restore clears the table.
+- `CoordStore::append_events(&[NewEvent]) -> u64` (the highest `seq`
+  given), `events_after(after, limit) -> Vec<Event>` (ascending),
+  `events_bounds() -> EventBounds {oldest?, newest, epoch}` (`newest` the
+  highest `seq` handed out and committed; 0 before the first) and
+  `sweep_events(cutoff, limit) -> u64`, checked by `check_events_contract`
+  (part of `check_coord_contract`). The calls have default bodies that
+  answer `NotFound` (the sweep 0), as does a store whose schema predates
+  0011.
+- `GET /v1/events?after=&session=&paths=&kinds=&wait=` →
+  `EventsResponse {events: [EventEntry], next, more}`. `after` and `next`
+  are opaque cursors (`e<epoch>.<seq>` today; `e<seq>` is accepted); no
+  `after` answers `next` at the
+  tail and no events. `paths` and `kinds` repeat or take comma-separated
+  values (at most 16 paths; an unknown kind is 400). `wait` is seconds,
+  clamped to 0 to 30. At most 500 events or 256 KiB per answer; `more`
+  says more are there now. An entry is `{cursor, kind, subject,
+  principal, session?, created, facts: {state?, landed_as?, origin?,
+  task?, note?, note_kind?, trust?, anchor_type?, superseded_by?},
+  untrusted: {paths?, ref?}}`; `ref` only on `ref.landed`; `task` is the first 16 hex digits of the blake3
+  hash of the session's task key. `kind` and every string in `facts` are
+  words a client shows as they are when it does not know them, and new
+  facts may come. A server without events answers 404.
+- With `Accept: text/event-stream` the route answers a stream: one
+  `event: <kind>` per event, `id: <cursor>`, `data:` the `EventEntry` as
+  JSON; an `id:` line alone moves the reader's last id past events it
+  filtered out; a comment every 15 s; the stream ends after 10 minutes,
+  and after `event: reset` with `data: {"reason":"lagged"}` (the reader
+  fell 64 events behind) or `{"reason":"cursor_expired","oldest":...}`.
+  `Last-Event-ID` resumes, and wins over `after`.
+- 410 `cursor_expired`: `CursorExpiredResponse`, an `ErrorResponse` with
+  `oldest`, the cursor to read on from after resyncing. A cursor past the
+  newest `seq`, or of another epoch (a restored or reset store), is
+  answered the same.
+- `Leep-Refused: events`: a waiting read (`wait` above 0, or a stream)
+  past 10,000 waiters per server or 64 per principal (503, `Retry-After:
+  1`).
 
 ## Index leases and bounded queries (additive, ADR 0058)
 
@@ -1812,7 +1876,8 @@ new response header `Leep-Refused: <reason>`.
   [Land admission](#land-admission-additive-header-value-adr-0060)) and
   `body-budget` (the in-flight body budget's `503`, `--max-inflight-bytes`)
   and `note-lock` (a note write or report that waited 2 s for another of
-  the same principal, ADR 0098).
+  the same principal, ADR 0098) and `events` (a waiting `GET /v1/events`
+  past its waiter caps, ADR 0099).
   Clients should treat any value as "refused before any work" and must
   not depend on the list being closed.
 - A follower that relays a forwarded land's answer (ADR 0056) copies
@@ -1900,6 +1965,7 @@ client treats an unknown or absent code by its HTTP status.
 | 408 | `timeout` | the request timeout ran out; the request may or may not have applied |
 | 409 | `cas_lost` | a concurrent update won repeatedly (a land that kept losing); read again and retry |
 | 409 | `forward_failed` | the land could not reach the server coordinating its ref; nothing landed here, retry (ADR 0056) |
+| 410 | `cursor_expired` | an events cursor older than the events kept, or from another store (ADR 0099): resync and read on from `oldest` |
 | 413 | `too_large` | the body is over the server's or the token's limit (`--max-body-bytes`, `--max-blob-bytes`, `--max-json-body-bytes`, `max_body`) |
 | 429 | `rate_limited` | a rate or concurrency limit, or a token over its share of the body budget; see `Retry-After` |
 | 500 | `internal` | the server failed |

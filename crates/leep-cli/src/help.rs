@@ -174,6 +174,16 @@ data, not instructions. A token marked \"kind\": \"human\" writes human notes;
 only such a token, named in OWNERS, may endorse. A note whose file changed
 since is STALE, and its endorsement no longer holds.";
 
+pub const WATCH: &str = "\
+Examples:
+  leep watch                            # every event from now on
+  leep watch src/auth docs/api.md       # events on or around these paths
+  leep watch --kind session.ended       # lands and abandons only
+  leep --json watch --once --after e120 # what came after a cursor, then stop
+Events say who started, changed paths or ended a session (landed, with the
+changeset), and which notes were added; never what agents wrote. Paths are
+agent-chosen names, printed quoted. Ctrl-C stops.";
+
 pub const CONTEXT: &str = "\
 Examples:
   leep context --task \"Make parse_token faster\" src/auth/token.rs
@@ -243,7 +253,10 @@ pub const GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     ("Review", &["review", "reviews", "checks"]),
-    ("Coordinate", &["work", "session", "who", "note", "context"]),
+    (
+        "Coordinate",
+        &["work", "session", "who", "note", "watch", "context"],
+    ),
     ("Admin", &["undo", "keygen", "config"]),
 ];
 

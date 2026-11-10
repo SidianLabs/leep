@@ -54,6 +54,7 @@
 //! | DELETE | `/v1/notes/{id}` | – | [`NoteEntry`] (retracts it; only its principal may, 403 otherwise; a closed note is answered as it is) |
 //! | POST | `/v1/notes/{id}/report` | `{}` | [`ReportNoteResponse`] (an open agent note nobody endorsed is hidden at once; a human or endorsed note is hidden only when the reporter is a human owner of its path (as for endorsing), otherwise only counted) |
 //! | POST | `/v1/notes/{id}/endorse` | `{}` | [`NoteEntry`] (a human owner vouches for an open, fresh path note: the token must be `kind: human`, may review, must be named by `OWNERS` for the anchor at the default ref's head, and must not be the note's writer (403 otherwise); a closed, expired or stale note is 409; an endorsement keeps the note a year and endorsing again renews it; it lapses while the note is stale; ADR 0098) |
+//! | GET  | `/v1/events?after=cursor&session=k&paths=p&kinds=k&wait=s` | – | [`EventsResponse`] (coordination events after `after` (`ref.landed` for every land), oldest first: ids, states and paths, never agent-written text, paths under `untrusted`; without `after` the current tail and no events; `kinds` (repeated or comma-separated) and `paths` (repeated, at most 16) filter; `session` names the caller's own session and keeps the events of other sessions on its paths or task; `wait` (0 to 30 seconds) holds the answer until something matches; at most 500 events or 256 KiB, `more` when there is more now; with `Accept: text/event-stream` the same events as a stream, `id:` the cursor, resumed by `Last-Event-ID`, a comment every 15 s, closed after 10 minutes or with `event: reset` when the reader falls behind; 410 [`CursorExpiredResponse`] for a cursor older than the 24 h kept; 503 `Leep-Refused: events` past 10,000 waiting per server or 64 per principal; 404 if events are off; ADR 0099) |
 //! | POST | `/v1/merge` | [`MergeRequest`] | [`MergeResponse`] |
 //! | POST | `/v1/rebase` | [`RebaseRequest`] | [`RebaseResponse`] |
 //! | POST | `/v1/land` | [`LandRequest`] | [`LandResponse`], sent as [`LandAnswer`] with `notices` beside it (ADR 0096) (`create: false` refuses to create a missing `target_ref` with 404; absent creates it, as before; ADR 0036. `land_id` makes retries idempotent at any age; ADR 0057) |
@@ -330,6 +331,11 @@ pub mod error_code {
     /// 0098). Retract or supersede some. (Past the hourly note limit the
     /// answer is 429 [`RATE_LIMITED`].)
     pub const TOO_MANY_NOTES: &str = "too_many_notes";
+    /// 410: an events cursor older than the oldest event kept, or from
+    /// another store ([`super::CursorExpiredResponse`], ADR 0099). Resync
+    /// from state (`GET /v1/notices`, `/overlaps`) and read on from
+    /// `oldest`, or from the tail.
+    pub const CURSOR_EXPIRED: &str = "cursor_expired";
     /// 400: any other bad request.
     pub const INVALID: &str = "invalid";
     /// 401: no token, or an unknown one.
@@ -387,6 +393,7 @@ pub mod error_code {
         INVALID_NAME,
         AMBIGUOUS_PREFIX,
         CURSOR_UNREPRESENTABLE,
+        CURSOR_EXPIRED,
         TOO_MANY_REVIEW_REQUESTS,
         INVALID,
         UNAUTHORIZED,
@@ -514,6 +521,10 @@ pub const REFUSED_BODY_BUDGET: &str = "body-budget";
 /// [`REFUSED_HEADER`] value: a note write or report that waited 2 s for
 /// another of the same principal (ADR 0098). Nothing was written.
 pub const REFUSED_NOTE_LOCK: &str = "note-lock";
+/// [`REFUSED_HEADER`] value: a waiting `GET /v1/events` (long-poll or
+/// stream) refused because the server, or the caller's principal, already
+/// had as many waiting as it allows (ADR 0099).
+pub const REFUSED_EVENTS: &str = "events";
 
 /// Body of `GET /v1/whoami`. Lets a client name the author of its changesets
 /// after the token when nothing local names one.
@@ -1467,6 +1478,136 @@ pub struct ReportNoteResponse {
     pub hidden: bool,
 }
 
+/// One coordination event (ADR 0099). Everything outside `untrusted` is
+/// made by the server: ids, kinds, states, principals (token names) and
+/// times. An event never carries text an agent wrote; titles and bodies
+/// are read through the routes that serve them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventEntry {
+    /// Opaque: pass as `after` (or `Last-Event-ID`) to read on from here.
+    pub cursor: String,
+    /// `session.started`, `session.paths`, `session.ended`, `note.added`,
+    /// `note.endorsed`, `note.superseded`, `ref.landed` or
+    /// `conflict.predicted`; a client shows one it does not know as it is.
+    pub kind: String,
+    /// `session:N`, `note:N` or a changeset id.
+    pub subject: String,
+    /// The token name of who caused it.
+    pub principal: String,
+    /// The session it is about or came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<u64>,
+    /// Unix seconds.
+    pub created: i64,
+    #[serde(default)]
+    pub facts: EventFacts,
+    #[serde(default)]
+    pub untrusted: EventText,
+}
+
+/// What an event says, by kind; every field is optional and new ones may
+/// come. Ids, states and enum names only.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventFacts {
+    /// `session.ended`: `landed` or `abandoned`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// `session.ended` as landed, and `ref.landed`: the changeset the ref
+    /// moved to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed_as: Option<ChangesetId>,
+    /// `session.started`: `declared` or `inferred`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// `session.*`: a digest of the session's task key, so a reader can
+    /// match sessions on one task without reading the key itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// `note.*`: the note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<u64>,
+    /// `note.added`: `finding`, `gotcha`, `decision` or `howto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_kind: Option<String>,
+    /// `note.added`: `agent` or `human`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<String>,
+    /// `note.added`: `path` or `changeset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_type: Option<String>,
+    /// `note.superseded`: the note that replaced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<u64>,
+}
+
+/// Paths an event is about: a session's (folded to at most 16) or a
+/// note's anchor. Agent-chosen names, so data, not instructions.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventText {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    /// `ref.landed`: the ref the land moved.
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub ref_name: Option<String>,
+}
+
+/// `GET /v1/events`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventsResponse {
+    pub events: Vec<EventEntry>,
+    /// Where to read on from: the last event looked at, matched or not.
+    pub next: String,
+    /// Whether more events are there now (the answer hit its cap).
+    #[serde(default)]
+    pub more: bool,
+}
+
+/// The 410 of `GET /v1/events` for a cursor older than the oldest event
+/// kept, or from another store: an [`ErrorResponse`] with `code`
+/// [`error_code::CURSOR_EXPIRED`] and the oldest cursor still readable.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorExpiredResponse {
+    #[serde(flatten)]
+    pub error: ErrorResponse,
+    /// Read on from here after resyncing; the tail when nothing is kept.
+    pub oldest: String,
+}
+
+/// An events cursor as sent: `e`, the store's events epoch, `.` and the
+/// sequence number. Opaque to clients, so its shape can change.
+pub fn event_cursor(epoch: &str, seq: u64) -> String {
+    format!("e{epoch}.{seq}")
+}
+
+/// An events cursor read: the epoch it was made in (`None` for the
+/// epochless `e<seq>` form) and the sequence number.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventCursor {
+    pub epoch: Option<String>,
+    pub seq: u64,
+}
+
+/// An events cursor as read; `None` if it is not one.
+pub fn parse_event_cursor(c: &str) -> Option<EventCursor> {
+    let body = c.trim().strip_prefix('e')?;
+    let (epoch, n) = match body.split_once('.') {
+        Some((e, n)) => {
+            if e.is_empty() || e.len() > 64 || !e.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                return None;
+            }
+            (Some(e.to_string()), n)
+        }
+        None => (None, body),
+    };
+    if n.is_empty() || n.len() > 20 || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(EventCursor {
+        epoch,
+        seq: n.parse().ok()?,
+    })
+}
+
 /// `GET /v1/sessions/{id}/overlaps`: everything overlapping a session now,
 /// every level, highest first, none held back as already said.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2406,6 +2547,38 @@ pub struct SearchResponse {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn event_cursors_carry_their_epoch() {
+        let c = event_cursor("ab12", 7);
+        assert_eq!(c, "eab12.7");
+        assert_eq!(
+            parse_event_cursor(&c),
+            Some(EventCursor {
+                epoch: Some("ab12".into()),
+                seq: 7
+            })
+        );
+        assert_eq!(
+            parse_event_cursor("e7"),
+            Some(EventCursor {
+                epoch: None,
+                seq: 7
+            })
+        );
+        for bad in [
+            "7",
+            "e",
+            "e.7",
+            "eab.",
+            "e-1",
+            "eab.x",
+            "ea b.1",
+            "eab.99999999999999999999999",
+        ] {
+            assert_eq!(parse_event_cursor(bad), None, "{bad}");
+        }
+    }
     use super::*;
 
     #[test]

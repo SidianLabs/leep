@@ -475,7 +475,7 @@ impl Server {
                 // Best effort, like every notice read: what the server
                 // cannot say now is said on a later answer.
                 if self.client.notices_now().is_ok() {
-                    *self.notice_poll.lock().unwrap() = Some(std::time::Instant::now());
+                    self.notice_poll.lock().unwrap().last = Some(std::time::Instant::now());
                 }
                 (s.content, s.notices, true)
             }
