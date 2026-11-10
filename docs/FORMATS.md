@@ -951,6 +951,39 @@ Added:
   without sessions (`--sessions off`, or older) answers the routes 404.
 - Error code `too_many_sessions` (400).
 
+## Overlap notices (additive API, store trait method, ADR 0096)
+
+No table, column, index or stored encoding changed; nothing is
+persisted. Added:
+
+- `CoordStore::near_paths(NearQuery {paths, siblings, exclude, per_range,
+  limit}) -> Vec<NearRow {session, kind, path}>` (checked by the coord
+  contract): path rows of active sessions equal to a path or a directory
+  above it, below it, and with `siblings` below its directory; each range
+  capped at `per_range`, the whole at `limit`; the sessions come without
+  their path lists. `SessionFilter.skip_paths` (default `false`) leaves a
+  listing's path lists empty.
+- `Notice {level, session?, principal?, changeset?, count?, by?,
+  similarity?, untrusted: {title?, path?, other_path?, task_key?}}`.
+  `level` is `near`, `same_file`, `claimed`, `possible_duplicate` or
+  `landed`, lowest first, and a client shows one it does not know as it
+  is; `by` is `task_key` or `similar`; `similarity` is a percentage.
+  Agent-written text is only under `untrusted`. Absent fields are omitted.
+- Optional `notices: [Notice]` (omitted when empty, default empty) on
+  `CreateChangesetResponse`, `DeclareSessionResponse` and
+  `SessionsResponse`, and beside the fields of the `POST /v1/land` answer:
+  `LandAnswer` is `LandResponse` flattened with `notices`, so `status` and
+  every other field are where they were and a client reading
+  `LandResponse` ignores the field.
+- `GET /v1/notices` → `NoticesResponse {notices}` (the caller's session
+  named by `Leep-Session`; empty without it; 404 without sessions) and
+  `GET /v1/sessions/{id}/overlaps` → `OverlapsResponse {session,
+  overlaps}` (404 for an unknown session).
+- Request header `Leep-Notices: near | same_file | claimed |
+  possible_duplicate | landed | off`: the lowest level an answer carries
+  (default `same_file`); an unknown value counts as absent. Forwarded lands
+  carry it and `Leep-Session` to the coordinating server.
+
 ## Index leases and bounded queries (additive, ADR 0058)
 
 No table, column or stored encoding changed.

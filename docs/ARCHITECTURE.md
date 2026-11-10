@@ -1422,7 +1422,7 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
 | Store call applies, then reports an error (lost commit acknowledgement, timeout after commit) | The write may exist. For a blob, changeset or derived row that is harmless. For `cas_ref` the caller cannot tell | `land` reads the ref again and recognises its own result (by land id at any age, ADR 0057; otherwise within the last 1024 changesets); other ref callers must read the ref before repeating |
 | Request cancelled by `--request-timeout` or a client disconnect | Same as a dead server for the work it had done; it performs no further writes, though a Postgres statement already sent runs on until it ends or `--meta-statement-timeout` (the request timeout plus 5 s by default) cancels it | Client retries |
 | MetaStore unavailable | Writes and uncached reads fail | Fail fast with 500; no local fallback |
-| Coordination writes fail or are slow (sessions, ADR 0095) | `leep who` goes stale; every other answer is unchanged: session updates follow the answer they ride on (a create waits at most 250 ms for its own), and failures are counted in `leep_session_hook_errors_total`, never returned | Nothing to repair: the next commit, heartbeat or sweep catches up; the tables can be dropped without losing history |
+| Coordination writes fail or are slow (sessions, ADR 0095) | `leep who` goes stale and answers carry no notices (ADR 0096); every other answer is unchanged: session updates follow the answer they ride on (a create waits at most 250 ms for its own, notices at most 150 ms), and failures are counted in `leep_session_hook_errors_total` and `leep_notices_omitted_total`, never returned | Nothing to repair: the next commit, heartbeat or sweep catches up; the tables can be dropped without losing history |
 | BlobStore slow | Cache tiers absorb repeated reads | — |
 | Land CAS contention | Bounded retries, then an error | Client retries `land` |
 | Server started on a database from a newer release, or whose applied migration was edited | The store refuses to open (`database schema vN is newer than this server`), before any write | Upgrade the server; never edit an applied migration (ADR 0023) |
@@ -1805,6 +1805,23 @@ a second kind of mutable state beside refs, behind its own trait,
 - **Untrusted text.** Titles and approaches are other agents' words, kept
   in an `untrusted` object on the wire and fenced in MCP results under a
   line saying they are data, not instructions.
+- **Notices** ([ADR 0096](adr/0096-overlap-notices-and-duplicate-flags.md)).
+  Answers to changeset creates, lands, session declarations and listings
+  carry at most three notices for the caller's session, highest level
+  first: `landed` (a changeset touching its paths landed on its target
+  ref since its base, found by walking at most 64 first parents),
+  `possible_duplicate` (same task key, or a declared title and approach at
+  least 60% alike by trigrams), `claimed`, `same_file` and `near` (one
+  `CoordStore::near_paths` call: exact probes plus capped range scans on
+  `(repo_id, path)`). Each is said once per session for 30 minutes (per
+  server); `Leep-Notices` picks the lowest level (default `same_file`) or
+  `off`. They are computed after the answer is decided, within 150 ms or
+  not at all, and never change it; the land answer travels as
+  `LandAnswer`, the same object with `notices` beside it. `GET
+  /v1/notices` answers only the notices, `GET /v1/sessions/{id}/overlaps`
+  everything overlapping a session. The CLI prints them on stderr,
+  escaped; MCP appends them, fenced, to every tool result and adds
+  `leep_overlaps`. `--notices off` leaves them out of answers.
 - **Scale.** Every table is keyed by `repo_id` first (ADR 0054), and
   nothing joins coordination to the land path, so the next steps are a
   separate coordination database and then sharding by path prefix (ADR

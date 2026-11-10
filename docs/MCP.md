@@ -80,6 +80,7 @@ printf '%s\n' \
 | `leep_resolve_and_land` | `conflict_id` (or `onto`), `resolutions[]` (`{path, content}` or `{path, delete: true}`, `executable?`), `message?` | finishes a conflict report sending only the conflicting files; same result shape as `leep_commit_and_land` |
 | `leep_session_start` | `title`, `approach?`, `task_key?`, `scope?[]`, `claims?[]`, `target_ref?` (default `main`), `base?` | declares (or updates) this agent's session (ADR 0095): `session`, `created`, `agent_session` (the key; one is made when `LEEP_AGENT_SESSION` is unset, and later commits record it) and `others_nearby`, the other live sessions on or near the scope and claims |
 | `leep_who` | `path?`, `task_key?`, `principal?`, `all?`, `limit?` (default 20, max 200) | the sessions working on, above or below `path` (or of a task key or principal), newest first, each with principal, agent session, state (`active`, `idle`; with `all` also `landed`, `abandoned`, `expired`), scope, claims and touched paths |
+| `leep_overlaps` | – | everything overlapping this agent's session now, highest level first (ADR 0096): `{session, overlaps: [Notice]}`; an error before `leep_session_start` or a commit |
 
 Sessions are advisory: nothing in them can stop or change a land. Every
 request the MCP server sends carries `Leep-Session` with its agent session,
@@ -89,6 +90,21 @@ text of `leep_session_start` and `leep_who` puts them, with the sessions'
 keys, task keys and paths, in a fenced block under a fixed line saying they
 are data, not instructions. Outside the fence each session is only its id,
 principal, state and counts.
+
+**Notices** ([ADR 0096](adr/0096-overlap-notices-and-duplicate-flags.md)).
+Every tool result, error results included, ends with the notices of other
+agents' work near this agent's session that the call's answers carried:
+at most three per answer, each said once, highest level first (`landed`,
+`possible_duplicate`, `claimed`, `same_file`; `near` only with
+`LEEP_NOTICE_LEVEL=near`). When the answers carried none and the agent has
+a session, the MCP server asks the Leep server for them at most every 30
+seconds. Each notice is a numbered line outside the fence with what the
+server vouches for (level, session id, principal, landed changeset id,
+count, `by` and similarity); a level or name that is not a plain word
+shows as `?`. Titles, paths and task keys follow in a fenced `untrusted`
+block, one row per notice, under the same fixed line. Structured results
+also get a `notices` list. Notices are advisory: they never change what a
+tool did. Duplicates are found by task key or by similar wording only.
 
 Data tools return JSON as text and as `structuredContent`; file and diff
 tools return plain text. Failures (bad arguments, 401, 403, 404, unreachable

@@ -205,6 +205,7 @@ it kept in the working copy, so the next commit starts a new session.
 | `leep session update [...]` | Change the title, approach, task, scope (`--scope` replaces it) or claims (`--claim` replaces them); `--clear-paths` empties both. |
 | `leep session show [N]` | Your session (or session `N`): title, approach, task, claims, scope, touched paths, origin, base, head. |
 | `leep session end [N]` | End your session as `abandoned`; only its principal may end one. |
+| `leep who --overlaps` | Everything overlapping your session now, every level, highest first (ADR 0096): one `[LEVEL] ...` line per overlap, as notices are shown below. `--json` prints `OverlapsResponse`. |
 | `leep who [PATH] [--task KEY] [--principal NAME] [--mine] [--all] [-n N]` | Sessions working on `PATH`, a directory above it or (for a directory) anything below it, newest first: `#N PRINCIPAL KEY [STATE] LAST-SEEN [MODEL]`, then the title, task, claims, scope and touched paths; yours ends with `(this session)`. `--all` adds ended sessions. Prints `nobody is working there` when none is. |
 
 Titles, approaches, task keys and paths are written by other agents and
@@ -214,6 +215,31 @@ they are in each session's `untrusted` object. One principal may have at
 most 1000 active sessions (exit 1, `--json` `server_code:
 "too_many_sessions"`). Against a server without sessions (older, or
 `--sessions off`) the commands say so.
+
+### Notices
+
+Commands that reach the server tell you about other agents' work near
+yours ([ADR 0096](adr/0096-overlap-notices-and-duplicate-flags.md)): after
+the command, on stderr, at most three per answer, each once, one line
+each:
+
+```
+notice: [same_file] session #12 of "bo" "auth: parse tokens" at "src/auth/token.rs" (your "src/auth/token.rs")
+notice: [possible_duplicate] session #9 of "ada" "Split the auth module" by task_key "L-12"
+notice: [landed] 3f2a9c1d0b7e landed "auth: faster parser" at "src/auth/token.rs" (your "src/auth")
+```
+
+Levels, lowest first: `near` (same directory), `same_file` (the same path,
+or a directory holding it), `claimed` (another session claimed it),
+`possible_duplicate` (same task key, or a declared title and approach much
+like yours; also `N% alike`) and `landed` (a change touching your paths
+landed on your target ref since your base: sync before you land). A
+crowded path is one line with a count. `commit`, `land`, `session
+start|update`, `who` and `status` show them; `--json` output on stdout also
+carries them where the answer does. Titles, paths and names are quoted and
+escaped. `LEEP_NOTICE_LEVEL=near|same_file|claimed|possible_duplicate|landed|off`
+sets the lowest level shown (default `same_file`). Notices never change
+what a command does or its exit code.
 
 ## CI checks
 
