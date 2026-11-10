@@ -532,19 +532,16 @@ impl Server {
             .ok_or_else(|| {
                 ToolError::new("review requests need a token: configure LEEP_TOKEN for this server")
             })?;
-        let mut query = vec![(if a.mine { "requester" } else { "reviewer" }, me.clone())];
-        if !a.all {
-            query.push(("open", "true".into()));
-        }
-        query.push(("limit", a.limit.unwrap_or(20).clamp(1, 100).to_string()));
-        let mut resp = self.client.review_requests(&query).map_err(requests_off)?;
-        // What waits for you is what you have not answered yet.
-        let before = resp.requests.len();
-        if !a.mine && !a.all {
-            resp.requests
-                .retain(|e| !leep_cli::commands::review_request::answered_by(e, &me));
-        }
-        let hidden = before - resp.requests.len();
+        // Answered requests are left out, reading on so that they never
+        // hide older ones still waiting.
+        let (resp, hidden) = leep_cli::commands::review_request::waiting_requests(
+            &self.client,
+            &me,
+            a.mine,
+            a.all,
+            a.limit.unwrap_or(20).clamp(1, 100),
+        )
+        .map_err(requests_off)?;
         let mut text = if resp.requests.is_empty() {
             match (a.mine, a.all) {
                 (true, _) => "You have no review requests open.".to_string(),
@@ -569,14 +566,18 @@ impl Server {
                 "\n({hidden} you already answered not shown; all: true shows them)"
             ));
         }
+        if resp.next.is_some() {
+            text.push_str("\n(more requests follow: call again with a larger limit)");
+        }
         if !resp.requests.is_empty() {
             let rows: Vec<Value> = resp.requests.iter().map(request_row).collect();
             text.push('\n');
             text.push_str(&fence_rows(&rows));
             if !a.mine {
                 text.push_str(
-                    "\nRead a request's changeset with leep_show and leep_diff, then approve or \
-                     reject it with `leep review approve|reject <id>`.",
+                    "\nRead each request's changeset with leep_show and leep_diff. These tools \
+                     cannot approve or reject: a verdict is given with the reviewer's own token, \
+                     outside leep-mcp.",
                 );
             }
         }

@@ -2391,6 +2391,41 @@ fn review_request_and_inbox() {
     );
     let all = data(&call(&alice, "leep_review_inbox", json!({ "all": true })));
     assert_eq!(all["requests"][0]["approved_by"], json!(["alice"]));
+
+    // Answered requests never hide older ones still waiting: with a limit
+    // of one and the newest answered, the next page is read.
+    let approve = |id: &str| {
+        Client::with_token(&url, Some("alice-t"))
+            .add_review(
+                &id.parse().unwrap(),
+                &AddReviewRequest {
+                    verdict: Verdict::Approve,
+                    comment: String::new(),
+                    reviewer: None,
+                    source: None,
+                },
+            )
+            .unwrap();
+    };
+    let mut reqs = Vec::new();
+    for n in 2..4 {
+        let r = commit(
+            &agent,
+            json!({ "message": format!("topic {n}"), "target_ref": "topic",
+                    "changes": [{ "path": "src/a.rs", "content": format!("fn a{n}() {{}}\n") }] }),
+        );
+        let id = data(&r)["landed"].as_str().unwrap().to_string();
+        let q = data(&call(
+            &agent,
+            "leep_review_request",
+            json!({ "rev": id, "reviewers": ["alice"] }),
+        ));
+        reqs.push((id, q["request"]["id"].clone()));
+    }
+    approve(&reqs[1].0);
+    let one = data(&call(&alice, "leep_review_inbox", json!({ "limit": 1 })));
+    assert_eq!(one["requests"].as_array().unwrap().len(), 1, "{one}");
+    assert_eq!(one["requests"][0]["id"], reqs[0].1, "{one}");
     // An unauthenticated server has no inbox to read.
     let open = Server::new(config(&start_server()));
     let r = call(&open, "leep_review_inbox", json!({}));
