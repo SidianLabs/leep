@@ -127,6 +127,11 @@ pub struct RepackOptions {
     /// 0100, `packs/considered`), so a pack with no delta record that it
     /// wrote is not taken for a whole pack again.
     pub mark: bool,
+    /// Object stores, [`RepackMode::Full`] only: refuse (`Conflict`) if the
+    /// bucket records a full repack less than this long ago, checked under
+    /// the lease, and record this one's time (`packs/.last-full`) before
+    /// the lease is let go (ADR 0100).
+    pub full_interval: Option<std::time::Duration>,
 }
 
 impl Default for RepackOptions {
@@ -141,6 +146,7 @@ impl Default for RepackOptions {
             loose_subset: None,
             leave: Vec::new(),
             mark: false,
+            full_interval: None,
         }
     }
 }
@@ -990,7 +996,11 @@ impl FsBlobStore {
         self.packs.unsupersede(&id);
         step(&opts, RepackStep::Retired)?;
         if opts.mark {
-            crate::considered::mark_fs(&dir, std::slice::from_ref(&id))?;
+            // Advisory: failing it only costs another pass over this pack,
+            // while failing here would drop the published pack's cleanup.
+            if let Err(e) = crate::considered::mark_fs(&dir, std::slice::from_ref(&id)) {
+                tracing::warn!(error = %e, pack = %id, "recording a considered pack failed");
+            }
         }
         // Loading the new index holds it beside the old ones; the per-object
         // arrays of this run go first.

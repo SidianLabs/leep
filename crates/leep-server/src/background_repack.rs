@@ -356,16 +356,7 @@ impl PackStore {
                 Ok(Pending::Fs(p))
             }
             PackStore::Object(s) => {
-                let full = opts.mode == RepackMode::Full;
                 let mut p = s.repack_publish(hints, opts).await?;
-                if full {
-                    // Under the lease, so a replica that waited for it reads
-                    // the new time.
-                    let now = jiff::Timestamp::now().as_second();
-                    if let Err(e) = s.record_full_repack(now).await {
-                        tracing::warn!(error = %e, "recording the full repack's time failed");
-                    }
-                }
                 p.unlock().await;
                 Ok(Pending::Object(p))
             }
@@ -852,15 +843,24 @@ impl BackgroundRepack {
                     if loose.len() as u64 <= room_objects && loose_bytes <= room_bytes {
                         loose_set.clone()
                     } else {
-                        // The oldest loose objects the walk lists first.
+                        // The oldest loose objects the walk lists first, then
+                        // those it does not list (uploads no ref reaches,
+                        // history past the walk limit) in hash order. The
+                        // first always fits, so every batch packs something
+                        // and a loose object larger than the room still goes.
                         more = true;
                         let size: HashMap<Hash, u64> = loose.iter().copied().collect();
                         let (mut n, mut b) = (0u64, 0u64);
                         let mut out = HashSet::new();
-                        for (h, _) in order.objects.iter() {
-                            let Some(&len) = size.get(&h) else { continue };
-                            if n + 1 > room_objects || b + len > room_bytes {
+                        let listed = order.objects.iter().map(|(h, _)| h);
+                        let rest = loose.iter().map(|(h, _)| *h);
+                        for h in listed.chain(rest) {
+                            if n >= room_objects.max(1) {
                                 break;
+                            }
+                            let Some(&len) = size.get(&h) else { continue };
+                            if out.contains(&h) || (n > 0 && b + len > room_bytes) {
+                                continue;
                             }
                             n += 1;
                             b += len;
@@ -891,6 +891,9 @@ impl BackgroundRepack {
                     level: auto.level,
                     mode: RepackMode::Full,
                     mark: true,
+                    // Checked again, and recorded, under the lease: a
+                    // replica may have run one since the check above.
+                    full_interval: Some(auto.object_store_interval),
                     threads: 1,
                     ..RepackOptions::default()
                 };
@@ -912,6 +915,9 @@ impl BackgroundRepack {
         let report = pending.report().clone();
         self.auto.corrupt.extend(report.corrupt.iter().copied());
         self.auto.waiting_since = None;
+        // A batch that packed nothing (everything vanished meanwhile) does
+        // not run again at once: the next check comes after the interval.
+        let more = more && report.objects > 0;
         self.auto.more = more;
         if more {
             // The next batch at the next tick, after its merges and cleanups.

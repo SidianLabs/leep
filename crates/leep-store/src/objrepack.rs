@@ -590,8 +590,33 @@ impl ObjectBlobStore {
             ));
         }
         let lease = Lease::acquire(self.store.clone()).await?;
+        let interval = opts
+            .full_interval
+            .filter(|_| opts.mode == crate::RepackMode::Full);
+        if let Some(iv) = interval {
+            let last = match crate::considered::read_last_full(&*self.store).await {
+                Ok(l) => l,
+                Err(e) => {
+                    lease.release().await;
+                    return Err(e);
+                }
+            };
+            if last.is_some_and(|l| now_secs() < l.saturating_add(iv.as_secs() as i64)) {
+                lease.release().await;
+                return Err(Error::Conflict(
+                    "a full repack of this bucket ran within the interval".into(),
+                ));
+            }
+        }
         match self.publish_leased(hints, &opts, &lease).await {
             Ok(p) => {
+                if interval.is_some() {
+                    if let Err(e) =
+                        crate::considered::write_last_full(&*self.store, now_secs()).await
+                    {
+                        tracing::warn!(error = %e, "recording the full repack's time failed");
+                    }
+                }
                 self.packs.supersede(&p.replaced).await;
                 Ok(PublishedObjectPack {
                     store: self.clone(),
@@ -878,8 +903,13 @@ impl ObjectBlobStore {
                 .filter(|p| !replaced.contains(p))
                 .chain([id.clone()])
                 .collect();
-            crate::considered::mark_object(&*self.store, std::slice::from_ref(&id), &published)
-                .await?;
+            // Advisory: see the filesystem store.
+            if let Err(e) =
+                crate::considered::mark_object(&*self.store, std::slice::from_ref(&id), &published)
+                    .await
+            {
+                tracing::warn!(error = %e, pack = %id, "recording a considered pack failed");
+            }
         }
         self.packs.rescan(ScanReason::Repack).await?;
         Ok(Published {

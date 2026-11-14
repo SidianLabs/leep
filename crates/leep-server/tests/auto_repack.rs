@@ -911,3 +911,91 @@ async fn corrupt_loose_objects_do_not_keep_triggering_runs() {
         assert_eq!(bg.tick().await.unwrap().auto, AutoOutcome::Nothing);
     }
 }
+
+/// A loose object larger than the room a batch leaves is still packed
+/// (the first object always fits), and the task then goes quiet instead of
+/// running empty batches at every tick.
+#[tokio::test]
+async fn a_loose_object_larger_than_the_batch_is_packed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = fs_store(dir.path());
+    let meta = Arc::new(MemoryMetaStore::new());
+    let repo = Repo::new(Arc::new(store.clone()), meta.clone());
+    let big = Bytes::from(version("big.txt", 2_000));
+    repo.blobs().put(big.clone()).await.unwrap();
+    let tip = commit(
+        &repo,
+        None,
+        &[("big.txt", String::from_utf8(big.to_vec()).unwrap())],
+    )
+    .await;
+    assert!(meta.cas_ref("main", None, Some(tip)).await.unwrap());
+    let bg = BackgroundRepack::new(
+        PackStore::Fs(store.clone()),
+        opts(AutoRepackOptions {
+            max_batch_bytes: 64,
+            ..eager()
+        }),
+    );
+    let walk = bg.walk_repo(meta.clone());
+    let mut bg = bg.with_repo(walk);
+    let mut packed = 0;
+    for _ in 0..6 {
+        match bg.tick().await.unwrap().auto {
+            AutoOutcome::Ran(r) => {
+                assert!(r.loose_before >= 1, "an empty batch: {r:?}");
+                packed += r.loose_before;
+            }
+            AutoOutcome::Nothing => break,
+            other => panic!("{other:?}"),
+        }
+        bg.finish_all().await.unwrap();
+    }
+    assert_eq!(packed, 2, "the content and its root node");
+    assert_eq!(store.loose_stats().unwrap().0, 0);
+    assert_eq!(bg.tick().await.unwrap().auto, AutoOutcome::Nothing);
+}
+
+/// Loose objects no ref reaches (abandoned uploads), more than one batch
+/// takes, are packed whole over several batches, each packing some.
+#[tokio::test]
+async fn unreachable_loose_objects_over_the_cap_are_packed_in_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = fs_store(dir.path());
+    let meta = Arc::new(MemoryMetaStore::new());
+    let repo = Repo::new(Arc::new(store.clone()), meta.clone());
+    import(&repo, &meta, 2).await;
+    for i in 0..25 {
+        repo.blobs()
+            .put(Bytes::from(format!("abandoned upload {i}\n")))
+            .await
+            .unwrap();
+    }
+    let bg = BackgroundRepack::new(
+        PackStore::Fs(store.clone()),
+        opts(AutoRepackOptions {
+            max_batch_objects: 10,
+            ..eager()
+        }),
+    );
+    let walk = bg.walk_repo(meta.clone());
+    let mut bg = bg.with_repo(walk);
+    let mut runs = 0;
+    for _ in 0..20 {
+        match bg.tick().await.unwrap().auto {
+            AutoOutcome::Ran(r) => {
+                assert!(r.objects >= 1 && r.loose_before <= 10, "{r:?}");
+                runs += 1;
+            }
+            AutoOutcome::Nothing => break,
+            other => panic!("{other:?}"),
+        }
+        bg.finish_all().await.unwrap();
+    }
+    assert!(runs >= 3, "{runs} batches");
+    assert_eq!(
+        store.loose_stats().unwrap().0,
+        0,
+        "every abandoned upload packed"
+    );
+}

@@ -75,7 +75,11 @@ A run on a filesystem store:
 1. takes one **batch**: the oldest whole packs (by their earliest record)
    within `--auto-repack-batch-bytes` (1 GiB), 500,000 objects and 256
    packs (always at least one), then loose objects within what the caps
-   leave (all of them if they fit, otherwise the oldest the walk lists);
+   leave (all of them if they fit, otherwise the oldest the walk lists,
+   then the loose objects it does not list, such as uploads no ref reaches,
+   in hash order; the first always fits, so a loose object larger than the
+   room is packed too and every batch packs something; a batch that packed
+   nothing ends the run of batches until the next check);
 2. walks their history with `pack_order_where`: `wanted` accepts objects
    of the batch, `walk_through` any loose object or object of a whole pack,
    so the walk passes through changesets and tree nodes outside the batch
@@ -129,7 +133,10 @@ objects never trigger it), and at most once per
 `--auto-repack-object-store-interval` (24 hours). The time of the last one
 is written to `packs/.last-full` (unix seconds) while the lease is still
 held, and read before each run, so restarts and replicas share the
-interval. Between runs, objects stay as they were before this change.
+interval. The interval is checked again under the lease, inside the
+repack (`RepackOptions::full_interval`), so two replicas that both passed
+the first check do not both rewrite the bucket. Between runs, objects stay
+as they were before this change.
 Implementing `Incremental` in `objrepack.rs` is a follow-up.
 
 ### 5. Bounded retired bytes, same fence
@@ -187,6 +194,14 @@ and searched packs), updated at each check.
 - Operators no longer need the nightly incremental `repack` cron; `gc` and
   an occasional `repack --full` (which also drops tombstoned objects)
   remain.
+- Follow-ups: the set of corrupt loose objects a run skipped lives in
+  memory and is never expired (a restart forgets it, so a corrupt object
+  costs one batch per restart until an operator repairs it), and an object
+  store is listed once per check interval (a bucket listing a minute) even
+  when nothing will run.
+- `leep-server repack` honours `packs/considered` (it leaves considered
+  packs alone) and marks what it writes. Recording a considered pack is
+  advisory: a failure there is logged and the repack's cleanup still runs.
 - New files: `packs/considered` (filesystem), `packs/.considered` and
   `packs/.last-full` (bucket). Advisory and ignored by older binaries and
   by backups; no existing file or format changes.

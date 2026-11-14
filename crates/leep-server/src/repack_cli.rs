@@ -155,10 +155,13 @@ pub async fn run_repack(meta: &str, blobs: &str, args: RepackArgs) -> anyhow::Re
     let order = match &target {
         Target::Fs(s) if mode != RepackMode::Full => {
             let ids = s.pack_sizes()?.into_iter().map(|p| p.id).collect();
+            // Packs a delta repack already wrote with no delta stay as they
+            // are (`packs/considered`).
+            let considered = s.considered_packs()?;
             whole = s
                 .pack_details(&ids)?
                 .into_iter()
-                .filter(|d| d.whole())
+                .filter(|d| d.whole() && !considered.contains(&d.id))
                 .map(|d| d.id)
                 .collect();
             let in_whole = s.packed_in(&whole.iter().cloned().collect())?;
@@ -180,6 +183,7 @@ pub async fn run_repack(meta: &str, blobs: &str, args: RepackArgs) -> anyhow::Re
         mode,
         threads: args.threads,
         packs: whole,
+        mark: true,
         ..RepackOptions::default()
     };
     let changesets = order.changesets;
