@@ -3005,6 +3005,10 @@ migrated database (8.42 MB); shared 4-core host, single runs.
   store past its first 100 changesets) never pay this.
 - The longer chain cap saves 0.35 MB on A and 0.58 MB on B; B's hot files
   are edited 2,000 times.
+- Measured before the step took a Postgres advisory lock, sampled at most
+  16 MiB, required 12% for a replacement and rewrote SQLite rows in one
+  statement per batch. None of that changes these sizes: each store got
+  one dictionary from samples under 16 MiB, and one pass.
 
 Per land (corpus C: A plus 200 one-file and 200 three-file lands through
 the CLI, one a second, `--auto-repack-max-age 2m` as in ADR 0100's

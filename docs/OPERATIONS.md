@@ -151,7 +151,8 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_repack_auto_objects_total` | counter | none | Objects the automatic runs wrote. |
 | `leep_repack_auto_waiting_objects` / `leep_repack_auto_waiting_bytes` | gauge | none | Objects (and their bytes on disk) waiting to be compressed at the last check: loose, or in packs written whole. Falls to near zero after each run; climbing past the thresholds means runs are held or failing. |
 | `leep_blob_store_bytes` / `leep_blob_store_logical_bytes` / `leep_blob_store_size_ratio` | gauge | none | Bytes on disk of loose objects and searched packs, the bytes they decode to, and the ratio, at the last check. About 0.03–0.1 on source code once compressed; near 1 means nothing is being delta-compressed. |
-| `leep_changeset_compact_steps_total` | counter | `outcome` = `ok`, `error` | Steps of the automatic changeset compaction (ADR 0101). An error is logged and retried at the next interval. |
+| `leep_changeset_compact_steps_total` | counter | `outcome` = `ok`, `busy`, `error` | Steps of the automatic changeset compaction (ADR 0101). `busy`: another server held the compaction's lock (Postgres). An error is logged and retried at the next interval. |
+| `leep_changeset_compact_corrupt_total` | counter | none | Changeset rows a pass found that do not decode; left as they are. Run `leep-server verify`. |
 | `leep_changeset_compact_trained_total` / `leep_changeset_compact_rejected_total` | counter | none | Dictionaries it trained and stored, and those it trained and dropped because they would not pay for themselves (tried again once the store doubles). |
 | `leep_changeset_compact_rows_total` / `leep_changeset_compact_saved_bytes_total` | counter | none | Changeset rows it rewrote, and the bytes that saved. |
 | `leep_changeset_compact_seconds` | histogram | none | Time of each step that passed over the rows. |
@@ -1848,27 +1849,39 @@ new dictionary (for example after the history has changed character) and
 moves every row to it; the old dictionary stays. A store with fewer than
 1,000 changesets is left alone.
 
-**Automatic changeset compaction (ADR 0101).** Since ADR 0101 a server
+**Automatic changeset compaction (ADR 0101).**
+
+> **One-way door.** About 2 minutes (up to 3) after a server of this
+> release first starts on a store of 100 or more changesets, it stores a
+> changeset dictionary and rewrites rows with it. From then on binaries
+> older than ADR 0053 (`leep-server`, `leep-git`, tools from before
+> October 2026) cannot read the database, and they do not check
+> `store_features`, so they fail on reads instead of refusing to start.
+> If any such binary still uses the database, start the new servers with
+> `--auto-compact off` (`LEEP_AUTO_COMPACT=off`) until it is gone.
+
+Since ADR 0101 a server
 does the above by itself; `compact-changesets` stays for an operator who
-wants it now, or a `--retrain`. Two minutes after it starts, then every
+wants it now, or a `--retrain`. Two to three minutes after it starts (a
+random delay within the last minute), then every
 `--auto-compact-interval`, the server trains a dictionary once the store
 has 100 changesets (16 KiB), again at 1,000 (60 KiB) and at 10,000 (64 KiB,
-the size `compact-changesets` trains, on up to 50,000 of them), keeps one
-only if it saves at least 5% counting its own size, and compresses the rows
-not yet on the newest dictionary. It runs on a thread of its own at the
-lowest CPU priority, with one database connection outside the server's
-pools, and never delays a land. A dictionary you trained with
-`compact-changesets` (64 KiB by default) is never replaced; new rows are
-compressed with it.
+the size `compact-changesets` trains, on up to 50,000 of them and 16 MiB),
+keeps a first one only if it saves at least 5% counting its own size and a
+replacement only if it saves 12% more than the one in force (a replacement
+rewrites every row), and compresses the rows not yet on the newest
+dictionary. It runs on a thread of its own at the lowest CPU priority, with
+one database connection outside the server's pools, and never delays a
+land. A dictionary over 60 KiB is never replaced, so one you trained with
+`compact-changesets` at its default 64 KiB stays (new rows are compressed
+with it); one under that (`--dict-size`, or a store too small to fill 64
+KiB) counts as the tier its size falls in and is replaced at the next
+tier. A row that does not decode is left alone, logged and counted
+(`leep_changeset_compact_corrupt_total`; run `leep-server verify`).
 
-- **Before upgrading to this release**, make sure no binary older than ADR
-  0053 (`leep-server`, `leep-git`, tools) still uses the database: the new
-  servers store a dictionary on their own, and such binaries cannot read
-  compressed rows (nor check `store_features`). To upgrade from such a
-  version in a rolling fashion, start the new servers with
-  `--auto-compact off` (or `LEEP_AUTO_COMPACT=off`) until the rollout is
-  done. Binaries since ADR 0053 read every row, so going back to one of
-  them after a dictionary exists is safe.
+- **Before upgrading to this release**, see the one-way door above.
+  Binaries since ADR 0053 read every row, so going back to one of them
+  after a dictionary exists is safe.
 - On Postgres, a store that was never compacted (an import, say) has every
   row rewritten by the first pass, as `compact-changesets` would; the old
   row versions are free space in the table, reused by later changesets, so
@@ -1877,16 +1890,17 @@ compressed with it.
   above). To choose when
   that happens, run `compact-changesets` yourself first, or keep
   `--auto-compact off` until then.
-- Several servers on one store each run it; a dictionary id is taken once,
-  and rewriting a row twice is harmless. To keep the work on one host, pass
-  `--auto-compact off` on the others.
+- Several servers on one Postgres store take turns: each step holds a
+  session advisory lock, and a server that finds it held skips the step
+  (`outcome="busy"` in `leep_changeset_compact_steps_total`). A dictionary
+  id is taken once in any case, and rewriting a row twice is harmless.
 
 | Flag / env | Default | What it does |
 |---|---|---|
 | `--auto-compact on\|off` / `LEEP_AUTO_COMPACT` | `on` | Compress changeset rows in the background. |
-| `--auto-compact-interval D` / `LEEP_AUTO_COMPACT_INTERVAL` | `10m` | How often it looks for work (the first time 2 minutes after start, or sooner with a shorter interval). A step counts changesets (up to 10,000), trains if a tier is due, and passes over the rows only after a new dictionary. |
+| `--auto-compact-interval D` / `LEEP_AUTO_COMPACT_INTERVAL` | `10m` | How often it looks for work (the first time 2 to 3 minutes after start, or sooner with a shorter interval). A step counts changesets (up to 10,000), trains if a tier is due, and passes over the rows only after a new dictionary. |
 | `--auto-compact-min-rows N` / `LEEP_AUTO_COMPACT_MIN_ROWS` | `100` | Fewest changesets it trains a dictionary on. |
-| `--auto-compact-batch N` / `LEEP_AUTO_COMPACT_BATCH` | `250` | Rows read and rewritten per statement; after each batch it rests three times as long as the batch took (at least 10 ms). |
+| `--auto-compact-batch N` / `LEEP_AUTO_COMPACT_BATCH` | `250` | Rows read and rewritten per statement (one statement per batch on both backends); after each batch it rests three times as long as the batch took (at least 10 ms). |
 
 The log lines "trained a changeset dictionary" and "compressed changeset
 rows" (level info) give each dictionary and each pass; the metrics are

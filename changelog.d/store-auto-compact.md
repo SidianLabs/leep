@@ -3,19 +3,21 @@
   `leep-server compact-changesets` does, run by the server in the
   background on a thread at the lowest CPU priority with one database
   connection of its own. It trains a 16 KiB dictionary once a store has
-  100 changesets, 60 KiB at 1,000 and 64 KiB at 10,000, stores one only if
-  it saves at least 5% counting its own size, and compresses the rows not
-  yet on the newest dictionary. A dictionary trained with
-  `compact-changesets` is never replaced. New flags `--auto-compact`,
+  100 changesets, 60 KiB at 1,000 and 64 KiB at 10,000, stores a first one
+  only if it saves at least 5% counting its own size (a replacement 12%),
+  and compresses the rows not yet on the newest dictionary, one server at
+  a time (a Postgres advisory lock). A dictionary over 60 KiB, such as one
+  `compact-changesets` trains by default, is never replaced. New flags `--auto-compact`,
   `--auto-compact-interval` (10m), `--auto-compact-min-rows` (100) and
   `--auto-compact-batch` (`LEEP_AUTO_COMPACT*`); new metrics
   `leep_changeset_compact_*` and `leep_changeset_dictionary`. Corpus B's
   changeset rows go from 3.41 MB to 1.06 MB. On Postgres, rows written
   before the first dictionary (an import) leave their old versions as free
   space that later rows reuse; `VACUUM FULL changesets` returns it.
-- **Changed.** **Upgrade note:** a server of this release records the
-  `changeset-zstd-dict` format feature and stores a dictionary on its own,
-  so no binary older than ADR 0053 may still use the database; start the
+- **Changed.** **Upgrade note:** about 2 to 3 minutes after it first
+  starts, a server of this release records the `changeset-zstd-dict`
+  format feature and stores a dictionary on its own, so no binary older
+  than ADR 0053 may still use the database; start the
   new servers with `--auto-compact off` until such a rollout is done.
 - **Changed.** The pack writer's delta chain cap is 63 instead of 32, so a
   file edited hundreds of times stores a whole version every 64 instead of

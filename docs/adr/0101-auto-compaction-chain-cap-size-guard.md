@@ -32,11 +32,17 @@ next steps:
 ### 1. The server compacts changeset rows itself
 A task in `leep-server` (`auto_compact`, on by default, `--auto-compact`)
 runs `leep_meta::auto_compact::AutoCompactor::step` every
-`--auto-compact-interval` (10 minutes; the first 2 minutes after start,
-while a new server warms its indexes). It runs
+`--auto-compact-interval` (10 minutes; the first 2 minutes plus up to 60 s
+of jitter after start, while a new server warms its indexes, and so that
+servers started together do not all step at once). It runs
 on a thread of its own at the lowest CPU priority, with a single-threaded
 runtime and one database connection of its own (not from the server's
-pools), so lands and reads never wait for it. A step:
+pools), so lands and reads never wait for it. On SQLite that is a pool of
+one connection. On Postgres each step first takes a session advisory lock
+(`pg_try_advisory_lock(0x1EE90101, hashtext(current_schema()))`, held on a
+connection of the compactor's lease pool) and skips the step if another
+server holds it, so replicas do not repeat each other's training and
+rewrites. A step:
 
 1. **Trains when the store has outgrown its dictionary.** Dictionaries come
    in tiers by changeset count (counted up to 10,000, so the count is cheap
@@ -49,29 +55,45 @@ pools), so lands and reads never wait for it. A step:
    | 10,000 | 64 KiB, what `compact-changesets` trains |
 
    trained on the first changesets in id order (a uniform sample, as
-   `compact-changesets`), at most 50,000. A dictionary's tier is read back
+   `compact-changesets`), at most 50,000 of them and at most 16 MiB of
+   canonical bytes, so training costs a few seconds of one core whatever
+   the rows' size. Rows that do not decode are left out of the sample. A dictionary's tier is read back
    from its size: at most 16 KiB is the first, at most 60 KiB the second,
-   anything larger the last. So the schedule keeps no state of its own,
-   holds across restarts and replicas, and never replaces a dictionary an
-   operator trained (64 KiB by default). Measured on B's rows, a larger
+   anything larger the last. So the schedule keeps no state of its own and
+   holds across restarts and replicas. The compactor cannot tell its own
+   dictionaries from an operator's without new state, so the rule is by
+   size: a dictionary over 60 KiB (`compact-changesets` trains 64 KiB by
+   default, on any store large enough to fill it) is never replaced; a
+   smaller one, from `--dict-size` or a small store, counts as the tier its
+   size falls in and is replaced at the next tier. Measured on B's rows, a larger
    dictionary always compresses better, but below about 1,000 rows the
    dictionary's own row costs more than the extra it saves (100 rows: 16
    KiB gives 166 KB plus the dictionary, 64 KiB 130 KB plus 64 KiB).
 2. **Stores a candidate only if it pays.** The samples compressed with the
    candidate, plus the candidate's own bytes, must be at least 5% smaller
-   than with the dictionary in force (or plain). A candidate that gains
-   less is dropped, nothing is recorded, and that tier is tried again only
-   once the store has doubled. A store of a few small changesets therefore
-   never gets a dictionary, nor the format feature.
+   than plain for a first dictionary, and at least 12% smaller than with
+   the dictionary in force for a replacement: a tier change rewrites every
+   row (and on Postgres leaves their old versions as free space), which a
+   few percent does not repay. A candidate that gains less is dropped and
+   nothing is recorded. Its tier is tried again once the store has doubled
+   or after 24 hours (the count stops at 10,000, so a large store would
+   never double by it). That memory is the process's: a restart tries once
+   more, at the bounded cost of one training. A store of a few small
+   changesets therefore never gets a dictionary, nor the format feature.
 3. **Records the feature, then the dictionary,** exactly as
    `compact-changesets` does (ADR 0055): `changeset-zstd-dict` is inserted
    first, and only when a dictionary is about to be stored, so a store is
-   marked only once a dictionary is used. Losing the race for the next
-   dictionary id to another server (or to `compact-changesets`) is not an
-   error: the next step sees that dictionary.
+   marked only once a dictionary is used. The new dictionary's id is the
+   newest id the step started with, plus one, so if another server (or
+   `compact-changesets`) stored one meanwhile the primary key refuses this
+   one; that is not an error, and the next step sees the other.
 4. **Passes over the rows** not on the newest dictionary, compressing plain
    rows where that is smaller and moving rows on an older dictionary to the
-   newest, in batches of 250 (`--auto-compact-batch`), each one statement,
+   newest, in batches of 250 (`--auto-compact-batch`), each one statement
+   (on SQLite too: one `UPDATE ... FROM (VALUES ...)`, so the write lock is
+   never held across awaits), ids sorted and rows already equal skipped
+   (`IS DISTINCT FROM`), so it cannot deadlock with a concurrent
+   `compact-changesets`,
    resting after each batch three times as long as it took (at least 10
    ms), so it keeps the database busy at most a quarter of the time. A
    pass reads only the first 32 bytes
@@ -81,7 +103,10 @@ pools), so lands and reads never wait for it. A step:
    look for a new dictionary at most a minute before a write
    (`codec::REFRESH`) and write plain rows until then. After that, steps
    only count rows. Each process passes once at its first step, so a pass a
-   crash interrupted is finished by the next process.
+   crash interrupted is finished by the next process. A row that does not
+   decode is left as it is, logged and counted
+   (`leep_changeset_compact_corrupt_total`), and the pass goes on: it is a
+   matter for `verify` and `repair`, not a reason to stop compacting.
 
 Crash safety is that of `compact-changesets`: the feature before the first
 dictionary, the dictionary before any row that names it, and each batch a
@@ -95,7 +120,8 @@ the two) is harmless, as ADR 0055 says.
 dictionary now or a `--retrain`. Its `MIN_TRAINING_ROWS` still applies to
 it; the automatic task has its own floor.
 
-Metrics: `leep_changeset_compact_steps_total{outcome}`,
+Metrics: `leep_changeset_compact_steps_total{outcome = ok | busy | error}`,
+`leep_changeset_compact_corrupt_total`,
 `leep_changeset_compact_trained_total`,
 `leep_changeset_compact_rejected_total`,
 `leep_changeset_compact_rows_total` (rows rewritten),
@@ -177,7 +203,8 @@ if none ran). The soak starts its server with `--auto-repack-max-age 2m`
   an exclusive lock on the table, so the server does not run it. Rows
   written after the first dictionary are compressed when written and
   never rewritten. An importer that trained before writing would avoid the
-  rewrite; that is a follow-up.- **Mixed versions.** A server of this release stores a dictionary on its
+  rewrite; that is a follow-up.
+- **Mixed versions.** A server of this release stores a dictionary on its
   own within a few minutes of starting on a store of 100 or more
   changesets that a dictionary pays for. Servers since ADR 0053 read such
   rows, and those since ADR 0055 check the feature; binaries older than
@@ -195,10 +222,12 @@ if none ran). The soak starts its server with `--auto-repack-max-age 2m`
   and a half times its compacted size until autovacuum makes the space
   reusable; `VACUUM FULL changesets` gives it back. Stores already
   compacted by hand keep their dictionary and are not rewritten.
-- Several servers on one store each run the task. Each trains and passes
-  on its own; the dictionary id's primary key lets one candidate in, and
-  the rewrites are idempotent, so the cost is duplicated work, not
-  conflict. `--auto-compact off` on all but one host keeps it on one.
+- Several servers on one Postgres store take turns: a step runs only
+  under the advisory lock, and is skipped (`busy`) while another server
+  holds it, so a pass is not done four times by four servers. Without the
+  lock (or on SQLite, whose single writer serialises anyway) the
+  dictionary id's primary key still lets only one candidate in, and the
+  rewrites are idempotent.
 - The feature is recorded once, before the first dictionary; a store that
   never gets one is never marked.
 - Follow-ups: the size guard's history is small, so its budgets are loose

@@ -156,15 +156,18 @@ and rewrites existing rows in place, beside running servers of this
 version; on git/git and Linux it halves the table (about 2.9 to 1.75 GB on
 all of Linux). Since ADR 0101 the server does the same by itself
 (`leep_meta::auto_compact`, run by `leep_server::auto_compact` every 10
-minutes, first 2 minutes after start, on a nice-19 thread with one
-connection of its own): it trains a
-16 KiB dictionary from 100 changesets, 60 KiB at 1,000 and 64 KiB at
-10,000 (a dictionary's tier is read back from its size, so an operator's
-64 KiB one is never replaced), stores one only if the rows compressed with
-it plus the dictionary itself are at least 5% smaller, and passes over the
-rows not on the newest dictionary, reading 32-byte heads and rewriting in
-batches of 250 (resting three times as long as each took), until a pass
-has started after every server had a minute to learn the dictionary. A frame header's claimed size is trusted for at most 1 MiB
+minutes, first 2 to 3 minutes after start, on a nice-19 thread with one
+connection of its own, under a Postgres advisory lock so one server steps
+at a time): it trains a 16 KiB dictionary from 100 changesets, 60 KiB at
+1,000 and 64 KiB at 10,000, on at most 16 MiB of samples (a dictionary's
+tier is read back from its size, so one over 60 KiB, such as
+`compact-changesets`' default, is never replaced), stores a first one only
+if the rows compressed with it plus the dictionary itself are at least 5%
+smaller and a replacement only if 12% smaller, and passes over the rows not
+on the newest dictionary, reading 32-byte heads and rewriting in
+single-statement batches of 250 (resting three times as long as each took,
+skipping rows that do not decode), until a pass has started after every
+server had a minute to learn the dictionary. A frame header's claimed size is trusted for at most 1 MiB
 of memory up front; larger frames decode as a stream.
 
 **Format features** ([ADR 0055](adr/0055-store-format-features.md)). The
