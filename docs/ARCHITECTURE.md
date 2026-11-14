@@ -1238,19 +1238,25 @@ while earlier cleanups wait out their fence.
 the same background task counts, at most once a minute, the loose objects
 and the live objects of *whole packs* (packs whose index has no delta
 record: what `put_many` writes; each pack's details are read once and
-cached by id). Past 1,024 objects or 32 MiB, or after 30 minutes of
-waiting, it walks their history with `pack_order_where` (wanted: loose, or
-in a whole pack; the walk stops at changesets whose root tree is in a delta
+cached by id; packs a delta repack wrote are listed in `packs/considered`
+and never count). Past 1,024 objects or 32 MiB, or after 30 minutes of
+waiting, it takes a batch (the oldest whole packs, then loose objects,
+within 1 GiB, 500,000 objects and 256 packs), walks its history with
+`pack_order_where` (wanted: the batch; passed through: any loose object or
+whole pack; the walk stops at changesets whose root tree is in a delta
 pack) and publishes a `RepackMode::Incremental` repack that merges the
-whole packs besides the geometric plan. Its write order
+batch's packs besides the geometric plan (leaving other whole packs for
+the next batch, a tick later). Its write order
 (`write_order_redelta`) keeps the base of each frame that was a delta and
 gives each frame that was whole the walk's base, pulling chains of bases
 forward so every base precedes its deltas; so import and land frames are
 compressed once, to the size `--full` gives. With the delta repack on, the
 tiered merge plans whole packs and delta packs apart. An object store
-(no incremental repack) gets a `Full` repack at most once a day instead.
-The bytes all pending cleanups will free are capped at half the live store
-(64 MiB to 4 GiB); the fence is unchanged. The write path is unchanged:
+(no incremental repack) gets a `Full` repack instead, once the waiting
+bytes are a quarter of the store, at most once a day by the time kept in
+`packs/.last-full`. The bytes all pending cleanups will free are capped at
+half the live store (64 MiB to 4 GiB), merges under 64 MiB exempt; the
+fence is unchanged. The write path is unchanged:
 lands still write whole level-1 frames and never wait for the task.
 
 **Retirement is durable** (ADR 0080). Once a repack (background merge or

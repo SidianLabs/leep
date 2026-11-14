@@ -116,6 +116,17 @@ pub struct RepackOptions {
     /// The packs a [`RepackMode::Planned`] repack merges, or an
     /// [`RepackMode::Incremental`] one merges besides its plan.
     pub packs: Vec<String>,
+    /// For an [`RepackMode::Incremental`] repack: pack only the loose
+    /// objects in this set (a batch of the automatic delta repack, ADR
+    /// 0100); `None` packs every loose object.
+    pub loose_subset: Option<Arc<HashSet<Hash>>>,
+    /// Packs an [`RepackMode::Incremental`] repack must not fold in by its
+    /// geometric rule: whole packs a later batch compresses.
+    pub leave: Vec<String>,
+    /// Record the new pack as already compressed by a delta repack (ADR
+    /// 0100, `packs/considered`), so a pack with no delta record that it
+    /// wrote is not taken for a whole pack again.
+    pub mark: bool,
 }
 
 impl Default for RepackOptions {
@@ -127,6 +138,9 @@ impl Default for RepackOptions {
             threads: 0,
             hook: None,
             packs: Vec::new(),
+            loose_subset: None,
+            leave: Vec::new(),
+            mark: false,
         }
     }
 }
@@ -164,14 +178,18 @@ pub struct PackDetail {
     /// Bytes the records decode to, and the `.pack` size.
     pub logical_bytes: u64,
     pub bytes: u64,
+    /// The earliest write time its records carry (unix seconds), to take
+    /// the oldest packs first.
+    pub oldest: i64,
 }
 
 impl PackDetail {
     pub(crate) fn of(id: &str, index: &pack::PackIndex) -> PackDetail {
-        let (mut deltas, mut logical) = (0u64, 0u64);
+        let (mut deltas, mut logical, mut oldest) = (0u64, 0u64, i64::MAX);
         for e in index.iter() {
             deltas += u64::from(e.base.is_some());
             logical += e.len;
+            oldest = oldest.min(e.modified);
         }
         PackDetail {
             id: id.to_string(),
@@ -179,6 +197,7 @@ impl PackDetail {
             deltas,
             logical_bytes: logical,
             bytes: index.pack_len(),
+            oldest,
         }
     }
 
@@ -270,6 +289,12 @@ impl PublishedPack {
     /// The packs this repack replaces, deleted by [`finish`](Self::finish).
     pub fn replaced(&self) -> &[String] {
         &self.replaced
+    }
+
+    /// Objects packed from loose copies, which stay on disk until
+    /// [`finish`](Self::finish).
+    pub fn packed_loose(&self) -> impl Iterator<Item = &Hash> {
+        self.from_loose.iter().map(|(h, _)| h)
     }
 
     /// Take the repack lock again after [`unlock`](Self::unlock); `Conflict`
@@ -707,11 +732,15 @@ impl FsBlobStore {
             ..LeftoverCounts::default()
         };
         let with_loose = !matches!(opts.mode, RepackMode::Planned { loose: false, .. });
-        let loose = if with_loose {
+        let mut loose = if with_loose {
             loose_objects(self.root(), &mut leftovers)?
         } else {
             Vec::new()
         };
+        if let (RepackMode::Incremental { .. }, Some(only)) = (opts.mode, &opts.loose_subset) {
+            loose.retain(|o| only.contains(&o.hash));
+        }
+        let named: HashSet<&String> = opts.packs.iter().collect();
         report.leftovers_restored = leftovers.restored;
         report.garbage_removed += leftovers.removed;
         report.packs_before = view.packs.len() as u64;
@@ -733,9 +762,10 @@ impl FsBlobStore {
                     .iter()
                     .map(|(p, dead)| (p.id.clone(), live(dead, p)))
                     .collect();
-                let extra: Vec<(String, u64)> = sizes
-                    .extract_if(.., |(id, _)| opts.packs.contains(id))
-                    .collect();
+                let extra: Vec<(String, u64)> =
+                    sizes.extract_if(.., |(id, _)| named.contains(id)).collect();
+                let leave: HashSet<&String> = opts.leave.iter().collect();
+                sizes.retain(|(id, _)| !leave.contains(id));
                 let new = loose.len() as u64 + extra.iter().map(|p| p.1).sum::<u64>();
                 plan_merge(&sizes, new, factor, max_packs)
                     .into_iter()
@@ -745,10 +775,11 @@ impl FsBlobStore {
             RepackMode::Planned { .. } => view
                 .searchable()
                 .iter()
-                .filter(|(p, _)| opts.packs.contains(&p.id))
+                .filter(|(p, _)| named.contains(&p.id))
                 .map(|(p, _)| p.id.clone())
                 .collect(),
         };
+        drop(named);
         report.packs_merged = merged.len() as u64;
         let all: Vec<(usize, &Pack, &HashSet<Hash>)> = view
             .packs
@@ -958,6 +989,9 @@ impl FsBlobStore {
         crate::retire::retire_for(&dir, &replaced, &id, now_secs())?;
         self.packs.unsupersede(&id);
         step(&opts, RepackStep::Retired)?;
+        if opts.mark {
+            crate::considered::mark_fs(&dir, std::slice::from_ref(&id))?;
+        }
         // Loading the new index holds it beside the old ones; the per-object
         // arrays of this run go first.
         drop((written, sources, table, view));
@@ -1003,6 +1037,22 @@ impl FsBlobStore {
     /// would pack. Lists every shard directory.
     pub fn loose_stats(&self) -> Result<(u64, u64)> {
         count_loose(self.root())
+    }
+
+    /// Every loose object with its size, in hash order: one listing of
+    /// every shard directory.
+    pub fn loose_listing(&self) -> Result<Vec<(Hash, u64)>> {
+        let mut leftovers = LeftoverCounts::default();
+        Ok(loose_objects(self.root(), &mut leftovers)?
+            .into_iter()
+            .map(|o| (o.hash, o.len))
+            .collect())
+    }
+
+    /// Packs a delta repack already compressed (ADR 0100,
+    /// `packs/considered`).
+    pub fn considered_packs(&self) -> Result<HashSet<String>> {
+        crate::considered::read_fs(self.packs.dir())
     }
 
     /// [`PackDetail`] of each searchable pack `ids` names. Reads every

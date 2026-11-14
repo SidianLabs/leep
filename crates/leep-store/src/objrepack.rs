@@ -631,6 +631,33 @@ impl ObjectBlobStore {
         Ok((loose.len() as u64, loose.values().map(|s| s.size).sum()))
     }
 
+    /// Every loose object with its size, in hash order.
+    pub async fn loose_listing(&self) -> Result<Vec<(Hash, u64)>> {
+        Ok(list_all_loose(&*self.store)
+            .await?
+            .into_iter()
+            .map(|(h, s)| (h, s.size))
+            .collect())
+    }
+
+    /// Packs a delta repack already compressed (ADR 0100,
+    /// `packs/.considered`).
+    pub async fn considered_packs(&self) -> Result<HashSet<String>> {
+        crate::considered::read_object(&*self.store).await
+    }
+
+    /// When the bucket last had an automatic full repack (ADR 0100), in
+    /// unix seconds, as [`record_full_repack`](Self::record_full_repack)
+    /// left it: shared by every server on the bucket and kept across
+    /// restarts.
+    pub async fn last_full_repack(&self) -> Result<Option<i64>> {
+        crate::considered::read_last_full(&*self.store).await
+    }
+
+    pub async fn record_full_repack(&self, at: i64) -> Result<()> {
+        crate::considered::write_last_full(&*self.store, at).await
+    }
+
     /// [`PackDetail`](crate::PackDetail) of each searchable pack `ids`
     /// names, from the cached view.
     pub async fn pack_details(&self, ids: &HashSet<String>) -> Result<Vec<crate::PackDetail>> {
@@ -843,6 +870,17 @@ impl ObjectBlobStore {
         self.retire(&replaced, &id, &id, lease).await?;
         self.packs.unsupersede(&id);
         step(opts, RepackStep::Retired)?;
+        if opts.mark {
+            let published: HashSet<String> = view
+                .packs
+                .iter()
+                .map(|(p, _)| p.id.clone())
+                .filter(|p| !replaced.contains(p))
+                .chain([id.clone()])
+                .collect();
+            crate::considered::mark_object(&*self.store, std::slice::from_ref(&id), &published)
+                .await?;
+        }
         self.packs.rescan(ScanReason::Repack).await?;
         Ok(Published {
             report,
@@ -1079,6 +1117,12 @@ impl PublishedObjectPack {
     /// The packs this repack replaces, deleted by [`finish`](Self::finish).
     pub fn replaced(&self) -> &[String] {
         &self.replaced
+    }
+
+    /// Objects packed from loose copies, which stay until
+    /// [`finish`](Self::finish).
+    pub fn packed_loose(&self) -> impl Iterator<Item = &Hash> {
+        self.from_loose.iter().map(|(h, _)| h)
     }
 
     /// Take the lease again after [`unlock`](Self::unlock); `Conflict`

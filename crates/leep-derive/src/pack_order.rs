@@ -159,7 +159,9 @@ pub async fn pack_order(repo: &Repo) -> Result<PackOrder> {
                     r => Some(*walk.ids.hash(r)),
                 },
             };
-            roots[i as usize] = walk.changeset(repo, root, parent_root, &|_| true).await?;
+            roots[i as usize] = walk
+                .changeset(repo, root, parent_root, &|_| true, &|_| true)
+                .await?;
         }
     }
     Ok(PackOrder {
@@ -182,12 +184,15 @@ pub async fn pack_order_loose(
     pack_order_where(repo, is_loose, is_loose, usize::MAX).await
 }
 
-/// Like [`pack_order_loose`], for a merge of packs (ADR 0068): lists the
-/// objects `wanted` accepts, walking back from every ref tip through each
-/// changeset whose root tree `wanted` or `walk_through` accepts (a land's
-/// copy has its tree in a land pack, a fast-forwarded create its tree
-/// loose), and at most `limit` changesets, so a store whose loose objects
-/// are never packed does not walk all of its history every time.
+/// Like [`pack_order_loose`], for a merge of packs (ADR 0068) or a batch
+/// of the automatic delta repack (ADR 0100): lists the objects `wanted`
+/// accepts, walking back from every ref tip through each changeset whose
+/// root tree `wanted` or `walk_through` accepts (a land's copy has its tree
+/// in a land pack, a fast-forwarded create its tree loose), and down
+/// through every tree node either accepts, and at most `limit` changesets,
+/// so a store whose loose objects are never packed does not walk all of its
+/// history every time. An object the walk does not reach is still packed by
+/// the repack, whole.
 pub async fn pack_order_where(
     repo: &Repo,
     wanted: &(dyn Fn(&Hash) -> bool + Sync),
@@ -225,7 +230,7 @@ pub async fn pack_order_where(
             },
             None => None,
         };
-        walk.changeset(repo, roots[&id], parent_root, wanted)
+        walk.changeset(repo, roots[&id], parent_root, wanted, walk_through)
             .await?;
     }
     Ok(PackOrder {
@@ -276,15 +281,16 @@ impl Walk {
 
     /// List the objects of the changeset with root tree `root` that its
     /// first parent (root tree `parent_root`) lacks, oldest generation first
-    /// across calls. Objects `wanted` refuses are not listed, and a refused
-    /// tree node's subtree is not entered; both still serve as bases.
-    /// Returns the id of `root`.
+    /// across calls. Objects `wanted` refuses are not listed, and the
+    /// subtree of a node both `wanted` and `descend` refuse is not entered;
+    /// they still serve as bases. Returns the id of `root`.
     async fn changeset(
         &mut self,
         repo: &Repo,
         root: Hash,
         parent_root: Option<Hash>,
         wanted: &(dyn Fn(&Hash) -> bool + Sync),
+        descend: &(dyn Fn(&Hash) -> bool + Sync),
     ) -> Result<u32> {
         let empty = TreeNode::empty_hash();
         let root_id = self.id(&root);
@@ -300,11 +306,17 @@ impl Walk {
             };
             let tree = *self.ids.hash(tree_id);
             self.last_at.insert(path.clone(), tree_id);
-            if tree == empty || !wanted(&tree) {
+            if tree == empty {
                 // The empty node is never stored; read_tree answers it.
                 continue;
             }
-            self.objects.push((tree_id, base));
+            let want = wanted(&tree);
+            if !want && !descend(&tree) {
+                continue;
+            }
+            if want {
+                self.objects.push((tree_id, base));
+            }
             // Shared: the parent's node read here is usually the node the
             // parent's own walk just read.
             let node = repo.read_tree_view(tree).await?;

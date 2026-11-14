@@ -389,8 +389,10 @@ async fn bytes_waiting_for_cleanup_hold_the_next_run() {
 }
 
 /// An object store has no incremental repack: the task runs a full one,
-/// whole import pack and loose objects included, and the next only after
-/// its interval.
+/// whole import pack and loose objects included, once the bytes waiting
+/// are a large enough share of the store (never on age alone), and the
+/// next only after its interval, which the bucket keeps: a restarted task
+/// (or another replica) waits for it too.
 #[tokio::test]
 async fn an_object_store_gets_a_full_repack_at_most_once_per_interval() {
     let dir = tempfile::tempdir().unwrap();
@@ -404,24 +406,49 @@ async fn an_object_store_gets_a_full_repack_at_most_once_per_interval() {
     let repo = Repo::new(Arc::new(store.clone()), meta.clone());
     import(&repo, &meta, 30).await;
     assert_eq!(store.pack_count().await.unwrap(), 1);
+    let task = |auto: AutoRepackOptions| {
+        let bg = BackgroundRepack::new(PackStore::Object(store.clone()), opts(auto));
+        let walk = bg.walk_repo(meta.clone());
+        bg.with_repo(walk)
+    };
+    // The default floor (64 MiB) is far above this store: no full repack,
+    // even with every object past its age.
+    let mut bg = task(AutoRepackOptions {
+        max_age: Some(Duration::ZERO),
+        ..eager()
+    });
+    assert!(matches!(
+        bg.tick().await.unwrap().auto,
+        AutoOutcome::BelowThreshold { .. }
+    ));
     let auto = AutoRepackOptions {
         object_store_interval: Duration::from_secs(3600),
+        object_store_min_bytes: 0,
         ..eager()
     };
-    let bg = BackgroundRepack::new(PackStore::Object(store.clone()), opts(auto));
-    let walk = bg.walk_repo(meta.clone());
-    let mut bg = bg.with_repo(walk);
+    let mut bg = task(auto.clone());
     let r = ran(bg.tick().await.unwrap().auto);
     assert_eq!(r.packs_merged, 1, "{r:?}");
     assert!(r.loose_before > 0 && r.deltas > 3 * r.whole, "{r:?}");
     bg.finish_all().await.unwrap();
     assert_eq!(store.loose_stats().await.unwrap(), (0, 0));
+    assert!(store.last_full_repack().await.unwrap().is_some());
     land_one(&repo, &meta, 30).await;
     assert_eq!(bg.tick().await.unwrap().auto, AutoOutcome::Held("interval"));
-    // A task whose interval has passed (here: a new one) runs again.
-    let bg = BackgroundRepack::new(PackStore::Object(store.clone()), opts(eager()));
-    let walk = bg.walk_repo(meta.clone());
-    let mut bg = bg.with_repo(walk);
+    // A restart (a new task, a new store handle) waits for the interval too.
+    let fresh = ObjectBlobStore::local(dir.path()).unwrap();
+    let bg2 = BackgroundRepack::new(PackStore::Object(fresh.clone()), opts(auto.clone()));
+    let walk = bg2.walk_repo(meta.clone());
+    let mut bg2 = bg2.with_repo(walk);
+    assert_eq!(
+        bg2.tick().await.unwrap().auto,
+        AutoOutcome::Held("interval")
+    );
+    // Once it has passed (here: an interval of zero), it runs again.
+    let mut bg = task(AutoRepackOptions {
+        object_store_interval: Duration::ZERO,
+        ..auto
+    });
     let r = ran(bg.tick().await.unwrap().auto);
     assert_eq!(r.loose_before, 6, "{r:?}");
     bg.finish_all().await.unwrap();
@@ -589,8 +616,8 @@ async fn whole_packs_and_delta_packs_merge_apart() {
 }
 
 /// The loose copies a run packed stay on disk until its cleanup, a fence
-/// later: they are not counted as waiting, and no run packs them again
-/// meanwhile, even with the byte cap far away.
+/// later: they are not counted as waiting, and a run meanwhile packs only
+/// what came since, so no object is packed twice.
 #[tokio::test]
 async fn loose_copies_waiting_for_cleanup_are_not_packed_twice() {
     let dir = tempfile::tempdir().unwrap();
@@ -615,11 +642,272 @@ async fn loose_copies_waiting_for_cleanup_are_not_packed_twice() {
     );
     assert_eq!(bg.tick().await.unwrap().auto, AutoOutcome::Nothing);
     land_one(&repo, &meta, 10).await;
-    assert_eq!(bg.tick().await.unwrap().auto, AutoOutcome::Held("pending"));
-    assert_eq!(store.pack_count().unwrap(), 1, "no second pack");
-    bg.finish_all().await.unwrap();
+    // The next run packs only the new land's objects, not the copies the
+    // first one packed and has not deleted yet.
     let r = ran(bg.tick().await.unwrap().auto);
     assert_eq!(r.loose_before, 6, "only the new land: {r:?}");
     bg.finish_all().await.unwrap();
+    assert_eq!(store.loose_stats().unwrap().0, 0);
+    let entries: u64 = store.pack_sizes().unwrap().iter().map(|p| p.objects).sum();
+    assert_eq!(entries, r.packed_before + 6, "each object once");
     assert_main_readable(Arc::new(FsBlobStore::new(dir.path())), &meta, "twice").await;
+}
+
+/// A history whose contents came in several whole packs (an import in
+/// batches). Returns the number of packs.
+async fn import_in_packs(repo: &Repo, meta: &Arc<MemoryMetaStore>, versions: usize, per: usize) {
+    for chunk in (0..versions).collect::<Vec<_>>().chunks(per) {
+        let items: Vec<(Hash, Bytes)> = chunk
+            .iter()
+            .flat_map(|&v| FILES.iter().map(move |f| Bytes::from(version(f, v))))
+            .map(|b| (Hash::of_blob(&b), b))
+            .collect();
+        repo.blobs().put_many(items).await.unwrap();
+    }
+    let mut tip = None;
+    for v in 0..versions {
+        let files: Vec<(&str, String)> = FILES.iter().map(|f| (*f, version(f, v))).collect();
+        tip = Some(commit(repo, tip, &files).await);
+    }
+    let old = meta.get_ref("main").await.unwrap();
+    assert!(meta.cas_ref("main", old, tip).await.unwrap());
+}
+
+/// More waiting than one run may take runs as several batches, oldest
+/// packs first, one a tick: merges run in the ticks between, a restart
+/// keeps the batches already published, and in the end nothing waits.
+#[tokio::test]
+async fn a_large_backlog_runs_in_batches_with_merges_between() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = fs_store(dir.path());
+    let meta = Arc::new(MemoryMetaStore::new());
+    let repo = Repo::new(Arc::new(store.clone()), meta.clone());
+    import_in_packs(&repo, &meta, 48, 6).await;
+    assert_eq!(store.pack_sizes().unwrap().len(), 8);
+    let o = BackgroundRepackOptions {
+        trigger_packs: 1,
+        fanout: 2,
+        ..opts(AutoRepackOptions {
+            max_batch_packs: 2,
+            max_batch_objects: 60,
+            ..eager()
+        })
+    };
+    let task = |o: BackgroundRepackOptions| {
+        let bg = BackgroundRepack::new(PackStore::Fs(store.clone()), o);
+        let walk = bg.walk_repo(meta.clone());
+        bg.with_repo(walk)
+    };
+    let mut bg = task(o.clone());
+    let tick = bg.tick().await.unwrap();
+    // The other whole packs merged with each other in the same tick.
+    let mut merged_between = tick.merged.len();
+    let first = ran(tick.auto);
+    assert_eq!(first.packs_merged, 2, "the two oldest packs: {first:?}");
+    assert!(
+        first.loose_before <= 60 - 36,
+        "loose objects within the cap: {first:?}"
+    );
+    bg.finish_all().await.unwrap();
+    // A restart: the new task carries on, it does not start over.
+    let mut bg = task(o);
+    let mut runs = 1;
+    for _ in 0..20 {
+        let tick = bg.tick().await.unwrap();
+        bg.finish_all().await.unwrap();
+        match tick.auto {
+            AutoOutcome::Ran(r) => {
+                assert!(r.objects > 0, "{r:?}");
+                runs += 1;
+                merged_between += tick.merged.len();
+            }
+            AutoOutcome::Nothing => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(runs >= 4, "{runs} batches");
+    assert!(merged_between > 0, "merges ran between batches");
+    assert_eq!(bg.tick().await.unwrap().auto, AutoOutcome::Nothing);
+    assert_eq!(store.loose_stats().unwrap().0, 0);
+    let ids: HashSet<String> = store
+        .pack_sizes()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    let considered = store.considered_packs().unwrap();
+    for d in store.pack_details(&ids).unwrap() {
+        assert!(
+            !d.whole() || considered.contains(&d.id),
+            "{d:?} waits still"
+        );
+    }
+    assert_main_readable(Arc::new(FsBlobStore::new(dir.path())), &meta, "batches").await;
+}
+
+/// With the cap on bytes waiting for cleanup hit (a long fence, a tiny
+/// cap), merges of small land packs still run, so the pack count stays
+/// bounded under land load; without that exemption it grows.
+#[tokio::test]
+async fn small_merges_keep_the_pack_count_bounded_past_the_cap() {
+    let o = BackgroundRepackOptions {
+        trigger_packs: 4,
+        fence: Duration::from_secs(3600),
+        pending_share: 0.0,
+        min_pending_bytes: 1,
+        auto: Some(AutoRepackOptions {
+            objects: u64::MAX,
+            bytes: u64::MAX,
+            max_age: None,
+            ..AutoRepackOptions::default()
+        }),
+        ..BackgroundRepackOptions::default()
+    };
+    let (most, pending) = land_load(o.clone()).await;
+    assert!(pending > o.pending_cap(0), "the cap was hit");
+    assert!(most <= o.trigger_packs + 8, "{most} packs searched at most");
+    let (control, _) = land_load(BackgroundRepackOptions {
+        small_merge_bytes: 0,
+        ..o
+    })
+    .await;
+    assert!(control > 3 * most, "without the exemption: {control}");
+}
+
+/// 40 rounds of three small land packs each, a tick after each round: the
+/// most packs searched after a tick, and the bytes left waiting.
+async fn land_load(o: BackgroundRepackOptions) -> (usize, u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = fs_store(dir.path());
+    let meta = Arc::new(MemoryMetaStore::new());
+    let repo = Repo::new(Arc::new(store.clone()), meta.clone());
+    import(&repo, &meta, 4).await;
+    let bg = BackgroundRepack::new(PackStore::Fs(store.clone()), o);
+    let walk = bg.walk_repo(meta.clone());
+    let mut bg = bg.with_repo(walk);
+    let mut most = 0;
+    for round in 0..40 {
+        for b in 0..3 {
+            let items: Vec<(Hash, Bytes)> = (0..5)
+                .map(|i| {
+                    let d = Bytes::from(format!("round {round} batch {b} object {i}\n"));
+                    (Hash::of_blob(&d), d)
+                })
+                .collect();
+            store.put_many(items).await.unwrap();
+        }
+        let tick = bg.tick().await.unwrap();
+        most = most.max(tick.packs);
+    }
+    (most, bg.pending_bytes())
+}
+
+/// A pack the delta repack wrote with no delta (nothing to delta against)
+/// is recorded in `packs/considered`: a restarted task does not compress
+/// it again, and the merge of such packs inherits the mark.
+#[tokio::test]
+async fn considered_packs_are_not_compressed_again_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = fs_store(dir.path());
+    let meta = Arc::new(MemoryMetaStore::new());
+    let repo = Repo::new(Arc::new(store.clone()), meta.clone());
+    let task = |o: BackgroundRepackOptions| {
+        let bg = BackgroundRepack::new(PackStore::Fs(store.clone()), o);
+        let walk = bg.walk_repo(meta.clone());
+        bg.with_repo(walk)
+    };
+    let unrelated = |n: usize| -> Vec<(Hash, Bytes)> {
+        (0..10)
+            .map(|i| Bytes::from(format!("batch {n} file {i}\n")))
+            .map(|b| (Hash::of_blob(&b), b))
+            .collect()
+    };
+    // A single-commit import of unrelated files: nothing to delta.
+    store.put_many(unrelated(0)).await.unwrap();
+    let files: Vec<(String, String)> = (0..10)
+        .map(|i| (format!("f{i}.txt"), format!("batch 0 file {i}\n")))
+        .collect();
+    let refs: Vec<(&str, String)> = files.iter().map(|(p, b)| (p.as_str(), b.clone())).collect();
+    let tip = commit(&repo, None, &refs).await;
+    assert!(meta.cas_ref("main", None, Some(tip)).await.unwrap());
+    let mut bg = task(opts(eager()));
+    let r = ran(bg.tick().await.unwrap().auto);
+    assert_eq!(r.deltas, 0, "{r:?}");
+    bg.finish_all().await.unwrap();
+    let first = r.pack_id.clone().unwrap();
+    assert!(store.considered_packs().unwrap().contains(&first));
+    // A restart: nothing waits.
+    let mut bg = task(opts(eager()));
+    assert_eq!(bg.tick().await.unwrap().auto, AutoOutcome::Nothing);
+
+    // Another considered pack beside it (a repack marked it), then a
+    // merge of the two: its output is considered too.
+    store.put_many(unrelated(1)).await.unwrap();
+    let whole: Vec<String> = store
+        .pack_sizes()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .filter(|id| *id != first)
+        .collect();
+    let marked = leep_store::RepackOptions {
+        mode: leep_store::RepackMode::Planned { loose: false },
+        packs: whole,
+        mark: true,
+        ..leep_store::RepackOptions::default()
+    };
+    store
+        .repack_publish(Vec::new(), marked)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert_eq!(store.considered_packs().unwrap().len(), 2);
+    let mut bg = task(BackgroundRepackOptions {
+        trigger_packs: 1,
+        fanout: 2,
+        ..opts(eager())
+    });
+    let tick = bg.tick().await.unwrap();
+    assert_eq!(tick.auto, AutoOutcome::Nothing);
+    assert_eq!(tick.merged.len(), 1, "{tick:?}");
+    bg.finish_all().await.unwrap();
+    let merged = tick.merged[0].pack_id.clone().unwrap();
+    assert!(store.considered_packs().unwrap().contains(&merged));
+    let mut bg = task(opts(eager()));
+    assert_eq!(bg.tick().await.unwrap().auto, AutoOutcome::Nothing);
+}
+
+/// A corrupt loose object is left in place by a run and never counted as
+/// waiting again, so it does not trigger a run at every check.
+#[tokio::test]
+async fn corrupt_loose_objects_do_not_keep_triggering_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = fs_store(dir.path());
+    let meta = Arc::new(MemoryMetaStore::new());
+    let repo = Repo::new(Arc::new(store.clone()), meta.clone());
+    import(&repo, &meta, 4).await;
+    let bad = Hash::of_blob(b"what the file should hold");
+    let hex = bad.to_hex();
+    std::fs::create_dir_all(dir.path().join(&hex[..2])).unwrap();
+    std::fs::write(
+        dir.path().join(&hex[..2]).join(&hex[2..]),
+        b"something else",
+    )
+    .unwrap();
+    let auto = AutoRepackOptions {
+        max_age: Some(Duration::ZERO),
+        ..eager()
+    };
+    let bg = BackgroundRepack::new(PackStore::Fs(store.clone()), opts(auto));
+    let walk = bg.walk_repo(meta.clone());
+    let mut bg = bg.with_repo(walk);
+    let r = ran(bg.tick().await.unwrap().auto);
+    assert_eq!(r.corrupt, vec![bad], "{r:?}");
+    bg.finish_all().await.unwrap();
+    assert_eq!(store.loose_stats().unwrap().0, 1, "left for an operator");
+    for _ in 0..3 {
+        assert_eq!(bg.tick().await.unwrap().auto, AutoOutcome::Nothing);
+    }
 }

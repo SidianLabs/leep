@@ -2570,9 +2570,19 @@ so a server with default flags stays near the size a full repack gives
 objects of packs written whole (land batches, `leep-git import`); once a
 threshold is passed it walks their history and publishes one pack of
 deltas, the whole frames included, then deletes what it replaced a fence
-later, like a merge; it does not run again until that cleanup is done
-(its loose copies are still on disk), so at most once per fence. It runs on
-the background repack's nice-19 thread and never delays a land.
+later, like a merge (the loose copies it packed are not counted again
+meanwhile). A backlog larger than `--auto-repack-batch-bytes` runs in
+batches, one a tick, so merges, cleanups and sweeps go on between them and
+a restart keeps the batches done. It runs on the background repack's
+nice-19 thread and never delays a land. Packs it has compressed are listed
+in `packs/considered` (`packs/.considered` in a bucket), so no server
+compresses them again; deleting that file only costs one more pass.
+Corrupt loose objects it meets stay in place, are logged in its report,
+and are not counted again (run `leep-server verify --full --rehash`).
+
+**After upgrading an existing store,** run `leep-server repack --full`
+once: whole frames that earlier background merges folded into delta packs
+are no longer recognised as waiting.
 
 | Flag / env | Default | What it does |
 |---|---|---|
@@ -2581,8 +2591,9 @@ the background repack's nice-19 thread and never delays a land.
 | `--auto-repack-bytes B` / `LEEP_AUTO_REPACK_BYTES` | `32M` | Run once they take this many bytes on disk (`K`, `M`, `G` are powers of 1024). |
 | `--auto-repack-max-age D` / `LEEP_AUTO_REPACK_MAX_AGE` | `30m` | Run once any has waited this long, below both thresholds; `off` waits for a threshold. |
 | `--auto-repack-check-interval D` / `LEEP_AUTO_REPACK_CHECK_INTERVAL` | `1m` | How often it counts (a listing of the loose shard directories, or one bucket listing). |
+| `--auto-repack-batch-bytes B` / `LEEP_AUTO_REPACK_BATCH_BYTES` | `1G` | Bytes one run takes at most (whole packs oldest first, then loose objects; also at most 500,000 objects and 256 packs). The rest runs as further batches, one a background tick, with merges and cleanups between them. |
 | `--auto-repack-level N` / `LEEP_AUTO_REPACK_LEVEL` | `9` | zstd level of the packs it writes, 1 to 22. |
-| `--auto-repack-object-store-interval D` / `LEEP_AUTO_REPACK_OBJECT_STORE_INTERVAL` | `24h` | Object stores: the shortest time between two automatic full repacks. |
+| `--auto-repack-object-store-interval D` / `LEEP_AUTO_REPACK_OBJECT_STORE_INTERVAL` | `24h` | Object stores: the shortest time between two automatic full repacks, kept in the bucket (`packs/.last-full`), so restarts and replicas share it. |
 
 What operators no longer need: the nightly or hourly incremental `repack`
 cron, and the loose-object count job, on servers with the defaults. Keep
@@ -2590,16 +2601,18 @@ cron, and the loose-object count job, on servers with the defaults. Keep
 from packs, and writes the first new version at each path as a delta where
 the automatic runs (like any incremental repack) store it whole.
 
-**Object stores** have no incremental repack yet: when a threshold is
-passed the server runs a full repack (it walks all history and rewrites
-every pack, through the bucket), at most once per
-`--auto-repack-object-store-interval`. On a large bucket, raise the
+**Object stores** have no incremental repack yet: the server runs a full
+repack (it walks all history and rewrites every pack, through the bucket)
+once the bytes waiting reach a quarter of the store and at least 64 MiB,
+never for age alone, and at most once per
+`--auto-repack-object-store-interval` across restarts and servers. On a large bucket, raise the
 interval or keep `repack` on your own schedule with `--auto-repack off`.
 
-**After a large import** the first run walks all of its history; on a
-history the size of Linux that is hours of one low-priority core (a full
-repack of Linux took 4 h 55 min on one VPS) and its peak memory (about
-620 bytes per object). Lands go on meanwhile. To control when it happens,
+**After a large import** the backlog runs in batches of
+`--auto-repack-batch-bytes`; each batch's walk still passes through the
+unpacked history, so on a history the size of Linux the whole backlog is
+hours of one low-priority core (a full repack of Linux took 4 h 55 min on
+one VPS). Lands go on meanwhile, and so do merges and cleanups. To control when it happens,
 run `leep-server repack` yourself first, or start servers with
 `--auto-repack off` until then.
 

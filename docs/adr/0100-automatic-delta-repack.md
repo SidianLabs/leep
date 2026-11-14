@@ -47,11 +47,22 @@ waits to be compressed:
   an object store), and
 - the live objects of **whole packs**: packs whose index has no delta
   record. That is what `put_many` writes (land batches, imports). Pack
-  details (record count, deltas, logical bytes) are read once per pack id
-  and cached, since packs never change. A pack the task itself wrote is
-  never counted again in that process, even if it holds no delta (a
-  history with nothing to delta against); after a restart such a pack is
-  compressed once more, which only costs time.
+  details (record count, deltas, logical bytes, oldest record) are read
+  once per pack id and cached, since packs never change. A pack a delta
+  repack wrote, or a tiered merge made from such packs, is recorded in
+  `packs/considered` (a bucket's `packs/.considered`): one pack id per
+  line, rewritten whole under the repack lock or lease, pruned to the
+  published packs at each write. It is never counted as whole again, in
+  any process or after a restart, even with no delta (a history with
+  nothing to delta against). The record is advisory: losing it costs one
+  more pass, and older binaries ignore it; no existing file changes.
+
+Loose copies a run packed stay on disk until its cleanup a fence later;
+they are subtracted from the count (and left out of the next run), and so
+are loose objects a run found corrupt (left for `verify --rehash`), so
+neither keeps triggering runs. The loose objects are listed once per check
+into a set, off the async workers, so the walk's predicates are memory
+lookups, not a `stat` per object.
 
 It runs when the objects reach `--auto-repack-objects` (1,024), or their
 bytes on disk reach `--auto-repack-bytes` (32 MiB), or some have waited
@@ -61,17 +72,31 @@ over more lands store fewer of them per land.
 
 A run on a filesystem store:
 
-1. walks the history of what waits with `pack_order_where`, whose `wanted`
-   (and `walk_through`) accepts an object that is loose or live in a whole
-   pack, from every ref tip back to changesets whose root tree is in a
-   delta pack already, so its cost is the new history;
-2. publishes a `RepackMode::Incremental` repack (geometric factor 2, at
+1. takes one **batch**: the oldest whole packs (by their earliest record)
+   within `--auto-repack-batch-bytes` (1 GiB), 500,000 objects and 256
+   packs (always at least one), then loose objects within what the caps
+   leave (all of them if they fit, otherwise the oldest the walk lists);
+2. walks their history with `pack_order_where`: `wanted` accepts objects
+   of the batch, `walk_through` any loose object or object of a whole pack,
+   so the walk passes through changesets and tree nodes outside the batch
+   to reach it, from every ref tip back to changesets whose root tree is
+   in a delta pack already, at most 2,000,000 changesets (an object it
+   does not reach is still packed, whole);
+3. publishes a `RepackMode::Incremental` repack (geometric factor 2, at
    most 8 packs, as `leep-server repack`) whose `RepackOptions::packs`
-   names the whole packs, which are merged besides the geometric plan, at
-   zstd level 9 (`--auto-repack-level`) on one compression thread, on the
-   task's nice-19 thread;
-3. queues its cleanup (loose copies and replaced packs) behind the fence,
+   names the batch's packs, `loose_subset` its loose objects, and `leave`
+   the whole packs left for later batches (the geometric rule may not fold
+   those in), at zstd level 9 (`--auto-repack-level`) on one compression
+   thread, on the task's nice-19 thread, and marks the new pack considered;
+4. queues its cleanup (loose copies and replaced packs) behind the fence,
    exactly as a merge's.
+
+What the caps leave runs as the next batch at the next tick, without a
+threshold, after that tick's sweep, cleanups and merges. Each batch is
+published on its own, so a restart keeps every batch done and resumes
+with the rest. A large import thus never holds the task for hours: the
+memory and time of one run are those of one batch, plus the walk, which
+still passes through the whole unpacked history once per batch.
 
 ### 2. Whole frames get the walk's bases
 An incremental repack writes the merged packs' objects in their old order
@@ -96,10 +121,15 @@ packs it stays whole, and the next delta run takes it.
 ### 4. Object stores: a scheduled full repack
 An object store has no incremental repack, and the safer choice is to
 reuse the full repack that `leep-server repack` already runs there (lease,
-retirement, late tombstones, fault tests) rather than add a mode. When a
-threshold is passed, the task walks all history (`pack_order`) and runs
-`RepackMode::Full`, at most once per `--auto-repack-object-store-interval`
-(24 hours). Between runs, objects stay as they were before this change.
+retirement, late tombstones, fault tests) rather than add a mode. A full
+repack rewrites the whole bucket, so it is gated differently: it runs once
+the bytes waiting reach a quarter of the store (pack plus loose bytes) and
+at least 64 MiB, never on age or count alone (a few old or corrupt loose
+objects never trigger it), and at most once per
+`--auto-repack-object-store-interval` (24 hours). The time of the last one
+is written to `packs/.last-full` (unix seconds) while the lease is still
+held, and read before each run, so restarts and replicas share the
+interval. Between runs, objects stay as they were before this change.
 Implementing `Incremental` in `objrepack.rs` is a follow-up.
 
 ### 5. Bounded retired bytes, same fence
@@ -107,13 +137,14 @@ The fence must exceed the request timeout (ADR 0080, ADR 0012), so it is
 not shortened. Instead the bytes waiting for cleanup (replaced packs and
 packed loose copies) are capped at `pending_share` (0.5) of the live store
 (pack plus loose bytes), at least `min_pending_bytes` (64 MiB) and at most
-`max_pending_bytes` (4 GiB, as before). Past the cap neither a merge nor a
-delta run starts; they resume once cleanups finish. A delta run's loose
-copies stay on disk until its cleanup, so they are not counted as waiting,
-and no delta run starts while one's cleanup is pending: it would pack them
-again. Delta runs therefore come at most once per fence. A store is never held
-at much more than 1.5 times its size, and small stores keep the old
-behaviour.
+`max_pending_bytes` (4 GiB, as before). Past the cap no delta run starts,
+and no merge of more than 64 MiB (`small_merge_bytes`): small-class merges
+of land packs keep running, so the pack count stays bounded after a large
+run (a test shows it bounded at the cap, and growing without the
+exemption). A held run backs off its listing until the first pending
+cleanup is due (or finishes), and an object store's held full repack until
+its interval ends. A store is never held at much more than 1.5 times its
+size plus the small merges, and small stores keep the old behaviour.
 
 ### 6. Lands are untouched
 The write path does not change: `put_many` still writes whole level-1
@@ -137,9 +168,9 @@ and searched packs), updated at each check.
 
 - Measured on Postgres with default flags and no manual repack
   (PERFORMANCE.md, "Automatic delta repack"): corpus A settles at 13.5 MB
-  in all (8.15 MB database, 5.38 MB blobs: the `--full` size) instead of
+  in all (8.09 MB database, 5.38 MB blobs: the `--full` size) instead of
   112 MB, 2.8 times Git; B at 22.5 MB (15.84 + 6.66) instead of 168.5 MB,
-  3.4 times Git. Over 400 lands the blob store grew 2,184 bytes a land once
+  3.4 times Git. Over 400 lands the blob store grew 2,192 bytes a land once
   settled, against 48 to 58 KB before (1,994 after a manual incremental
   repack).
 - The first new version at each path per run is stored whole, and so is
@@ -156,5 +187,10 @@ and searched packs), updated at each check.
 - Operators no longer need the nightly incremental `repack` cron; `gc` and
   an occasional `repack --full` (which also drops tombstoned objects)
   remain.
-- A restart forgets which zero-delta packs the task wrote, so one may be
-  rewritten once more.
+- New files: `packs/considered` (filesystem), `packs/.considered` and
+  `packs/.last-full` (bucket). Advisory and ignored by older binaries and
+  by backups; no existing file or format changes.
+- Stores that existed before this change hold whole land and import packs
+  merged into delta packs by earlier background merges; those frames are
+  no longer whole packs and stay as they are. Run `leep-server repack
+  --full` once after upgrading to compress them.

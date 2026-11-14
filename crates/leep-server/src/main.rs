@@ -464,11 +464,19 @@ struct Args {
     /// loose objects).
     #[arg(long, env = "LEEP_AUTO_REPACK_CHECK_INTERVAL", default_value = "1m", value_parser = parse_interval)]
     auto_repack_check_interval: std::time::Duration,
+    /// Bytes one automatic repack takes at most (whole packs, oldest first,
+    /// then loose objects); the rest runs as further batches, one a tick,
+    /// so merges and cleanups go on between them and a restart keeps the
+    /// batches done.
+    #[arg(long, env = "LEEP_AUTO_REPACK_BATCH_BYTES", default_value = "1G", value_parser = parse_byte_size)]
+    auto_repack_batch_bytes: u64,
     /// zstd level of the packs the automatic repack writes, 1 to 22.
     #[arg(long, env = "LEEP_AUTO_REPACK_LEVEL", default_value_t = 9, value_parser = clap::value_parser!(i32).range(1..=22))]
     auto_repack_level: i32,
     /// On an object store, the shortest time between two automatic full
-    /// repacks.
+    /// repacks, kept in the bucket (`packs/.last-full`) so restarts and
+    /// replicas share it. A full repack also waits until the bytes waiting
+    /// reach a quarter of the store (at least 64 MiB), whatever their age.
     #[arg(long, env = "LEEP_AUTO_REPACK_OBJECT_STORE_INTERVAL", default_value = "24h", value_parser = parse_grace)]
     auto_repack_object_store_interval: std::time::Duration,
     /// Copy a land onto the ref without a three-way merge when nothing the
@@ -1075,6 +1083,7 @@ fn parse_byte_size(s: &str) -> Result<u64, String> {
         "K" | "KB" | "KIB" => 10,
         "M" | "MB" | "MIB" => 20,
         "G" | "GB" | "GIB" => 30,
+        "T" | "TB" | "TIB" => 40,
         _ => return Err(format!("expected a byte count like 32M, got {s:?}")),
     };
     n.checked_mul(1 << shift)
@@ -2202,6 +2211,7 @@ async fn run() -> anyhow::Result<()> {
                         DurationOrOff::Off => None,
                     },
                     check_interval: args.auto_repack_check_interval,
+                    max_batch_bytes: args.auto_repack_batch_bytes,
                     level: args.auto_repack_level,
                     object_store_interval: args.auto_repack_object_store_interval,
                     ..Default::default()
@@ -2989,6 +2999,7 @@ mod tests {
         ));
         assert_eq!(a.auto_repack_check_interval, Duration::from_secs(60));
         assert_eq!(a.auto_repack_level, 9);
+        assert_eq!(a.auto_repack_batch_bytes, 1 << 30);
         let a = parse_args([
             "leep-server",
             "--auto-repack",
@@ -3006,7 +3017,8 @@ mod tests {
         assert_eq!(parse_byte_size("4KiB"), Ok(4096));
         assert_eq!(parse_byte_size("2mb"), Ok(2 << 20));
         assert!(parse_byte_size("0").is_err());
-        assert!(parse_byte_size("3T").is_err());
+        assert_eq!(parse_byte_size("3T"), Ok(3 << 40));
+        assert!(parse_byte_size("3P").is_err());
         assert!(parse_byte_size("M").is_err());
     }
 

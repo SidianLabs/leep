@@ -3,6 +3,7 @@
 //! that can sit in front of any of them.
 
 mod cache;
+mod considered;
 mod dirsync;
 mod fs;
 mod groupsync;
