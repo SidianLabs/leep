@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use leep_core::{Error, MetaStore, Result};
 
+pub mod auto_compact;
 mod codec;
 pub mod compact;
 pub mod coord;

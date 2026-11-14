@@ -154,14 +154,27 @@ unknown one and at most a minute before a write), and plain rows until a
 dictionary exists. `leep-server compact-changesets` trains the dictionary
 and rewrites existing rows in place, beside running servers of this
 version; on git/git and Linux it halves the table (about 2.9 to 1.75 GB on
-all of Linux). A frame header's claimed size is trusted for at most 1 MiB
+all of Linux). Since ADR 0101 the server does the same by itself
+(`leep_meta::auto_compact`, run by `leep_server::auto_compact` every 10
+minutes, first 2 to 3 minutes after start, on a nice-19 thread with one
+connection of its own, under a Postgres advisory lock so one server steps
+at a time): it trains a 16 KiB dictionary from 100 changesets, 60 KiB at
+1,000 and 64 KiB at 10,000, on at most 16 MiB of samples (a dictionary's
+tier is read back from its size, so one over 60 KiB, such as
+`compact-changesets`' default, is never replaced), stores a first one only
+if the rows compressed with it plus the dictionary itself are at least 5%
+smaller and a replacement only if 12% smaller, and passes over the rows not
+on the newest dictionary, reading 32-byte heads and rewriting in
+single-statement batches of 250 (resting three times as long as each took,
+skipping rows that do not decode), until a pass has started after every
+server had a minute to learn the dictionary. A frame header's claimed size is trusted for at most 1 MiB
 of memory up front; larger frames decode as a stream.
 
 **Format features** ([ADR 0055](adr/0055-store-format-features.md)). The
 `store_features` table names what a store's rows use that a reader must
 understand (`changeset-zstd-dict` so far). A tool records a feature before
-it writes the first row that needs it (`compact-changesets` does so before
-it stores a dictionary). Every binary that has the table reads it on open
+it writes the first row that needs it (`compact-changesets` and the
+automatic compaction do so before they store a dictionary). Every binary that has the table reads it on open
 and refuses to start on a name it does not know, so a newer format fails
 at startup rather than on the first row it cannot read. Binaries from
 before the table do not check it.
@@ -1258,6 +1271,10 @@ bytes are a quarter of the store, at most once a day by the time kept in
 half the live store (64 MiB to 4 GiB), merges under 64 MiB exempt; the
 fence is unchanged. The write path is unchanged:
 lands still write whole level-1 frames and never wait for the task.
+`cargo test -p leep-e2e --test storage_size` (ADR 0101) holds a default
+server's settled size per land and its ratio to Git under budgets in CI,
+and `leep-soak --max-blob-store-ratio` bounds `leep_blob_store_size_ratio`
+in a soak.
 
 **Retirement is durable** (ADR 0080). Once a repack (background merge or
 `leep-server repack`) has published the pack that replaces others, it
@@ -1280,7 +1297,10 @@ objects once more per restart.
 
 `leep-server repack` moves loose objects into a pack: a file version is
 stored as a zstd delta against the previous version at its path, a tree node
-against the same directory in the first parent, chains capped at 32. By
+against the same directory in the first parent, chains capped at 63 (32
+before ADR 0101: a read decodes at most 64 frames, what every reader since
+ADR 0029 follows; readers now accept 256, so a later writer can go
+further). By
 default it is incremental (ADR 0039). It walks back from the refs only
 through changesets whose root tree is still loose, packs the loose objects,
 and merges the smallest packs by a geometric rule, so the pack count stays

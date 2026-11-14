@@ -102,6 +102,9 @@ pub struct SqliteMetaStore {
     pub(crate) has_dicts: bool,
     /// Whether the schema has `store_features` (ADR 0055).
     pub(crate) has_features: bool,
+    /// The `pool` label of statements in metrics: `data`, or `compact` for
+    /// the automatic compaction's own store (ADR 0101).
+    pub(crate) data_label: &'static str,
     /// Whether `changesets` has `stored_at` (ADR 0059).
     pub(crate) has_stored_at: bool,
     /// Whether the schema has the review request tables (ADR 0086).
@@ -148,7 +151,18 @@ impl SqliteMetaStore {
         mode: SchemaMode,
         migrations: &[Migration],
     ) -> Result<Self> {
-        let pool = Self::pool(url).await?;
+        Self::connect_with_max(url, mode, migrations, 8).await
+    }
+
+    /// [`connect_with_migrations`](Self::connect_with_migrations) with at
+    /// most `max` connections to a file (an in-memory database has one).
+    pub(crate) async fn connect_with_max(
+        url: &str,
+        mode: SchemaMode,
+        migrations: &[Migration],
+        max: u32,
+    ) -> Result<Self> {
+        let pool = Self::pool_with(url, max).await?;
         let report = Self::run(&pool, migrations, mode == SchemaMode::Migrate).await?;
         if mode == SchemaMode::RequireCurrent {
             migrate::require_current(&report)?;
@@ -194,6 +208,10 @@ impl SqliteMetaStore {
     }
 
     async fn pool(url: &str) -> Result<SqlitePool> {
+        Self::pool_with(url, 8).await
+    }
+
+    async fn pool_with(url: &str, file_max: u32) -> Result<SqlitePool> {
         let opts = SqliteConnectOptions::from_str(&sqlite_url(url)).map_err(storage)?;
         let memory = url.contains(":memory:") || url.contains("mode=memory");
         let (opts, max) = if memory {
@@ -202,7 +220,7 @@ impl SqliteMetaStore {
             (
                 opts.journal_mode(SqliteJournalMode::Wal)
                     .busy_timeout(BUSY_TIMEOUT),
-                8,
+                file_max,
             )
         };
         let mut pool = SqlitePoolOptions::new().max_connections(max);
@@ -323,7 +341,8 @@ impl SqliteMetaStore {
     /// `leep_meta_statements_total` (ADR 0081): one query, or one
     /// transaction, per call of this.
     fn db_for(&self, op: &'static str) -> &SqlitePool {
-        metrics::counter!("leep_meta_statements_total", "op" => op, "pool" => "data").increment(1);
+        metrics::counter!("leep_meta_statements_total", "op" => op, "pool" => self.data_label)
+            .increment(1);
         &self.pool
     }
 
@@ -345,6 +364,7 @@ impl SqliteMetaStore {
         Self {
             pool,
             codec: Codec::default(),
+            data_label: "data",
             has_dicts: migrations
                 .iter()
                 .any(|m| m.version >= crate::compact::DICTS_SCHEMA_VERSION),

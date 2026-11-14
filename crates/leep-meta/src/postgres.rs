@@ -161,6 +161,13 @@ pub struct PostgresMetaStore {
     /// Tops the pools up to their warm floor (ADR 0084); `None` without
     /// one.
     pub(crate) keeper: Option<crate::pool_floor::Keeper>,
+    /// The `pool` label of the data pool in metrics: `data`, or `compact`
+    /// for the automatic compaction's own store (ADR 0101), so its
+    /// statements and connection are not counted as the server's.
+    pub(crate) data_label: &'static str,
+    /// The connection holding the automatic compaction's advisory lock
+    /// (ADR 0101), from the lease pool, while a step runs.
+    pub(crate) compact_lock: tokio::sync::Mutex<Option<sqlx::pool::PoolConnection<sqlx::Postgres>>>,
 }
 
 impl PostgresMetaStore {
@@ -814,7 +821,7 @@ impl PostgresMetaStore {
         let (name, pool) = match (lane, &self.land_pool, &self.index_pool) {
             (Lane::Land, Some(land), _) => ("land", land),
             (Lane::Index, _, Some(index)) => ("index", index),
-            _ => ("data", &self.pool),
+            _ => (self.data_label, &self.pool),
         };
         pool_gauges(name, pool);
         metrics::counter!("leep_meta_statements_total", "op" => op, "pool" => name).increment(1);
@@ -881,6 +888,8 @@ impl PostgresMetaStore {
                 .any(|m| m.version >= crate::review_requests::REVIEW_REQUESTS_SCHEMA_VERSION),
             coord,
             keeper: None,
+            data_label: "data",
+            compact_lock: tokio::sync::Mutex::new(None),
         }
     }
 

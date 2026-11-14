@@ -674,6 +674,18 @@ fn run_crash_rounds(backend: &str, meta_url: Option<String>) {
 
 /// [`run_crash_rounds`] with the server started with `extra` flags too.
 fn run_crash_rounds_with(backend: &str, meta_url: Option<String>, extra: &[&str]) -> u64 {
+    run_crash_rounds_prepared(backend, meta_url, extra, |_| {}, |_| {})
+}
+
+/// [`run_crash_rounds_with`], with `prepare` run on the stores before the
+/// first server starts and `after` once the rounds passed.
+fn run_crash_rounds_prepared(
+    backend: &str,
+    meta_url: Option<String>,
+    extra: &[&str],
+    prepare: impl FnOnce(&Stores),
+    after: impl FnOnce(&Stores),
+) -> u64 {
     let _g = serial();
     let _w = Watchdog::start();
     let seed = env_u64("LEEP_CRASH_SEED", DEFAULT_SEED);
@@ -686,11 +698,15 @@ fn run_crash_rounds_with(backend: &str, meta_url: Option<String>, extra: &[&str]
         Some(url) => Stores::with_meta(&root.join("data"), url),
         None => Stores::sqlite(&root.join("data")),
     };
+    prepare(&stores);
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crash_rounds(backend, seed, rounds, http_agents, root, &stores, extra)
     }));
     let not_admitted = match outcome {
-        Ok(n) => n,
+        Ok(n) => {
+            after(&stores);
+            n
+        }
         Err(e) => {
             progress!(
                 "crash test failed: backend {backend}, LEEP_CRASH_SEED={seed}, rounds {rounds}, \
@@ -917,7 +933,10 @@ fn verify_exact(tag: &str, stores: &Stores, shared: &Shared) {
         let mut messages: HashMap<String, u32> = HashMap::new();
         while let Some(id) = stack.pop() {
             let cs = repo.get_changeset(id).await.unwrap();
-            *messages.entry(cs.message).or_default() += 1;
+            // History a test planted before the agents started.
+            if !cs.message.starts_with(PLANTED_MSG) {
+                *messages.entry(cs.message).or_default() += 1;
+            }
             for p in cs.parents {
                 if seen.insert(p) {
                     stack.push(p);
@@ -947,11 +966,28 @@ fn verify_exact(tag: &str, stores: &Stores, shared: &Shared) {
                 .unwrap_or_else(|| panic!("[{tag}] {} is missing at main", s.path));
             assert_eq!(&data[..], s.body.as_bytes(), "[{tag}] {}", s.path);
         }
-        let moves = repo
+        let mut moves = repo
             .meta()
             .ref_log(Some("main"), None, usize::MAX >> 1)
             .await
             .unwrap();
+        // Not the move that put planted history on `main`.
+        let mut lands = Vec::new();
+        for m in moves.drain(..) {
+            let planted = match m.new {
+                Some(id) => repo
+                    .get_changeset(id)
+                    .await
+                    .unwrap()
+                    .message
+                    .starts_with(PLANTED_MSG),
+                None => false,
+            };
+            if !planted {
+                lands.push(m);
+            }
+        }
+        let moves = lands;
         assert_eq!(
             moves.len(),
             confirmed.len(),
@@ -1058,6 +1094,235 @@ fn killed_server_with_eager_auto_repack_loses_nothing_postgres() {
         return;
     };
     run_crash_rounds_with("postgres, auto repack", Some(db.url.clone()), AUTO_REPACK);
+    drop(db);
+}
+
+/// ADR 0101: the automatic changeset compaction looks every second, over
+/// a store that starts with 300 changesets on `main` (rows a
+/// dictionary pays for), in batches of eight, so kills land while it
+/// trains, stores a dictionary or rewrites rows (each server's first pass
+/// covers every row), beside lands. Nothing is lost and every store
+/// verifies (every changeset is read back through the codec).
+const AUTO_COMPACT: &[&str] = &[
+    "--auto-compact-interval",
+    "1s",
+    "--auto-compact-min-rows",
+    "2",
+    "--auto-compact-batch",
+    "8",
+];
+
+#[test]
+fn killed_server_with_eager_auto_compaction_loses_nothing_sqlite() {
+    run_crash_rounds_prepared(
+        "sqlite, auto compaction",
+        None,
+        AUTO_COMPACT,
+        |s| {
+            plant_compactable(s);
+        },
+        compacted,
+    );
+}
+
+/// The compaction ran: a dictionary exists and most rows use one.
+fn compacted(stores: &Stores) {
+    let (plain, packed, dicts) = row_encodings(stores);
+    progress!("after the rounds: {plain} plain rows, {packed} compressed, {dicts} dictionaries");
+    assert!(
+        dicts >= 1 && packed >= 300,
+        "{plain} plain, {packed} compressed, {dicts} dictionaries"
+    );
+}
+
+/// The start of the messages of changesets [`plant_compactable`] writes,
+/// which [`verify_exact`] does not count as lands.
+const PLANTED_MSG: &str = "planted: ";
+
+/// 300 changesets on `main`, with messages like real ones, so a
+/// dictionary pays for itself. On `main`, not a side ref: the CLI agents
+/// create `main` only in an empty repository (ADR 0036), so a store with
+/// some other ref and no `main` would refuse their first land.
+fn plant_compactable(stores: &Stores) -> Vec<ChangesetId> {
+    gc_ok("plant", stores, &["--dry-run"]);
+    let repo = open_repo(stores);
+    let mut tip: Option<ChangesetId> = None;
+    let mut made = Vec::new();
+    for i in 0..300 {
+        let id = plant_commit_with(
+            &repo,
+            tip,
+            &format!("seed/mod{}/f{}.rs", i % 7, i % 23),
+            &format!("fn f{i}() {{}}\n"),
+            &format!(
+                "{PLANTED_MSG}mod{}: rework f{i} so it no longer allocates\n\nThe old version \
+                 copied its input on every call; this one borrows it.\n\n\
+                 Signed-off-by: Dev {} <dev{}@example.org>\n",
+                i % 7,
+                i % 5,
+                i % 5
+            ),
+        );
+        made.push(id);
+        tip = Some(id);
+    }
+    common_block_on(repo.meta().cas_ref("main", None, tip)).unwrap();
+    made
+}
+
+#[test]
+fn killed_server_with_eager_auto_compaction_loses_nothing_postgres() {
+    let Some(db) = PgDb::create("leep_e2e") else {
+        return;
+    };
+    run_crash_rounds_prepared(
+        "postgres, auto compaction",
+        Some(db.url.clone()),
+        AUTO_COMPACT,
+        |s| {
+            plant_compactable(s);
+        },
+        compacted,
+    );
+    drop(db);
+}
+
+/// Changeset rows still plain, rows compressed, and dictionaries stored.
+fn row_encodings(stores: &Stores) -> (i64, i64, i64) {
+    use sqlx::Connection;
+    common_block_on(async {
+        let plain = "SELECT COUNT(*) FROM changesets WHERE NOT (data >= X'28B52FFD' AND data < X'28B52FFE')";
+        let all = "SELECT COUNT(*) FROM changesets";
+        let dicts = "SELECT COUNT(*) FROM changeset_dicts";
+        let (p, a, d): (i64, i64, i64) = if stores.meta.starts_with("sqlite:") {
+            let mut c = sqlx::SqliteConnection::connect(&stores.meta).await.unwrap();
+            (
+                sqlx::query_scalar(plain).fetch_one(&mut c).await.unwrap(),
+                sqlx::query_scalar(all).fetch_one(&mut c).await.unwrap(),
+                sqlx::query_scalar(dicts).fetch_one(&mut c).await.unwrap(),
+            )
+        } else {
+            let plain = "SELECT COUNT(*) FROM changesets \
+                         WHERE substring(data from 1 for 4) <> '\\x28b52ffd'::bytea";
+            let mut c = sqlx::PgConnection::connect(&stores.meta).await.unwrap();
+            (
+                sqlx::query_scalar(plain).fetch_one(&mut c).await.unwrap(),
+                sqlx::query_scalar(all).fetch_one(&mut c).await.unwrap(),
+                sqlx::query_scalar(dicts).fetch_one(&mut c).await.unwrap(),
+            )
+        };
+        (p, a - p, d)
+    })
+}
+
+/// A server SIGKILLed inside a pass of its automatic compaction, after two
+/// batches of rows were rewritten: the store verifies with rows of both
+/// encodings, every changeset reads back, and the next server finishes the
+/// pass.
+fn run_compaction_kill(backend: &str, meta_url: Option<String>) {
+    let _g = serial();
+    let _w = Watchdog::start();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stores = match meta_url {
+        Some(url) => Stores::with_meta(&root.join("data"), url),
+        None => Stores::sqlite(&root.join("data")),
+    };
+    let made = plant_compactable(&stores);
+    let repo = open_repo(&stores);
+    let want: Vec<Changeset> = common_block_on(repo.meta().get_changesets(&made))
+        .unwrap()
+        .into_iter()
+        .map(Option::unwrap)
+        .collect();
+    drop(repo);
+    let tag = format!("{backend}, compaction killed mid-pass");
+    let mut server = Server::start_with(
+        free_port(),
+        &stores,
+        root,
+        &[
+            "--auto-compact-interval",
+            "1s",
+            "--auto-compact-batch",
+            "40",
+            "--debug-compact-pause-after",
+            "2",
+        ],
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !server
+        .log_text()
+        .contains("leep-compact: paused at batch 2")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "[{tag}] never paused\n{}",
+            server.log_text()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    server.kill();
+    let (plain, packed, dicts) = row_encodings(&stores);
+    progress!("[{tag}] SIGKILLed: {plain} plain rows, {packed} compressed, {dicts} dictionaries");
+    assert_eq!(dicts, 1, "[{tag}]");
+    assert!(
+        plain > 0 && packed >= 80,
+        "[{tag}] {plain} plain, {packed} compressed"
+    );
+    verify_clean(&format!("{tag}, after SIGKILL"), &stores, &["--full"]);
+    let repo = open_repo(&stores);
+    let got: Vec<Changeset> = common_block_on(repo.meta().get_changesets(&made))
+        .unwrap()
+        .into_iter()
+        .map(Option::unwrap)
+        .collect();
+    assert_eq!(got, want, "[{tag}] read back after the kill");
+    drop(repo);
+    // The next server finishes the pass.
+    let server = Server::start_with(
+        free_port(),
+        &stores,
+        root,
+        &["--auto-compact-interval", "1s"],
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while row_encodings(&stores).0 > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "[{tag}] the pass was not finished: {:?}\n{}",
+            row_encodings(&stores),
+            server.log_text()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(server);
+    assert_eq!(row_encodings(&stores), (0, made.len() as i64, 1), "[{tag}]");
+    verify_clean(
+        &format!("{tag}, after the next server"),
+        &stores,
+        &["--full"],
+    );
+    let repo = open_repo(&stores);
+    let got: Vec<Changeset> = common_block_on(repo.meta().get_changesets(&made))
+        .unwrap()
+        .into_iter()
+        .map(Option::unwrap)
+        .collect();
+    assert_eq!(got, want, "[{tag}] read back after the pass");
+}
+
+#[test]
+fn killed_auto_compaction_mid_pass_loses_nothing_sqlite() {
+    run_compaction_kill("sqlite", None);
+}
+
+#[test]
+fn killed_auto_compaction_mid_pass_loses_nothing_postgres() {
+    let Some(db) = PgDb::create("leep_e2e") else {
+        return;
+    };
+    run_compaction_kill("postgres", Some(db.url.clone()));
     drop(db);
 }
 
@@ -1272,6 +1537,17 @@ fn killed_land_leader_is_replaced_postgres() {
 
 /// A commit of one file, straight into the stores.
 fn plant_commit(repo: &Repo, parent: Option<ChangesetId>, path: &str, body: &str) -> ChangesetId {
+    plant_commit_with(repo, parent, path, body, path)
+}
+
+/// [`plant_commit`] with a commit message of its own.
+fn plant_commit_with(
+    repo: &Repo,
+    parent: Option<ChangesetId>,
+    path: &str,
+    body: &str,
+    message: &str,
+) -> ChangesetId {
     common_block_on(async {
         let content = repo
             .put_blob(body.as_bytes().to_vec().into())
@@ -1281,7 +1557,7 @@ fn plant_commit(repo: &Repo, parent: Option<ChangesetId>, path: &str, body: &str
             parents: parent.into_iter().collect(),
             author: "crash".into(),
             timestamp: 1,
-            message: path.into(),
+            message: message.into(),
             changes: BTreeMap::from([(
                 RepoPath::new(path).unwrap(),
                 FileChange::Modify {

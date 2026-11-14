@@ -2972,6 +2972,160 @@ other B run 43 ms; swarm sync p99 99.3 ms once), the same size of outlier
 as the A runs show (swarm land p99 146.5 ms against 21.2 ms). Counts
 (statements and bytes per land, CAS losses, pool use) matched in every run.
 
+### Automatic changeset compaction, chain cap 63 (ADR 0101)
+
+The corpora of "Automatic delta repack" above (A: Leep's own history,
+Git 4.84 MB; B: A plus 2,000 one-file edits, Git 6.58 MB), imported into a
+fresh Postgres 16 database and filesystem store, then a release
+`leep-server` with every flag at its default, measured once no loose
+object or retired pack was left, every changeset row was compressed and
+nothing changed for 30 s. The base is 827d550 (ADR 0100), measured again
+on the same host in the same session; database sizes are net of an empty
+migrated database (8.42 MB); shared 4-core host, single runs.
+
+| | A: DB + blobs | B: DB + blobs |
+|---|---|---|
+| Base (827d550), defaults, settled | 8.06 + 5.38 = 13.44 MB (2.8x Git) | 15.86 + 6.66 = 22.52 MB (3.4x) |
+| **Now, defaults, settled** | **9.05 + 5.03 = 14.08 MB** | **16.66 + 6.08 = 22.74 MB** |
+| Base, then `VACUUM FULL changesets` | 8.00 + 5.38 = 13.38 MB | 15.83 + 6.66 = 22.49 MB |
+| **Now, then `VACUUM FULL changesets`** | **7.58 + 5.03 = 12.61 MB (2.6x Git)** | **14.16 + 6.08 = 20.24 MB (3.1x)** |
+| Changeset rows (`id` and `data`, logical) | 2.09 to 0.77 MB | 3.49 to 1.13 MB (`data` alone 3.41 to 1.06) |
+| Pack, chain cap 32 to 63 | 5.08 to 4.73 MB | 5.94 to 5.36 MB |
+
+- The server trained one dictionary at its first step (30 s after start
+  in the build measured, before the start was moved to 2 minutes; sizes do
+  not depend on it): 16 KiB on A's 231 changesets, 60 KiB on B's 2,231 (the second
+  tier), and rewrote every row in one pass (A: 0.3 s).
+- **On Postgres the pass leaves the rows' old versions as free space** in
+  `changesets` and its TOAST table until later rows reuse it, so right
+  after the pass the table is larger (A: 1.66 to 2.48 MB, B: 3.35 to 4.08
+  MB) and the database is too. The next changesets fill that space
+  (below); `VACUUM FULL changesets` returns it at once (A: 1.01 MB, B:
+  1.57 MB). Stores whose rows are written after the dictionary exists (any
+  store past its first 100 changesets) never pay this.
+- The longer chain cap saves 0.35 MB on A and 0.58 MB on B; B's hot files
+  are edited 2,000 times.
+- Measured before the step took a Postgres advisory lock, sampled at most
+  16 MiB, required 12% for a replacement and rewrote SQLite rows in one
+  statement per batch. None of that changes these sizes: each store got
+  one dictionary from samples under 16 MiB, and one pass.
+
+Per land (corpus C: A plus 200 one-file and 200 three-file lands through
+the CLI, one a second, `--auto-repack-max-age 2m` as in ADR 0100's
+measurement), growth from the settled import to settled after the 400th
+land, averaged over all 400:
+
+| Bytes per land | Base (827d550) | Now |
+|---|---|---|
+| Blob store (pack and index) | 2,198 (1,883 + 315) | **1,515** (1,200 + 314) |
+| Database | 26,030 | 25,559 |
+| ... changeset rows (`id` and `data`, logical) | 300 | 211 |
+| ... `changesets` table | 451 | 61 (the space the pass freed) |
+| ... `derived` table | 23,859 | 23,941 |
+
+The database's growth per land is the indexes (search alone is 13.5 KB a
+land here, three-file lands included), which this change does not touch;
+the changeset row is 30% smaller. The blob store grows 31% less a land.
+
+Land latency: the land path is unchanged; the compaction runs on a
+nice-19 thread with its own connection and rests three times as long as
+each batch took. The ratio bench (`scripts/perf-ratio.sh`, base 827d550,
+this host): with an earlier version of this change, whose first step ran
+30 s after start (inside the bench's swarm) with batches of 500 and a 10 ms
+pause, four runs failed one to three wall-time p99 checks each (for
+example swarm sync p99 2.6x against the same build with `--auto-compact
+off`), and one with `LEEP_AUTO_COMPACT=off` passed. With the first step
+after 2 minutes, batches of 250 and the rest of three times each batch, two
+runs passed 23 of 23 checks (statements per land 0.99-1.02x, bytes per land
+0.99-1.01x: the bench ends before the first step), and so did a run with
+`LEEP_AUTO_COMPACT_INTERVAL=20s`, whose step trains and passes inside the
+swarm: swarm write bytes per land 0.69x (rows written compressed), database
+bytes per land 1.03x (the rewritten rows' old versions), every p99 within
+noise.
+
+### Delta chain cap
+
+ADR 0101 raised the writer's cap from 32 to 63 deltas. `cargo run
+--release -p leep-store --example chain_depth_latency` writes 260 versions
+each of a 6 KiB and a 53 KiB source-like file (one line changed per
+version, one added every eighth), packs them with a full repack whose hints
+chain every version to the one before, and times the first `get` of the
+deepest version (40 samples) and of every version: on a filesystem store
+with the pack dropped from the page cache (`posix_fadvise DONTNEED`) and a
+fresh store before each read, and on an object store simulated as S3
+(`object_store::throttle`: 20 ms a request plus 10 ns a byte, a fresh store
+before each read, 10 samples). 4-vCPU sandbox, release build, quiet host, two runs (ranges are the two
+runs' means; p99 in brackets).
+
+| Cap | Pack of 520 versions | 6 KiB file: deepest, fs cold | 53 KiB file: deepest, fs cold | 53 KiB file: any version, fs cold | 53 KiB deepest, S3 simulated |
+|---|---|---|---|---|---|
+| 32 (before) | 112,388 bytes | 0.25-0.28 ms (0.5-0.9) | 0.62 ms (1.6-2.4) | 0.36-0.39 ms | 43.2-43.5 ms |
+| **63** | **79,015 bytes** | **0.37-0.38 ms (0.8-0.9)** | **1.0-2.4 ms (3.1-5.4)** | **0.63-0.92 ms** | **43.8 ms** |
+| 128 | 56,489 bytes | 0.65-0.67 ms (1.0-1.1) | 1.8-4.7 ms (2.8-8.1) | 1.0-2.3 ms | 45.5-45.7 ms |
+
+- **Size.** The pack of the 520 versions shrinks by 30% at 63 (50% at
+  128): a whole version every 64 instead of every 33.
+- **Filesystem, cold.** A read plans the whole chain from the index and
+  asks the kernel for every frame at once, so the extra frames cost decoding
+  (zstd with the base as a dictionary, then BLAKE3 of each link), not disk
+  round trips: the deepest version of the small file is still under a
+  millisecond and that of the 64 KiB file a few milliseconds. The
+  decoded-object cache (64 MiB) serves neighbouring versions after the
+  first read.
+- **Object store.** One ranged request for the chain's frames either way;
+  the extra frames are a few KB, so the time is the request's.
+- **Budgets.** The operation budgets (ADR 0081) count store calls, and a
+  read is still one call (`get`, or `get_many` for a batch) on the
+  filesystem and one ranged request on an object store, so none moves.
+  The cold-read figures of "Packed blobs" (first read mean 190 us, p99
+  about 1 ms, mean chain 13 at cap 32) grow at most with the chain's
+  length on the deepest versions; at cap 128 the 53 KiB file's deepest
+  version took 1.8-4.7 ms. Neither cap breaks a budget; 128 was not
+  chosen for compatibility, below.
+- **Why 63, not 128.** Readers before ADR 0101 decode at most 64 frames for
+  one object, so 63 deltas over a whole frame is the longest chain the
+  previous release, and a downgrade, can read; 128 would have been a format
+  change. Readers now accept 256 frames, so a later release can raise the
+  cap with no format change.
+
+### Storage size guard
+
+`cargo test -p leep-e2e --test storage_size` (ADR 0101) holds the size of
+a default server's store under budgets in CI. A deterministic history (24
+source-like files, 50 commits of one to three files with real-looking
+messages) is generated in the test, imported with `leep-git`, and 60
+edits (one file, one in five three files) land through the HTTP API.
+Every storage flag is at its default except how soon background work runs:
+`--auto-repack-check-interval 1s`, `--auto-repack-max-age 2s`,
+`--background-repack-interval 1s`, `--background-repack-fence 3s` (with
+`--request-timeout 2s`) and `--auto-compact-interval 2s`. Sizes are read
+once nothing changes for 2 s with no loose object, no retired pack and
+every changeset row compressed. It takes about 20 s.
+
+| Checked | SQLite: measured / budget | Postgres: measured / budget |
+|---|---|---|
+| Blob store bytes per land, settled | 469-474 / 700 | 469 / 700 |
+| Database bytes per land, settled | 8,669-9,830 / 14,500 | 13,380-13,789 / 20,500 |
+| All storage (database above an empty one, plus blobs) over Git's `objects/` after `git gc` (149 KB) | 5.8-6.2x / 9x | 9.2-9.5x / 14x |
+| `leep_blob_store_size_ratio` | 0.080 / 0.12 | 0.080 / 0.12 |
+
+Budgets are about 1.5 times the measured values (two runs each). The ratio
+to Git is high because the history is tiny: the search and history indexes
+and Postgres's per-table pages dominate; the corpora above are the precise
+measure. A change that stops the automatic repack or compaction fails too,
+as the store never settles (90 s). When a change moves a line on purpose,
+measure again and move the budget in the same change, with the reason.
+
+`leep-soak --max-blob-store-ratio` (default 0.9) fails a soak whose
+`leep_blob_store_size_ratio` exceeds it in the second half, on samples
+taken after the server's first automatic delta repack; the soak's server
+runs with `--auto-repack-max-age 2m` so a short soak repacks. In a
+4-minute soak (50 agents, Postgres) the repack ran every minute and the
+ratio read 1.0 before the first run, then 0.78, 0.70 and 0.67: the soak's
+files are tens of bytes and its tree nodes mostly hashes, which neither
+deltas nor zstd shrink much. The bound catches a repack that stopped
+running or compressing (about 1), not a few percent.
+
 ### Repack memory and time
 
 A full repack of all of Linux (10.08M objects) on the VPS peaked at about

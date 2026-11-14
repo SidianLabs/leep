@@ -42,6 +42,8 @@ pub(crate) const REFRESH: Duration = Duration::from_secs(60);
 /// One stored dictionary, prepared for both directions.
 struct Dict {
     id: u32,
+    /// Bytes of the stored dictionary.
+    len: usize,
     enc: EncoderDictionary<'static>,
     dec: DecoderDictionary<'static>,
 }
@@ -82,6 +84,7 @@ impl Codec {
             check_dictionary(id, &data)?;
             prepared.push(Arc::new(Dict {
                 id,
+                len: data.len(),
                 enc: EncoderDictionary::copy(&data, LEVEL),
                 dec: DecoderDictionary::copy(&data),
             }));
@@ -109,6 +112,16 @@ impl Codec {
             .newest
             .as_ref()
             .map_or(0, |d| d.id)
+    }
+
+    /// Bytes of the newest dictionary, 0 for none.
+    pub(crate) fn newest_len(&self) -> usize {
+        self.dicts
+            .read()
+            .unwrap()
+            .newest
+            .as_ref()
+            .map_or(0, |d| d.len)
     }
 
     /// Whether a writer should look for a newer dictionary before writing.

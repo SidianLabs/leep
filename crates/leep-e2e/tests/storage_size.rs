@@ -1,0 +1,552 @@
+//! The storage size guard (ADR 0101): a server with default flags keeps a
+//! small history at a bounded size, so a change that makes storage grow
+//! fails here instead of in a deployment.
+//!
+//! A deterministic history is generated in the test (source-like files,
+//! commits of one to three files with realistic messages), imported with
+//! `leep-git`, and then `LANDS` more edits land through the HTTP API on a
+//! server with every storage flag at its default except how soon the
+//! background work runs: the automatic delta repack (ADR 0100) checks every
+//! second and takes objects 2 s old, the fence is 3 s, and the automatic
+//! changeset compaction (ADR 0101) looks every 2 s. Once the blob store and
+//! the database stop changing (every loose object packed, every retired
+//! pack swept, every changeset row compressed), it checks:
+//!
+//! - blob store bytes per land and database bytes per land, settled;
+//! - all storage (database above an empty one, plus blobs) against Git's
+//!   `objects/` after `git gc` for the same history;
+//! - `leep_blob_store_size_ratio`.
+//!
+//! The budgets are about 1.5 times the values measured when they were set
+//! (docs/PERFORMANCE.md, "Storage size guard"). If a change trips one on
+//! purpose, measure again and move the line in the same change, saying
+//! why. Runs on Postgres when `LEEP_TEST_POSTGRES_URL` is set (as in CI),
+//! on SQLite otherwise; run `cargo build --workspace` first.
+
+mod common;
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use common::*;
+use leep_core::api::{CreateChangesetResponse, LandRequest, LandResponse, RefResponse};
+use leep_core::{Changeset, ChangesetId, FileChange, FileKind, Hash, RepoPath};
+
+/// Files in the generated tree, commits imported, and lands after.
+const FILES: usize = 24;
+const IMPORT_COMMITS: usize = 50;
+const LANDS: usize = 60;
+
+/// A budget per backend: the database differs, the blob store does not.
+struct Budgets {
+    /// Blob store bytes per land, settled (pack, index and loose files).
+    blob_per_land: u64,
+    /// Database bytes per land, settled.
+    db_per_land: u64,
+    /// All storage over Git's `objects/` after `git gc`.
+    ratio_to_git: f64,
+    /// `leep_blob_store_size_ratio`, settled: stored over logical bytes.
+    blob_store_ratio: f64,
+}
+
+// Measured when set (two runs each): blobs 469-474 bytes a land on both;
+// database 8,669-9,830 (SQLite) and 13,380-13,789 (Postgres) a land; all
+// storage 5.8-6.2x (SQLite) and 9.2-9.5x (Postgres) git's 149 KB, most of it
+// the search and history indexes of a history this small; blob store ratio
+// 0.080.
+const SQLITE: Budgets = Budgets {
+    blob_per_land: 700,
+    db_per_land: 14_500,
+    ratio_to_git: 9.0,
+    blob_store_ratio: 0.12,
+};
+
+const POSTGRES: Budgets = Budgets {
+    blob_per_land: 700,
+    db_per_land: 20_500,
+    ratio_to_git: 14.0,
+    blob_store_ratio: 0.12,
+};
+
+/// The server's flags: defaults, but background work runs within seconds.
+const FLAGS: &[&str] = &[
+    "--request-timeout",
+    "2s",
+    "--background-repack-interval",
+    "1s",
+    "--background-repack-fence",
+    "3s",
+    "--auto-repack-check-interval",
+    "1s",
+    "--auto-repack-max-age",
+    "2s",
+    "--auto-compact-interval",
+    "2s",
+];
+
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+/// The generated history: the files as they stand, and how to edit them.
+struct Corpus {
+    rng: Rng,
+    words: Vec<String>,
+    files: BTreeMap<String, Vec<String>>,
+}
+
+impl Corpus {
+    fn new() -> Corpus {
+        let mut rng = Rng(0x5EED_0101);
+        let syll = [
+            "ar", "be", "co", "de", "en", "fi", "ga", "hu", "io", "ka", "lu", "me", "no", "pa",
+            "re", "si", "ta", "un", "ve", "wo",
+        ];
+        let words = (0..400)
+            .map(|_| {
+                (0..2 + rng.below(3))
+                    .map(|_| syll[rng.below(syll.len())])
+                    .collect()
+            })
+            .collect();
+        let mut c = Corpus {
+            rng,
+            words,
+            files: BTreeMap::new(),
+        };
+        for i in 0..FILES {
+            let path = format!("src/{}/m{i}.rs", ["core", "store", "net", "cli"][i % 4]);
+            let n = 60 + c.rng.below(200);
+            let lines = (0..n).map(|_| c.line()).collect();
+            c.files.insert(path, lines);
+        }
+        c
+    }
+
+    fn word(&mut self) -> String {
+        self.words[self.rng.below(self.words.len())].clone()
+    }
+
+    fn line(&mut self) -> String {
+        match self.rng.below(4) {
+            0 => format!(
+                "// {} {} {} {}",
+                self.word(),
+                self.word(),
+                self.word(),
+                self.word()
+            ),
+            1 => format!("fn {}_{}(x: u32) -> u32 {{", self.word(), self.word()),
+            2 => format!(
+                "    let {} = {}.{}({}, {});",
+                self.word(),
+                self.word(),
+                self.word(),
+                self.word(),
+                self.rng.below(1000)
+            ),
+            _ => "}".to_string(),
+        }
+    }
+
+    /// Edit `n` files: one line changed and one to three inserted near it.
+    /// Returns the paths and their new contents.
+    fn edit(&mut self, n: usize) -> Vec<(String, String)> {
+        let paths: Vec<String> = self.files.keys().cloned().collect();
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let p = paths[self.rng.below(paths.len())].clone();
+            let at = self.rng.below(self.files[&p].len());
+            let changed = self.line();
+            let added: Vec<String> = (0..1 + self.rng.below(3)).map(|_| self.line()).collect();
+            let lines = self.files.get_mut(&p).unwrap();
+            lines[at] = changed;
+            for (k, l) in added.into_iter().enumerate() {
+                lines.insert(at + k, l);
+            }
+            out.retain(|(q, _)| *q != p);
+            out.push((p.clone(), self.content(&p)));
+        }
+        out
+    }
+
+    fn content(&self, path: &str) -> String {
+        self.files[path].join("\n") + "\n"
+    }
+
+    /// A commit message shaped like a real one: a subject, a paragraph and
+    /// a trailer.
+    fn message(&mut self, k: usize) -> String {
+        let body: Vec<String> = (0..20 + self.rng.below(30)).map(|_| self.word()).collect();
+        let who = self.rng.below(5);
+        format!(
+            "{}: {} the {} of {} ({k})\n\n{}.\n\nSigned-off-by: Dev {who} <dev{who}@example.org>\n",
+            ["core", "store", "net", "cli"][self.rng.below(4)],
+            self.word(),
+            self.word(),
+            self.word(),
+            body.join(" ")
+        )
+    }
+}
+
+/// Write `files` into the git work tree and commit them.
+fn git_commit(dir: &Path, files: &[(String, String)], msg: &str) {
+    for (p, body) in files {
+        write(dir, p, body);
+    }
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-q", "-m", msg]);
+}
+
+fn dir_bytes(dir: &Path) -> u64 {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return 0;
+    };
+    rd.flatten()
+        .map(|e| {
+            let m = e.metadata().unwrap();
+            if m.is_dir() {
+                dir_bytes(&e.path())
+            } else {
+                m.len()
+            }
+        })
+        .sum()
+}
+
+/// What the blob store and the database hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Sizes {
+    blobs: u64,
+    loose: usize,
+    retired: usize,
+    db: u64,
+    /// Changeset rows not compressed, and dictionaries stored.
+    plain_rows: i64,
+    dicts: i64,
+}
+
+fn blobs_dir(stores: &Stores) -> std::path::PathBuf {
+    stores.blobs.strip_prefix("file://").unwrap().into()
+}
+
+fn sizes(stores: &Stores) -> Sizes {
+    use sqlx::Connection;
+    let dir = blobs_dir(stores);
+    let mut loose = 0;
+    for shard in fs::read_dir(&dir).unwrap().flatten() {
+        if shard.file_name().len() == 2 {
+            loose += fs::read_dir(shard.path()).unwrap().flatten().count();
+        }
+    }
+    let retired = fs::read_to_string(dir.join("packs/retired"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (db, plain_rows, dicts) = rt.block_on(async {
+        if stores.meta.starts_with("sqlite:") {
+            let mut c = sqlx::SqliteConnection::connect(&stores.meta).await.unwrap();
+            let pages: i64 = sqlx::query_scalar("PRAGMA page_count")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+            let free: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+            let size: i64 = sqlx::query_scalar("PRAGMA page_size")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+            let plain: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM changesets WHERE substr(data, 1, 4) <> X'28B52FFD'",
+            )
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+            let dicts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM changeset_dicts")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+            (((pages - free) * size) as u64, plain, dicts)
+        } else {
+            let mut c = sqlx::PgConnection::connect(&stores.meta).await.unwrap();
+            let db: i64 = sqlx::query_scalar("SELECT pg_database_size(current_database())")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+            let plain: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM changesets \
+                 WHERE substring(data from 1 for 4) <> '\\x28b52ffd'::bytea",
+            )
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+            let dicts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM changeset_dicts")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+            (db as u64, plain, dicts)
+        }
+    });
+    Sizes {
+        blobs: dir_bytes(&dir),
+        loose,
+        retired,
+        db,
+        plain_rows,
+        dicts,
+    }
+}
+
+/// Wait until every loose object is packed, every retired pack swept, the
+/// rows compressed (with `compacted`), and nothing changes for 2 s.
+fn settle(stores: &Stores, server: &Server, compacted: bool) -> Sizes {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut last = sizes(stores);
+    let mut still = 0;
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        let now = sizes(stores);
+        let done = now.loose == 0
+            && now.retired == 0
+            && (!compacted || (now.dicts > 0 && now.plain_rows == 0));
+        if done && now == last {
+            still += 1;
+            if still >= 4 {
+                return now;
+            }
+        } else {
+            still = 0;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "storage did not settle: {now:?}\n{}",
+            server.log_text()
+        );
+        last = now;
+    }
+}
+
+fn metric(addr: SocketAddr, name: &str) -> Option<f64> {
+    let (status, _, body) = http_get(addr, "/metrics", None);
+    assert_eq!(status, 200);
+    body.lines()
+        .find(|l| l.starts_with(name) && l[name.len()..].starts_with(' '))
+        .and_then(|l| l.rsplit_once(' ')?.1.parse().ok())
+}
+
+fn expect(what: &str, got: std::io::Result<(u16, Vec<u8>)>) -> Vec<u8> {
+    let (status, body) = got.unwrap_or_else(|e| panic!("{what}: {e}"));
+    assert_eq!(
+        status,
+        if what == "put blob" { 204 } else { 200 },
+        "{what}: {}",
+        String::from_utf8_lossy(&body)
+    );
+    body
+}
+
+/// Land one changeset of `files` on `main` through the HTTP API.
+fn land(
+    addr: SocketAddr,
+    parent: ChangesetId,
+    files: &[(String, String)],
+    msg: &str,
+) -> ChangesetId {
+    let mut changes = BTreeMap::new();
+    for (p, body) in files {
+        let h = Hash::of_blob(body.as_bytes());
+        expect(
+            "put blob",
+            http(addr, "PUT", &format!("/v1/blobs/{h}"), body.as_bytes()),
+        );
+        changes.insert(
+            RepoPath::new(p.as_str()).unwrap(),
+            FileChange::Modify {
+                content: h,
+                kind: FileKind::Regular,
+                size: body.len() as u64,
+            },
+        );
+    }
+    let cs = Changeset {
+        parents: vec![parent],
+        author: "Dev 1 <dev1@example.org>".into(),
+        timestamp: 1_700_000_000,
+        message: msg.into(),
+        changes,
+        extra: BTreeMap::new(),
+    };
+    let made: CreateChangesetResponse = serde_json::from_slice(&expect(
+        "create changeset",
+        http(
+            addr,
+            "POST",
+            "/v1/changesets",
+            &serde_json::to_vec(&cs).unwrap(),
+        ),
+    ))
+    .unwrap();
+    let req = LandRequest {
+        changeset: made.id,
+        target_ref: "main".into(),
+        create: None,
+        land_id: None,
+    };
+    let resp: LandResponse = serde_json::from_slice(&expect(
+        "land",
+        http(addr, "POST", "/v1/land", &serde_json::to_vec(&req).unwrap()),
+    ))
+    .unwrap();
+    match resp {
+        LandResponse::Landed { landed, .. } => landed,
+        other => panic!("a lone writer conflicted: {other:?}"),
+    }
+}
+
+#[test]
+fn storage_stays_within_its_budgets() {
+    let _g = serial();
+    let started = Instant::now();
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path();
+    let pg = PgDb::create("leep_e2e");
+    let (stores, budgets, backend) = match &pg {
+        Some(db) => (
+            Stores::with_meta(&work.join("data"), db.url.clone()),
+            &POSTGRES,
+            "postgres",
+        ),
+        None => (Stores::sqlite(&work.join("data")), &SQLITE, "sqlite"),
+    };
+    // An empty database at the current schema: the baseline.
+    assert_ok(&server_cmd(&stores, &["migrate"]), "leep-server migrate");
+    let empty = sizes(&stores);
+
+    // The history, in git, imported.
+    let repo = work.join("git");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    let mut corpus = Corpus::new();
+    let all: Vec<(String, String)> = corpus
+        .files
+        .keys()
+        .map(|p| (p.clone(), corpus.content(p)))
+        .collect();
+    let msg = corpus.message(0);
+    git_commit(&repo, &all, &msg);
+    for k in 1..IMPORT_COMMITS {
+        let n = 1 + corpus.rng.below(3);
+        let files = corpus.edit(n);
+        let msg = corpus.message(k);
+        git_commit(&repo, &files, &msg);
+    }
+    leep_git(&[
+        "import",
+        "--meta",
+        &stores.meta,
+        "--blobs",
+        &stores.blobs,
+        "--git-dir",
+        repo.to_str().unwrap(),
+        "--set-ref",
+        "main",
+    ]);
+
+    let metrics_port = free_port();
+    let metrics_addr: SocketAddr = format!("127.0.0.1:{metrics_port}").parse().unwrap();
+    let listen = metrics_addr.to_string();
+    let mut flags = FLAGS.to_vec();
+    flags.extend(["--metrics-listen", &listen]);
+    let server = Server::start_with(free_port(), &stores, work, &flags);
+    let before = settle(&stores, &server, false);
+
+    // The lands: one file, and one in five three files, each a small edit.
+    let head: RefResponse = serde_json::from_slice(&expect(
+        "get ref",
+        http(server.addr, "GET", "/v1/refs/main", b""),
+    ))
+    .unwrap();
+    let mut tip = head.target.expect("main after the import");
+    let mut landed = Vec::new();
+    for k in 0..LANDS {
+        let files = corpus.edit(if k % 5 == 4 { 3 } else { 1 });
+        let msg = corpus.message(IMPORT_COMMITS + k);
+        tip = land(server.addr, tip, &files, &msg);
+        landed.push((files, msg));
+    }
+    let after = settle(&stores, &server, true);
+    let size_ratio = metric(metrics_addr, "leep_blob_store_size_ratio");
+    let dictionary = metric(metrics_addr, "leep_changeset_dictionary");
+    drop(server);
+
+    // Git's size for the same history.
+    for (files, msg) in &landed {
+        git_commit(&repo, files, msg);
+    }
+    git(&repo, &["gc", "-q"]);
+    let git_bytes = dir_bytes(&repo.join(".git/objects"));
+
+    let blob_per_land = (after.blobs.saturating_sub(before.blobs)) / LANDS as u64;
+    let db_per_land = (after.db.saturating_sub(before.db)) / LANDS as u64;
+    let total = after.blobs + after.db.saturating_sub(empty.db);
+    let ratio = total as f64 / git_bytes as f64;
+    let report = format!(
+        "[{backend}] blobs {} -> {} ({blob_per_land} per land), db {} -> {} above {} \
+         ({db_per_land} per land), total {total} = {ratio:.2}x git ({git_bytes}), \
+         blob store ratio {size_ratio:?}, dictionary {dictionary:?}, {:.1}s",
+        before.blobs,
+        after.blobs,
+        before.db - empty.db,
+        after.db - empty.db,
+        empty.db,
+        started.elapsed().as_secs_f64()
+    );
+    println!("{report}");
+    assert!(
+        blob_per_land <= budgets.blob_per_land,
+        "blob store bytes per land over budget ({}): {report}",
+        budgets.blob_per_land
+    );
+    assert!(
+        db_per_land <= budgets.db_per_land,
+        "database bytes per land over budget ({}): {report}",
+        budgets.db_per_land
+    );
+    assert!(
+        ratio <= budgets.ratio_to_git,
+        "storage over {}x git: {report}",
+        budgets.ratio_to_git
+    );
+    let size_ratio = size_ratio.expect("leep_blob_store_size_ratio");
+    assert!(
+        size_ratio <= budgets.blob_store_ratio,
+        "leep_blob_store_size_ratio over {}: {report}",
+        budgets.blob_store_ratio
+    );
+    assert!(dictionary.unwrap_or(0.0) >= 1.0, "no dictionary: {report}");
+    let out = server_cmd(&stores, &["verify", "--full"]);
+    assert_ok(&out, "leep-server verify --full");
+    drop(pg);
+}

@@ -102,6 +102,14 @@ pub async fn compact_changesets(
 
 type Pair = (Vec<u8>, Vec<u8>);
 
+/// Bytes of a row [`Rows::heads`] returns: a zstd frame header is at most
+/// 18 bytes.
+pub(crate) const HEAD_BYTES: i64 = 32;
+
+// The automatic compaction's Postgres advisory lock (ADR 0101) is the pair
+// (518586625 = 0x1EE90101, hashtext(current_schema())): stores in
+// different schemas of one database lock apart.
+
 /// The statements a compaction needs from a backend.
 #[async_trait]
 pub(crate) trait Rows: Sync {
@@ -113,6 +121,22 @@ pub(crate) trait Rows: Sync {
     /// Insert a dictionary; `false` if another run took the id first.
     async fn insert_dict(&self, id: i64, data: &[u8]) -> Result<bool>;
     async fn rewrite(&self, rows: &[Pair]) -> Result<()>;
+    /// Changesets in the table, counting no further than `limit`.
+    async fn count_upto(&self, limit: u64) -> Result<u64>;
+    /// Like [`page`](Rows::page), with only the first [`HEAD_BYTES`] of
+    /// each row: enough for a frame header and its dictionary id.
+    async fn heads(&self, after: &[u8], limit: usize) -> Result<Vec<Pair>>;
+    /// The rows of `ids` that exist, in any order.
+    async fn rows(&self, ids: &[Vec<u8>]) -> Result<Vec<Pair>>;
+    /// When dictionary `id` was stored (unix seconds).
+    async fn dict_created_at(&self, id: i64) -> Result<i64>;
+    /// Take the automatic compaction's lock for this store, without
+    /// waiting; `false` if another holds it. Postgres: a session advisory
+    /// lock on this store's own connection. SQLite: always `true` (it has
+    /// one writer at a time anyway).
+    async fn try_lock(&self) -> Result<bool>;
+    /// Give the lock back.
+    async fn unlock(&self) -> Result<()>;
     /// Record a format feature (ADR 0055); idempotent.
     async fn add_feature(&self, name: &str) -> Result<()>;
     #[cfg(test)]
@@ -213,17 +237,53 @@ pub(crate) async fn run(
 /// Canonical bytes of up to `n` changesets, the first in id order, each
 /// checked against its id.
 async fn sample(store: &dyn Rows, n: usize, batch: usize) -> Result<Vec<Vec<u8>>> {
+    Ok(sample_within(store, n, usize::MAX, batch, false).await?.0)
+}
+
+/// [`sample`], stopping once the samples hold `max_bytes`, and with
+/// `skip_corrupt` passing over rows that do not decode (counted in the
+/// second value) instead of failing.
+pub(crate) async fn sample_within(
+    store: &dyn Rows,
+    n: usize,
+    max_bytes: usize,
+    batch: usize,
+    skip_corrupt: bool,
+) -> Result<(Vec<Vec<u8>>, u64)> {
     let mut out = Vec::new();
+    let (mut bytes, mut corrupt) = (0usize, 0u64);
     let mut after = Vec::new();
-    while out.len() < n {
+    while out.len() < n && bytes < max_bytes {
         let page = store.page(&after, batch.min(n - out.len())).await?;
         let Some(last) = page.last() else { break };
         after = last.0.clone();
         for (id, data) in &page {
-            out.push(store.codec().decode_checked(&to_id(id)?, data)?.encode());
+            if bytes >= max_bytes {
+                break;
+            }
+            match store.codec().decode_checked(&to_id(id)?, data) {
+                Ok(cs) => {
+                    let b = cs.encode();
+                    bytes += b.len();
+                    out.push(b);
+                }
+                Err(e) if skip_corrupt => {
+                    corrupt += 1;
+                    tracing::warn!(error = %e, "changeset row left out of the dictionary's samples");
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
-    Ok(out)
+    Ok((out, corrupt))
+}
+
+/// `rows` sorted by id, so concurrent rewrites take row locks in one order
+/// and cannot deadlock.
+fn sorted(rows: &[Pair]) -> Vec<&Pair> {
+    let mut v: Vec<&Pair> = rows.iter().collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
 }
 
 #[async_trait]
@@ -273,17 +333,92 @@ impl Rows for PostgresMetaStore {
     }
 
     async fn rewrite(&self, rows: &[Pair]) -> Result<()> {
+        let rows = sorted(rows);
         let ids: Vec<&[u8]> = rows.iter().map(|r| r.0.as_slice()).collect();
         let data: Vec<&[u8]> = rows.iter().map(|r| r.1.as_slice()).collect();
         sqlx::query(
             "UPDATE changesets SET data = v.data \
-             FROM UNNEST($1::bytea[], $2::bytea[]) AS v(id, data) WHERE changesets.id = v.id",
+             FROM UNNEST($1::bytea[], $2::bytea[]) AS v(id, data) \
+             WHERE changesets.id = v.id AND changesets.data IS DISTINCT FROM v.data",
         )
         .bind(ids)
         .bind(data)
         .execute(&self.pool)
         .await
         .map_err(storage)?;
+        Ok(())
+    }
+
+    async fn count_upto(&self, limit: u64) -> Result<u64> {
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM (SELECT 1 FROM changesets LIMIT $1) t")
+                .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+                .fetch_one(&self.pool)
+                .await
+                .map_err(storage)?;
+        Ok(n as u64)
+    }
+
+    async fn heads(&self, after: &[u8], limit: usize) -> Result<Vec<Pair>> {
+        let rows = sqlx::query(
+            "SELECT id, substring(data from 1 for $3) FROM changesets WHERE id > $1 \
+             ORDER BY id LIMIT $2",
+        )
+        .bind(after)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .bind(HEAD_BYTES as i32)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    async fn rows(&self, ids: &[Vec<u8>]) -> Result<Vec<Pair>> {
+        let ids: Vec<&[u8]> = ids.iter().map(Vec::as_slice).collect();
+        let rows = sqlx::query("SELECT id, data FROM changesets WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage)?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    async fn dict_created_at(&self, id: i64) -> Result<i64> {
+        sqlx::query_scalar("SELECT created_at FROM changeset_dicts WHERE id = $1")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(storage)
+    }
+
+    async fn try_lock(&self) -> Result<bool> {
+        // A session lock: held on a connection of its own (from the lease
+        // pool, so the data pool's connections stay free) until `unlock`.
+        let mut held = self.compact_lock.lock().await;
+        if held.is_some() {
+            return Ok(true);
+        }
+        let mut conn = self.lease_pool.acquire().await.map_err(storage)?;
+        let got: bool = sqlx::query_scalar(
+            "SELECT pg_try_advisory_lock(518586625, hashtext(current_schema()::text))",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(storage)?;
+        if got {
+            *held = Some(conn);
+        }
+        Ok(got)
+    }
+
+    async fn unlock(&self) -> Result<()> {
+        let Some(mut conn) = self.compact_lock.lock().await.take() else {
+            return Ok(());
+        };
+        sqlx::query("SELECT pg_advisory_unlock(518586625, hashtext(current_schema()::text))")
+            .execute(&mut *conn)
+            .await
+            .map_err(storage)?;
         Ok(())
     }
 
@@ -343,16 +478,78 @@ impl Rows for SqliteMetaStore {
     }
 
     async fn rewrite(&self, rows: &[Pair]) -> Result<()> {
-        let mut tx = self.pool.begin().await.map_err(storage)?;
-        for (id, data) in rows {
-            sqlx::query("UPDATE changesets SET data = ? WHERE id = ?")
-                .bind(data.as_slice())
-                .bind(id.as_slice())
-                .execute(&mut *tx)
+        // One statement per chunk, so the write lock is held for one
+        // statement, never across awaits between statements.
+        for chunk in sorted(rows).chunks(500) {
+            let values = vec!["(?, ?)"; chunk.len()].join(",");
+            // Only placeholders are formatted in; ids and rows are bound.
+            let sql = format!(
+                "UPDATE changesets SET data = v.column2 FROM (VALUES {values}) AS v \
+                 WHERE changesets.id = v.column1 AND changesets.data IS NOT v.column2"
+            );
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for (id, data) in chunk {
+                q = q.bind(id.as_slice()).bind(data.as_slice());
+            }
+            q.execute(&self.pool).await.map_err(storage)?;
+        }
+        Ok(())
+    }
+
+    async fn count_upto(&self, limit: u64) -> Result<u64> {
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM (SELECT 1 FROM changesets LIMIT ?) t")
+                .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+                .fetch_one(&self.pool)
                 .await
                 .map_err(storage)?;
+        Ok(n as u64)
+    }
+
+    async fn heads(&self, after: &[u8], limit: usize) -> Result<Vec<Pair>> {
+        let rows = sqlx::query(
+            "SELECT id, substr(data, 1, ?) FROM changesets WHERE id > ? ORDER BY id LIMIT ?",
+        )
+        .bind(HEAD_BYTES)
+        .bind(after)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    async fn rows(&self, ids: &[Vec<u8>]) -> Result<Vec<Pair>> {
+        let mut out = Vec::with_capacity(ids.len());
+        // Within SQLite's default limit of bound parameters.
+        for chunk in ids.chunks(500) {
+            let marks = vec!["?"; chunk.len()].join(",");
+            // Only placeholders are formatted in; the ids are bound.
+            let sql = format!("SELECT id, data FROM changesets WHERE id IN ({marks})");
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                q = q.bind(id.as_slice());
+            }
+            let rows = q.fetch_all(&self.pool).await.map_err(storage)?;
+            out.extend(rows.iter().map(|r| (r.get(0), r.get(1))));
         }
-        tx.commit().await.map_err(storage)
+        Ok(out)
+    }
+
+    async fn dict_created_at(&self, id: i64) -> Result<i64> {
+        sqlx::query_scalar("SELECT created_at FROM changeset_dicts WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(storage)
+    }
+
+    async fn try_lock(&self) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn unlock(&self) -> Result<()> {
+        Ok(())
     }
 
     async fn add_feature(&self, name: &str) -> Result<()> {

@@ -1355,3 +1355,83 @@ async fn an_incremental_repack_of_whole_packs_killed_at_any_step_leaves_a_readab
         assert_eq!(loose_count(dir.path()), 0, "{what}");
     }
 }
+
+/// The writer's chains reach `MAX_CHAIN` deltas and no more, so a read of
+/// any object decodes at most 64 frames: the limit of every reader before
+/// ADR 0101.
+#[tokio::test]
+async fn written_chains_stop_at_the_cap_within_the_old_read_limit() {
+    const OLD_READ_LIMIT: usize = 64;
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsBlobStore::new(dir.path());
+    let v = versions(200);
+    let mut hashes = Vec::new();
+    for b in &v {
+        hashes.push(store.put(b.clone()).await.unwrap());
+    }
+    repack(&store, chain_hints(&hashes)).await;
+    let idx = index_of(dir.path());
+    let mut deepest = 0;
+    for e in idx.iter() {
+        let (mut depth, mut cur) = (0, e);
+        while let Some(b) = cur.base {
+            cur = idx.entry(b);
+            depth += 1;
+        }
+        deepest = deepest.max(depth);
+    }
+    assert_eq!(deepest, pack::MAX_CHAIN, "chains reach the cap");
+    assert!(deepest < OLD_READ_LIMIT, "an old reader decodes them");
+    let fresh = FsBlobStore::new(dir.path());
+    for (h, b) in hashes.iter().zip(&v) {
+        assert_eq!(&fresh.get(h).await.unwrap().unwrap(), b);
+    }
+}
+
+/// A pack written by hand with one whole frame and `deltas` deltas, each
+/// on the one before; returns the store's root and the deepest object.
+fn hand_written_chain(deltas: usize) -> (tempfile::TempDir, Hash, Bytes) {
+    let v = versions(deltas + 1);
+    let mut packfile = b"LEEPPAK1".to_vec();
+    let mut entries = Vec::new();
+    for (i, b) in v.iter().enumerate() {
+        let frame = if i == 0 {
+            pack::compress_whole(b, 3).unwrap()
+        } else {
+            pack::compress_delta(&v[i - 1], b, 3).unwrap().unwrap()
+        };
+        entries.push(IdxEntry {
+            hash: Hash::of_blob(b),
+            offset: packfile.len() as u64,
+            stored_len: frame.len() as u64,
+            len: b.len() as u64,
+            base: (i > 0).then(|| (i - 1) as u32),
+            modified: 1_000,
+        });
+        packfile.extend_from_slice(&frame);
+    }
+    let pack_hash = *blake3::hash(&packfile).as_bytes();
+    let idx = PackIndex::encode(packfile.len() as u64, pack_hash, &entries).unwrap();
+    let id = pack::pack_id(&idx);
+    let dir = tempfile::tempdir().unwrap();
+    let packs = dir.path().join("packs");
+    std::fs::create_dir_all(&packs).unwrap();
+    std::fs::write(packs.join(format!("{id}.pack")), &packfile).unwrap();
+    std::fs::write(packs.join(format!("{id}.idx")), &idx).unwrap();
+    let last = v.last().unwrap().clone();
+    (dir, Hash::of_blob(&last), last)
+}
+
+/// Readers decode up to `READ_CHAIN_LIMIT` frames (255 deltas over a whole
+/// frame), so a later writer may raise its cap that far; one more is a
+/// corrupt pack.
+#[tokio::test]
+async fn reads_follow_chains_up_to_the_read_limit() {
+    let (dir, h, want) = hand_written_chain(pack::READ_CHAIN_LIMIT - 1);
+    let store = FsBlobStore::new(dir.path());
+    assert_eq!(store.get(&h).await.unwrap().unwrap(), want);
+    let (dir, h, _) = hand_written_chain(pack::READ_CHAIN_LIMIT);
+    let store = FsBlobStore::new(dir.path());
+    let err = store.get(&h).await.unwrap_err();
+    assert!(err.to_string().contains("delta chain too long"), "{err}");
+}
