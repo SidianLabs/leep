@@ -1200,3 +1200,158 @@ async fn the_pack_does_not_depend_on_the_thread_count() {
         "same pack for 1, 2, 8 threads"
     );
 }
+
+/// A store whose versions were written by `put_many` as packs of whole
+/// frames (land batches, imports: ADR 0068), with one deleted and one
+/// deleted and uploaded again, and the ids of those packs.
+async fn whole_world(store: &FsBlobStore) -> (World, Vec<String>) {
+    let vs = versions(40);
+    let hashes: Vec<Hash> = vs.iter().map(|v| Hash::of_blob(v)).collect();
+    for chunk in vs.chunks(8) {
+        let items: Vec<(Hash, Bytes)> = chunk
+            .iter()
+            .map(|v| (Hash::of_blob(v), v.clone()))
+            .collect();
+        store.put_many(items).await.unwrap();
+    }
+    let mut live: BTreeMap<Hash, Bytes> = hashes.iter().copied().zip(vs.iter().cloned()).collect();
+    let gone = vec![hashes[5]];
+    store.delete(&hashes[5]).await.unwrap();
+    live.remove(&hashes[5]);
+    store.delete(&hashes[9]).await.unwrap();
+    store.put(live[&hashes[9]].clone()).await.unwrap();
+    let ids: Vec<String> = store
+        .pack_sizes()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    let all = ids.iter().cloned().collect();
+    let details = store.pack_details(&all).unwrap();
+    assert_eq!(details.len(), 5);
+    assert!(details.iter().all(|d| d.whole()), "{details:?}");
+    let w = World {
+        live,
+        gone,
+        hints: chain_hints(&hashes),
+    };
+    (w, ids)
+}
+
+/// An incremental repack told to merge packs of whole frames writes their
+/// objects as deltas against the bases the hints name (ADR 0100) instead of
+/// copying the frames, as small as a full repack, and the store passes the
+/// contract.
+#[tokio::test]
+async fn an_incremental_repack_compresses_the_whole_packs_it_is_given() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsBlobStore::new(dir.path()).with_pack_writes(crate::PackWrites {
+        min_objects: 4,
+        ..crate::PackWrites::default()
+    });
+    let (w, ids) = whole_world(&store).await;
+    let opts = RepackOptions {
+        mode: INCREMENTAL,
+        packs: ids.clone(),
+        ..RepackOptions::default()
+    };
+    let r = store
+        .repack_publish(w.hints.clone(), opts)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert_eq!(r.packs_merged, 5, "{r:?}");
+    assert_eq!(r.objects, 39, "{r:?}");
+    // Only the first version and the one after the deleted version (its
+    // base is gone) keep their whole frames.
+    assert_eq!(r.frames_reused, 2, "{r:?}");
+    assert!(r.whole <= 3, "{r:?}");
+    check_world(dir.path(), &w, "redelta").await;
+    assert_eq!(pack_ids(dir.path()).len(), 1);
+    // Without hints for them, the same store's frames are copied.
+    let full_dir = tempfile::tempdir().unwrap();
+    let full = FsBlobStore::new(full_dir.path()).with_pack_writes(crate::PackWrites {
+        min_objects: 4,
+        ..crate::PackWrites::default()
+    });
+    whole_world(&full).await;
+    let copied = repack_incremental(&full, Vec::new()).await;
+    assert_eq!(copied.frames_reused, 38, "{copied:?}");
+    assert!(r.pack_bytes * 3 < copied.pack_bytes, "{r:?} {copied:?}");
+    check_blob_store_contract(&store).await;
+    check_blob_store_contract(&FsBlobStore::new(dir.path())).await;
+}
+
+/// The same repack killed at each step leaves every live object readable
+/// and every deleted one gone, and the next run cleans up and succeeds.
+#[tokio::test]
+async fn an_incremental_repack_of_whole_packs_killed_at_any_step_leaves_a_readable_store() {
+    let steps = [
+        RepackStep::Started,
+        RepackStep::Wrote(3),
+        RepackStep::PackSynced,
+        RepackStep::PackRenamed,
+        RepackStep::IndexSynced,
+        RepackStep::Published,
+        RepackStep::Retired,
+        RepackStep::RemovingLoose(1),
+        RepackStep::LooseMovedAside(1),
+        RepackStep::OldPacksRemoved,
+        RepackStep::TombstonesRewritten,
+    ];
+    for kill_at in steps {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path()).with_pack_writes(crate::PackWrites {
+            min_objects: 4,
+            ..crate::PackWrites::default()
+        });
+        let (w, ids) = whole_world(&store).await;
+        let opts = RepackOptions {
+            mode: INCREMENTAL,
+            packs: ids.clone(),
+            hook: Some(Arc::new(move |s| {
+                if s == kill_at {
+                    Err(Error::Storage(format!("killed at {s:?}")))
+                } else {
+                    Ok(())
+                }
+            })),
+            ..RepackOptions::default()
+        };
+        let res = match store.repack_publish(w.hints.clone(), opts).await {
+            Ok(p) => p.finish().await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        assert!(res.is_err(), "{kill_at:?} was reached");
+        let what = format!("killed at {kill_at:?}");
+        check_world(dir.path(), &w, &what).await;
+        store
+            .retire_sweep(std::time::Duration::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        check_world(dir.path(), &w, &format!("{what}, swept")).await;
+        let left: Vec<String> = store
+            .pack_sizes()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        let opts = RepackOptions {
+            mode: INCREMENTAL,
+            packs: left,
+            ..RepackOptions::default()
+        };
+        store
+            .repack_publish(w.hints.clone(), opts)
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        check_world(dir.path(), &w, &format!("{what}, repacked")).await;
+        assert_eq!(loose_count(dir.path()), 0, "{what}");
+    }
+}

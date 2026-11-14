@@ -150,6 +150,80 @@ pub(crate) fn write_order(
     order
 }
 
+/// The write order of an incremental repack: every object of `table` once,
+/// each with the base it keeps from its old pack (`old`, in each pack's
+/// write order), except that an object stored whole there takes the base
+/// the history walk names for it (`hints`), so the whole frames of land and
+/// import packs (ADR 0068) are compressed against their previous version
+/// once instead of copied. Objects only in `hints` take its base. A base
+/// is always placed before the objects based on it: an object pulls its
+/// chain of bases forward, and a chain that loops (bases from two orders
+/// can disagree) is cut by writing one of its objects whole.
+pub(crate) fn write_order_redelta(
+    table: &ObjectTable,
+    old: Vec<(u32, u32)>,
+    hints: Vec<(u32, u32)>,
+) -> Vec<(u32, u32)> {
+    let n = table.len();
+    let bit = |id: u32| (id as usize / 64, 1u64 << (id % 64));
+    // The base each object gets, and the order to consider objects in:
+    // old pack order first (merged deltas stay where they were), then the
+    // walk's, then the rest.
+    let mut base = vec![NO_ID; n];
+    let mut listed = vec![0u64; n.div_ceil(64)];
+    let mut sequence = Vec::with_capacity(n);
+    for (id, b) in old {
+        let (w, m) = bit(id);
+        if listed[w] & m == 0 {
+            listed[w] |= m;
+            base[id as usize] = if b == id { NO_ID } else { b };
+            sequence.push(id);
+        }
+    }
+    for (id, b) in hints {
+        let (w, m) = bit(id);
+        if listed[w] & m == 0 {
+            listed[w] |= m;
+            sequence.push(id);
+        }
+        if base[id as usize] == NO_ID && b != id {
+            base[id as usize] = b;
+        }
+    }
+    for id in 0..n as u32 {
+        let (w, m) = bit(id);
+        if listed[w] & m == 0 {
+            sequence.push(id);
+        }
+    }
+    drop(listed);
+    // 0: not placed, 1: on the chain being placed, 2: placed.
+    let mut state = vec![0u8; n];
+    let mut order = Vec::with_capacity(n);
+    let mut chain: Vec<u32> = Vec::new();
+    for id in sequence {
+        let mut at = id;
+        while state[at as usize] == 0 {
+            state[at as usize] = 1;
+            chain.push(at);
+            match base[at as usize] {
+                NO_ID => break,
+                b if state[b as usize] == 1 => {
+                    // A loop: `at` is written whole.
+                    base[at as usize] = NO_ID;
+                    break;
+                }
+                b => at = b,
+            }
+        }
+        while let Some(c) = chain.pop() {
+            state[c as usize] = 2;
+            order.push((c, base[c as usize]));
+        }
+    }
+    order
+}
+
 /// The entries as written, in pack order, one array per field (28 bytes
 /// an entry). A frame's length is the distance to the next entry (or the
 /// pack's end).
@@ -827,4 +901,42 @@ pub fn plan_merge(
         return Vec::new();
     }
     sorted[..split].iter().map(|p| p.0.clone()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table(n: u8) -> ObjectTable {
+        ObjectTable::from_sorted((0..n).map(|i| Hash([i; 32])).collect()).unwrap()
+    }
+
+    /// Whole old frames take the walk's base, deltas keep theirs, every
+    /// base comes before its delta, and a loop of bases is cut.
+    #[test]
+    fn the_redelta_order_places_bases_first_and_keeps_old_deltas() {
+        let t = table(6);
+        // Old pack: 0 whole, 1 on 0, 2 whole. Walk: 0 on 3, 2 on 1,
+        // 1 on 4 (ignored: 1 is a delta already), 3 and 4 new.
+        let old = vec![(0, NO_ID), (1, 0), (2, NO_ID)];
+        let hints = vec![(3, NO_ID), (0, 3), (4, NO_ID), (1, 4), (2, 1)];
+        let order = write_order_redelta(&t, old, hints);
+        let pos: Vec<usize> = (0..6)
+            .map(|id| order.iter().position(|&(o, _)| o == id).unwrap())
+            .collect();
+        let base: Vec<u32> = (0..6).map(|id| order[pos[id]].1).collect();
+        assert_eq!(order.len(), 6);
+        assert_eq!(base, vec![3, 0, 1, NO_ID, NO_ID, NO_ID]);
+        for (id, &b) in base.iter().enumerate() {
+            if b != NO_ID {
+                assert!(pos[b as usize] < pos[id], "{order:?}");
+            }
+        }
+        // 0 whole on 1 and 1 on 0: one of them is written whole.
+        let order = write_order_redelta(&t, vec![(0, NO_ID), (1, 0)], vec![(0, 1)]);
+        assert_eq!(order.len(), 6);
+        let wholes = order[..2].iter().filter(|(_, b)| *b == NO_ID).count();
+        assert_eq!(wholes, 1, "{order:?}");
+        assert_eq!(order[0].1, NO_ID);
+    }
 }

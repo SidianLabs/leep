@@ -43,7 +43,8 @@ pub use packput::{
 };
 pub use packwrite::plan_merge;
 pub use repack::{
-    PackSize, PublishedPack, RepackHook, RepackMode, RepackOptions, RepackReport, RepackStep,
+    PackDetail, PackSize, PublishedPack, RepackHook, RepackMode, RepackOptions, RepackReport,
+    RepackStep,
 };
 pub use retire::SweepReport;
 

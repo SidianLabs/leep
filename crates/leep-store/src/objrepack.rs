@@ -625,6 +625,24 @@ impl ObjectBlobStore {
             .collect())
     }
 
+    /// Loose objects and their total size, from one listing of `blobs/`.
+    pub async fn loose_stats(&self) -> Result<(u64, u64)> {
+        let loose = list_all_loose(&*self.store).await?;
+        Ok((loose.len() as u64, loose.values().map(|s| s.size).sum()))
+    }
+
+    /// [`PackDetail`](crate::PackDetail) of each searchable pack `ids`
+    /// names, from the cached view.
+    pub async fn pack_details(&self, ids: &HashSet<String>) -> Result<Vec<crate::PackDetail>> {
+        let view = self.packs.view().await?;
+        Ok(view
+            .searchable()
+            .iter()
+            .filter(|(p, _)| ids.contains(&p.id))
+            .map(|(p, _)| crate::PackDetail::of(&p.id, &p.index))
+            .collect())
+    }
+
     /// Whether `hash` has a live copy in one of the packs `ids` names, for
     /// the walk that picks delta bases of a planned merge.
     pub async fn packed_in(

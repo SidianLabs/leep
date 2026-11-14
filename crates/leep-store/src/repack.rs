@@ -32,7 +32,8 @@ use crate::packset::{
     TOMBSTONES,
 };
 use crate::packwrite::{
-    hint_ids, plan_merge, write_order, write_pack, ObjectTable, PackSource, SourceRead,
+    hint_ids, plan_merge, write_order, write_order_redelta, write_pack, ObjectTable, PackSource,
+    SourceRead,
 };
 use crate::tmpfile::create_exclusive;
 use crate::{storage_err, FsBlobStore};
@@ -85,7 +86,10 @@ pub enum RepackMode {
     Full,
     /// The loose objects into a new pack, together with the packs
     /// [`plan_merge`](crate::plan_merge) picks, so pack sizes stay a geometric series and the
-    /// count stays at most `max_packs`. The other packs are left alone.
+    /// count stays at most `max_packs`, and the packs
+    /// [`RepackOptions::packs`] names (whole-frame packs whose objects the
+    /// hints give bases). The other packs are left alone. An object stored
+    /// whole in a merged pack takes the base its hint names.
     Incremental { factor: u64, max_packs: usize },
     /// Exactly the packs [`RepackOptions::packs`] names that are still
     /// published and searched (the caller ran
@@ -109,7 +113,8 @@ pub struct RepackOptions {
     pub threads: usize,
     /// Called at each step; an error aborts the repack where it stands.
     pub hook: Option<RepackHook>,
-    /// The packs a [`RepackMode::Planned`] repack merges.
+    /// The packs a [`RepackMode::Planned`] repack merges, or an
+    /// [`RepackMode::Incremental`] one merges besides its plan.
     pub packs: Vec<String>,
 }
 
@@ -144,6 +149,43 @@ pub struct PackSize {
     pub id: String,
     pub objects: u64,
     pub bytes: u64,
+}
+
+/// What a pack's index says about how it was written: a pack with no
+/// delta records was written whole (a land batch, an import, ADR 0068), and
+/// its objects are worth compressing against their previous versions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackDetail {
+    pub id: String,
+    /// Records in the index, tombstoned ones included.
+    pub objects: u64,
+    /// Records stored as a delta.
+    pub deltas: u64,
+    /// Bytes the records decode to, and the `.pack` size.
+    pub logical_bytes: u64,
+    pub bytes: u64,
+}
+
+impl PackDetail {
+    pub(crate) fn of(id: &str, index: &pack::PackIndex) -> PackDetail {
+        let (mut deltas, mut logical) = (0u64, 0u64);
+        for e in index.iter() {
+            deltas += u64::from(e.base.is_some());
+            logical += e.len;
+        }
+        PackDetail {
+            id: id.to_string(),
+            objects: index.len() as u64,
+            deltas,
+            logical_bytes: logical,
+            bytes: index.pack_len(),
+        }
+    }
+
+    /// Written whole: no record is a delta.
+    pub fn whole(&self) -> bool {
+        self.deltas == 0 && self.objects > 0
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -684,13 +726,20 @@ impl FsBlobStore {
                 }
                 // Retired packs are left to the sweep (ADR 0080): their
                 // live objects are in a searched pack already.
-                let sizes: Vec<(String, u64)> = view
+                // The packs the caller names (whole-frame packs to compress
+                // again) join the loose objects as the new material.
+                let mut sizes: Vec<(String, u64)> = view
                     .searchable()
                     .iter()
                     .map(|(p, dead)| (p.id.clone(), live(dead, p)))
                     .collect();
-                plan_merge(&sizes, loose.len() as u64, factor, max_packs)
+                let extra: Vec<(String, u64)> = sizes
+                    .extract_if(.., |(id, _)| opts.packs.contains(id))
+                    .collect();
+                let new = loose.len() as u64 + extra.iter().map(|p| p.1).sum::<u64>();
+                plan_merge(&sizes, new, factor, max_packs)
                     .into_iter()
+                    .chain(extra.into_iter().map(|p| p.0))
                     .collect()
             }
             RepackMode::Planned { .. } => view
@@ -804,11 +853,12 @@ impl FsBlobStore {
         drop(all);
 
         // A full repack trusts the walk first; an incremental one writes the
-        // merged packs first, so loose objects can use them as bases.
+        // merged packs first, so loose objects can use them as bases, and
+        // gives their whole frames the walk's bases.
         let hints = hint_ids(&table, hints);
         let order = match opts.mode {
             RepackMode::Full | RepackMode::Planned { .. } => write_order(&table, hints, old_bases),
-            RepackMode::Incremental { .. } => write_order(&table, old_bases, hints),
+            RepackMode::Incremental { .. } => write_order_redelta(&table, old_bases, hints),
         };
 
         let (tmp_pack, file) = create_exclusive(&dir, ".pack").map_err(storage_err)?;
@@ -949,6 +999,24 @@ impl FsBlobStore {
             })
             .collect())
     }
+    /// Loose objects and their total size: what an incremental repack
+    /// would pack. Lists every shard directory.
+    pub fn loose_stats(&self) -> Result<(u64, u64)> {
+        count_loose(self.root())
+    }
+
+    /// [`PackDetail`] of each searchable pack `ids` names. Reads every
+    /// index record, so callers keep the answer: packs never change.
+    pub fn pack_details(&self, ids: &HashSet<String>) -> Result<Vec<PackDetail>> {
+        let view = self.packs.view()?;
+        Ok(view
+            .searchable()
+            .iter()
+            .filter(|(p, _)| ids.contains(&p.id))
+            .map(|(p, _)| PackDetail::of(&p.id, &p.index))
+            .collect())
+    }
+
     /// Whether `hash` has a live copy in one of the packs `ids` names, for
     /// the walk that picks delta bases of a planned merge.
     pub fn packed_in(&self, ids: &HashSet<String>) -> Result<impl Fn(&Hash) -> bool + Send + Sync> {
