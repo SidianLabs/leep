@@ -156,10 +156,10 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_changeset_compact_trained_total` / `leep_changeset_compact_rejected_total` | counter | none | Dictionaries it trained and stored, and those it trained and dropped because they would not pay for themselves (tried again once the store doubles). |
 | `leep_changeset_compact_rows_total` / `leep_changeset_compact_saved_bytes_total` | counter | none | Changeset rows it rewrote, and the bytes that saved. |
 | `leep_changeset_compact_seconds` | histogram | none | Time of each step that passed over the rows. |
-| `leep_search_retention_passes_total` | counter | `outcome` = `ok`, `busy`, `error` | Passes of the search row retention (ADR 0102). `busy`: another server held its lease. An error is logged and retried at the next interval; nothing is deleted after an error in the walk. |
-| `leep_search_retention_rows_total` | counter | `kind` = `blob-trigrams-v2`, `blob-trigrams-v1`; `outcome` = `deleted`, `restored` | Blob rows it deleted, and deleted rows it derived again at once because a ref moved to a head holding the blob during the pass (a revert to old content). |
+| `leep_search_retention_passes_total` | counter | `outcome` = `ok`, `busy`, `skipped`, `error` | Passes of the search row retention (ADR 0102). `busy`: another server held its lease. `skipped`: nothing moved since a pass that deleted nothing. An error is logged and retried at the next interval; nothing is deleted after an error in the walk, and a failed restore is retried first. |
+| `leep_search_retention_rows_total` | counter | `kind` = `blob-trigrams-v2`, `blob-trigrams-v1`; `outcome` = `deleted`, `restored`, `backfilled` | Blob rows it deleted; deleted rows it derived again because a ref moved to a head holding the blob during the pass (a revert to old content); and missing rows of current heads' blobs its backfill derived. |
 | `leep_search_retention_seconds` | histogram | none | Time of each pass that ran (walk, listing, deletes and rests). |
-| `leep_search_retention_live_blobs` | gauge | none | Blobs the last pass kept: those below every head current now or within `--search-retention`. |
+| `leep_search_retention_live_blobs` | gauge | none | Blob entries the last pass found below every head current now or within `--search-retention` (a blob under several trees counts once per tree). |
 | `leep_changeset_dictionary` | gauge | none | The id of the newest changeset dictionary (0: none yet). |
 | `leep_land_cancelled_total` | counter | none | Lands whose caller went away (timeout, disconnect) while queued, dropped before their batch replayed them. |
 | `leep_land_batch_deadline_total` | counter | none | Lands answered 409 because their batch was still retrying 60 s after its first attempt (`MAX_BATCH_LIFETIME`, ADR 0059) and gave up instead of moving the ref. Clients resend; keyed lands are then answered from their record. Anything but rare means a store so slow, or a ref so contended, that lands do not finish. |
@@ -1781,17 +1781,33 @@ answering. New servers write v2 rows only; old servers ignore them and
 derive v1 rows for the few files of a head they find without one. Both
 versions share the search group's index lease (`tree-trigrams-v2`), and
 whichever holds it warms heads in its own format. Going back to an older
-binary works (it derives what it lacks). Once no old server runs, delete
-the old rows; until then the search row retention deletes the old rows of
-blobs no head has held for `--search-retention`:
+binary works (it derives what it lacks; see "Rolling back" below). Once no
+old server runs, delete the old rows; until then the search row retention
+deletes the old rows of blobs no head has held for `--search-retention`:
 
 ```sh
 leep-server repair drop --kind blob-trigrams-v1 --dry-run   # count the old rows
-leep-server repair drop --kind blob-trigrams-v1             # delete them once no old server runs
+leep-server repair drop --kind blob-trigrams-v1             # copy, then delete, once no old server runs
 ```
 
-`upgrade-index --drop-retired --old-servers-stopped` drops them with the
-other retired kinds.
+The drop first copies every v1 row whose blob has no v2 row into
+`blob-trigrams-v2` (the same bytes; it prints how many): a file unchanged
+since the upgrade has only its v1 row, and the directory filters above it
+stay, so nothing else would derive it again. `upgrade-index --drop-retired
+--old-servers-stopped` drops them with the other retired kinds, and copies
+the same way.
+
+**Rolling back past ADR 0102.** Older binaries read only `blob-trigrams-v1`
+rows and their warmers stop at a stored directory filter, so after a
+rollback the files changed since the upgrade (and every file, once v1 rows
+were dropped) have no row they read: with `--indexing local` their searches
+derive and store them on first probe; with `--indexing lease` their bounded
+searches store nothing and may answer 503 for a broad query on a large tree.
+After rolling back a lease-mode fleet, run `leep-server repair drop --kind
+tree-trigrams-v2` with the old binary so its warmer derives the heads'
+filters again, and with them every missing v1 row (`derive-search main`
+does it ahead of traffic). Rolling forward again needs nothing: the
+retention's backfill derives any v2 row a current head lacks.
 
 **From `history-tree-v3` to `history-tree-v4` on a large store** (ADR 0045).
 `upgrade-index` runs these steps; they are kept here to say what each costs.
@@ -3595,17 +3611,39 @@ it uses the index connections and never the land path's. It:
    `blob-trigrams-v1` (primary key only, no values), 500 at a time, and
    deletes those not live with one statement per batch, resting three times
    as long as each batch took;
-3. reads the refs again before each delete (a new head's blobs become live
-   first) and after it, and derives again at once a deleted row that a head
-   which appeared meanwhile holds (`leep_search_retention_rows_total{outcome="restored"}`).
+3. checks the ref log before each delete and, if it moved, lists the refs
+   and makes a new head's blobs live first; checks again after it, and
+   derives again at once a deleted row that a head which appeared meanwhile
+   holds (`leep_search_retention_rows_total{outcome="restored"}`). A restore
+   that fails is tried three times and then first thing at the next pass.
+
+Before deleting, a pass also **backfills**: it walks the current heads'
+tree nodes it has not checked yet (all of them on a server's first pass,
+then only what lands changed), asks which of their blobs lack a row (keys
+only) and derives up to 4,096 of them a pass
+(`leep_search_retention_rows_total{outcome="backfilled"}`). That repairs a
+head whose directory filters are stored but whose blob rows are not: a ref
+created at a commit older than the window, a revert to old content, a
+rollback, or a restore lost with a restarted process.
+
+A pass is skipped (`leep_search_retention_passes_total{outcome="skipped"}`)
+when the ref log has not moved since the last pass, that pass deleted
+nothing and its backfill finished, and less than a day has passed. Memory: a
+Bloom filter over the window's blobs (10 bits a row of the kind, so about
+2.5 bytes a row; a false positive, about 1%, only keeps a row) and the set
+of tree nodes walked (exact, about 60 bytes a node, since skipping a node
+would miss its blobs); its tree reads never fill the shared node cache.
+Ref log entries are stamped by each server's clock: the window is read five
+minutes past its start, so a server whose clock runs up to five minutes
+behind does not make a head leave the window early.
 
 What it never deletes: a row of a blob any head held within the window,
 keyframes (`blob-trigrams-keyframe-v2`, which live patches may stand on),
 and directory filters. A head that takes over a whole directory from a
 revision older than the window (a revert to old content, a branch from an
 old commit) reuses that directory's stored filter, so the warmer derives
-nothing below it; its first searches derive the rows retention removed
-there, as for any old revision.
+nothing below it; the next pass's backfill derives the rows retention
+removed there, and a search before it derives what it probes.
 
 **Space on Postgres.** A deleted row is a dead tuple until autovacuum marks
 its space free; new rows then reuse it, so `derived` stops growing by the

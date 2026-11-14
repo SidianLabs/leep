@@ -632,11 +632,18 @@ row an older server wrote (`blob-trigrams-v1`), while any are stored.
 under a store-wide lease in the index lane, deletes the blob rows of blobs
 that no ref head holds now or held within `--search-retention` (14 days,
 from the ref log's moves): the blobs below those heads are walked into a
-live set, the kind's keys are listed and the others deleted in batches,
-reading the refs again before and after each delete and deriving again at
-once a deleted row that a head which appeared meanwhile holds. Searches of
-older revisions derive the missing rows on their first probe and store them.
-Keyframes and directory filters are not retired.
+Bloom filter (a false positive only keeps a row), the kind's keys are
+listed and the others deleted in batches, checking the ref log before and
+after each delete and deriving again at once a deleted row that a head
+which appeared meanwhile holds (a failed restore is retried first by the
+next pass). Each pass first backfills: it walks the current heads' tree
+nodes it has not checked, finds blobs without a row by key
+(`MetaStore::derived_present`) and derives a bounded number, which repairs
+a head that reused old directory filters (a branch from an old commit, a
+revert, a rollback). Searches of older revisions derive the missing rows on
+their first probe and store them. Keyframes and directory filters are not
+retired. `repair drop --kind blob-trigrams-v1` copies v1 rows without a v2
+row into `blob-trigrams-v2` before deleting them.
 `leep-server derive-search <rev>` warms any other revision ahead of time. Clients are `leep search` and the `leep_search` MCP tool.
 
 **Verification and repair** ([ADR 0025](adr/0025-repair-tools.md)).

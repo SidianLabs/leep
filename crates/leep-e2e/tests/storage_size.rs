@@ -97,6 +97,9 @@ const SEARCH_BLOB_BYTES: &str =
 // tenth. Either budget fails if blob rows are written whole again.
 const SEARCH_BLOB_PER_LAND: u64 = 1_950;
 const SEARCH_BLOB_SHARE: f64 = 0.95;
+/// One-file lands after the measurement, each waiting for the warmer: all
+/// but at most one must store their blob row as a patch.
+const PACED_LANDS: usize = 10;
 
 /// The server's flags: defaults, but background work runs within seconds.
 const FLAGS: &[&str] = &[
@@ -268,6 +271,8 @@ struct Sizes {
     dicts: i64,
     /// Key and value bytes of the code search blob rows and keyframes.
     search_blobs: i64,
+    /// `blob-trigrams-v2` rows that are patches.
+    patches: i64,
 }
 
 fn blobs_dir(stores: &Stores) -> std::path::PathBuf {
@@ -292,7 +297,7 @@ fn sizes(stores: &Stores) -> Sizes {
         .enable_all()
         .build()
         .unwrap();
-    let (db, plain_rows, dicts, search_blobs) = rt.block_on(async {
+    let (db, plain_rows, dicts, search_blobs, patches) = rt.block_on(async {
         if stores.meta.starts_with("sqlite:") {
             let mut c = sqlx::SqliteConnection::connect(&stores.meta).await.unwrap();
             let pages: i64 = sqlx::query_scalar("PRAGMA page_count")
@@ -321,7 +326,20 @@ fn sizes(stores: &Stores) -> Sizes {
                 .fetch_one(&mut c)
                 .await
                 .unwrap();
-            (((pages - free) * size) as u64, plain, dicts, search)
+            let patches: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM derived WHERE kind = 'blob-trigrams-v2' \
+                 AND substr(value, 1, 1) = X'02'",
+            )
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+            (
+                ((pages - free) * size) as u64,
+                plain,
+                dicts,
+                search,
+                patches,
+            )
         } else {
             let mut c = sqlx::PgConnection::connect(&stores.meta).await.unwrap();
             let db: i64 = sqlx::query_scalar("SELECT pg_database_size(current_database())")
@@ -343,7 +361,14 @@ fn sizes(stores: &Stores) -> Sizes {
                 .fetch_one(&mut c)
                 .await
                 .unwrap();
-            (db as u64, plain, dicts, search)
+            let patches: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM derived WHERE kind = 'blob-trigrams-v2' \
+                 AND get_byte(value, 0) = 2",
+            )
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+            (db as u64, plain, dicts, search, patches)
         }
     });
     Sizes {
@@ -354,6 +379,7 @@ fn sizes(stores: &Stores) -> Sizes {
         plain_rows,
         dicts,
         search_blobs,
+        patches,
     }
 }
 
@@ -537,6 +563,36 @@ fn storage_stays_within_its_budgets() {
     let after = settle(&stores, &server, true);
     let size_ratio = metric(metrics_addr, "leep_blob_store_size_ratio");
     let dictionary = metric(metrics_addr, "leep_changeset_dictionary");
+
+    // Blob rows as patches, counted directly (ADR 0102): lands that
+    // outrun the warmer leave heads unindexed, so the measurement above
+    // cannot tell patches from whole rows reliably. These lands each wait
+    // until the warmer indexed their head, as at the pace of a CLI; every
+    // one edits one file, so each should store one patch.
+    let warmed = || {
+        metric(
+            metrics_addr,
+            "leep_index_rows_total{kind=\"tree-trigrams-v2\"}",
+        )
+        .unwrap_or(0.0)
+    };
+    for k in 0..PACED_LANDS {
+        let files = corpus.edit(1);
+        let msg = corpus.message(IMPORT_COMMITS + LANDS + k);
+        let before_warm = warmed();
+        tip = land(server.addr, tip, &files, &msg);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while warmed() <= before_warm {
+            assert!(
+                Instant::now() < deadline,
+                "the warmer did not index paced land {k}\n{}",
+                server.log_text()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    // Not in Git's history below: what is compared is what `after` holds.
+    let paced_patches = sizes(&stores).patches - after.patches;
     drop(server);
 
     // Git's size for the same history.
@@ -567,12 +623,14 @@ fn storage_stays_within_its_budgets() {
         "[{backend}] blobs {} -> {} ({blob_per_land} per land), db {} -> {} above {} \
          ({db_per_land} per land), total {total} = {ratio:.2}x git ({git_bytes}), \
          blob store ratio {size_ratio:?}, dictionary {dictionary:?}, search blob rows \
-         {search_per_land} per land ({search_share:.2} of whole rows' {whole_per_land}), {:.1}s",
+         {search_per_land} per land ({search_share:.2} of whole rows' {whole_per_land}), {} \
+         patches over {PACED_LANDS} paced lands, {:.1}s",
         before.blobs,
         after.blobs,
         before.db - empty.db,
         after.db - empty.db,
         empty.db,
+        paced_patches,
         started.elapsed().as_secs_f64()
     );
     println!("{report}");
@@ -602,6 +660,11 @@ fn storage_stays_within_its_budgets() {
         search_per_land <= budgets.search_blob_per_land,
         "search blob rows per land over budget ({}): {report}",
         budgets.search_blob_per_land
+    );
+    assert!(
+        paced_patches >= PACED_LANDS as i64 - 1,
+        "fewer than {} of {PACED_LANDS} paced lands stored a patch: {report}",
+        PACED_LANDS - 1
     );
     assert!(
         search_share <= budgets.search_blob_share,

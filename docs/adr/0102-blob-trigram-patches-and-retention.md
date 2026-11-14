@@ -112,10 +112,21 @@ nor write them and derive v1 rows for the files of a head they find
 without one, a few per land. Both versions keep sharing the search group's
 index lease (`tree-trigrams-v2`), which is safe because the directory
 filters they write are the same: whichever holds it warms heads in its own
-blob format, and the other side reads or derives what it lacks. Going back
-to an older binary works the same way. `repair drop --kind
-blob-trigrams-v1` (or `upgrade-index --drop-retired
---old-servers-stopped`) deletes the old rows once no old server is left.
+blob format, and the other side reads or derives what it lacks. `repair
+drop --kind blob-trigrams-v1` (or `upgrade-index --drop-retired
+--old-servers-stopped`) deletes the old rows once no old server is left,
+after copying every v1 row whose blob has no v2 row into
+`blob-trigrams-v2` (the same bytes): a file unchanged since the upgrade has
+only its v1 row and the filters above it stay, so nothing else would derive
+it again.
+
+**Rolling back** to a binary before this one: it reads only v1 rows, and its
+warmer stops at a stored directory filter, so the files changed since the
+upgrade have no row it reads. In `local` mode its searches derive and store
+them on first probe; in `lease` mode its bounded searches store nothing, so
+after rolling back such a fleet `repair drop --kind tree-trigrams-v2`
+(with the old binary) makes its warmer derive the heads' filters again, and
+every missing v1 row with them (OPERATIONS.md, "Upgrading").
 
 ### 2. Retention of blob rows
 A task in `leep-server` (`search_retention`, `--search-retention`, default
@@ -126,42 +137,62 @@ first pass 10 to 15 minutes after start) runs
 time runs it, and in the index lane (ADR 0073), so it uses the index
 connections and never the land path's. A pass:
 
-1. **Finds the live blobs.** The heads are every ref's head now, and the old
+1. **Backfills the current heads.** It walks the tree nodes of the current
+   heads it has not checked yet (every node on a server's first pass, then
+   what lands changed; a node is remembered once its whole subtree has rows,
+   up to a million nodes), asks which of their blobs have neither a v2 nor a
+   v1 row with the new `MetaStore::derived_present` (keys only), and
+   derives up to 4,096 of them a pass.
+2. **Finds the live blobs.** The heads are every ref's head now, and the old
    and new head of every ref log move within the window (newest first, read
-   five minutes past the window's start for the servers' clock skew): every head
-   a ref held at any time within it, deleted refs included. Their trees are
-   walked iteratively into a set of live blobs, one batched read per level,
-   each distinct node once; heads whose changeset is gone are skipped.
-2. **Deletes the others.** The keys of `blob-trigrams-v2`, then of the
+   five minutes past the window's start, so a server whose clock runs up to
+   five minutes behind does not end a head's window early): every head a ref
+   held at any time within it, deleted refs included. Their trees are walked
+   iteratively, one batched read per level, each distinct node once, through
+   a handle that never fills the shared node cache; heads whose changeset is
+   gone are skipped. Liveness is a Bloom filter (10 bits a row of the kind,
+   seven probes, about 1% false positives, each only keeping a row); the
+   nodes walked are held exactly, since skipping a node would miss its
+   blobs.
+3. **Deletes the others.** The keys of `blob-trigrams-v2`, then of the
    retired `blob-trigrams-v1`, are listed 500 at a time with the new
    `MetaStore::list_derived_keys` (the primary key alone; the Postgres and
    SQLite backends never read a value), and the keys not live are deleted
    with one `delete_derived_keys` per batch. The pass rests three times as
    long as each batch took.
-3. **Rereads the refs around each delete.** Before it, the blobs of any
-   head not yet walked join the live set and leave the batch. After it, a
-   deleted row whose blob a head that appeared meanwhile holds is derived
-   again at once.
+4. **Rereads the refs around each delete, when the ref log moved.** Before
+   it, the blobs of any head not yet walked join the live set and leave the
+   batch. After it, a deleted row whose blob a head that appeared meanwhile
+   holds is derived again at once from the blob's bytes, tried three times;
+   one that still fails stops the pass and is derived first at the next.
+
+A pass is skipped when the ref log has not moved since the last pass, that
+pass deleted nothing and its backfill finished, and it ran less than a day
+ago.
 
 Why it is safe beside lands, the warmer and searches, without coordinating
 with them:
 
-- A row a head holds is never left deleted by a pass: a head that existed
-  before the read that precedes a delete is in the live set; one that
-  appeared between that read and the delete is seen by the read after it,
-  which derives the row again; one that appeared after that read was
+- A row a head holds is never left deleted by a completed pass: a head
+  that existed before the check that precedes a delete is in the live set;
+  one that appeared between that check and the delete is seen by the check
+  after it, which derives the row again (a failure there is retried first
+  by the next pass, and a restore lost with a restarted process is found
+  by the next process's backfill); one that appeared after that check was
   warmed after the delete took effect, and a derivation computes every
-  missing row of the directories it derives.
-- What can be left missing is what "keep N days, then on demand" means: a
-  head that takes over a whole directory unchanged from a revision older
-  than the window (a revert to old content, a branch from an old commit)
-  reuses that directory's stored filter, so the warmer derives nothing below
-  it; the rows retention removed there are derived by the first search that
-  probes them, as for any revision older than the window. ADR 0094's
-  invariant, "a stored filter has its whole subtree stored", which the
-  bounded checks and `stale-ok` rely on to judge cost, therefore holds for
-  every tree a head held within the window, and for older trees only once
-  searched. The answers never depend on it.
+  missing row of the directories it derives. A fault sweep
+  (`fault_tests::retention_keeps_every_head_row_under_faults`) holds it
+  with deletes applied then failed, failed restores, lost state and a
+  racing land of old content.
+- A head that takes over a whole directory unchanged from a revision older
+  than the window (a revert to old content, a branch from an old commit, a
+  rollback) reuses that directory's stored filter, so the warmer derives
+  nothing below it. The next pass's backfill derives those rows; until it
+  does, a search derives what it probes. ADR 0094's invariant, "a stored
+  filter has its whole subtree stored", which the bounded checks and
+  `stale-ok` rely on to judge cost, therefore holds for every current head
+  once a pass has run, for every tree a head held within the window, and
+  for older trees once searched. The answers never depend on it.
 - So that such searches converge in `lease` mode, a bounded query now
   stores the blob rows it computes for the files it probes (with
   `put_derived_if_absent`, a pure function of the blob, safe to write from

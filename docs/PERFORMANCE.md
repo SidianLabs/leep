@@ -3205,7 +3205,12 @@ search lines added, by ADR 0102). The search blob budgets fail if blob rows
 are written whole again (a share of 1.0 or more); the share is high for a
 history this short, where most files are edited about three times and
 most of the bytes are the keyframes promoted from the import's whole rows
-(on corpus C, a tenth: "Blob trigram patches and retention"). The ratio
+(on corpus C, a tenth: "Blob trigram patches and retention"). Because the
+60 lands outrun the warmer, which then indexes only some heads and may find
+no indexed predecessor, the guard counts patches directly too: 10 more
+one-file lands after the measurement, each waiting until the warmer
+indexed its head, must store at least 9 patches (10 of 10 in every run on
+both backends). The ratio
 to Git is high because the history is tiny: the search and history indexes
 and Postgres's per-table pages dominate; the corpora above are the precise
 measure. A change that stops the automatic repack or compaction fails too,
