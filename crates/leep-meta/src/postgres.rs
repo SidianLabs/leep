@@ -1630,6 +1630,26 @@ impl MetaStore for PostgresMetaStore {
             .collect()
     }
 
+    /// The primary key alone: no value is read.
+    async fn list_derived_keys(
+        &self,
+        kind: &str,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> Result<Vec<Hash>> {
+        let after = after.map_or_else(Vec::new, |h| h.0.to_vec());
+        let rows: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT key FROM derived WHERE kind = $1 AND key > $2 ORDER BY key LIMIT $3",
+        )
+        .bind(kind)
+        .bind(after)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(self.db_for("list_derived_keys"))
+        .await
+        .map_err(storage)?;
+        rows.iter().map(|k| to_hash(k)).collect()
+    }
+
     /// An index-only scan of the primary key: no value is read.
     async fn count_derived(&self, kind: &str) -> Result<u64> {
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM derived WHERE kind = $1")

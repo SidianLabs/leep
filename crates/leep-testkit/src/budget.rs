@@ -752,6 +752,22 @@ impl MetaStore for Budget {
         .await
     }
 
+    async fn list_derived_keys(
+        &self,
+        kind: &str,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> Result<Vec<Hash>> {
+        self.meta(
+            "meta.list_derived_keys",
+            0,
+            0,
+            self.meta.list_derived_keys(kind, after, limit),
+            |v| n(v.len() * 32),
+        )
+        .await
+    }
+
     async fn count_derived(&self, kind: &str) -> Result<u64> {
         self.meta(
             "meta.count_derived",

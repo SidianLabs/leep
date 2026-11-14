@@ -187,7 +187,10 @@ struct Frame {
 impl Repo {
     /// The stored row of a blob of `size` bytes, computed (whole) and
     /// stored if missing. An oversize blob is recorded without being
-    /// fetched. A bounded query keeps what it computes in its own memory.
+    /// fetched. A bounded query keeps what it computes in its own memory,
+    /// and also stores the blob row: a pure function of the blob, safe to
+    /// write from any server, so a search whose rows retention removed
+    /// (ADR 0102) derives each of them once, not on every retry.
     pub(crate) async fn blob_row_stored(
         &self,
         hash: Hash,
@@ -200,6 +203,9 @@ impl Repo {
         let row = Bytes::from(self.fresh_blob_row(hash, size, c).await?.encode());
         if let Some(scan) = &c.scan {
             scan.put(false, hash, row.clone());
+            self.meta()
+                .put_derived_if_absent(BLOB_KIND, &hash, row.clone())
+                .await?;
             return Ok(StoredBlobRow::whole(row));
         }
         self.meta()

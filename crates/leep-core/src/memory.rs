@@ -1687,6 +1687,23 @@ async fn check_list_derived(store: &dyn MetaStore) {
         got.extend(page);
     }
     assert_eq!(got, want_a, "ascending, complete, one kind only");
+    // The keys alone, paged the same way.
+    let mut keys = Vec::new();
+    let mut after = None;
+    loop {
+        let page = store.list_derived_keys("ld-a", after, 3).await.unwrap();
+        assert!(page.len() <= 3, "limit is honoured");
+        let Some(&last) = page.last() else {
+            break;
+        };
+        after = Some(last);
+        keys.extend(page);
+    }
+    assert_eq!(
+        keys,
+        want_a.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+        "list_derived_keys lists list_derived's keys"
+    );
     assert!(
         store
             .list_derived("ld-a", Some(want_a[6].0), 10)

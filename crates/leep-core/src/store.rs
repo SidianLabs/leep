@@ -728,6 +728,24 @@ pub trait MetaStore: Send + Sync + 'static {
         ))
     }
 
+    /// The keys of [`list_derived`](Self::list_derived)'s page, without
+    /// the values: for a pass that only needs to know which rows exist
+    /// (search row retention, ADR 0102). Database backends read the primary
+    /// key alone; the default pages through `list_derived`.
+    async fn list_derived_keys(
+        &self,
+        kind: &str,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> Result<Vec<Hash>> {
+        Ok(self
+            .list_derived(kind, after, limit)
+            .await?
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect())
+    }
+
     /// How many rows of `kind` are stored. Database backends count without
     /// reading values (ADR 0052); the default pages through
     /// [`list_derived`](Self::list_derived).

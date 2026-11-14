@@ -499,6 +499,21 @@ struct Args {
     /// statement.
     #[arg(long, env = "LEEP_AUTO_COMPACT_BATCH", default_value_t = 250, value_parser = clap::value_parser!(u64).range(1..=10_000))]
     auto_compact_batch: u64,
+    /// Keep the code-search rows of a blob (ADR 0102) this long after the
+    /// last ref head that held it moved on or was deleted, then delete them:
+    /// a search that needs one again derives it on its first probe, and the
+    /// rows of every current head are always kept. Passes run under a
+    /// store-wide lease, one server at a time, in the index lane; lands never
+    /// wait for them. `off` keeps every row.
+    #[arg(long, env = "LEEP_SEARCH_RETENTION", default_value = "14d", value_parser = parse_duration_or_off)]
+    search_retention: DurationOrOff,
+    /// How often the search row retention runs (ADR 0102).
+    #[arg(long, env = "LEEP_SEARCH_RETENTION_INTERVAL", default_value = "1h", value_parser = parse_interval)]
+    search_retention_interval: std::time::Duration,
+    /// Testing only: when the first search row retention pass runs after
+    /// start (default 10 minutes, plus up to 5 of jitter).
+    #[arg(long, hide = true, value_parser = parse_interval)]
+    debug_search_retention_first: Option<std::time::Duration>,
     /// Testing only: stop the automatic compaction for good after this many
     /// batches of rows were rewritten, printing `leep-compact: paused at
     /// batch N`, so a crash test can kill the server inside a pass.
@@ -2312,6 +2327,31 @@ async fn run() -> anyhow::Result<()> {
         }
     } else {
         tracing::info!("automatic changeset compaction off (--auto-compact off)");
+    }
+    match args.search_retention {
+        DurationOrOff::For(keep) => {
+            let mut schedule = leep_server::search_retention::RetentionSchedule {
+                interval: args.search_retention_interval,
+                pass: leep_derive::search::retention::RetentionOptions {
+                    keep,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            if let Some(first) = args.debug_search_retention_first {
+                schedule.first = first;
+                schedule.jitter = std::time::Duration::ZERO;
+            }
+            leep_server::search_retention::spawn(repo.clone(), schedule);
+            tracing::info!(
+                keep_s = keep.as_secs(),
+                interval_s = args.search_retention_interval.as_secs_f64(),
+                "retiring search rows of blobs no head has held for the retention (ADR 0102)"
+            );
+        }
+        DurationOrOff::Off => {
+            tracing::info!("search row retention off (--search-retention off)")
+        }
     }
     let coordination = match args.land_coordination {
         Coordination::Off => None,

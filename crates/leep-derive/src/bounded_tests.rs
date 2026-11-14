@@ -247,6 +247,9 @@ fn bounded_scanning(r: &Repo, budgets: Budgets, scan_first: usize) -> Repo {
 }
 
 /// Index rows of every index kind, to tell that queries wrote none.
+/// Index rows a bounded query must not store. Blob rows are left out: a
+/// bounded search stores the whole rows of the files it probes, each a pure
+/// function of its blob (ADR 0102).
 async fn index_rows(meta: &dyn MetaStore) -> usize {
     let mut n = 0;
     for kind in [
@@ -255,7 +258,8 @@ async fn index_rows(meta: &dyn MetaStore) -> usize {
         LogFilterIndex::NAME,
         derived::LOG_FILTER_NAME_KIND,
         crate::search::TREE_KIND,
-        crate::search::BLOB_KIND,
+        crate::search::KEYFRAME_KIND,
+        crate::search::BLOB_KEYFRAME_KIND,
     ] {
         n += meta
             .list_derived(kind, None, usize::MAX)

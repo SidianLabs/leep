@@ -14,8 +14,11 @@
 pub(crate) mod index;
 #[doc(hidden)]
 pub mod plan;
+pub mod retention;
 pub mod trigram;
 
+#[cfg(test)]
+mod retention_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 

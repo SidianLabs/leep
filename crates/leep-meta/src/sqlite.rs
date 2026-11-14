@@ -1047,6 +1047,26 @@ impl MetaStore for SqliteMetaStore {
             .collect()
     }
 
+    /// The primary key alone: no value is read.
+    async fn list_derived_keys(
+        &self,
+        kind: &str,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> Result<Vec<Hash>> {
+        let after = after.map_or_else(Vec::new, |h| h.0.to_vec());
+        let rows: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT key FROM derived WHERE kind = ? AND key > ? ORDER BY key LIMIT ?",
+        )
+        .bind(kind)
+        .bind(after)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(self.db_for("list_derived_keys"))
+        .await
+        .map_err(storage)?;
+        rows.iter().map(|k| to_hash(k)).collect()
+    }
+
     async fn count_derived(&self, kind: &str) -> Result<u64> {
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM derived WHERE kind = ?")
             .bind(kind)
