@@ -1542,6 +1542,26 @@ impl MetaStore for PostgresMetaStore {
         ))
     }
 
+    async fn derived_present(&self, kind: &str, keys: &[Hash]) -> Result<Vec<bool>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: Vec<&[u8]> = unique(keys.iter().map(|k| k.as_bytes().as_slice()));
+        let found: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT key FROM derived WHERE kind = (SELECT $1::text) AND key = ANY($2)",
+        )
+        .bind(kind)
+        .bind(wanted)
+        .fetch_all(self.db_for("derived_present"))
+        .await
+        .map_err(storage)?;
+        let found: std::collections::HashSet<Vec<u8>> = found.into_iter().collect();
+        Ok(keys
+            .iter()
+            .map(|k| found.contains(k.as_bytes().as_slice()))
+            .collect())
+    }
+
     /// One statement: a `UNION ALL` of the `get_derived_many` query per
     /// non-empty read, each tagged with its read's index, so every branch
     /// keeps that query's plan.

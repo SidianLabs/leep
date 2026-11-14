@@ -1019,6 +1019,30 @@ impl MetaStore for SqliteMetaStore {
         Ok(values_in_order(keys, found.into_iter()))
     }
 
+    async fn derived_present(&self, kind: &str, keys: &[Hash]) -> Result<Vec<bool>> {
+        let wanted: Vec<&[u8]> = unique(keys.iter().map(|k| k.as_bytes().as_slice()));
+        let mut found: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for chunk in wanted.chunks(BATCH_PARAMS) {
+            let sql = format!(
+                "SELECT key FROM derived WHERE kind = ? AND key IN ({})",
+                placeholders(chunk.len())
+            );
+            let mut q = sqlx::query_scalar::<_, Vec<u8>>(AssertSqlSafe(sql)).bind(kind);
+            for k in chunk {
+                q = q.bind(*k);
+            }
+            found.extend(
+                q.fetch_all(self.db_for("derived_present"))
+                    .await
+                    .map_err(storage)?,
+            );
+        }
+        Ok(keys
+            .iter()
+            .map(|k| found.contains(k.as_bytes().as_slice()))
+            .collect())
+    }
+
     /// An empty `after` sorts below every 32-byte key, so `None` needs no
     /// separate query; `(kind, key)` is the primary key, so this is a range scan.
     async fn list_derived(

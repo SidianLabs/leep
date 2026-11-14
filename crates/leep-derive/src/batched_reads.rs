@@ -360,6 +360,10 @@ impl MetaStore for BatchedMeta {
         self.inner.list_derived_keys(kind, after, limit).await
     }
 
+    async fn derived_present(&self, kind: &str, keys: &[Hash]) -> Result<Vec<bool>> {
+        self.inner.derived_present(kind, keys).await
+    }
+
     async fn count_derived(&self, kind: &str) -> Result<u64> {
         self.inner.count_derived(kind).await
     }

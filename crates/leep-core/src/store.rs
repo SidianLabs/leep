@@ -845,6 +845,20 @@ pub trait MetaStore: Send + Sync + 'static {
         Ok(out)
     }
 
+    /// Whether a row of `kind` is stored under each of `keys`, in order,
+    /// without reading values: for a check of which rows exist (search row
+    /// backfill, ADR 0102). The default reads them with
+    /// [`get_derived_many`](Self::get_derived_many); database backends read
+    /// the primary key alone.
+    async fn derived_present(&self, kind: &str, keys: &[Hash]) -> Result<Vec<bool>> {
+        Ok(self
+            .get_derived_many(kind, keys)
+            .await?
+            .into_iter()
+            .map(|v| v.is_some())
+            .collect())
+    }
+
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()>;
 
     /// Store `value` at `(kind, key)` unless a row is there already, and
