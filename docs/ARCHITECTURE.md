@@ -237,7 +237,8 @@ way.
 | `cs-tombstone-v1` | per deleted changeset id: deletion time and root tree hash, written before the delete; dropped after `--tombstone-retention` (ADR 0059 section 11) | `gc --full --backup-fence`, and the sweep's tombstone pass |
 | `cs-reach-v1` | per changeset id, one byte: "a ref or ref log entry reaches it, and every parent has a row"; written parents first, plus a progress row at the zero key (ADR 0059 section 4) | the changeset sweep's incremental reachability mark |
 | `gc-mark-v1` | per changeset id, tree node hash or blob hash, one byte: "referenced by a stored changeset, and everything below has a row"; written by GC marks in post-order (ADR 0033) | incremental GC marks, which skip covered changesets and stop at marked tree nodes |
-| `blob-trigrams-v1` | per blob hash: sorted trigram set of a UTF-8 text blob up to 1 MiB (delta varints), or a "not indexed" marker (ADR 0014) | code search |
+| `blob-trigrams-v2` | per blob hash: sorted trigram set of a UTF-8 text blob up to 1 MiB (delta varints), or a "not indexed" marker, stored whole (the retired `blob-trigrams-v1` encoding, which is read where a blob has no v2 row) or as a patch (codes added and removed) on the set in `blob-trigrams-keyframe-v2` of the keyframe its predecessor (the file at the same path in the directory's predecessor) is on, while `patch² <= 128 × whole`; a probe costs at most two rows. Rows of blobs no ref head has held for `--search-retention` (14 days) are deleted and derived again on demand (ADR 0014, ADR 0102) | code search |
+| `blob-trigrams-keyframe-v2` | per blob hash: that blob's whole set, the base of patches; written before any patch on it, in its one encoding, so it never changes, and never retired (ADR 0102) | as above |
 | `git-blob-v1` / `git-tree-v1` | per blob hash / tree node hash: the 20-byte sha1 git gives the blob, or the git tree of the node (a subtree with no files left out); pure functions of content (ADR 0090) | git ids of a store's objects, the coming git wire protocol |
 | `git-commit-v1` | per changeset: the 20-byte sha1 of its git commit under the store's commit style, from its root tree's and its parents' git ids. Imported changesets reproduce their original commit; others carry `Leep-Changeset:` under the `trailer` style, the mirror's rule (ADR 0049, 0090). Derived on demand; deleted with its changeset by the sweep | as above |
 | `git-oid-v1` | per `Hash::of_object("git-oid", sha)`: kind byte (1 blob, 2 tree, 3 commit) and the 32-byte Leep hash; written beside each forward row; a lookup checks the forward row, so one whose changeset was swept answers "unknown" (ADR 0090) | finding the Leep object a git id names |
@@ -588,7 +589,7 @@ planner turns the query into trigrams every matching file must contain
 (literal trigrams, case variants, or literals extracted from the regex syntax
 tree; none means a plain scan). Execution walks the tree depth first with an
 explicit stack, skipping directories whose `tree-trigrams-v2` filter lacks a
-required trigram and files whose `blob-trigrams-v1` set does, then fetches the
+required trigram and files whose `blob-trigrams-v2` set does, then fetches the
 survivors (16 at a time, order preserved) and runs the matcher on blocking
 threads. A directory's children's rows and surviving nodes are read in batches
 when it is opened, and the subdirectories of the directory the walk is in are
@@ -596,9 +597,10 @@ opened ahead of it, four at a time. Probing a row stops decoding as soon as
 the requirement is false with every value not yet read counted as present
 (the requirement has no negation, so that bound only falls). Each `Repo`
 keeps the encoded `tree-trigrams-v2` rows its searches read from the store,
-and the keyframes their patches are on (64 MiB of the derive cache budget by
-default), so the upper directories' filters, shared by every query and every
-revision that did not change them, are not read again; rows a bounded query computes are never cached, and a
+and the keyframes their patches are on, blob keyframes included (64 MiB of
+the derive cache budget by default), so the upper directories' filters,
+shared by every query and every revision that did not change them, are not
+read again; rows a bounded query computes are never cached, and a
 row repaired by another process is seen after a restart. Output is ordered
 by path then line and is identical with or without the index, which a property
 test checks; the walk is lazy, so a search that has enough matches stops early.
@@ -613,10 +615,28 @@ in batches of at most 4,096 rows and 16 MiB, each batch reading its files'
 rows in one call, computing the missing ones side by side and writing them
 with one `put_derived_many` before its filters, and each level written
 before its parents, so a stored filter always has its subtree stored (which
-`stale-ok` and the bounded checks rely on), and a gap of many lands costs a
-few round trips per level. One derivation per tree root runs at a time in a
+`stale-ok` and the bounded checks rely on; retention keeps that true for
+every revision a head held within its window, and older ones derive what it
+removed when searched), and a gap of many lands costs a few round trips per
+level. One derivation per tree root runs at a time in a
 process (`Repo::search_flights`); others wait for it and then read the rows;
-a bounded query's scan stores nothing and does not wait.
+a bounded query's scan stores no filter and does not wait, but stores the
+blob rows of the files it probes, each a pure function of its blob.
+A file's row is a patch on the keyframe its predecessor's row is on, the
+predecessor being the file at the same path in its directory's predecessor
+(ADR 0102); the keyframe is read with the directory's rows, through the same
+cache, so a probe costs at most two rows, and the patch is applied only at
+the probed codes. A blob without a `blob-trigrams-v2` row falls back to the
+row an older server wrote (`blob-trigrams-v1`), while any are stored.
+**Retention** (ADR 0102): a pass every `--search-retention-interval` (1 h),
+under a store-wide lease in the index lane, deletes the blob rows of blobs
+that no ref head holds now or held within `--search-retention` (14 days,
+from the ref log's moves): the blobs below those heads are walked into a
+live set, the kind's keys are listed and the others deleted in batches,
+reading the refs again before and after each delete and deriving again at
+once a deleted row that a head which appeared meanwhile holds. Searches of
+older revisions derive the missing rows on their first probe and store them.
+Keyframes and directory filters are not retired.
 `leep-server derive-search <rev>` warms any other revision ahead of time. Clients are `leep search` and the `leep_search` MCP tool.
 
 **Verification and repair** ([ADR 0025](adr/0025-repair-tools.md)).
