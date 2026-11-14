@@ -590,8 +590,33 @@ impl ObjectBlobStore {
             ));
         }
         let lease = Lease::acquire(self.store.clone()).await?;
+        let interval = opts
+            .full_interval
+            .filter(|_| opts.mode == crate::RepackMode::Full);
+        if let Some(iv) = interval {
+            let last = match crate::considered::read_last_full(&*self.store).await {
+                Ok(l) => l,
+                Err(e) => {
+                    lease.release().await;
+                    return Err(e);
+                }
+            };
+            if last.is_some_and(|l| now_secs() < l.saturating_add(iv.as_secs() as i64)) {
+                lease.release().await;
+                return Err(Error::Conflict(
+                    "a full repack of this bucket ran within the interval".into(),
+                ));
+            }
+        }
         match self.publish_leased(hints, &opts, &lease).await {
             Ok(p) => {
+                if interval.is_some() {
+                    if let Err(e) =
+                        crate::considered::write_last_full(&*self.store, now_secs()).await
+                    {
+                        tracing::warn!(error = %e, "recording the full repack's time failed");
+                    }
+                }
                 self.packs.supersede(&p.replaced).await;
                 Ok(PublishedObjectPack {
                     store: self.clone(),
@@ -622,6 +647,51 @@ impl ObjectBlobStore {
                 objects: p.index.len().saturating_sub(dead.len()) as u64,
                 bytes: p.index.pack_len(),
             })
+            .collect())
+    }
+
+    /// Loose objects and their total size, from one listing of `blobs/`.
+    pub async fn loose_stats(&self) -> Result<(u64, u64)> {
+        let loose = list_all_loose(&*self.store).await?;
+        Ok((loose.len() as u64, loose.values().map(|s| s.size).sum()))
+    }
+
+    /// Every loose object with its size, in hash order.
+    pub async fn loose_listing(&self) -> Result<Vec<(Hash, u64)>> {
+        Ok(list_all_loose(&*self.store)
+            .await?
+            .into_iter()
+            .map(|(h, s)| (h, s.size))
+            .collect())
+    }
+
+    /// Packs a delta repack already compressed (ADR 0100,
+    /// `packs/.considered`).
+    pub async fn considered_packs(&self) -> Result<HashSet<String>> {
+        crate::considered::read_object(&*self.store).await
+    }
+
+    /// When the bucket last had an automatic full repack (ADR 0100), in
+    /// unix seconds, as [`record_full_repack`](Self::record_full_repack)
+    /// left it: shared by every server on the bucket and kept across
+    /// restarts.
+    pub async fn last_full_repack(&self) -> Result<Option<i64>> {
+        crate::considered::read_last_full(&*self.store).await
+    }
+
+    pub async fn record_full_repack(&self, at: i64) -> Result<()> {
+        crate::considered::write_last_full(&*self.store, at).await
+    }
+
+    /// [`PackDetail`](crate::PackDetail) of each searchable pack `ids`
+    /// names, from the cached view.
+    pub async fn pack_details(&self, ids: &HashSet<String>) -> Result<Vec<crate::PackDetail>> {
+        let view = self.packs.view().await?;
+        Ok(view
+            .searchable()
+            .iter()
+            .filter(|(p, _)| ids.contains(&p.id))
+            .map(|(p, _)| crate::PackDetail::of(&p.id, &p.index))
             .collect())
     }
 
@@ -825,6 +895,22 @@ impl ObjectBlobStore {
         self.retire(&replaced, &id, &id, lease).await?;
         self.packs.unsupersede(&id);
         step(opts, RepackStep::Retired)?;
+        if opts.mark {
+            let published: HashSet<String> = view
+                .packs
+                .iter()
+                .map(|(p, _)| p.id.clone())
+                .filter(|p| !replaced.contains(p))
+                .chain([id.clone()])
+                .collect();
+            // Advisory: see the filesystem store.
+            if let Err(e) =
+                crate::considered::mark_object(&*self.store, std::slice::from_ref(&id), &published)
+                    .await
+            {
+                tracing::warn!(error = %e, pack = %id, "recording a considered pack failed");
+            }
+        }
         self.packs.rescan(ScanReason::Repack).await?;
         Ok(Published {
             report,
@@ -1061,6 +1147,12 @@ impl PublishedObjectPack {
     /// The packs this repack replaces, deleted by [`finish`](Self::finish).
     pub fn replaced(&self) -> &[String] {
         &self.replaced
+    }
+
+    /// Objects packed from loose copies, which stay until
+    /// [`finish`](Self::finish).
+    pub fn packed_loose(&self) -> impl Iterator<Item = &Hash> {
+        self.from_loose.iter().map(|(h, _)| h)
     }
 
     /// Take the lease again after [`unlock`](Self::unlock); `Conflict`

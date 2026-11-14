@@ -1034,6 +1034,33 @@ fn killed_server_with_pipelined_batches_loses_nothing_postgres() {
     drop(db);
 }
 
+/// ADR 0100: the automatic delta repack runs at every background tick
+/// (one object waiting is enough), so kills land while it walks history,
+/// writes, publishes or waits for its cleanup, beside lands and the live
+/// gc of the rounds. Nothing is lost and every store verifies.
+const AUTO_REPACK: &[&str] = &[
+    "--background-repack-interval",
+    "1s",
+    "--auto-repack-objects",
+    "1",
+    "--auto-repack-check-interval",
+    "0",
+];
+
+#[test]
+fn killed_server_with_eager_auto_repack_loses_nothing_sqlite() {
+    run_crash_rounds_with("sqlite, auto repack", None, AUTO_REPACK);
+}
+
+#[test]
+fn killed_server_with_eager_auto_repack_loses_nothing_postgres() {
+    let Some(db) = PgDb::create("leep_e2e") else {
+        return;
+    };
+    run_crash_rounds_with("postgres, auto repack", Some(db.url.clone()), AUTO_REPACK);
+    drop(db);
+}
+
 // ---------------------------------------------------------------------------
 // Several servers coordinating lands (ADR 0056)
 

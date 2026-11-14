@@ -38,10 +38,13 @@ it when it is true of your deployment, and redo the list after an upgrade.
   [Cron wrappers](RUNBOOKS.md#cron-wrappers)), and its failures alert
   (`LeepGcStale`). [Changeset garbage collection](#changeset-garbage-collection)
   needs nothing scheduled yet.
-- [ ] **Repack schedule (filesystem blob stores).** An incremental
-  `leep-server repack` runs nightly and after load tests or large imports,
-  or whenever loose objects pass a count you chose, so loose files do not
-  use up the volume's inodes ([Packing blobs](#packing-blobs)). The blob
+- [ ] **Repack schedule (filesystem blob stores).** The server packs and
+  delta-compresses new objects itself (ADR 0100, on by default:
+  [Automatic delta repack](#automatic-delta-repack)); if it is turned off,
+  an incremental `leep-server repack` runs nightly and after load tests or
+  large imports, so loose files do not use up the volume's inodes
+  ([Packing blobs](#packing-blobs)). A `repack --full` weekly to monthly
+  still drops what GC deleted from packs. The blob
   volume has inodes to spare: ext4 fixes the count when the filesystem is
   made, so a dedicated blob volume gets a smaller inode ratio
   (`mkfs.ext4 -i 4096`), or blobs live in packs or `s3://`. If
@@ -141,6 +144,13 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_repack_background_seconds` | histogram | none | Time of each merge: walk, write and publish. |
 | `leep_repack_background_cleanup_seconds` | histogram | none | Time of each cleanup a fence after a merge (deleting the merged packs). |
 | `leep_repack_retired_removed_total` | counter | none | Retired packs deleted by the sweep at server start and at each background interval once their fence passed (ADR 0080). Grows after restarts that left merged packs waiting; the merges' own cleanups are under `leep_repack_background_cleanup_seconds`. |
+| `leep_repack_auto_runs_total` | counter | `outcome` = `ran`, `error` | Automatic delta repacks published (ADR 0100). An error is logged and retried at the next check. |
+| `leep_repack_auto_skipped_total` | counter | `reason` = `threshold`, `pending`, `interval`, `busy` | Checks that did not run: below every threshold, cleanups waiting on too many bytes, an object store's full repack ran within its interval, or another repack held the store. |
+| `leep_repack_auto_seconds` | histogram | none | Time of each automatic delta repack: walk, write and publish. |
+| `leep_repack_auto_input_bytes_total` / `leep_repack_auto_delta_bytes_total` | counter | none | Bytes that waited (loose files and whole packs) and pack bytes written for them. Their ratio is the compression the runs achieve. |
+| `leep_repack_auto_objects_total` | counter | none | Objects the automatic runs wrote. |
+| `leep_repack_auto_waiting_objects` / `leep_repack_auto_waiting_bytes` | gauge | none | Objects (and their bytes on disk) waiting to be compressed at the last check: loose, or in packs written whole. Falls to near zero after each run; climbing past the thresholds means runs are held or failing. |
+| `leep_blob_store_bytes` / `leep_blob_store_logical_bytes` / `leep_blob_store_size_ratio` | gauge | none | Bytes on disk of loose objects and searched packs, the bytes they decode to, and the ratio, at the last check. About 0.03–0.1 on source code once compressed; near 1 means nothing is being delta-compressed. |
 | `leep_land_cancelled_total` | counter | none | Lands whose caller went away (timeout, disconnect) while queued, dropped before their batch replayed them. |
 | `leep_land_batch_deadline_total` | counter | none | Lands answered 409 because their batch was still retrying 60 s after its first attempt (`MAX_BATCH_LIFETIME`, ADR 0059) and gave up instead of moving the ref. Clients resend; keyed lands are then answered from their record. Anything but rare means a store so slow, or a ref so contended, that lands do not finish. |
 | `leep_land_answered_from_record_total` | counter | `original` = `present`, `missing` | Keyed lands answered from their land id record instead of landing again (ADR 0057). `missing`: the changeset was no longer stored (garbage collected, ADR 0059) and the record answered without reading it. |
@@ -2436,7 +2446,11 @@ one to two orders of magnitude (the first 3,795 commits of git/git: 91.2 MB
 loose, 4.2 MB packed with its index) and the store holds a handful of files
 instead of one per object. Uploads and lone writes stay loose until the next
 repack; land batches write their new objects as one pack each, which the
-server merges in the background (below, ADR 0068).
+server merges in the background (below, ADR 0068). Since ADR 0100 the server
+also runs the delta repack itself once enough loose objects and whole packs
+wait ([Automatic delta repack](#automatic-delta-repack)), so the commands
+below are for imports you want packed at once, `--full`, and servers with
+`--auto-repack off`.
 
 ```sh
 leep-server repack                    # loose objects into a new pack; merge small packs (ADR 0039)
@@ -2448,8 +2462,10 @@ leep-server repack --json             # the report as JSON
 It uses the same `--meta` and `--blobs` as the server and runs beside running
 servers. By default it is incremental. It walks back from every ref only as
 far as the history whose objects are still loose, writes and publishes a new
-pack holding the loose objects, and leaves existing packs alone, except that
-it folds in small packs so the count stays low. It then waits `--fence`
+pack holding the loose objects and the objects of packs written whole (land
+batches, imports; compressed against their previous versions, ADR 0100), and
+leaves other packs alone, except that it folds in small packs so the count
+stays low. It then waits `--fence`
 (default 10m: longer than the servers' `--request-timeout` plus clock skew;
 the statement term of `gc --fence` does not apply, since repack's fence covers
 reads of the loose copies, not metadata writes) and deletes the loose copies and any
@@ -2514,11 +2530,15 @@ the packs of the lowest class holding at least four, smallest first, up to
 `leep-server repack`. Each object is rewritten at most once per class
 (about six), and at most about 32 packs below 256 MiB stay searched; the
 packs above it grow by about one per 256 MiB to 1 GiB written, so keep the
-cron `repack` of this section. Merges leave loose objects alone and do not
-walk history: merged packs hold whole frames, and `leep-server repack`
-stores versions as deltas. They run one at a time on a thread at the
-lowest CPU priority. At most 256 merges, or 4 GiB of merged packs, wait for
-their fence at once. A merge records the packs it merged as retired, in
+occasional `repack --full`. Merges leave loose objects alone and do not
+walk history: merged packs hold whole frames, and the automatic delta repack
+(below) or `leep-server repack` stores versions as deltas. With the delta
+repack on, packs written whole are merged only with each other, so their
+frames are still found and compressed. They run one at a time on a thread
+at the lowest CPU priority. At most 256 merges, or bytes of merged packs
+and packed loose copies up to half the live store (at least 64 MiB, at
+most 4 GiB), wait for their fence at once; past that no merge or delta
+repack starts until cleanups finish. The fence itself is not shortened. A merge records the packs it merged as retired, in
 `packs/retired` (`packs/.retired` in a bucket), right after it publishes
 the merged pack (ADR 0080): from then on no server reads or merges them,
 and they are deleted a fence later, by the merge's cleanup or, if the
@@ -2538,6 +2558,79 @@ default), and the start-up log line "swept packs left by earlier repacks"
 (level info) counts what was deleted. `leep_repack_retired_removed_total`
 counts retired packs deleted. Restarting a server inside the fence no
 longer makes it merge the same packs again.
+
+### Automatic delta repack
+
+Since ADR 0100 the background repack also compresses new file versions and
+tree nodes against their previous versions, as `leep-server repack` does,
+so a server with default flags stays near the size a full repack gives
+(Leep's own history: 13.4 MB in all instead of 112 MB; see
+[PERFORMANCE.md](PERFORMANCE.md), "Automatic delta repack"). Every
+`--auto-repack-check-interval` it counts the loose objects and the live
+objects of packs written whole (land batches, `leep-git import`); once a
+threshold is passed it walks their history and publishes one pack of
+deltas, the whole frames included, then deletes what it replaced a fence
+later, like a merge (the loose copies it packed are not counted again
+meanwhile). A backlog larger than `--auto-repack-batch-bytes` runs in
+batches, one a tick, so merges, cleanups and sweeps go on between them and
+a restart keeps the batches done. It runs on the background repack's
+nice-19 thread and never delays a land. Packs it has compressed are listed
+in `packs/considered` (`packs/.considered` in a bucket), so no server
+compresses them again; deleting that file only costs one more pass.
+Corrupt loose objects it meets stay in place, are logged in its report,
+and are not counted again (run `leep-server verify --full --rehash`).
+
+**After upgrading an existing store,** run `leep-server repack --full`
+once: whole frames that earlier background merges folded into delta packs
+are no longer recognised as waiting.
+
+| Flag / env | Default | What it does |
+|---|---|---|
+| `--auto-repack on\|off` / `LEEP_AUTO_REPACK` | `on` | Run the delta repack in the background. Needs `--background-repack on`. |
+| `--auto-repack-objects N` / `LEEP_AUTO_REPACK_OBJECTS` | `1024` | Run once this many objects wait (loose, or in whole packs). |
+| `--auto-repack-bytes B` / `LEEP_AUTO_REPACK_BYTES` | `32M` | Run once they take this many bytes on disk (`K`, `M`, `G` are powers of 1024). |
+| `--auto-repack-max-age D` / `LEEP_AUTO_REPACK_MAX_AGE` | `30m` | Run once any has waited this long, below both thresholds; `off` waits for a threshold. |
+| `--auto-repack-check-interval D` / `LEEP_AUTO_REPACK_CHECK_INTERVAL` | `1m` | How often it counts (a listing of the loose shard directories, or one bucket listing). |
+| `--auto-repack-batch-bytes B` / `LEEP_AUTO_REPACK_BATCH_BYTES` | `1G` | Bytes one run takes at most (whole packs oldest first, then loose objects; also at most 500,000 objects and 256 packs). The rest runs as further batches, one a background tick, with merges and cleanups between them. |
+| `--auto-repack-level N` / `LEEP_AUTO_REPACK_LEVEL` | `9` | zstd level of the packs it writes, 1 to 22. |
+| `--auto-repack-object-store-interval D` / `LEEP_AUTO_REPACK_OBJECT_STORE_INTERVAL` | `24h` | Object stores: the shortest time between two automatic full repacks, kept in the bucket (`packs/.last-full`), so restarts and replicas share it. |
+
+What operators no longer need: the nightly or hourly incremental `repack`
+cron, and the loose-object count job, on servers with the defaults. Keep
+`gc`, and a `repack --full` weekly to monthly: it drops objects GC deleted
+from packs, and writes the first new version at each path as a delta where
+the automatic runs (like any incremental repack) store it whole.
+
+**Object stores** have no incremental repack yet: the server runs a full
+repack (it walks all history and rewrites every pack, through the bucket)
+once the bytes waiting reach a quarter of the store and at least 64 MiB,
+never for age alone, and at most once per
+`--auto-repack-object-store-interval` across restarts and servers. On a large bucket, raise the
+interval or keep `repack` on your own schedule with `--auto-repack off`.
+
+**After a large import** the backlog runs in batches of
+`--auto-repack-batch-bytes`; each batch's walk still passes through the
+unpacked history, so on a history the size of Linux the whole backlog is
+hours of one low-priority core (a full repack of Linux took 4 h 55 min on
+one VPS). Lands go on meanwhile, and so do merges and cleanups. To control when it happens,
+run `leep-server repack` yourself first, or start servers with
+`--auto-repack off` until then.
+
+**Several servers on one store** each run the task; the repack lock (or
+lease) lets one run at a time and the others skip ("busy" in
+`leep_repack_auto_skipped_total`). To keep the work on one host, pass
+`--auto-repack off` on the others.
+
+**To turn it off**: `--auto-repack off` (or `LEEP_AUTO_REPACK=off`), and
+schedule `repack` as below. `--background-repack off` turns off merges and
+the delta repack.
+
+Metrics: `leep_repack_auto_runs_total{outcome}`,
+`leep_repack_auto_skipped_total{reason}`, `leep_repack_auto_seconds`,
+`leep_repack_auto_waiting_objects` and `_bytes`, and
+`leep_blob_store_size_ratio` ([Metrics](#metrics)). The log line
+"automatic delta repack published a pack" (level info) gives each run's
+objects, deltas, whole frames and time.
 
 **Leftovers from before ADR 0080.** Older servers stopped inside a fence
 left merged packs published beside the pack that replaced them, and each
@@ -2562,7 +2655,8 @@ there: a server built before ADR 0068 lists `packs/` on a miss at most
 every 5 s and may briefly miss the objects of a land pack another server
 just wrote.
 
-When to run it: after a large import, then incremental runs often and a full
+When to run it, with `--auto-repack off` (with it on, only `--full` needs a
+schedule): after a large import, then incremental runs often and a full
 one rarely. The incremental run's cost follows the new history, so daily or
 hourly both suit. Run `--full` weekly to monthly, depending on how much
 GC deletes and how much the pack bytes grow between full runs. Run both after
@@ -2585,11 +2679,14 @@ free: writes then fail with `No space left on device`. One VPS reached
 that load tests (about 27,000 files a run) left in a store nobody
 repacked. So on every filesystem store:
 
-- Run the incremental `repack` on a schedule, nightly as above (hourly
+- Keep `--auto-repack on` (the default), which packs loose objects once
+  1,024 wait. With it off, run the incremental `repack` on a schedule,
+  nightly as above (hourly
   for a busy fleet), and also after load tests and large imports, or
   whenever the loose objects pass a count you choose, such as 100,000.
-  Leep exports no loose-object metric; count them in the job, stopping
-  early so a large store costs little:
+  `leep_repack_auto_waiting_objects` counts them while the automatic
+  repack is on; otherwise count them in the job, stopping early so a large
+  store costs little:
   ```sh
   loose=$(find /var/lib/leep/blobs/[0-9a-f][0-9a-f] -type f ! -name '.*' | head -n 100001 | wc -l)
   [ "$loose" -gt 100000 ] && leep-cron repack leep-server repack

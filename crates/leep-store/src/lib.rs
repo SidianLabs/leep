@@ -3,6 +3,7 @@
 //! that can sit in front of any of them.
 
 mod cache;
+mod considered;
 mod dirsync;
 mod fs;
 mod groupsync;
@@ -43,7 +44,8 @@ pub use packput::{
 };
 pub use packwrite::plan_merge;
 pub use repack::{
-    PackSize, PublishedPack, RepackHook, RepackMode, RepackOptions, RepackReport, RepackStep,
+    PackDetail, PackSize, PublishedPack, RepackHook, RepackMode, RepackOptions, RepackReport,
+    RepackStep,
 };
 pub use retire::SweepReport;
 

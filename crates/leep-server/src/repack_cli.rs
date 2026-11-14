@@ -1,5 +1,6 @@
 //! `leep-server repack` (ADR 0029, ADR 0039, ADR 0040): pack the loose
-//! objects of a filesystem blob store into a new pack, merging small packs
+//! objects of a filesystem blob store, and the packs written whole by land
+//! batches and imports, into a new pack, merging small packs
 //! so their count stays low, or with `--full` pack every live object into
 //! one pack. An object store (`s3://`) is always packed in full for now.
 //! Each file version is compressed against the previous one at its path and
@@ -24,8 +25,9 @@ use leep_store::{
 pub struct RepackArgs {
     /// Pack every live object, loose and packed, into one pack, walking all
     /// of history for delta bases. Drops objects GC deleted from packs.
-    /// Without it, only loose objects are packed and the walk covers only
-    /// the history they belong to. Object stores always pack in full.
+    /// Without it, only loose objects and packs written whole (by land
+    /// batches and imports) are packed, and the walk covers only the
+    /// history they belong to. Object stores always pack in full.
     #[arg(long)]
     full: bool,
     /// Merge packs until each is at least this many times the size (in
@@ -147,10 +149,25 @@ pub async fn run_repack(meta: &str, blobs: &str, args: RepackArgs) -> anyhow::Re
         _ => RepackMode::Full,
     };
     tracing::info!(?mode, "walking history for delta bases");
+    // Packs written whole (land batches, imports: ADR 0068) are compressed
+    // again with deltas, like the loose objects (ADR 0100).
+    let mut whole: Vec<String> = Vec::new();
     let order = match &target {
         Target::Fs(s) if mode != RepackMode::Full => {
+            let ids = s.pack_sizes()?.into_iter().map(|p| p.id).collect();
+            // Packs a delta repack already wrote with no delta stay as they
+            // are (`packs/considered`).
+            let considered = s.considered_packs()?;
+            whole = s
+                .pack_details(&ids)?
+                .into_iter()
+                .filter(|d| d.whole() && !considered.contains(&d.id))
+                .map(|d| d.id)
+                .collect();
+            let in_whole = s.packed_in(&whole.iter().cloned().collect())?;
             let s = s.clone();
-            leep_derive::pack_order::pack_order_loose(&repo, &move |h| s.is_loose(h)).await?
+            let wanted = move |h: &leep_core::Hash| s.is_loose(h) || in_whole(h);
+            leep_derive::pack_order::pack_order_where(&repo, &wanted, &wanted, usize::MAX).await?
         }
         _ => leep_derive::pack_order::pack_order(&repo).await?,
     };
@@ -165,6 +182,8 @@ pub async fn run_repack(meta: &str, blobs: &str, args: RepackArgs) -> anyhow::Re
         level: args.level,
         mode,
         threads: args.threads,
+        packs: whole,
+        mark: true,
         ..RepackOptions::default()
     };
     let changesets = order.changesets;
@@ -247,7 +266,7 @@ fn print_report(r: &RepackReport, full: bool, changesets: u64, t: &Timing) {
         if full {
             "full"
         } else {
-            "incremental (loose objects, merging packs by the geometric rule)"
+            "incremental (loose objects and whole packs, merging packs by the geometric rule)"
         }
     );
     outln!("changesets walked: {changesets}");

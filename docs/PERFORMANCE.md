@@ -2918,6 +2918,60 @@ is in an older pack). Writing a whole copy of that base and a delta instead
 was measured on every such chain head (about 256 per round): 3.6% larger
 than writing the version whole.
 
+### Automatic delta repack
+
+ADR 0100. The storage corpora of the size study (Leep's own history at
+89fb9ad: A, 231 commits, 803 files at the head; B, A plus 2,000 generated
+one-file edits; Git after `git gc`: 4.84 MB and 6.58 MB), imported with
+`leep-git import` into a fresh Postgres 16 database and filesystem store,
+then a release `leep-server` with every flag at its default and **no
+manual repack**, measured once the background repack had run and its fence
+(6 minutes) had passed. Database sizes are net of an empty migrated
+database (8.42 MB); shared 4-core host, single runs.
+
+| | A: DB + blobs | B: DB + blobs |
+|---|---|---|
+| Before (89fb9ad), default steady state | 8.03 + 104.08 = 112.1 MB (23x Git) | 15.86 + 152.65 = 168.5 MB (26x) |
+| Before, after a manual `repack --full` | 8.03 + 5.38 = 13.4 MB | 15.86 + 6.66 = 22.5 MB |
+| **Now, defaults, settled** | **8.09 + 5.38 = 13.5 MB (2.8x Git)** | **15.84 + 6.66 = 22.5 MB (3.4x)** |
+| Now, 60 s after start (inside the fence) | blobs 74.3 MB | blobs 124.2 MB |
+
+- One run each, 9 s (A) and 12 s (B) after the server started: 6,665
+  objects in 3.5 s (walk 0.23 s) and 16,241 objects in 7.0 s (walk 1.8 s),
+  on the nice-19 thread. Each wrote the same pack bytes as `--full`
+  (about 5.09 and 5.94 MB): the import packs' whole frames were
+  compressed, not copied.
+- Inside the fence the replaced import packs and the packed loose copies
+  stay on disk (the 60 s row); they are deleted when it passes.
+  `leep_blob_store_size_ratio` settles at 0.037 (A) and 0.032 (B).
+
+Per land (corpus C: A plus 200 one-file and 200 three-file lands, one a
+second through the CLI, as in the size study), blob store growth once
+settled:
+
+| | Bytes per land |
+|---|---|
+| Before (89fb9ad), defaults: loose and raw until someone repacks | 48,054 (one file) to 57,965 (three files) |
+| Before, after a manual incremental `repack` (average of all 400) | 1,994 |
+| **Now, defaults, settled (average of all 400: pack plus index)** | **2,192** |
+
+The 400 lands took four runs after the import's: 420 objects (the max
+age), 1,830 (1,410 loose plus the first run's pack, folded in by the
+geometric rule), 2,800 (972 loose plus the previous pack) and 2 stragglers
+no ref reaches, in 0.38, 0.66, 0.63 and 0.02 s; each a single batch. For this run `--auto-repack-max-age` was 2 minutes
+instead of 30, so the tail below the thresholds settled within the
+measurement; the sizes do not depend on it. Between runs the lands' objects
+are loose (up to 56 MB here, at the 400th land), as before.
+
+Land latency: the write path is unchanged. The ratio bench
+(`scripts/perf-ratio.sh`, base 89fb9ad, this 4-core host) passed 23 of 23
+checks with the defaults and with `LEEP_AUTO_REPACK_CHECK_INTERVAL=0` (so a
+run lands inside the bench); one more run of each failed one wall-time
+p99 each (land-bench land p99 203.8 ms and 477.1 ms in a single B run, the
+other B run 43 ms; swarm sync p99 99.3 ms once), the same size of outlier
+as the A runs show (swarm land p99 146.5 ms against 21.2 ms). Counts
+(statements and bytes per land, CAS losses, pool use) matched in every run.
+
 ### Repack memory and time
 
 A full repack of all of Linux (10.08M objects) on the VPS peaked at about
