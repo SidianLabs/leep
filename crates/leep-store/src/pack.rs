@@ -24,12 +24,17 @@ pub const IDX_HEADER_LEN: usize = 8 + 8 + 8 + 32 + 8 + 8;
 pub const IDX_FANOUT_LEN: usize = 256 * 4;
 /// BLAKE3 of everything before it.
 pub const IDX_TRAILER_LEN: usize = 32;
-/// Longest delta chain the writer produces. Bounds the entries one read
-/// decodes.
-pub const MAX_CHAIN: usize = 32;
-/// Longest chain a reader follows before calling the pack corrupt. Above
-/// [`MAX_CHAIN`] so packs from a writer with a higher cap still read.
-pub const READ_CHAIN_LIMIT: usize = 64;
+/// Longest delta chain the writer produces (ADR 0101; 32 before). Bounds
+/// the frames one read decodes: at most 64 with the whole frame at the
+/// chain's start, the most every reader since ADR 0029 follows
+/// (`READ_CHAIN_LIMIT` was 64), so older binaries read what this one
+/// writes.
+pub const MAX_CHAIN: usize = 63;
+/// Most frames a reader decodes for one object (the object and its bases)
+/// before calling the pack corrupt. Well above [`MAX_CHAIN`] + 1, so a later
+/// writer may raise its cap once no binary older than this one reads the
+/// store.
+pub const READ_CHAIN_LIMIT: usize = 256;
 /// zstd's default decoder window limit is 2^27; deltas need the base and the
 /// object inside one window, so larger pairs are stored whole.
 const MAX_DELTA_WINDOW_LOG: u32 = 27;
