@@ -102,6 +102,9 @@ pub struct SqliteMetaStore {
     pub(crate) has_dicts: bool,
     /// Whether the schema has `store_features` (ADR 0055).
     pub(crate) has_features: bool,
+    /// The `pool` label of statements in metrics: `data`, or `compact` for
+    /// the automatic compaction's own store (ADR 0101).
+    pub(crate) data_label: &'static str,
     /// Whether `changesets` has `stored_at` (ADR 0059).
     pub(crate) has_stored_at: bool,
     /// Whether the schema has the review request tables (ADR 0086).
@@ -323,7 +326,8 @@ impl SqliteMetaStore {
     /// `leep_meta_statements_total` (ADR 0081): one query, or one
     /// transaction, per call of this.
     fn db_for(&self, op: &'static str) -> &SqlitePool {
-        metrics::counter!("leep_meta_statements_total", "op" => op, "pool" => "data").increment(1);
+        metrics::counter!("leep_meta_statements_total", "op" => op, "pool" => self.data_label)
+            .increment(1);
         &self.pool
     }
 
@@ -345,6 +349,7 @@ impl SqliteMetaStore {
         Self {
             pool,
             codec: Codec::default(),
+            data_label: "data",
             has_dicts: migrations
                 .iter()
                 .any(|m| m.version >= crate::compact::DICTS_SCHEMA_VERSION),

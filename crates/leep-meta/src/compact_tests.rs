@@ -312,3 +312,321 @@ async fn older_schema_refuses_compaction() {
     assert!(err.to_string().contains("migrate"), "{err}");
     reads_back(&s, &history(MIN_TRAINING_ROWS, 1)).await;
 }
+
+// ---------------------------------------------------------------------------
+// Automatic compaction (ADR 0101)
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use crate::auto_compact::{tier_of, AutoCompactOptions, AutoCompactor, TIERS};
+
+/// A store whose `rewrite` fails after `rewrites` successful calls, and
+/// whose `insert_dict` fails while `fail_dict` is set: a compaction killed
+/// inside a pass, or between recording the feature and storing the
+/// dictionary.
+struct Faulty<S> {
+    inner: Arc<S>,
+    rewrites: AtomicU64,
+    fail_dict: std::sync::atomic::AtomicBool,
+}
+
+impl<S> Faulty<S> {
+    fn new(inner: Arc<S>) -> Self {
+        Faulty {
+            inner,
+            rewrites: AtomicU64::new(u64::MAX),
+            fail_dict: Default::default(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<S: Rows + Send + Sync> Rows for Faulty<S> {
+    fn codec(&self) -> &Codec {
+        self.inner.codec()
+    }
+    fn has_dicts(&self) -> bool {
+        self.inner.has_dicts()
+    }
+    async fn load_dicts(&self) -> leep_core::Result<()> {
+        self.inner.load_dicts().await
+    }
+    async fn page(&self, after: &[u8], limit: usize) -> leep_core::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.inner.page(after, limit).await
+    }
+    async fn max_dict(&self) -> leep_core::Result<i64> {
+        self.inner.max_dict().await
+    }
+    async fn insert_dict(&self, id: i64, data: &[u8]) -> leep_core::Result<bool> {
+        if self.fail_dict.load(Ordering::SeqCst) {
+            return Err(leep_core::Error::Storage(
+                "killed before the dictionary".into(),
+            ));
+        }
+        self.inner.insert_dict(id, data).await
+    }
+    async fn rewrite(&self, rows: &[(Vec<u8>, Vec<u8>)]) -> leep_core::Result<()> {
+        let left = self.rewrites.load(Ordering::SeqCst);
+        if left == 0 {
+            return Err(leep_core::Error::Storage("killed inside the pass".into()));
+        }
+        self.rewrites
+            .store(left.saturating_sub(1), Ordering::SeqCst);
+        self.inner.rewrite(rows).await
+    }
+    async fn count_upto(&self, limit: u64) -> leep_core::Result<u64> {
+        self.inner.count_upto(limit).await
+    }
+    async fn heads(
+        &self,
+        after: &[u8],
+        limit: usize,
+    ) -> leep_core::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.inner.heads(after, limit).await
+    }
+    async fn rows(&self, ids: &[Vec<u8>]) -> leep_core::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.inner.rows(ids).await
+    }
+    async fn dict_created_at(&self, id: i64) -> leep_core::Result<i64> {
+        self.inner.dict_created_at(id).await
+    }
+    async fn add_feature(&self, name: &str) -> leep_core::Result<()> {
+        self.inner.add_feature(name).await
+    }
+    async fn features(&self) -> leep_core::Result<Vec<String>> {
+        self.inner.features().await
+    }
+}
+
+/// [`history`] with messages made of phrases from a set of about 45 KB:
+/// more than a first-tier dictionary holds, less than a second-tier one,
+/// so the second gains over the first.
+fn varied_history(n: usize, seed: u64) -> Vec<Changeset> {
+    let mut rng = seed | 1;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let syll = [
+        "ka", "lo", "mi", "ne", "ru", "sa", "to", "vi", "xe", "zu", "pre", "dor",
+    ];
+    let mut phrase = || -> String {
+        let words: Vec<String> = (0..8)
+            .map(|_| {
+                (0..2 + next() % 2)
+                    .map(|_| syll[(next() % syll.len() as u64) as usize])
+                    .collect()
+            })
+            .collect();
+        words.join(" ")
+    };
+    let phrases: Vec<String> = (0..900).map(|_| phrase()).collect();
+    let mut out = history(n, seed as u32);
+    let mut parent: Option<ChangesetId> = None;
+    for cs in &mut out {
+        let mut pick = || phrases[(next() % phrases.len() as u64) as usize].clone();
+        let body: Vec<String> = (0..10).map(|_| pick()).collect();
+        cs.message = format!("{}\n\n{}\n", pick(), body.join(".\n"));
+        cs.parents = parent.into_iter().collect();
+        parent = Some(cs.id());
+    }
+    out
+}
+
+fn auto_opts() -> AutoCompactOptions {
+    AutoCompactOptions {
+        batch: 64,
+        pause: std::time::Duration::ZERO,
+        idle: 0,
+        settle: std::time::Duration::ZERO,
+        ..Default::default()
+    }
+}
+
+/// How many stored rows use dictionary `id`, and how many are plain.
+async fn on_dict(rows: &dyn Rows, id: u32) -> (usize, usize) {
+    let all = raw(rows).await;
+    let on = all.values().filter(|d| Codec::uses(d, id)).count();
+    let plain = all
+        .values()
+        .filter(|d| !d.starts_with(&codec::ZSTD_MAGIC))
+        .count();
+    (on, plain)
+}
+
+/// `a` writes as a server would; `own` is the compactor's own handle on the
+/// same database, as the server opens one.
+async fn check_auto_compaction<S: Rows + MetaStore + 'static>(a: &S, own: Arc<S>) {
+    let all = varied_history(MIN_TRAINING_ROWS + 200, 4);
+    let faulty = Arc::new(Faulty::new(own.clone()));
+    let mut auto = AutoCompactor::new(faulty.clone(), auto_opts());
+
+    // Below the first tier: nothing is trained, recorded or rewritten.
+    put_all(a, &all[..50]).await;
+    let r = auto.step().await.unwrap();
+    assert_eq!((r.rows, r.dictionary, r.passed), (50, 0, false));
+    assert_eq!(r.trained, None);
+    assert!(a.features().await.unwrap().is_empty());
+    assert_eq!(on_dict(a, 0).await, (0, 50));
+
+    // Killed between the feature and the dictionary: the feature alone is
+    // harmless, rows stay plain and readable, and the next step trains.
+    put_all(a, &all[50..150]).await;
+    faulty.fail_dict.store(true, Ordering::SeqCst);
+    assert!(auto.step().await.is_err());
+    assert_eq!(
+        a.features().await.unwrap(),
+        [crate::features::CHANGESET_ZSTD_DICT]
+    );
+    assert_eq!(a.max_dict().await.unwrap(), 0);
+    reads_back(a, &all[..150]).await;
+    faulty.fail_dict.store(false, Ordering::SeqCst);
+
+    // Killed inside the pass after one batch: the rows rewritten and the
+    // rest both read back, and the next step finishes.
+    faulty.rewrites.store(1, Ordering::SeqCst);
+    assert!(auto.step().await.is_err());
+    let (on, plain) = on_dict(a, 1).await;
+    assert!(on > 0 && plain > 0 && on + plain == 150, "{on} {plain}");
+    assert!(tier_of(own.codec().newest_len()) == Some(0));
+    reads_back(a, &all[..150]).await;
+    faulty.rewrites.store(u64::MAX, Ordering::SeqCst);
+    let r = auto.step().await.unwrap();
+    assert_eq!(r.trained, None, "the stored dictionary is reused");
+    assert!(r.passed && r.rewritten as usize == plain, "{r:?}");
+    assert_eq!(on_dict(a, 1).await, (150, 0));
+    assert!(r.bytes_after * 2 < r.bytes_before, "{r:?}");
+    // The handle the server writes with learns the dictionary on read.
+    reads_back(a, &all[..150]).await;
+
+    // Covered for good (the dictionary is old enough here): later steps do
+    // not pass again.
+    let r = auto.step().await.unwrap();
+    assert!(!r.passed, "{r:?}");
+
+    // A restarted compactor passes once, and compresses what a server that
+    // had not looked wrote plain.
+    a.load_dicts().await.unwrap();
+    put_all(a, &all[150..200]).await;
+    let mut auto = AutoCompactor::new(faulty.clone(), auto_opts());
+    let r = auto.step().await.unwrap();
+    assert!(r.passed, "{r:?}");
+    assert_eq!(on_dict(a, 1).await, (200, 0));
+
+    // At 1,000 changesets the second tier's dictionary replaces it, and
+    // every row moves to it.
+    put_all(a, &all[200..]).await;
+    let r = auto.step().await.unwrap();
+    let (id, bytes, samples) = r
+        .trained
+        .unwrap_or_else(|| panic!("a second-tier dictionary: {r:?}"));
+    assert_eq!(id, 2);
+    assert!(bytes as usize > TIERS[0].dict_bytes && bytes as usize <= TIERS[1].dict_bytes);
+    assert_eq!(samples, all.len() as u64);
+    assert_eq!(on_dict(a, 2).await, (all.len(), 0));
+    reads_back(a, &all).await;
+    // Nothing more until the next tier.
+    let r = auto.step().await.unwrap();
+    assert_eq!((r.trained, r.rejected, r.passed), (None, false, false));
+    assert_eq!(a.max_dict().await.unwrap(), 2);
+}
+
+/// A dictionary an operator trained (64 KiB by default) is in the last
+/// tier: the compactor never replaces it, and only compresses new rows.
+async fn check_operator_dictionary_is_kept<S: Rows + MetaStore + 'static>(a: &S, own: Arc<S>) {
+    let all = history(MIN_TRAINING_ROWS + 10, 6);
+    put_all(a, &all).await;
+    let r = compact(a, CompactOptions::default()).await;
+    assert_eq!((r.dictionary, r.trained), (1, true));
+    // Written by a handle that had not looked yet: plain.
+    let more = history(30, 8);
+    own.put_changeset(&more[0]).await.unwrap();
+    let mut auto = AutoCompactor::new(own.clone(), auto_opts());
+    let r = auto.step().await.unwrap();
+    assert_eq!(tier_of(own.codec().newest_len()), Some(TIERS.len() - 1));
+    assert_eq!((r.trained, r.dictionary, r.rewritten), (None, 1, 1));
+    assert_eq!(a.max_dict().await.unwrap(), 1);
+    assert_eq!(on_dict(a, 1).await, (all.len() + 1, 0));
+}
+
+/// A dictionary that would cost more than it saves (a few small rows) is
+/// not stored, and nothing is recorded.
+async fn check_useless_dictionary_is_not_stored<S: Rows + MetaStore + 'static>(a: &S, own: Arc<S>) {
+    // Small changesets of random-looking text: nothing repeats between rows,
+    // and all of them together are smaller than a dictionary.
+    let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let all: Vec<Changeset> = (0..150)
+        .map(|_| Changeset {
+            parents: vec![],
+            author: format!("{:016x}{:016x}", next(), next()),
+            timestamp: next() as i64 >> 2,
+            message: (0..2).map(|_| format!("{:016x}", next())).collect(),
+            changes: BTreeMap::new(),
+            extra: BTreeMap::new(),
+        })
+        .collect();
+    put_all(a, &all).await;
+    let mut auto = AutoCompactor::new(own.clone(), auto_opts());
+    let r = auto.step().await.unwrap();
+    assert!(
+        r.rejected && r.trained.is_none() && r.dictionary == 0,
+        "{r:?}"
+    );
+    assert_eq!(a.max_dict().await.unwrap(), 0);
+    assert!(a.features().await.unwrap().is_empty());
+    // Not tried again until the store has doubled.
+    let r = auto.step().await.unwrap();
+    assert!(!r.rejected, "{r:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_auto_compaction() {
+    for (name, check) in [("tiers", 0), ("operator", 1), ("useless", 2)] {
+        let dir = tempfile::tempdir().unwrap();
+        let url = snapshot::sqlite_file_url(&dir.path().join(format!("{name}.db")), true);
+        let a = SqliteMetaStore::connect(&url).await.unwrap();
+        let own = Arc::new(SqliteMetaStore::connect(&url).await.unwrap());
+        match check {
+            0 => check_auto_compaction(&a, own).await,
+            1 => check_operator_dictionary_is_kept(&a, own).await,
+            _ => check_useless_dictionary_is_not_stored(&a, own).await,
+        }
+    }
+    // A store a second connection cannot share is left alone.
+    let none = AutoCompactor::connect("sqlite::memory:", auto_opts())
+        .await
+        .unwrap();
+    assert!(none.is_none());
+    assert!(AutoCompactor::connect("mem://", auto_opts())
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_auto_compaction() {
+    for (name, check) in [("autotiers", 0), ("autooperator", 1), ("autouseless", 2)] {
+        let Some((a, schema)) = pg_store(name).await else {
+            return;
+        };
+        let own = Arc::new(
+            PostgresMetaStore::connect_with_schema(&schema.url, &schema.name)
+                .await
+                .unwrap(),
+        );
+        match check {
+            0 => check_auto_compaction(&a, own).await,
+            1 => check_operator_dictionary_is_kept(&a, own).await,
+            _ => check_useless_dictionary_is_not_stored(&a, own).await,
+        }
+    }
+}

@@ -102,6 +102,10 @@ pub async fn compact_changesets(
 
 type Pair = (Vec<u8>, Vec<u8>);
 
+/// Bytes of a row [`Rows::heads`] returns: a zstd frame header is at most
+/// 18 bytes.
+pub(crate) const HEAD_BYTES: i64 = 32;
+
 /// The statements a compaction needs from a backend.
 #[async_trait]
 pub(crate) trait Rows: Sync {
@@ -113,6 +117,15 @@ pub(crate) trait Rows: Sync {
     /// Insert a dictionary; `false` if another run took the id first.
     async fn insert_dict(&self, id: i64, data: &[u8]) -> Result<bool>;
     async fn rewrite(&self, rows: &[Pair]) -> Result<()>;
+    /// Changesets in the table, counting no further than `limit`.
+    async fn count_upto(&self, limit: u64) -> Result<u64>;
+    /// Like [`page`](Rows::page), with only the first [`HEAD_BYTES`] of
+    /// each row: enough for a frame header and its dictionary id.
+    async fn heads(&self, after: &[u8], limit: usize) -> Result<Vec<Pair>>;
+    /// The rows of `ids` that exist, in any order.
+    async fn rows(&self, ids: &[Vec<u8>]) -> Result<Vec<Pair>>;
+    /// When dictionary `id` was stored (unix seconds).
+    async fn dict_created_at(&self, id: i64) -> Result<i64>;
     /// Record a format feature (ADR 0055); idempotent.
     async fn add_feature(&self, name: &str) -> Result<()>;
     #[cfg(test)]
@@ -212,7 +225,7 @@ pub(crate) async fn run(
 
 /// Canonical bytes of up to `n` changesets, the first in id order, each
 /// checked against its id.
-async fn sample(store: &dyn Rows, n: usize, batch: usize) -> Result<Vec<Vec<u8>>> {
+pub(crate) async fn sample(store: &dyn Rows, n: usize, batch: usize) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     let mut after = Vec::new();
     while out.len() < n {
@@ -287,6 +300,48 @@ impl Rows for PostgresMetaStore {
         Ok(())
     }
 
+    async fn count_upto(&self, limit: u64) -> Result<u64> {
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM (SELECT 1 FROM changesets LIMIT $1) t")
+                .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+                .fetch_one(&self.pool)
+                .await
+                .map_err(storage)?;
+        Ok(n as u64)
+    }
+
+    async fn heads(&self, after: &[u8], limit: usize) -> Result<Vec<Pair>> {
+        let rows = sqlx::query(
+            "SELECT id, substring(data from 1 for $3) FROM changesets WHERE id > $1 \
+             ORDER BY id LIMIT $2",
+        )
+        .bind(after)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .bind(HEAD_BYTES as i32)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    async fn rows(&self, ids: &[Vec<u8>]) -> Result<Vec<Pair>> {
+        let ids: Vec<&[u8]> = ids.iter().map(Vec::as_slice).collect();
+        let rows = sqlx::query("SELECT id, data FROM changesets WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage)?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    async fn dict_created_at(&self, id: i64) -> Result<i64> {
+        sqlx::query_scalar("SELECT created_at FROM changeset_dicts WHERE id = $1")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(storage)
+    }
+
     async fn add_feature(&self, name: &str) -> Result<()> {
         PostgresMetaStore::add_feature(self, name).await
     }
@@ -353,6 +408,54 @@ impl Rows for SqliteMetaStore {
                 .map_err(storage)?;
         }
         tx.commit().await.map_err(storage)
+    }
+
+    async fn count_upto(&self, limit: u64) -> Result<u64> {
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM (SELECT 1 FROM changesets LIMIT ?) t")
+                .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+                .fetch_one(&self.pool)
+                .await
+                .map_err(storage)?;
+        Ok(n as u64)
+    }
+
+    async fn heads(&self, after: &[u8], limit: usize) -> Result<Vec<Pair>> {
+        let rows = sqlx::query(
+            "SELECT id, substr(data, 1, ?) FROM changesets WHERE id > ? ORDER BY id LIMIT ?",
+        )
+        .bind(HEAD_BYTES)
+        .bind(after)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    async fn rows(&self, ids: &[Vec<u8>]) -> Result<Vec<Pair>> {
+        let mut out = Vec::with_capacity(ids.len());
+        // Within SQLite's default limit of bound parameters.
+        for chunk in ids.chunks(500) {
+            let marks = vec!["?"; chunk.len()].join(",");
+            // Only placeholders are formatted in; the ids are bound.
+            let sql = format!("SELECT id, data FROM changesets WHERE id IN ({marks})");
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                q = q.bind(id.as_slice());
+            }
+            let rows = q.fetch_all(&self.pool).await.map_err(storage)?;
+            out.extend(rows.iter().map(|r| (r.get(0), r.get(1))));
+        }
+        Ok(out)
+    }
+
+    async fn dict_created_at(&self, id: i64) -> Result<i64> {
+        sqlx::query_scalar("SELECT created_at FROM changeset_dicts WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(storage)
     }
 
     async fn add_feature(&self, name: &str) -> Result<()> {

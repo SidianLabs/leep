@@ -479,6 +479,31 @@ struct Args {
     /// reach a quarter of the store (at least 64 MiB), whatever their age.
     #[arg(long, env = "LEEP_AUTO_REPACK_OBJECT_STORE_INTERVAL", default_value = "24h", value_parser = parse_grace)]
     auto_repack_object_store_interval: std::time::Duration,
+    /// Compress changeset rows with a dictionary trained on the store's own
+    /// history in the background (ADR 0101), as `leep-server
+    /// compact-changesets` does: a small dictionary from
+    /// --auto-compact-min-rows changesets, larger ones at 1,000 and 10,000.
+    /// Runs on a thread of its own at the lowest CPU priority, with one
+    /// database connection of its own; lands never wait for it. Once it
+    /// stores a dictionary, servers older than ADR 0053 cannot read the
+    /// store (servers since ADR 0055 refuse it at startup instead).
+    #[arg(long, env = "LEEP_AUTO_COMPACT", value_enum, default_value_t = Switch::On)]
+    auto_compact: Switch,
+    /// How often the automatic changeset compaction looks for work.
+    #[arg(long, env = "LEEP_AUTO_COMPACT_INTERVAL", default_value = "10m", value_parser = parse_interval)]
+    auto_compact_interval: std::time::Duration,
+    /// Fewest changesets the automatic compaction trains a dictionary on.
+    #[arg(long, env = "LEEP_AUTO_COMPACT_MIN_ROWS", default_value_t = leep_meta::auto_compact::TIERS[0].rows, value_parser = clap::value_parser!(u64).range(2..))]
+    auto_compact_min_rows: u64,
+    /// Changeset rows the automatic compaction reads and rewrites per
+    /// statement.
+    #[arg(long, env = "LEEP_AUTO_COMPACT_BATCH", default_value_t = 250, value_parser = clap::value_parser!(u64).range(1..=10_000))]
+    auto_compact_batch: u64,
+    /// Testing only: stop the automatic compaction for good after this many
+    /// batches of rows were rewritten, printing `leep-compact: paused at
+    /// batch N`, so a crash test can kill the server inside a pass.
+    #[arg(long, hide = true)]
+    debug_compact_pause_after: Option<u64>,
     /// Copy a land onto the ref without a three-way merge when nothing the
     /// ref changed since the land's base touches its paths (ADR 0066). The
     /// answers are the same either way; `off` replays every land in full,
@@ -2266,6 +2291,27 @@ async fn run() -> anyhow::Result<()> {
                 });
             }
         }
+    }
+    if args.auto_compact == Switch::On {
+        let schedule = leep_server::auto_compact::AutoCompactSchedule {
+            interval: args.auto_compact_interval,
+            step: leep_meta::auto_compact::AutoCompactOptions {
+                min_rows: args.auto_compact_min_rows,
+                batch: args.auto_compact_batch as usize,
+                debug_pause_after: args.debug_compact_pause_after,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        if leep_server::auto_compact::spawn(&args.meta, schedule).is_some() {
+            tracing::info!(
+                interval_s = args.auto_compact_interval.as_secs_f64(),
+                min_rows = args.auto_compact_min_rows,
+                "compressing changeset rows in the background (ADR 0101)"
+            );
+        }
+    } else {
+        tracing::info!("automatic changeset compaction off (--auto-compact off)");
     }
     let coordination = match args.land_coordination {
         Coordination::Off => None,
