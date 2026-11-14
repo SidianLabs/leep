@@ -61,10 +61,10 @@ struct Budgets {
 // both; database 8,669-9,830 (SQLite) and 13,380-13,789 (Postgres) a land;
 // all storage 5.8-6.2x (SQLite) and 9.2-9.5x (Postgres) git's 149 KB, most of
 // it the search and history indexes of a history this small; blob store
-// ratio 0.080. With blob rows as patches (ADR 0102, four runs on SQLite,
-// three on Postgres):
-// database 8,601-9,966 (SQLite) and 12,151-13,107 (Postgres) a land, all
-// storage 5.9-6.3x and 8.8-9.4x.
+// ratio 0.080. With blob rows as patches (ADR 0102, ten runs on each
+// backend): database 7,850-9,966 (SQLite) and 11,605-13,107 (Postgres) a
+// land, all storage 5.4-6.3x and 8.8-9.4x; the budgets keep 40% or more
+// over the worst run.
 const SQLITE: Budgets = Budgets {
     blob_per_land: 700,
     db_per_land: 14_000,
@@ -90,13 +90,15 @@ const SEARCH_BLOB_BYTES: &str =
      FROM derived WHERE kind IN ('blob-trigrams-v1', 'blob-trigrams-v2', \
      'blob-trigrams-keyframe-v2')";
 
-// Measured when set (ADR 0102, five runs): 1,420-1,579 bytes a land, 0.71-0.79
-// of the 2,001 whole rows would take (`blob-trigrams-v1`, 1.0 by definition).
-// A history this short edits each file about three times, so most of it is
-// the keyframes promoted from the import's whole rows; on corpus C it is a
-// tenth. Either budget fails if blob rows are written whole again.
-const SEARCH_BLOB_PER_LAND: u64 = 1_950;
-const SEARCH_BLOB_SHARE: f64 = 0.95;
+// Measured when set (ADR 0102, twenty runs on both backends): 1,267-1,579
+// bytes a land, 0.63-0.79 of the 2,001 whole rows would take
+// (`blob-trigrams-v1`, 1.0 by definition). A history this short edits each
+// file about three times, so most of it is the keyframes promoted from the
+// import's whole rows; on corpus C it is a tenth. The budgets keep 25% over
+// the worst run and still fail if blob rows are written whole again (2,001
+// bytes, a share of 1.0); the paced lands below count patches directly.
+const SEARCH_BLOB_PER_LAND: u64 = 1_990;
+const SEARCH_BLOB_SHARE: f64 = 0.99;
 /// One-file lands after the measurement, each waiting for the warmer: all
 /// but at most one must store their blob row as a patch.
 const PACED_LANDS: usize = 10;
