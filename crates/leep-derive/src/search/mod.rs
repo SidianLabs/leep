@@ -18,7 +18,7 @@ pub mod retention;
 pub mod trigram;
 
 #[cfg(test)]
-mod retention_tests;
+pub(crate) mod retention_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 

@@ -514,6 +514,10 @@ struct Args {
     /// start (default 10 minutes, plus up to 5 of jitter).
     #[arg(long, hide = true, value_parser = parse_interval)]
     debug_search_retention_first: Option<std::time::Duration>,
+    /// Testing only: the clock skew a search row retention pass allows
+    /// for in the ref log's times (default 5 minutes).
+    #[arg(long, hide = true, value_parser = parse_interval)]
+    debug_search_retention_skew: Option<std::time::Duration>,
     /// Testing only: stop the automatic compaction for good after this many
     /// batches of rows were rewritten, printing `leep-compact: paused at
     /// batch N`, so a crash test can kill the server inside a pass.
@@ -2338,6 +2342,9 @@ async fn run() -> anyhow::Result<()> {
                 },
                 ..Default::default()
             };
+            if let Some(skew) = args.debug_search_retention_skew {
+                schedule.pass.skew = skew;
+            }
             if let Some(first) = args.debug_search_retention_first {
                 schedule.first = first;
                 schedule.jitter = std::time::Duration::ZERO;

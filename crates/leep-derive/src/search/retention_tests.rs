@@ -8,7 +8,7 @@ use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
 use leep_core::{Changeset, ChangesetId, FileKind, Hash, MetaStore, Result};
 
 use super::index::{BLOB_KIND, RETIRED_BLOB_KIND};
-use super::retention::RetentionOptions;
+use super::retention::{RetentionOptions, RetentionState};
 use super::tests::{assert_closed, commit_files, Files};
 use super::SearchQuery;
 use crate::Repo;
@@ -20,10 +20,9 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
-/// A time past every ref log entry by more than the clock skew a pass
-/// allows for.
+/// A time past every ref log entry.
 fn later() -> i64 {
-    now() + 3 * 300
+    now() + 10
 }
 
 /// Retire everything no current head holds: a window of zero, at
@@ -33,6 +32,8 @@ fn at_once() -> RetentionOptions {
         keep: std::time::Duration::ZERO,
         batch: 7,
         rest_factor: 0,
+        skew: std::time::Duration::ZERO,
+        ..RetentionOptions::default()
     }
 }
 
@@ -111,7 +112,12 @@ async fn rows_no_head_holds_are_deleted_after_the_window() {
 
     // Inside the window: nothing goes.
     let kept = r
-        .retire_search_rows(&RetentionOptions::default(), now(), &ok)
+        .retire_search_rows(
+            &RetentionOptions::default(),
+            now(),
+            &mut RetentionState::default(),
+            &ok,
+        )
         .await
         .unwrap();
     assert_eq!(kept.deleted, 0);
@@ -123,7 +129,7 @@ async fn rows_no_head_holds_are_deleted_after_the_window() {
         ..at_once()
     };
     let report = r
-        .retire_search_rows(&opts, now() + 86_400, &ok)
+        .retire_search_rows(&opts, now() + 86_400, &mut RetentionState::default(), &ok)
         .await
         .unwrap();
     let live = blobs_of(&r, head).await;
@@ -166,7 +172,12 @@ async fn heads_inside_the_window_keep_their_rows() {
     r.meta().cas_ref("topic", None, Some(ids[2])).await.unwrap();
     r.meta().cas_ref("topic", Some(ids[2]), None).await.unwrap();
     let report = r
-        .retire_search_rows(&RetentionOptions::default(), now(), &ok)
+        .retire_search_rows(
+            &RetentionOptions::default(),
+            now(),
+            &mut RetentionState::default(),
+            &ok,
+        )
         .await
         .unwrap();
     assert_eq!(report.deleted, 0);
@@ -193,7 +204,7 @@ async fn retired_v1_rows_are_retired_too() {
             .await
             .unwrap();
     }
-    r.retire_search_rows(&at_once(), later(), &ok)
+    r.retire_search_rows(&at_once(), later(), &mut RetentionState::default(), &ok)
         .await
         .unwrap();
     let v1: HashSet<Hash> = r
@@ -218,7 +229,7 @@ async fn a_failed_check_deletes_nothing() {
     let before = blob_rows(&r).await;
     let lost = || Err(leep_core::Error::Conflict("lost the lease".into()));
     assert!(r
-        .retire_search_rows(&at_once(), later(), &lost)
+        .retire_search_rows(&at_once(), later(), &mut RetentionState::default(), &lost)
         .await
         .is_err());
     assert_eq!(blob_rows(&r).await, before);
@@ -376,7 +387,7 @@ async fn a_head_that_appears_during_a_pass_keeps_every_row() {
         assert_eq!(back.len(), 1);
         *racing.target.lock().unwrap() = Some(back[0]);
         let report = r
-            .retire_search_rows(&at_once(), later(), &ok)
+            .retire_search_rows(&at_once(), later(), &mut RetentionState::default(), &ok)
             .await
             .unwrap();
         assert_eq!(
@@ -396,4 +407,223 @@ async fn a_head_that_appears_during_a_pass_keeps_every_row() {
         r.derive_search(revert).await.unwrap();
         assert_closed(&r, r.root_tree(revert).await.unwrap(), "revert").await;
     }
+}
+
+/// A head whose directory filters are stored but whose blob rows are not
+/// (a branch from content older than the window, a rollback, a dropped
+/// kind) gets its rows back from the backfill, a bounded number a pass,
+/// and a pass with nothing new to do is skipped.
+#[tokio::test]
+async fn the_backfill_restores_rows_under_stored_filters() {
+    let r = Repo::new(
+        Arc::new(MemoryBlobStore::new()),
+        Arc::new(MemoryMetaStore::new()),
+    );
+    let ids = chain(&r, 3).await;
+    let head = *ids.last().unwrap();
+    let all: Vec<Hash> = blob_rows(&r).await.into_iter().collect();
+    r.meta()
+        .delete_derived_keys(&[BLOB_KIND], &all)
+        .await
+        .unwrap();
+    // The warmer finds the root's filter stored and derives nothing.
+    assert_eq!(r.derive_search(head).await.unwrap().blob_rows, 0);
+    assert!(blob_rows(&r).await.is_empty());
+    let opts = RetentionOptions {
+        backfill_rows: 8,
+        ..RetentionOptions::default()
+    };
+    let mut state = RetentionState::default();
+    let first = r
+        .retire_search_rows(&opts, now(), &mut state, &ok)
+        .await
+        .unwrap();
+    assert_eq!(first.backfilled, 8, "bounded: {first:?}");
+    let mut passes = 1;
+    loop {
+        let rep = r
+            .retire_search_rows(&opts, now(), &mut state, &ok)
+            .await
+            .unwrap();
+        passes += 1;
+        if rep.backfilled == 0 {
+            break;
+        }
+        assert!(passes < 10);
+    }
+    assert_eq!(blob_rows(&r).await, blobs_of(&r, head).await);
+    assert_closed(&r, r.root_tree(head).await.unwrap(), "backfilled").await;
+    let quiet = r
+        .retire_search_rows(&opts, now(), &mut state, &ok)
+        .await
+        .unwrap();
+    assert!(quiet.skipped, "{quiet:?}");
+    // A land wakes it up again.
+    let one = Files::from([("new.rs".to_string(), file("fn x() {}\n"))]);
+    let next = commit_files(&r, &[head], &one).await;
+    r.meta()
+        .cas_ref("main", Some(head), Some(next))
+        .await
+        .unwrap();
+    let woke = r
+        .retire_search_rows(&opts, now(), &mut state, &ok)
+        .await
+        .unwrap();
+    assert!(!woke.skipped);
+}
+
+/// One server at a time runs a pass: while another holds the lease, a
+/// pass deletes nothing and says so; once it is released, the pass runs.
+#[tokio::test]
+async fn a_pass_waits_for_the_lease_another_server_holds() {
+    let meta: Arc<dyn MetaStore> = Arc::new(MemoryMetaStore::new());
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let one = Repo::new(blobs.clone(), meta.clone());
+    let other = Repo::new(blobs, meta.clone());
+    chain(&one, 3).await;
+    let before = blob_rows(&one).await;
+    let held = crate::gc_lease::GcLease::acquire_key(
+        &meta,
+        super::retention::lease_key(),
+        "search-retention",
+    )
+    .await
+    .unwrap()
+    .expect("memory store has leases");
+    let mut state = RetentionState::default();
+    let busy = super::retention::retention_pass(&other, &at_once(), later(), &mut state)
+        .await
+        .unwrap();
+    assert!(busy.is_none());
+    assert_eq!(blob_rows(&one).await, before);
+    held.release().await.unwrap();
+    let ran = super::retention::retention_pass(&other, &at_once(), later(), &mut state)
+        .await
+        .unwrap()
+        .expect("the lease is free");
+    assert_eq!(ran.deleted, 3);
+}
+
+/// Dropping the retired kind copies its rows to `blob-trigrams-v2` first:
+/// a file unchanged since the upgrade has only its v1 row, and the
+/// directory filters above it stay, so nothing would derive it again.
+#[tokio::test]
+async fn dropping_v1_rows_copies_them_to_v2_first() {
+    let r = Repo::new(
+        Arc::new(MemoryBlobStore::new()),
+        Arc::new(MemoryMetaStore::new()),
+    );
+    let ids = chain(&r, 2).await;
+    let head = *ids.last().unwrap();
+    // What an older server left: v1 rows only.
+    let v2 = r
+        .meta()
+        .list_derived(BLOB_KIND, None, usize::MAX)
+        .await
+        .unwrap();
+    for (k, v) in &v2 {
+        r.meta()
+            .put_derived(RETIRED_BLOB_KIND, k, v.clone())
+            .await
+            .unwrap();
+    }
+    let keys: Vec<Hash> = v2.iter().map(|(k, _)| *k).collect();
+    r.meta()
+        .delete_derived_keys(&[BLOB_KIND], &keys)
+        .await
+        .unwrap();
+    let report =
+        crate::integrity::drop_kinds(&r, &[RETIRED_BLOB_KIND], false, &crate::integrity::Quiet)
+            .await
+            .unwrap();
+    assert_eq!(report.copied, v2.len() as u64);
+    assert_eq!(report.rows[RETIRED_BLOB_KIND], v2.len() as u64);
+    let after: Vec<(Hash, Bytes)> = r
+        .meta()
+        .list_derived(BLOB_KIND, None, usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(after, v2, "the same bytes, as v2 rows");
+    let fresh = Repo::new(r.blobs().clone(), r.meta().clone());
+    let got = fresh
+        .search(head, &SearchQuery::new("needle_2_3"))
+        .await
+        .unwrap();
+    assert_eq!(got.matches.len(), 20);
+    assert_eq!(got.stats.blob_rows_derived, 0);
+}
+
+/// One seed of the retention fault sweep (`fault_tests`): a pass over a
+/// store whose calls fail at random (deletes applied then failed among
+/// them), with a land of old content racing its deletes and, now and then,
+/// the server's state lost as by a restart, is retried until one pass
+/// completes; then every blob of the current head has a row. Returns the
+/// injected failures it met.
+pub(crate) async fn retention_fault_sweep(seed: u64) -> u64 {
+    use leep_testkit::{is_injected, Fault, FaultPlan, FaultyBlobStore, FaultyMetaStore, Op};
+    let meta = Arc::new(MemoryMetaStore::new());
+    let blobs: Arc<dyn leep_core::BlobStore> = Arc::new(MemoryBlobStore::new());
+    let racing = Arc::new(Racing {
+        inner: meta.clone(),
+        when: When::Deleting,
+        revert: Mutex::new(None),
+        target: Mutex::new(None),
+    });
+    let clean = Repo::new(blobs.clone(), racing.clone());
+    let ids = chain(&clean, 8).await;
+    let head = *ids.last().unwrap();
+    let mut old = Files::new();
+    for f in clean.list_files(ids[2], "").await.unwrap() {
+        let data = clean.blobs().get(&f.content).await.unwrap().unwrap();
+        old.insert(f.path.as_str().to_string(), (data.to_vec(), f.kind));
+    }
+    let revert = commit_files(&clean, &[head], &old).await;
+    let back: Vec<Hash> = blobs_of(&clean, revert)
+        .await
+        .difference(&blobs_of(&clean, head).await)
+        .copied()
+        .collect();
+    *racing.revert.lock().unwrap() = Some((head, revert));
+    *racing.target.lock().unwrap() = back.first().copied();
+
+    let plan = FaultPlan::new(seed);
+    plan.rate(Op::META, 60, Fault::Fail)
+        .rate(&[Op::PutDerived], 80, Fault::FailAfter)
+        .rate(&[Op::DeleteChangesets], 250, Fault::FailAfter)
+        .rate(&[Op::DeleteChangesets], 100, Fault::Fail)
+        .rate(Op::BLOB, 40, Fault::Fail);
+    let faulty = Repo::new(
+        Arc::new(FaultyBlobStore::new(blobs.clone(), plan.clone())),
+        Arc::new(FaultyMetaStore::new(racing.clone(), plan.clone())),
+    );
+    let mut rng = leep_testkit::Rng::new(seed ^ 0x0102);
+    let mut state = RetentionState::default();
+    let mut failures = 0;
+    loop {
+        match faulty
+            .retire_search_rows(&at_once(), later(), &mut state, &ok)
+            .await
+        {
+            Ok(_) => break,
+            Err(e) if is_injected(&e) => {
+                failures += 1;
+                if rng.below(4) == 0 {
+                    state = RetentionState::default();
+                }
+            }
+            Err(e) => panic!("seed {seed}: {e}"),
+        }
+        assert!(failures < 500, "seed {seed}: no pass completes");
+    }
+    let now_head = meta.get_ref("main").await.unwrap().unwrap();
+    let reader = Repo::new(blobs, meta.clone());
+    let stored = blob_rows(&reader).await;
+    for b in blobs_of(&reader, now_head).await {
+        assert!(
+            stored.contains(&b),
+            "seed {seed}: the head's blob {b} lost its row after {failures} failures"
+        );
+    }
+    assert_closed(&reader, reader.root_tree(now_head).await.unwrap(), "sweep").await;
+    failures
 }

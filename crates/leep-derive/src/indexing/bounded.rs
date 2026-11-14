@@ -657,8 +657,10 @@ impl Repo {
     /// search whose starting directory has no stored row yet (computing it
     /// fetches up to the budget from the blob store, so it is done only once
     /// the row exists or the wait is over), or a walk of which more than the
-    /// budget of what the last check found missing still lacks rows. Rows
-    /// are never removed by an indexer, so those are still missing now.
+    /// budget of what the last check found missing still lacks rows. Per
+    /// changeset rows are never removed by an indexer, so those are still
+    /// missing now; search blob rows may be (ADR 0102), which only makes
+    /// a search start look cheaper than it is.
     async fn still_over(
         &self,
         group: IndexGroup,

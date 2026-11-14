@@ -27,7 +27,7 @@ use crate::search::index::{same_keyframe, TreeRowMemo};
 use crate::search::trigram::SATURATED_ROW;
 use crate::search::{
     BLOB_KEYFRAME_KIND as BLOB_KEYFRAMES, BLOB_KIND as BLOB_TRIGRAMS,
-    KEYFRAME_KIND as TREE_KEYFRAMES, TREE_KIND as TREE_TRIGRAMS,
+    KEYFRAME_KIND as TREE_KEYFRAMES, RETIRED_BLOB_KIND, TREE_KIND as TREE_TRIGRAMS,
 };
 use crate::Repo;
 
@@ -294,6 +294,13 @@ impl Rederive<'_> {
         let meta = self.real.meta().clone();
         let mut scan = RowScan::new(kind, true, 0);
         while let Some(page) = scan.next(&*meta).await? {
+            let keyframes = if kind == BLOB_TRIGRAMS {
+                self.real
+                    .blob_keyframes_for(page.iter().map(|(_, v)| v.as_ref()))
+                    .await?
+            } else {
+                Default::default()
+            };
             for (key, value) in page {
                 self.report(kind).examined += 1;
                 let data = match self.real.blobs().get(&key).await {
@@ -313,7 +320,7 @@ impl Rederive<'_> {
                 let same = if kind == BLOB_KEYFRAMES {
                     expected == value
                 } else {
-                    expected == value || self.real.same_blob_set(&value, &expected).await?
+                    expected == value || Repo::same_blob_set_with(&value, &expected, &keyframes)
                 };
                 if same {
                     self.report(kind).matched += 1;
@@ -631,6 +638,11 @@ pub struct DropReport {
     pub dry_run: bool,
     /// Rows per kind deleted (or, in a dry run, stored).
     pub rows: BTreeMap<String, u64>,
+    /// Retired `blob-trigrams-v1` rows copied to `blob-trigrams-v2` before
+    /// they were dropped, for blobs without a v2 row (ADR 0102); a dry run
+    /// counts none.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub copied: u64,
     pub elapsed_secs: f64,
 }
 
@@ -661,6 +673,14 @@ pub async fn drop_kinds(
     let meta = repo.meta();
     let started = Instant::now();
     let mut deleted = vec![0u64; order.len()];
+    // A blob not changed since the upgrade has only its v1 row, and the
+    // directory filters above it stay, so nothing would derive it again:
+    // its bytes are a whole v2 row, so copy it first (ADR 0102).
+    let mut copied = 0;
+    if !dry_run && order.contains(&RETIRED_BLOB_KIND) && !order.contains(&BLOB_TRIGRAMS) {
+        progress.info("repair: copying blob-trigrams-v1 rows that have no blob-trigrams-v2 row");
+        copied = copy_retired_blob_rows(meta.as_ref()).await?;
+    }
     if dry_run {
         for (n, kind) in deleted.iter_mut().zip(&order) {
             *n = meta.count_derived(kind).await?;
@@ -695,8 +715,41 @@ pub async fn drop_kinds(
     Ok(DropReport {
         dry_run,
         rows,
+        copied,
         elapsed_secs: started.elapsed().as_secs_f64(),
     })
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// Copy every `blob-trigrams-v1` row whose blob has no `blob-trigrams-v2`
+/// row into `blob-trigrams-v2`: the same bytes are a whole v2 row. A v2 row
+/// written meanwhile by a derivation (a patch) may be overwritten by the
+/// whole row, which stands for the same set. Returns the rows copied.
+pub async fn copy_retired_blob_rows(meta: &dyn leep_core::MetaStore) -> Result<u64> {
+    let mut copied = 0;
+    let mut after = None;
+    loop {
+        let page = meta.list_derived(RETIRED_BLOB_KIND, after, PAGE).await?;
+        let Some((last, _)) = page.last() else {
+            return Ok(copied);
+        };
+        after = Some(*last);
+        let keys: Vec<Hash> = page.iter().map(|(k, _)| *k).collect();
+        let present = meta.get_derived_many(BLOB_TRIGRAMS, &keys).await?;
+        let rows: Vec<leep_core::DerivedRow> = page
+            .into_iter()
+            .zip(present)
+            .filter(|(_, v2)| v2.is_none())
+            .map(|((k, v), _)| leep_core::DerivedRow::new(BLOB_TRIGRAMS, k, v))
+            .collect();
+        if !rows.is_empty() {
+            meta.put_derived_many(&rows).await?;
+            copied += rows.len() as u64;
+        }
+    }
 }
 
 /// "repair: 1234567 rows deleted (41000/s), 120000 of 4000000 pages (3%), about 9m left"

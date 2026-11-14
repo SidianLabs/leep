@@ -65,6 +65,7 @@ const RETIRED_RECHECK: std::time::Duration = std::time::Duration::from_secs(600)
 #[derive(Default)]
 pub(crate) struct RetiredBlobRows {
     last: std::sync::Mutex<Option<(bool, std::time::Instant)>>,
+    counting: tokio::sync::Mutex<()>,
 }
 
 /// Where blob keyframes sit in the search filter cache.
@@ -203,9 +204,25 @@ impl Repo {
         let row = Bytes::from(self.fresh_blob_row(hash, size, c).await?.encode());
         if let Some(scan) = &c.scan {
             scan.put(false, hash, row.clone());
-            self.meta()
+            let kept = self
+                .meta()
                 .put_derived_if_absent(BLOB_KIND, &hash, row.clone())
                 .await?;
+            // The row there was not readable (a patch whose keyframe a
+            // drop deleted): replace it, or nothing ever would.
+            if kept != row {
+                if let Ok(StoredBlob::Patch(p)) = StoredBlob::parse(&kept) {
+                    if !self
+                        .blob_keyframe_rows(&[p.base])
+                        .await?
+                        .contains_key(&p.base)
+                    {
+                        self.meta()
+                            .put_derived(BLOB_KIND, &hash, row.clone())
+                            .await?;
+                    }
+                }
+            }
             return Ok(StoredBlobRow::whole(row));
         }
         self.meta()
@@ -219,7 +236,12 @@ impl Repo {
     /// The row of a blob that has none, computed. An oversize blob is
     /// recorded without being fetched; a bounded query counts the bytes it
     /// fetches against its budget and stops past it.
-    async fn fresh_blob_row(&self, hash: Hash, size: u64, c: &Counters) -> Result<BlobRow> {
+    pub(crate) async fn fresh_blob_row(
+        &self,
+        hash: Hash,
+        size: u64,
+        c: &Counters,
+    ) -> Result<BlobRow> {
         if size > MAX_INDEXED_BYTES {
             return Ok(BlobRow::NotIndexed(Skip::TooLarge));
         }
@@ -305,15 +327,17 @@ impl Repo {
     /// Whether `blob-trigrams-v1` rows may be stored: counted (whether any
     /// exist is exact) at most every [`RETIRED_RECHECK`].
     async fn may_have_retired_blob_rows(&self) -> Result<bool> {
-        let known = *self
-            .retired_blob_rows
-            .last
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some((any, at)) = known {
-            if at.elapsed() < RETIRED_RECHECK {
-                return Ok(any);
-            }
+        let fresh = |r: &RetiredBlobRows| {
+            let known = *r.last.lock().unwrap_or_else(|e| e.into_inner());
+            known.filter(|(_, at)| at.elapsed() < RETIRED_RECHECK)
+        };
+        if let Some((any, _)) = fresh(&self.retired_blob_rows) {
+            return Ok(any);
+        }
+        // One count at a time: the others wait for it and use its answer.
+        let _counting = self.retired_blob_rows.counting.lock().await;
+        if let Some((any, _)) = fresh(&self.retired_blob_rows) {
+            return Ok(any);
         }
         // A store that cannot count is read as if it had some.
         let any = match self.meta().estimate_derived(RETIRED_BLOB_KIND).await {
@@ -345,18 +369,20 @@ impl Repo {
     }
 
     /// Whole rows of blobs this derivation stored or found stored, read
-    /// again because they did not fit in memory.
-    async fn blob_rows_present(&self, keys: &[Hash], c: &Counters) -> Result<Vec<Bytes>> {
-        let rows = self.stored_blob_rows(keys, c).await?;
-        keys.iter()
-            .zip(rows)
-            .map(|(h, row)| match row {
-                Some(row) => row.whole_row(),
-                None => Err(Error::Storage(format!(
-                    "{BLOB_KIND} row of {h} vanished while deriving"
-                ))),
-            })
-            .collect()
+    /// again because they did not fit in memory. One deleted since (search
+    /// row retention, a `repair drop`, ADR 0102) is computed and stored
+    /// again.
+    async fn blob_rows_present(&self, files: &[(Hash, u64)], c: &Counters) -> Result<Vec<Bytes>> {
+        let keys: Vec<Hash> = files.iter().map(|f| f.0).collect();
+        let rows = self.stored_blob_rows(&keys, c).await?;
+        let mut out = Vec::with_capacity(files.len());
+        for (&(h, size), row) in files.iter().zip(rows) {
+            out.push(match row {
+                Some(row) => row.whole_row()?,
+                None => self.blob_row_stored(h, size, c).await?.whole_row()?,
+            });
+        }
+        Ok(out)
     }
 
     async fn frame(&self, hash: Hash) -> Result<Frame> {
@@ -960,10 +986,10 @@ impl Repo {
             }
             if !union.is_saturated() {
                 let mut absent = Vec::new();
-                for (h, _) in &dir.files {
-                    match blobs.get(h) {
+                for &(h, size) in &dir.files {
+                    match blobs.get(&h) {
                         Some(row) => add_blob_row(&mut union, row)?,
-                        None => absent.push(*h),
+                        None => absent.push((h, size)),
                     }
                 }
                 for row in self.blob_rows_present(&absent, c).await? {
@@ -1598,10 +1624,57 @@ impl Repo {
 }
 
 impl Repo {
+    /// The stored keyframe rows the patches among `rows` stand on, read
+    /// from the store (not the cache) in one batch: for checking a page of
+    /// rows (ADR 0102).
+    pub(crate) async fn blob_keyframes_for<'a>(
+        &self,
+        rows: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Result<HashMap<Hash, Bytes>> {
+        let mut bases: Vec<Hash> = rows
+            .into_iter()
+            .filter_map(|r| StoredBlob::parse(r).ok()?.base())
+            .collect();
+        bases.sort_unstable();
+        bases.dedup();
+        if bases.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let got = self
+            .meta()
+            .get_derived_many(BLOB_KEYFRAME_KIND, &bases)
+            .await?;
+        Ok(bases
+            .into_iter()
+            .zip(got)
+            .filter_map(|(h, v)| Some((h, v?)))
+            .collect())
+    }
+
+    /// Whether the stored blob row `row` stands for the same set as
+    /// `expected`, a whole row, its patch applied to the keyframe in
+    /// `keyframes` ([`Repo::blob_keyframes_for`]).
+    pub(crate) fn same_blob_set_with(
+        row: &[u8],
+        expected: &[u8],
+        keyframes: &HashMap<Hash, Bytes>,
+    ) -> bool {
+        let keyframe = match StoredBlob::parse(row) {
+            Ok(StoredBlob::Patch(p)) => keyframes.get(&p.base).map(|b| b.as_ref()),
+            Ok(_) => None,
+            Err(_) => return false,
+        };
+        matches!(
+            (BlobRow::of_stored(row, keyframe), BlobRow::decode(expected)),
+            (Ok(a), Ok(b)) if a == b
+        )
+    }
+
     /// Whether the stored blob row `row` stands for the same set as
     /// `expected`, a whole row: a patch is applied to its keyframe, read
     /// from the store (ADR 0102). A row that cannot be read that way does
     /// not match.
+    #[cfg(test)]
     pub(crate) async fn same_blob_set(&self, row: &[u8], expected: &[u8]) -> Result<bool> {
         let keyframe = match StoredBlob::parse(row) {
             Ok(StoredBlob::Patch(p)) => {

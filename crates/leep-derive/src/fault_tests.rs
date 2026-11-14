@@ -2868,3 +2868,17 @@ async fn search_rows_stay_closed_when_derivation_stops_anywhere() {
         "{failed} failed writes, {lost} lost leases, {chained} failed lands"
     );
 }
+
+/// Search row retention under faults (ADR 0102): a delete applied then
+/// failed, a restore that fails, a state lost as by a restart, with a land
+/// of old content racing the deletes, never leave the current head without
+/// a row once a pass completes: failed restores are retried first, and the
+/// backfill finds what a lost state forgot.
+#[tokio::test]
+async fn retention_keeps_every_head_row_under_faults() {
+    let mut failures = 0;
+    for seed in seeds() {
+        failures += crate::search::retention_tests::retention_fault_sweep(seed).await;
+    }
+    assert!(failures > 0, "no fault hit a pass");
+}

@@ -187,6 +187,10 @@ pub struct Repo {
     /// read of blobs without a `blob-trigrams-v2` row (ADR 0102), shared by
     /// clones.
     pub(crate) retired_blob_rows: Arc<crate::search::index::RetiredBlobRows>,
+    /// Whether tree nodes this handle reads go into the shared node cache:
+    /// off for walks over many revisions (search row retention, ADR 0102)
+    /// that would evict what queries use.
+    pub(crate) cache_nodes: bool,
     /// Blames running detached, by changeset and path, shared by clones
     /// (ADR 0078).
     pub(crate) blame_flights: Arc<crate::blame_flight::BlameFlights>,
@@ -704,6 +708,7 @@ impl Repo {
             search_pool: None,
             search_flights: Arc::default(),
             retired_blob_rows: Arc::default(),
+            cache_nodes: true,
             blame_flights: Arc::default(),
             blame_checkpoint_every: crate::blame::CHECKPOINT_EVERY,
             blame_tracker: Arc::default(),
@@ -1723,8 +1728,19 @@ impl Repo {
     /// Keep a node read from the store and checked against its hash. In a
     /// staged land batch the nodes the batch wrote are answered by its memo
     /// before the store is asked, so only stored nodes get here.
-    fn cache_node(&self, tree: Hash, node: &Arc<TreeNode>, encoded_len: usize) {
-        self.nodes.insert_sized(tree, node.clone(), 3 * encoded_len);
+    pub(crate) fn cache_node(&self, tree: Hash, node: &Arc<TreeNode>, encoded_len: usize) {
+        if self.cache_nodes {
+            self.nodes.insert_sized(tree, node.clone(), 3 * encoded_len);
+        }
+    }
+
+    /// This handle reading tree nodes from the shared node cache without
+    /// adding to it, for a walk over many revisions whose nodes no query
+    /// is about to read.
+    pub fn without_node_caching(&self) -> Repo {
+        let mut r = self.clone();
+        r.cache_nodes = false;
+        r
     }
 
     /// [`Repo::read_tree`] of each of `trees`, in order, with one

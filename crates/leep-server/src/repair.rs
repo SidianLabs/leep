@@ -462,6 +462,12 @@ fn print_drop(r: &DropReport) {
         if r.dry_run { " (dry run)" } else { "" },
         r.elapsed_secs
     );
+    if r.copied > 0 {
+        outln!(
+            "  copied {} blob-trigrams-v1 row(s) to blob-trigrams-v2 first (ADR 0102)",
+            r.copied
+        );
+    }
     for (kind, n) in &r.rows {
         outln!(
             "  {kind:<18} {n} row(s) {}",

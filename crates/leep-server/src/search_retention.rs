@@ -7,7 +7,9 @@
 use std::time::Duration;
 
 use leep_core::lane::{scope, Lane};
-use leep_derive::search::retention::{retention_pass, RetentionOptions, RetentionReport};
+use leep_derive::search::retention::{
+    retention_pass, RetentionOptions, RetentionReport, RetentionState,
+};
 use leep_derive::Repo;
 
 /// When passes run.
@@ -45,8 +47,11 @@ fn describe() {
         metrics::counter!("leep_search_retention_rows_total", "kind" => kind, "outcome" => "deleted")
             .increment(0);
     }
-    metrics::counter!("leep_search_retention_rows_total", "kind" => leep_derive::search::BLOB_KIND, "outcome" => "restored")
-        .increment(0);
+    for outcome in ["restored", "backfilled"] {
+        metrics::counter!("leep_search_retention_rows_total", "kind" => leep_derive::search::BLOB_KIND, "outcome" => outcome)
+            .increment(0);
+    }
+    metrics::counter!("leep_search_retention_passes_total", "outcome" => "skipped").increment(0);
 }
 
 /// `first` plus a jitter below `jitter`, or `interval` if shorter.
@@ -71,15 +76,21 @@ fn record(r: &Option<RetentionReport>, took: Duration) {
         metrics::counter!("leep_search_retention_passes_total", "outcome" => "busy").increment(1);
         return;
     };
+    if r.skipped {
+        metrics::counter!("leep_search_retention_passes_total", "outcome" => "skipped")
+            .increment(1);
+        return;
+    }
     metrics::counter!("leep_search_retention_passes_total", "outcome" => "ok").increment(1);
     metrics::histogram!("leep_search_retention_seconds").record(took.as_secs_f64());
-    if r.deleted > 0 || r.restored > 0 {
+    if r.deleted > 0 || r.restored > 0 || r.backfilled > 0 {
         tracing::info!(
             heads = r.heads,
             live_blobs = r.live_blobs,
             examined = r.examined,
             deleted = r.deleted,
             restored = r.restored,
+            backfilled = r.backfilled,
             seconds = took.as_secs_f64(),
             "retired search rows of blobs no head holds (ADR 0102)"
         );
@@ -91,9 +102,10 @@ pub fn spawn(repo: Repo, schedule: RetentionSchedule) -> tokio::task::JoinHandle
     describe();
     tokio::spawn(scope(Lane::Index, async move {
         tokio::time::sleep(first_delay(&schedule)).await;
+        let mut state = RetentionState::default();
         loop {
             let started = std::time::Instant::now();
-            match retention_pass(&repo, &schedule.pass, unix_now()).await {
+            match retention_pass(&repo, &schedule.pass, unix_now(), &mut state).await {
                 Ok(r) => record(&r, started.elapsed()),
                 Err(e) => {
                     metrics::counter!("leep_search_retention_passes_total", "outcome" => "error")
