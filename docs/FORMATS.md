@@ -702,7 +702,12 @@ magic; they compress them, with dictionary 0 if there is none.
 dictionary id as `u32` little-endian), trained with zstd's
 `ZDICT_trainFromBuffer` on canonical changeset bytes; its header id must
 equal the row's `id` (ids start at 1). Rows are added by `leep-server
-compact-changesets` and never changed or deleted. Rows in different stores
+compact-changesets` and by a server's automatic compaction (ADR 0101), and
+never changed or deleted. The automatic compaction trains 16 KiB, 60 KiB
+and 64 KiB dictionaries at 100, 1,000 and 10,000 changesets and tells them
+apart by size alone (at most 16 KiB, at most 60 KiB, larger); the size is
+not otherwise part of the format, and `created_at` tells it when a
+dictionary is old enough for every server to know it. Rows in different stores
 of the same history are different bytes; only the decoded changesets and
 their ids compare.
 
@@ -716,7 +721,7 @@ one. Names so far:
 
 | Name | Meaning | Recorded by |
 |---|---|---|
-| `changeset-zstd-dict` | `changesets.data` may be a zstd frame made with a `changeset_dicts` dictionary (ADR 0053) | `compact-changesets`, before it stores or uses a dictionary; migration 0004 for a store that already has one |
+| `changeset-zstd-dict` | `changesets.data` may be a zstd frame made with a `changeset_dicts` dictionary (ADR 0053) | `compact-changesets`, before it stores or uses a dictionary; a server's automatic compaction (ADR 0101), before the first dictionary it stores and before it rewrites rows; migration 0004 for a store that already has one |
 
 Binaries from before migration 0004 do not read the table.
 
@@ -1396,8 +1401,10 @@ A reader of either layout checks the magic, the trailing checksum, the order,
 that every frame lies inside the pack after its magic, that every base is
 another entry of the same pack at a lower offset (so chains end), and that
 the `.pack` has the recorded length and magic. It
-decodes a delta chain iteratively (the writer caps chains at 32; readers
-refuse more than 64) and checks every decoded object against its address:
+decodes a delta chain iteratively (the writer caps chains at 63 deltas
+over a whole frame, 32 before ADR 0101; readers refuse to decode more than
+256 frames for one object, 64 before ADR 0101, so every reader since ADR
+0029 reads what a writer of ADR 0101 writes) and checks every decoded object against its address:
 `BLAKE3(bytes)` for a file blob, `Hash::of_object("tree-v1", bytes)` for a
 tree node. Any failure is `Error::Storage`.
 

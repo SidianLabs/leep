@@ -151,6 +151,11 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_repack_auto_objects_total` | counter | none | Objects the automatic runs wrote. |
 | `leep_repack_auto_waiting_objects` / `leep_repack_auto_waiting_bytes` | gauge | none | Objects (and their bytes on disk) waiting to be compressed at the last check: loose, or in packs written whole. Falls to near zero after each run; climbing past the thresholds means runs are held or failing. |
 | `leep_blob_store_bytes` / `leep_blob_store_logical_bytes` / `leep_blob_store_size_ratio` | gauge | none | Bytes on disk of loose objects and searched packs, the bytes they decode to, and the ratio, at the last check. About 0.03–0.1 on source code once compressed; near 1 means nothing is being delta-compressed. |
+| `leep_changeset_compact_steps_total` | counter | `outcome` = `ok`, `error` | Steps of the automatic changeset compaction (ADR 0101). An error is logged and retried at the next interval. |
+| `leep_changeset_compact_trained_total` / `leep_changeset_compact_rejected_total` | counter | none | Dictionaries it trained and stored, and those it trained and dropped because they would not pay for themselves (tried again once the store doubles). |
+| `leep_changeset_compact_rows_total` / `leep_changeset_compact_saved_bytes_total` | counter | none | Changeset rows it rewrote, and the bytes that saved. |
+| `leep_changeset_compact_seconds` | histogram | none | Time of each step that passed over the rows. |
+| `leep_changeset_dictionary` | gauge | none | The id of the newest changeset dictionary (0: none yet). |
 | `leep_land_cancelled_total` | counter | none | Lands whose caller went away (timeout, disconnect) while queued, dropped before their batch replayed them. |
 | `leep_land_batch_deadline_total` | counter | none | Lands answered 409 because their batch was still retrying 60 s after its first attempt (`MAX_BATCH_LIFETIME`, ADR 0059) and gave up instead of moving the ref. Clients resend; keyed lands are then answered from their record. Anything but rare means a store so slow, or a ref so contended, that lands do not finish. |
 | `leep_land_answered_from_record_total` | counter | `original` = `present`, `missing` | Keyed lands answered from their land id record instead of landing again (ADR 0057). `missing`: the changeset was no longer stored (garbage collected, ADR 0059) and the record answered without reading it. |
@@ -1843,13 +1848,59 @@ new dictionary (for example after the history has changed character) and
 moves every row to it; the old dictionary stays. A store with fewer than
 1,000 changesets is left alone.
 
+**Automatic changeset compaction (ADR 0101).** Since ADR 0101 a server
+does the above by itself; `compact-changesets` stays for an operator who
+wants it now, or a `--retrain`. Two minutes after it starts, then every
+`--auto-compact-interval`, the server trains a dictionary once the store
+has 100 changesets (16 KiB), again at 1,000 (60 KiB) and at 10,000 (64 KiB,
+the size `compact-changesets` trains, on up to 50,000 of them), keeps one
+only if it saves at least 5% counting its own size, and compresses the rows
+not yet on the newest dictionary. It runs on a thread of its own at the
+lowest CPU priority, with one database connection outside the server's
+pools, and never delays a land. A dictionary you trained with
+`compact-changesets` (64 KiB by default) is never replaced; new rows are
+compressed with it.
+
+- **Before upgrading to this release**, make sure no binary older than ADR
+  0053 (`leep-server`, `leep-git`, tools) still uses the database: the new
+  servers store a dictionary on their own, and such binaries cannot read
+  compressed rows (nor check `store_features`). To upgrade from such a
+  version in a rolling fashion, start the new servers with
+  `--auto-compact off` (or `LEEP_AUTO_COMPACT=off`) until the rollout is
+  done. Binaries since ADR 0053 read every row, so going back to one of
+  them after a dictionary exists is safe.
+- On Postgres, a store that was never compacted (an import, say) has every
+  row rewritten by the first pass, as `compact-changesets` would; the old
+  row versions are free space in the table, reused by later changesets, so
+  the database is larger right after the pass (Leep's own history: 9.05 MB
+  instead of 8.06; after `VACUUM FULL changesets`, 7.58 MB; see step 4
+  above). To choose when
+  that happens, run `compact-changesets` yourself first, or keep
+  `--auto-compact off` until then.
+- Several servers on one store each run it; a dictionary id is taken once,
+  and rewriting a row twice is harmless. To keep the work on one host, pass
+  `--auto-compact off` on the others.
+
+| Flag / env | Default | What it does |
+|---|---|---|
+| `--auto-compact on\|off` / `LEEP_AUTO_COMPACT` | `on` | Compress changeset rows in the background. |
+| `--auto-compact-interval D` / `LEEP_AUTO_COMPACT_INTERVAL` | `10m` | How often it looks for work (the first time 2 minutes after start, or sooner with a shorter interval). A step counts changesets (up to 10,000), trains if a tier is due, and passes over the rows only after a new dictionary. |
+| `--auto-compact-min-rows N` / `LEEP_AUTO_COMPACT_MIN_ROWS` | `100` | Fewest changesets it trains a dictionary on. |
+| `--auto-compact-batch N` / `LEEP_AUTO_COMPACT_BATCH` | `250` | Rows read and rewritten per statement; after each batch it rests three times as long as the batch took (at least 10 ms). |
+
+The log lines "trained a changeset dictionary" and "compressed changeset
+rows" (level info) give each dictionary and each pass; the metrics are
+`leep_changeset_compact_*` and `leep_changeset_dictionary`
+([Metrics](#metrics)).
+
 ### Format features
 
 **Format features (schema v4, ADR 0055).** Migration 0004 adds a
 `store_features` table. Like 0003, it may be applied beside servers of the
 previous version. A row names a format the store's rows use that a server
-must understand. `compact-changesets` records `changeset-zstd-dict` before
-it stores a dictionary, and the migration records it for a store compacted
+must understand. `compact-changesets`, and a server's automatic compaction
+(ADR 0101), record `changeset-zstd-dict` before they store a dictionary
+(so a store that never gets one is never marked), and the migration records it for a store compacted
 before the table existed. A server, or any `leep-server` tool, that opens a
 store naming a feature it does not know refuses to start:
 
@@ -2601,6 +2652,14 @@ cron, and the loose-object count job, on servers with the defaults. Keep
 from packs, and writes the first new version at each path as a delta where
 the automatic runs (like any incremental repack) store it whole.
 
+**Delta chains** are capped at 63 (32 before ADR 0101), so a file edited
+hundreds of times stores a whole version every 64 instead of every 33. A
+read of the deepest version decodes 64 frames; on a filesystem store that
+is still one planned read of the chain, on an object store one ranged
+request (PERFORMANCE.md, "Delta chain cap"). Every release since ADR 0029
+reads such packs, so upgrading and going back need nothing; readers of this
+release accept chains of up to 255, for a later, higher cap.
+
 **Object stores** have no incremental repack yet: the server runs a full
 repack (it walks all history and rewrites every pack, through the bucket)
 once the bytes waiting reach a quarter of the store and at least 64 MiB,
@@ -3243,6 +3302,12 @@ LEEP_CRASH_SEED=12345 LEEP_CRASH_ROUNDS=9 cargo test -p leep-e2e --test crash
 | `LEEP_CRASH_SEED` | fixed | Seeds the kill delays, each agent's workload and which requests hang up. |
 | `LEEP_CRASH_AGENTS` | 6 | HTTP agents; two `leep` CLI agents always run too. |
 
+Besides the default rounds it runs them with the automatic delta repack
+and the automatic changeset compaction (ADR 0100, ADR 0101) set to run all
+the time, and kills a server inside a compaction pass at a fixed point
+(`--debug-compact-pause-after`): the store must verify with rows of both
+encodings, and the next server must finish the pass.
+
 After every kill the test also runs `leep-server verify` against the store, and at the end `verify --full --rehash` (see "Verify and repair"), so a kill that left a derived row wrong, or a ref log that no longer replays, fails the run.
 
 The seed fixes the plan, not the interleaving of threads and processes, so a
@@ -3364,6 +3429,7 @@ history's depth.
 | `--stall-timeout` | 120s | An agent with no progress for this long is a deadlock |
 | `--max-land-p99` | 5s | Client-side p99 of land requests |
 | `--max-rss-slope-mib-h`, `--rss-min-window-secs` | 64, 300 | Leak bound and the shortest window it is judged over |
+| `--max-blob-store-ratio`, `--auto-repack-max-age` | 0.9, 2m | Most `leep_blob_store_size_ratio` (blob store bytes over the bytes they hold) in the second half, after the server's first automatic delta repack (not judged if none ran): the repack keeps up (ADR 0101). The second is passed to the server so the repack runs within a short soak |
 | `--baseline`, `--max-regression` | none, 1.5 | Compare p99 and throughput with an earlier `report.json` |
 | `--no-fail-fast` | off | Keep running after the first violation |
 
