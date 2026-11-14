@@ -180,6 +180,32 @@ pub fn write(i: Inputs) -> Result<bool> {
             );
         }
     }
+    // The blob store stays compressed: the automatic delta repack keeps
+    // up with what lands write (ADR 0100, ADR 0101). Judged on samples of
+    // the second half taken after the server's first automatic run.
+    let ratios: Vec<f64> = tr
+        .samples
+        .iter()
+        .filter(|s| s.t >= run_secs / 2.0 && s.auto_repack_runs.is_some_and(|n| n >= 1.0))
+        .filter_map(|s| s.blob_store_ratio)
+        .collect();
+    match ratios.iter().copied().reduce(f64::max) {
+        Some(worst) => {
+            let pass = worst <= args.max_blob_store_ratio;
+            thresholds.push(json!({ "name": "blob store size ratio, second half (max)", "limit": args.max_blob_store_ratio, "value": round2(worst), "last": ratios.last().copied().map(round2), "pass": pass }));
+            if !pass {
+                push_violation(
+                    sh,
+                    "threshold_blob_store_ratio",
+                    format!(
+                        "the blob store held {worst:.2} bytes per logical byte in the second half (limit {})",
+                        args.max_blob_store_ratio
+                    ),
+                );
+            }
+        }
+        None => thresholds.push(json!({ "name": "blob store size ratio, second half (max)", "limit": args.max_blob_store_ratio, "value": null, "pass": true, "note": "no automatic delta repack ran in the second half" })),
+    }
     let acks = sh.ledger.len();
     let lands = acks as f64;
     if args.duration.as_secs() >= 10 && acks == 0 {

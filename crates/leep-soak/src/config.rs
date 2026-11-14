@@ -168,6 +168,19 @@ pub struct Args {
     /// shorter runs only report it.
     #[arg(long, default_value_t = 300)]
     pub rss_min_window_secs: u64,
+    /// Fail when `leep_blob_store_size_ratio` (blob store bytes over the
+    /// logical bytes they hold, ADR 0100) exceeds this in the second half of
+    /// the run, once the automatic delta repack has run (ADR 0101): it
+    /// stopped keeping up, or stopped compressing. Not judged if no
+    /// automatic repack ran. The soak's files are small and its tree nodes
+    /// mostly hashes, so it settles near 0.7; a store nothing compresses
+    /// reads about 1.
+    #[arg(long, default_value_t = 0.9)]
+    pub max_blob_store_ratio: f64,
+    /// The server's `--auto-repack-max-age`: shorter than its default (30
+    /// minutes) so the automatic delta repack runs within a soak.
+    #[arg(long, default_value = "2m")]
+    pub auto_repack_max_age: String,
     /// An earlier report.json to compare against.
     #[arg(long)]
     pub baseline: Option<PathBuf>,

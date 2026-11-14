@@ -30,6 +30,10 @@ pub struct Sample {
     pub lands_per_sec: f64,
     pub cache_hit_ratio: Option<f64>,
     pub in_flight: Option<f64>,
+    /// `leep_blob_store_size_ratio`: stored over logical bytes (ADR 0100).
+    pub blob_store_ratio: Option<f64>,
+    /// Automatic delta repacks this server incarnation has run.
+    pub auto_repack_runs: Option<f64>,
 }
 
 #[derive(Default)]
@@ -140,6 +144,8 @@ pub async fn sampler(cfg: SamplerCfg) {
 
         let mut hit_ratio = None;
         let mut in_flight = None;
+        let mut blob_store_ratio = None;
+        let mut auto_repack_runs = None;
         if let Some(url) = &cfg.metrics_url {
             if let Ok(r) = client.get(url).send().await {
                 if let Ok(text) = r.text().await {
@@ -162,6 +168,10 @@ pub async fn sampler(cfg: SamplerCfg) {
                         hit_ratio = Some(hits / (hits + miss));
                     }
                     in_flight = Some(sum_prefix(&m, "leep_requests_in_flight"));
+                    blob_store_ratio = m.get("leep_blob_store_size_ratio").copied();
+                    auto_repack_runs = m
+                        .get("leep_repack_auto_runs_total{outcome=\"ran\"}")
+                        .copied();
                 }
             }
         }
@@ -204,6 +214,8 @@ pub async fn sampler(cfg: SamplerCfg) {
             lands_per_sec: (lands - last_reqs.1) as f64 / dt,
             cache_hit_ratio: hit_ratio,
             in_flight,
+            blob_store_ratio,
+            auto_repack_runs,
         };
         last_reqs = (reqs, lands, t);
         cfg.trends.lock().unwrap().samples.push(sample);

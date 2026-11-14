@@ -297,6 +297,8 @@ async fn run(args: Args) -> Result<bool> {
         extra.extend([
             "--cache-bytes".to_string(),
             (args.cache_mib * 1024 * 1024).to_string(),
+            "--auto-repack-max-age".to_string(),
+            args.auto_repack_max_age.clone(),
         ]);
         if let Some(r) = args.rate_limit {
             extra.extend(["--rate-limit".to_string(), r.to_string()]);
