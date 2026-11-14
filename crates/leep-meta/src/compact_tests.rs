@@ -391,6 +391,12 @@ impl<S: Rows + Send + Sync> Rows for Faulty<S> {
     async fn dict_created_at(&self, id: i64) -> leep_core::Result<i64> {
         self.inner.dict_created_at(id).await
     }
+    async fn try_lock(&self) -> leep_core::Result<bool> {
+        self.inner.try_lock().await
+    }
+    async fn unlock(&self) -> leep_core::Result<()> {
+        self.inner.unlock().await
+    }
     async fn add_feature(&self, name: &str) -> leep_core::Result<()> {
         self.inner.add_feature(name).await
     }
@@ -428,7 +434,7 @@ fn varied_history(n: usize, seed: u64) -> Vec<Changeset> {
     let mut parent: Option<ChangesetId> = None;
     for cs in &mut out {
         let mut pick = || phrases[(next() % phrases.len() as u64) as usize].clone();
-        let body: Vec<String> = (0..10).map(|_| pick()).collect();
+        let body: Vec<String> = (0..20).map(|_| pick()).collect();
         cs.message = format!("{}\n\n{}\n", pick(), body.join(".\n"));
         cs.parents = parent.into_iter().collect();
         parent = Some(cs.id());
@@ -534,6 +540,29 @@ async fn check_auto_compaction<S: Rows + MetaStore + 'static>(a: &S, own: Arc<S>
     assert_eq!(a.max_dict().await.unwrap(), 2);
 }
 
+/// A row that does not decode is left as it is and counted; the other rows
+/// are compressed, and the next steps go on.
+async fn check_corrupt_row_is_skipped<S: Rows + MetaStore + 'static>(a: &S, own: Arc<S>) {
+    let all = varied_history(150, 9);
+    put_all(a, &all).await;
+    let bad = all[7].id().0.as_bytes().to_vec();
+    a.rewrite(&[(bad.clone(), b"not a changeset".to_vec())])
+        .await
+        .unwrap();
+    let mut auto = AutoCompactor::new(own.clone(), auto_opts());
+    let r = auto.step().await.unwrap();
+    assert!(r.trained.is_some(), "{r:?}");
+    assert_eq!((r.corrupt, r.rewritten), (1, 149), "{r:?}");
+    let rows = raw(a).await;
+    assert_eq!(rows[&bad], b"not a changeset");
+    assert_eq!(on_dict(a, 1).await, (149, 1));
+    // A restarted compactor's pass skips it again rather than failing.
+    let mut auto = AutoCompactor::new(own.clone(), auto_opts());
+    let r = auto.step().await.unwrap();
+    assert!(r.passed, "{r:?}");
+    assert_eq!((r.corrupt, r.rewritten), (1, 0), "{r:?}");
+}
+
 /// A dictionary an operator trained (64 KiB by default) is in the last
 /// tier: the compactor never replaces it, and only compresses new rows.
 async fn check_operator_dictionary_is_kept<S: Rows + MetaStore + 'static>(a: &S, own: Arc<S>) {
@@ -590,7 +619,12 @@ async fn check_useless_dictionary_is_not_stored<S: Rows + MetaStore + 'static>(a
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sqlite_auto_compaction() {
-    for (name, check) in [("tiers", 0), ("operator", 1), ("useless", 2)] {
+    for (name, check) in [
+        ("tiers", 0),
+        ("operator", 1),
+        ("useless", 2),
+        ("corrupt", 3),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let url = snapshot::sqlite_file_url(&dir.path().join(format!("{name}.db")), true);
         let a = SqliteMetaStore::connect(&url).await.unwrap();
@@ -598,7 +632,8 @@ async fn sqlite_auto_compaction() {
         match check {
             0 => check_auto_compaction(&a, own).await,
             1 => check_operator_dictionary_is_kept(&a, own).await,
-            _ => check_useless_dictionary_is_not_stored(&a, own).await,
+            2 => check_useless_dictionary_is_not_stored(&a, own).await,
+            _ => check_corrupt_row_is_skipped(&a, own).await,
         }
     }
     // A store a second connection cannot share is left alone.
@@ -614,7 +649,12 @@ async fn sqlite_auto_compaction() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_auto_compaction() {
-    for (name, check) in [("autotiers", 0), ("autooperator", 1), ("autouseless", 2)] {
+    for (name, check) in [
+        ("autotiers", 0),
+        ("autooperator", 1),
+        ("autouseless", 2),
+        ("autocorrupt", 3),
+    ] {
         let Some((a, schema)) = pg_store(name).await else {
             return;
         };
@@ -626,7 +666,32 @@ async fn postgres_auto_compaction() {
         match check {
             0 => check_auto_compaction(&a, own).await,
             1 => check_operator_dictionary_is_kept(&a, own).await,
-            _ => check_useless_dictionary_is_not_stored(&a, own).await,
+            2 => check_useless_dictionary_is_not_stored(&a, own).await,
+            _ => check_corrupt_row_is_skipped(&a, own).await,
         }
     }
+    // One step at a time per store: while another holds the lock, a step
+    // does nothing.
+    let Some((a, schema)) = pg_store("autolock").await else {
+        return;
+    };
+    put_all(&a, &varied_history(150, 3)).await;
+    let own = Arc::new(
+        PostgresMetaStore::connect_with_schema(&schema.url, &schema.name)
+            .await
+            .unwrap(),
+    );
+    let holder = Arc::new(
+        PostgresMetaStore::connect_with_schema(&schema.url, &schema.name)
+            .await
+            .unwrap(),
+    );
+    assert!(holder.try_lock().await.unwrap());
+    let mut auto = AutoCompactor::new(own.clone(), auto_opts());
+    let r = auto.step().await.unwrap();
+    assert!(r.busy && r.trained.is_none() && !r.passed, "{r:?}");
+    assert_eq!(a.max_dict().await.unwrap(), 0);
+    holder.unlock().await.unwrap();
+    let r = auto.step().await.unwrap();
+    assert!(!r.busy && r.trained.is_some(), "{r:?}");
 }

@@ -7,14 +7,18 @@
 //! - **Train when the store has outgrown its dictionary.** Dictionaries are
 //!   trained in tiers by changeset count ([`TIERS`]): 16 KiB from 100
 //!   changesets, 60 KiB at 1,000, and at 10,000 the 64 KiB that
-//!   `compact-changesets` trains, on at most 50,000 samples. A
+//!   `compact-changesets` trains, on at most 50,000 samples and 16 MiB. A
 //!   dictionary's tier is read back from its size, so the schedule needs no
-//!   state of its own, survives restarts and replicas, and leaves a
-//!   dictionary an operator trained (64 KiB by default) alone. A candidate
-//!   is stored only when the samples compressed with it, plus the
-//!   dictionary itself, are at least 5% smaller than with the dictionary in
-//!   force (or plain), so nothing is recorded for a store it would not
-//!   help.
+//!   state of its own and survives restarts and replicas. A dictionary
+//!   larger than 60 KiB (what `compact-changesets` trains by default on any
+//!   store large enough to fill it) is never replaced; a smaller one, from
+//!   either, counts as the tier its size falls in. A first dictionary is
+//!   stored only when the samples compressed with it, plus the dictionary
+//!   itself, are at least 5% smaller than plain, a replacement only when
+//!   12% smaller than with the dictionary in force (it rewrites every row),
+//!   so nothing is recorded for a store it would not help.
+//! - **One server at a time**: on Postgres a step runs under a session
+//!   advisory lock and is skipped while another server holds it.
 //! - **Compress the rows not yet on the newest dictionary**: once after
 //!   each new dictionary, and once more after every server has had time to
 //!   learn it (they look every minute), since servers write plain rows
@@ -26,7 +30,7 @@
 //! needs it, and each batch of rows is one statement whose rows decode to
 //! the same changesets before and after. A step killed anywhere leaves a
 //! store every reader of this version reads, and the next step redoes what
-//! is left.
+//! is left. A row that does not decode is left as it is and counted.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -70,9 +74,24 @@ pub const TIERS: [Tier; 3] = [
 /// Changesets a dictionary is trained on at most, as `compact-changesets`.
 pub const MAX_SAMPLES: usize = 50_000;
 
-/// A candidate must make the samples, plus its own bytes, at least this
-/// much smaller than the dictionary in force (or plain rows) to be stored.
+/// A first dictionary must make the samples, plus its own bytes, at least
+/// this much smaller than plain rows to be stored.
 const MIN_GAIN: f64 = 0.05;
+
+/// A dictionary that replaces one must gain this much over it: moving to
+/// it rewrites every row.
+const MIN_GAIN_REPLACE: f64 = 0.12;
+
+/// Bytes of canonical changesets a dictionary is trained on at most, so a
+/// step's training costs a few seconds of one core whatever the rows'
+/// size (Linux's rows average 2.3 KB: about 7,000 of them).
+pub const MAX_SAMPLE_BYTES: usize = 16 << 20;
+
+/// A tier whose candidate gained too little is tried again once the store
+/// has doubled, or after this long (the count stops at the last tier, so a
+/// large store never doubles by it). Kept in memory: a restart tries once
+/// more, bounded by [`MAX_SAMPLE_BYTES`].
+const REJECTED_RETRY: Duration = Duration::from_secs(24 * 3600);
 
 /// What a step does.
 #[derive(Debug, Clone)]
@@ -123,6 +142,11 @@ pub struct AutoCompactReport {
     pub rejected: bool,
     /// Whether the step ran a pass over the rows.
     pub passed: bool,
+    /// The step did nothing: another server held the compaction's lock.
+    pub busy: bool,
+    /// Rows the pass found that do not decode, left as they are (and out
+    /// of the samples).
+    pub corrupt: u64,
     /// Rows the pass rewrote, and their bytes before and after.
     pub rewritten: u64,
     pub bytes_before: u64,
@@ -139,8 +163,9 @@ pub struct AutoCompactor {
     /// passes once (one killed inside a pass leaves rows for the next).
     covered: Option<u32>,
     /// Tiers whose candidate gained too little, with the row count it was
-    /// trained at: tried again only once the store has doubled.
-    rejected: BTreeMap<usize, u64>,
+    /// trained at and when: tried again once the store has doubled, or
+    /// after [`REJECTED_RETRY`].
+    rejected: BTreeMap<usize, (u64, Instant)>,
 }
 
 impl AutoCompactor {
@@ -153,7 +178,13 @@ impl AutoCompactor {
             if url.contains(":memory:") || url.contains("mode=memory") {
                 return Ok(None);
             }
-            let mut s = SqliteMetaStore::connect_with(url, SchemaMode::RequireCurrent).await?;
+            let mut s = SqliteMetaStore::connect_with_max(
+                url,
+                SchemaMode::RequireCurrent,
+                crate::SQLITE_MIGRATIONS,
+                1,
+            )
+            .await?;
             s.data_label = "compact";
             Arc::new(s)
         } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
@@ -189,7 +220,25 @@ impl AutoCompactor {
 
     /// Train if the store has outgrown its dictionary, then compress the
     /// rows a pass has not covered yet.
+    /// Nothing happens while another server holds the compaction's lock
+    /// (`busy` in the report).
     pub async fn step(&mut self) -> Result<AutoCompactReport> {
+        let store = self.store.clone();
+        if !store.try_lock().await? {
+            return Ok(AutoCompactReport {
+                busy: true,
+                ..AutoCompactReport::default()
+            });
+        }
+        let r = self.step_locked().await;
+        // A failed unlock leaves the lock to the connection's end.
+        if let Err(e) = store.unlock().await {
+            tracing::debug!(error = %e, "releasing the compaction lock");
+        }
+        r
+    }
+
+    async fn step_locked(&mut self) -> Result<AutoCompactReport> {
         let store = self.store.clone();
         store.load_dicts().await?;
         let mut report = AutoCompactReport {
@@ -198,17 +247,16 @@ impl AutoCompactor {
         };
         if let Some(want) = wanted_tier(report.rows, self.opts.min_rows) {
             let have = tier_of(store.codec().newest_len());
-            let retry = self
-                .rejected
-                .get(&want)
-                .is_none_or(|at| report.rows >= at.saturating_mul(2));
+            let retry = self.rejected.get(&want).is_none_or(|(at, when)| {
+                report.rows >= at.saturating_mul(2) || when.elapsed() >= REJECTED_RETRY
+            });
             if have.is_none_or(|h| h < want) && retry {
                 match self.train(want, &mut report).await? {
                     true => {
                         self.rejected.remove(&want);
                     }
                     false => {
-                        self.rejected.insert(want, report.rows);
+                        self.rejected.insert(want, (report.rows, Instant::now()));
                     }
                 }
             }
@@ -244,11 +292,18 @@ impl AutoCompactor {
         } else {
             usize::try_from(report.rows).unwrap_or(MAX_SAMPLES)
         };
-        let samples = crate::compact::sample(store, n, self.opts.batch).await?;
+        // Rows that do not decode are left out (and logged); the pass
+        // counts them.
+        let (samples, _) =
+            crate::compact::sample_within(store, n, MAX_SAMPLE_BYTES, self.opts.batch, true)
+                .await?;
         if samples.len() < 2 {
             return Ok(false);
         }
-        let id = store.max_dict().await? + 1;
+        // The id after the newest this step started with: if another
+        // server stored a dictionary since, the key refuses this one.
+        let replacing = store.codec().newest_id() != 0;
+        let id = i64::from(store.codec().newest_id()) + 1;
         let id32 =
             u32::try_from(id).map_err(|_| Error::Storage("dictionary ids exhausted".into()))?;
         let dict = match codec::train(&samples, TIERS[tier].dict_bytes, id32) {
@@ -270,7 +325,12 @@ impl AutoCompactor {
         }
         // The dictionary is a row too, kept for good.
         then += dict.len() as u64;
-        if then as f64 > now as f64 * (1.0 - MIN_GAIN) {
+        let gain = if replacing {
+            MIN_GAIN_REPLACE
+        } else {
+            MIN_GAIN
+        };
+        if then as f64 > now as f64 * (1.0 - gain) {
             report.rejected = true;
             return Ok(false);
         }
@@ -330,7 +390,16 @@ impl AutoCompactor {
                 if Codec::uses(&data, target) {
                     continue;
                 }
-                let cs = store.codec().decode_checked(&to_id(&id)?, &data)?;
+                let cs = match to_id(&id).and_then(|i| store.codec().decode_checked(&i, &data)) {
+                    Ok(cs) => cs,
+                    // Left as it is, for `verify` and `repair`; the rest
+                    // goes on.
+                    Err(e) => {
+                        report.corrupt += 1;
+                        tracing::warn!(error = %e, "changeset row left uncompressed");
+                        continue;
+                    }
+                };
                 let new = store.codec().encode(&cs);
                 if new != data {
                     report.bytes_before += data.len() as u64;

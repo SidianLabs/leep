@@ -165,6 +165,9 @@ pub struct PostgresMetaStore {
     /// for the automatic compaction's own store (ADR 0101), so its
     /// statements and connection are not counted as the server's.
     pub(crate) data_label: &'static str,
+    /// The connection holding the automatic compaction's advisory lock
+    /// (ADR 0101), from the lease pool, while a step runs.
+    pub(crate) compact_lock: tokio::sync::Mutex<Option<sqlx::pool::PoolConnection<sqlx::Postgres>>>,
 }
 
 impl PostgresMetaStore {
@@ -886,6 +889,7 @@ impl PostgresMetaStore {
             coord,
             keeper: None,
             data_label: "data",
+            compact_lock: tokio::sync::Mutex::new(None),
         }
     }
 

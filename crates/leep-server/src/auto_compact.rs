@@ -14,10 +14,13 @@ use leep_meta::auto_compact::{AutoCompactOptions, AutoCompactReport, AutoCompact
 /// When the task runs.
 #[derive(Debug, Clone)]
 pub struct AutoCompactSchedule {
-    /// Time between two steps; the first runs after `first` (or this, if
-    /// shorter): a server that just started is busy warming its indexes.
+    /// Time between two steps; the first runs after `first` plus up to
+    /// `jitter` (or after `interval`, if shorter): a server that just
+    /// started is busy warming its indexes, and servers started together
+    /// should not all start at once.
     pub interval: Duration,
     pub first: Duration,
+    pub jitter: Duration,
     pub step: AutoCompactOptions,
 }
 
@@ -26,6 +29,7 @@ impl Default for AutoCompactSchedule {
         AutoCompactSchedule {
             interval: Duration::from_secs(600),
             first: Duration::from_secs(120),
+            jitter: Duration::from_secs(60),
             step: AutoCompactOptions::default(),
         }
     }
@@ -33,17 +37,23 @@ impl Default for AutoCompactSchedule {
 
 /// Register the task's metrics at zero, so dashboards see them at once.
 fn describe() {
-    for outcome in ["ok", "error"] {
+    for outcome in ["ok", "busy", "error"] {
         metrics::counter!("leep_changeset_compact_steps_total", "outcome" => outcome).increment(0);
     }
     metrics::counter!("leep_changeset_compact_trained_total").increment(0);
     metrics::counter!("leep_changeset_compact_rejected_total").increment(0);
     metrics::counter!("leep_changeset_compact_rows_total").increment(0);
+    metrics::counter!("leep_changeset_compact_corrupt_total").increment(0);
     metrics::counter!("leep_changeset_compact_saved_bytes_total").increment(0);
 }
 
 fn record(r: &AutoCompactReport, took: Duration) {
+    if r.busy {
+        metrics::counter!("leep_changeset_compact_steps_total", "outcome" => "busy").increment(1);
+        return;
+    }
     metrics::counter!("leep_changeset_compact_steps_total", "outcome" => "ok").increment(1);
+    metrics::counter!("leep_changeset_compact_corrupt_total").increment(r.corrupt);
     metrics::gauge!("leep_changeset_dictionary").set(f64::from(r.dictionary));
     if r.trained.is_some() {
         metrics::counter!("leep_changeset_compact_trained_total").increment(1);
@@ -96,8 +106,21 @@ pub fn spawn(url: &str, schedule: AutoCompactSchedule) -> Option<std::thread::Jo
     }
 }
 
+/// `first` plus a jitter below `jitter`, from the clock's nanoseconds and
+/// the process id (no generator needed for this), or `interval` if
+/// shorter.
+fn first_delay(s: &AutoCompactSchedule) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let seed = u64::from(nanos) ^ u64::from(std::process::id()).wrapping_mul(0x9E37_79B9);
+    let jitter_ms = s.jitter.as_millis() as u64;
+    let extra = if jitter_ms == 0 { 0 } else { seed % jitter_ms };
+    (s.first + Duration::from_millis(extra)).min(s.interval)
+}
+
 async fn run(url: String, schedule: AutoCompactSchedule) {
-    tokio::time::sleep(schedule.first.min(schedule.interval)).await;
+    tokio::time::sleep(first_delay(&schedule)).await;
     let mut compactor = None;
     loop {
         if compactor.is_none() {
