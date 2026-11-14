@@ -82,7 +82,7 @@ content-addressing and (b) the atomicity of `MetaStore::cas_ref`.
 | `leep-core` | Types, hashing, encoding, `BlobStore`/`MetaStore` traits and the `CoordStore` trait for coordination state (ADR 0095) (including listing and blob deletion for GC, a changeset id prefix lookup for short ids, listing and dropping derived rows by kind for repair, batched changeset and derived reads for history walks, derived reads of several kinds in one call, and batched derived writes and changeset-with-rows writes for changeset creation), in-memory stores, conformance tests, API types, pure rename detection | no other leep crate; no I/O, no async runtime |
 | `leep-store` | `BlobStore` backends: filesystem (loose objects plus delta-compressed packs, the repack writer, and packs written by `put_many`, ADR 0029, ADR 0039, ADR 0068), `object_store` (S3/MinIO; loose objects plus the same packs, ADR 0040), `CachedBlobStore`, `open_blob_store(url)`, and the incremental blob and pack copy backup and restore use (`sync`, `packfiles`, ADR 0026, ADR 0039) | core |
 | `leep-meta` | `MetaStore` backends: SQLite, Postgres (each also keeps the `CoordStore` of sessions, ADR 0095), `open_meta_store(url)`, the versioned schema migrator (`migrate`, ADR 0023), metadata snapshots and their import (`snapshot`, ADR 0026), and `analyze_meta_store`, which bulk loaders call to refresh Postgres planner statistics (ADR 0042) | core |
-| `leep-derive` | `Repo`: derived data framework and kinds (including the git ids of ADR 0090, through `leep-gitobj`), plus all operations, blob garbage collection (`gc`), the delta-base walks for `repack` (`pack_order`, full or loose-only) and store verification and repair (`integrity`) | core (traits only, never a concrete backend) |
+| `leep-derive` | `Repo`: derived data framework and kinds (including the git ids of ADR 0090, through `leep-gitobj`), plus all operations, blob garbage collection (`gc`), the delta-base walks for `repack` and the server's automatic delta repack (`pack_order`, full, loose-only or `pack_order_where`) and store verification and repair (`integrity`) | core (traits only, never a concrete backend) |
 | `leep-server` | HTTP server binary `leep-server`, and its offline subcommands (`gc`, `migrate`, `verify`, `repair`, `backup`, `restore`, `backup-verify`) | core, store, meta, derive |
 | `leep-cli` | Client binary `leep` | core only |
 | `leep-mcp` | MCP server binary `leep-mcp` for AI agents (stdio JSON-RPC; talks to `leep-server` over HTTP) | core and the `leep-cli` library (its HTTP client); never derive, store, meta or server outside dev-dependencies |
@@ -1233,6 +1233,25 @@ searched. Reads in the process stop
 searching the merged ("superseded") packs at once; they are deleted a fence
 later. Each repack step takes the repack lock, so merges follow each other
 while earlier cleanups wait out their fence.
+
+**The server writes deltas itself** (ADR 0100). Given a `Repo` to walk,
+the same background task counts, at most once a minute, the loose objects
+and the live objects of *whole packs* (packs whose index has no delta
+record: what `put_many` writes; each pack's details are read once and
+cached by id). Past 1,024 objects or 32 MiB, or after 30 minutes of
+waiting, it walks their history with `pack_order_where` (wanted: loose, or
+in a whole pack; the walk stops at changesets whose root tree is in a delta
+pack) and publishes a `RepackMode::Incremental` repack that merges the
+whole packs besides the geometric plan. Its write order
+(`write_order_redelta`) keeps the base of each frame that was a delta and
+gives each frame that was whole the walk's base, pulling chains of bases
+forward so every base precedes its deltas; so import and land frames are
+compressed once, to the size `--full` gives. With the delta repack on, the
+tiered merge plans whole packs and delta packs apart. An object store
+(no incremental repack) gets a `Full` repack at most once a day instead.
+The bytes all pending cleanups will free are capped at half the live store
+(64 MiB to 4 GiB); the fence is unchanged. The write path is unchanged:
+lands still write whole level-1 frames and never wait for the task.
 
 **Retirement is durable** (ADR 0080). Once a repack (background merge or
 `leep-server repack`) has published the pack that replaces others, it

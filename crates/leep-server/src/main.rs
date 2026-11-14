@@ -440,6 +440,37 @@ struct Args {
     /// zstd level of the packs the background repack writes, 1 to 22.
     #[arg(long, env = "LEEP_BACKGROUND_REPACK_LEVEL", default_value_t = 3, value_parser = clap::value_parser!(i32).range(1..=22))]
     background_repack_level: i32,
+    /// Compress new file versions and tree nodes against their previous
+    /// versions in the background (ADR 0100), as `leep-server repack` does,
+    /// once enough loose objects and whole-frame land or import packs wait.
+    /// Runs inside the background repack (off with it too), at the lowest
+    /// CPU priority; lands never wait for it. On an object store it runs a
+    /// full repack, at most once per --auto-repack-object-store-interval.
+    #[arg(long, env = "LEEP_AUTO_REPACK", value_enum, default_value_t = Switch::On)]
+    auto_repack: Switch,
+    /// The automatic repack runs once this many objects wait (loose, or in
+    /// packs written whole).
+    #[arg(long, env = "LEEP_AUTO_REPACK_OBJECTS", default_value_t = 1024, value_parser = clap::value_parser!(u64).range(1..))]
+    auto_repack_objects: u64,
+    /// The automatic repack runs once the objects waiting take this many
+    /// bytes on disk (K, M, G suffixes are powers of 1024).
+    #[arg(long, env = "LEEP_AUTO_REPACK_BYTES", default_value = "32M", value_parser = parse_byte_size)]
+    auto_repack_bytes: u64,
+    /// The automatic repack runs once any object has waited this long,
+    /// below both thresholds; `off` waits for a threshold.
+    #[arg(long, env = "LEEP_AUTO_REPACK_MAX_AGE", default_value = "30m", value_parser = parse_duration_or_off)]
+    auto_repack_max_age: DurationOrOff,
+    /// How often the automatic repack counts what waits (a listing of the
+    /// loose objects).
+    #[arg(long, env = "LEEP_AUTO_REPACK_CHECK_INTERVAL", default_value = "1m", value_parser = parse_interval)]
+    auto_repack_check_interval: std::time::Duration,
+    /// zstd level of the packs the automatic repack writes, 1 to 22.
+    #[arg(long, env = "LEEP_AUTO_REPACK_LEVEL", default_value_t = 9, value_parser = clap::value_parser!(i32).range(1..=22))]
+    auto_repack_level: i32,
+    /// On an object store, the shortest time between two automatic full
+    /// repacks.
+    #[arg(long, env = "LEEP_AUTO_REPACK_OBJECT_STORE_INTERVAL", default_value = "24h", value_parser = parse_grace)]
+    auto_repack_object_store_interval: std::time::Duration,
     /// Copy a land onto the ref without a three-way merge when nothing the
     /// ref changed since the land's base touches its paths (ADR 0066). The
     /// answers are the same either way; `off` replays every land in full,
@@ -1028,6 +1059,27 @@ fn parse_duration_or_off(s: &str) -> Result<DurationOrOff, String> {
             Err(e) => Err(e.to_string()),
         },
     }
+}
+
+/// A byte count: digits, optionally followed by K, M or G (powers of 1024,
+/// with or without a trailing `B` or `iB`).
+fn parse_byte_size(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    let digits = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    let (n, unit) = t.split_at(digits);
+    let n: u64 = n
+        .parse()
+        .map_err(|_| format!("expected a byte count like 32M, got {s:?}"))?;
+    let shift = match unit.trim().to_ascii_uppercase().as_str() {
+        "" | "B" => 0,
+        "K" | "KB" | "KIB" => 10,
+        "M" | "MB" | "MIB" => 20,
+        "G" | "GB" | "GIB" => 30,
+        _ => return Err(format!("expected a byte count like 32M, got {s:?}")),
+    };
+    n.checked_mul(1 << shift)
+        .filter(|&b| b > 0)
+        .ok_or_else(|| format!("expected a positive byte count, got {s:?}"))
 }
 
 /// `--background-repack-fence`, or by default the request timeout plus a
@@ -2141,11 +2193,26 @@ async fn run() -> anyhow::Result<()> {
     }
     match (args.background_repack, pack_store) {
         (Switch::On, Some(store)) => {
+            let auto = (args.auto_repack == Switch::On).then(|| {
+                leep_server::background_repack::AutoRepackOptions {
+                    objects: args.auto_repack_objects,
+                    bytes: args.auto_repack_bytes,
+                    max_age: match args.auto_repack_max_age {
+                        DurationOrOff::For(d) => Some(d),
+                        DurationOrOff::Off => None,
+                    },
+                    check_interval: args.auto_repack_check_interval,
+                    level: args.auto_repack_level,
+                    object_store_interval: args.auto_repack_object_store_interval,
+                    ..Default::default()
+                }
+            });
             let opts = leep_server::background_repack::BackgroundRepackOptions {
                 interval: args.background_repack_interval,
                 trigger_packs: args.background_repack_packs,
                 fence: background_repack_fence(&args),
                 level: args.background_repack_level,
+                auto,
                 ..Default::default()
             };
             if !args.request_timeout.is_zero() && opts.fence <= args.request_timeout {
@@ -2162,7 +2229,19 @@ async fn run() -> anyhow::Result<()> {
                 level = opts.level,
                 "merging packs in the background (ADR 0068)"
             );
-            leep_server::background_repack::BackgroundRepack::new(store, opts).spawn();
+            if let Some(a) = &opts.auto {
+                tracing::info!(
+                    objects = a.objects,
+                    bytes = a.bytes,
+                    max_age_s = a.max_age.map(|d| d.as_secs_f64()),
+                    check_interval_s = a.check_interval.as_secs_f64(),
+                    "compressing new objects against their previous versions in the background \
+                     (ADR 0100)"
+                );
+            }
+            let bg = leep_server::background_repack::BackgroundRepack::new(store, opts);
+            let walk = bg.walk_repo(repo.meta().clone());
+            bg.with_repo(walk).spawn();
         }
         (Switch::On, None) => {
             tracing::info!("background repack off: the blob store keeps no packs")
@@ -2896,6 +2975,39 @@ mod tests {
         ])
         .unwrap();
         assert!(a.land_packs == Switch::Off && a.background_repack == Switch::Off);
+    }
+
+    #[test]
+    fn auto_repack_flags() {
+        let a = parse_args(["leep-server"]).unwrap();
+        assert!(a.auto_repack == Switch::On);
+        assert_eq!(a.auto_repack_objects, 1024);
+        assert_eq!(a.auto_repack_bytes, 32 << 20);
+        assert!(matches!(
+            a.auto_repack_max_age,
+            DurationOrOff::For(d) if d == Duration::from_secs(1800)
+        ));
+        assert_eq!(a.auto_repack_check_interval, Duration::from_secs(60));
+        assert_eq!(a.auto_repack_level, 9);
+        let a = parse_args([
+            "leep-server",
+            "--auto-repack",
+            "off",
+            "--auto-repack-bytes",
+            "1G",
+            "--auto-repack-max-age",
+            "off",
+        ])
+        .unwrap();
+        assert!(a.auto_repack == Switch::Off);
+        assert_eq!(a.auto_repack_bytes, 1 << 30);
+        assert!(matches!(a.auto_repack_max_age, DurationOrOff::Off));
+        assert_eq!(parse_byte_size("512"), Ok(512));
+        assert_eq!(parse_byte_size("4KiB"), Ok(4096));
+        assert_eq!(parse_byte_size("2mb"), Ok(2 << 20));
+        assert!(parse_byte_size("0").is_err());
+        assert!(parse_byte_size("3T").is_err());
+        assert!(parse_byte_size("M").is_err());
     }
 
     #[test]
