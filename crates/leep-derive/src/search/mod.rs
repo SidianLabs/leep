@@ -1,8 +1,9 @@
 //! Server-side code search over a revision (ADR 0014).
 //!
-//! Derived kinds make it fast: `blob-trigrams-v1` (the trigram set of one
-//! text blob) and `tree-trigrams-v2` (a bloom filter over every trigram below
-//! a directory, stored whole, as a saturated marker, or as a patch on a
+//! Derived kinds make it fast: `blob-trigrams-v2` (the trigram set of one
+//! text blob, whole or as a patch on a `blob-trigrams-keyframe-v2` row; ADR
+//! 0102) and `tree-trigrams-v2` (a bloom filter over every trigram below a
+//! directory, stored whole, as a saturated marker, or as a patch on a
 //! `tree-trigrams-keyframe-v2` row; ADR 0094). A query names trigrams every
 //! matching file must contain
 //! ([`plan`]); directories and files that lack them are skipped unread, and
@@ -21,16 +22,17 @@ pub(crate) mod tests;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use globset::{GlobBuilder, GlobMatcher};
 use leep_core::api::{SearchMatch, SearchResponse, SearchStats};
 use leep_core::{ChangesetId, Error, FileKind, Hash, RepoPath, Result, TreeEntry, TreeNode};
 
-pub use index::{BLOB_KIND, KEYFRAME_KIND, RETIRED_TREE_KIND, TREE_KIND};
+pub use index::{
+    BLOB_KEYFRAME_KIND, BLOB_KIND, KEYFRAME_KIND, RETIRED_BLOB_KIND, RETIRED_TREE_KIND, TREE_KIND,
+};
 pub use trigram::MAX_INDEXED_BYTES;
 
-use index::{Counters, PoolSlot, StoredFilter, CONCURRENCY};
+use index::{Counters, PoolSlot, StoredBlobRow, StoredFilter, CONCURRENCY};
 use plan::Compiled;
 use trigram::is_text;
 
@@ -90,9 +92,10 @@ struct FileRef {
     content: Hash,
     kind: FileKind,
     size: u64,
-    /// The file's `blob-trigrams-v1` row, when the walk read it with its
-    /// directory's batch; `None` means look it up (and derive it if missing).
-    row: Option<Bytes>,
+    /// The file's `blob-trigrams-v2` row (and its keyframe), when the walk
+    /// read it with its directory's batch; `None` means look it up (and
+    /// derive it if missing).
+    row: Option<StoredBlobRow>,
     /// Lines up to this one were shown by an earlier page.
     skip_lines: u64,
 }
@@ -313,10 +316,9 @@ impl Opener {
                 .collect();
             let blob_keys: Vec<Hash> = wanted.iter().map(|&k| files[k].1.content).collect();
             let tree_keys: Vec<Hash> = dirs.iter().map(|d| d.2).collect();
-            let meta = self.repo.meta();
             let (tree_rows, blob_rows) = futures_util::try_join!(
                 self.repo.search_tree_rows(&tree_keys),
-                many(meta.as_ref(), BLOB_KIND, &blob_keys),
+                self.repo.stored_blob_rows(&blob_keys, &self.counters),
             )?;
             for (k, row) in wanted.into_iter().zip(blob_rows) {
                 files[k].1.row = row;
@@ -483,27 +485,6 @@ impl Walk {
 /// Whether `check_file` consults the file's index row.
 fn needs_row(f: &FileRef) -> bool {
     f.kind != FileKind::Symlink && f.size <= MAX_INDEXED_BYTES
-}
-
-/// `get_derived_many` that skips the round trip for no keys and checks the
-/// answer's length.
-async fn many(
-    meta: &dyn leep_core::MetaStore,
-    kind: &str,
-    keys: &[Hash],
-) -> Result<Vec<Option<Bytes>>> {
-    if keys.is_empty() {
-        return Ok(Vec::new());
-    }
-    let rows = meta.get_derived_many(kind, keys).await?;
-    if rows.len() != keys.len() {
-        return Err(Error::Storage(format!(
-            "get_derived_many answered {} of {} {kind} rows",
-            rows.len(),
-            keys.len()
-        )));
-    }
-    Ok(rows)
 }
 
 impl Repo {
@@ -788,9 +769,9 @@ impl Repo {
         if indexed {
             let row = match f.row.take() {
                 Some(row) => row,
-                None => self.blob_row_bytes(f.content, f.size, counters).await?,
+                None => self.blob_row_stored(f.content, f.size, counters).await?,
             };
-            match compiled.admits_blob(&row)? {
+            match compiled.admits_stored_blob(&row.row, row.keyframe.as_deref())? {
                 None => return Ok(Outcome::Skipped { fetched: 0 }),
                 Some(false) => return Ok(Outcome::Pruned),
                 Some(true) => {}

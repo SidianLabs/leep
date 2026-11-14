@@ -43,7 +43,8 @@ use crate::git_map::{self, GIT_BLOB_KIND, GIT_OID_KIND, GIT_STYLE_KIND, GIT_TREE
 use crate::path_history::{bad_chunk, chunk_fits, load_history_row, part_row, resolve_raw_row};
 use crate::search::index::{same_keyframe, TreeRowMemo};
 use crate::search::{
-    BLOB_KIND as BLOB_TRIGRAMS, KEYFRAME_KIND as TREE_KEYFRAMES, TREE_KIND as TREE_TRIGRAMS,
+    BLOB_KEYFRAME_KIND as BLOB_KEYFRAMES, BLOB_KIND as BLOB_TRIGRAMS,
+    KEYFRAME_KIND as TREE_KEYFRAMES, TREE_KIND as TREE_TRIGRAMS,
 };
 use crate::signatures::{storage_key as signature_storage_key, REBASED_ORIGIN_KIND};
 use crate::{reviews, Repo};
@@ -477,8 +478,12 @@ impl Verifier<'_> {
         self.visited_blobs = HashSet::new();
 
         self.phase("derived rows keyed by content");
+        // Keyframes first: a patch is checked against its keyframe.
+        if self.has(BLOB_KEYFRAMES) {
+            self.scan_blob_trigrams(BLOB_KEYFRAMES).await?;
+        }
         if self.has(BLOB_TRIGRAMS) {
-            self.scan_blob_trigrams().await?;
+            self.scan_blob_trigrams(BLOB_TRIGRAMS).await?;
         }
         // Keyframes first: a patch is checked against its keyframe.
         if self.has(TREE_KEYFRAMES) {
@@ -911,8 +916,10 @@ impl Verifier<'_> {
 
     // --- rows keyed by content ----------------------------------------------
 
-    async fn scan_blob_trigrams(&mut self) -> Result<()> {
-        let kind = BLOB_TRIGRAMS;
+    /// A blob row is checked for the set it stands for, not its bytes: a
+    /// patch depends on the predecessor it was derived after (ADR 0102). A
+    /// keyframe must be the whole row, byte for byte.
+    async fn scan_blob_trigrams(&mut self, kind: &'static str) -> Result<()> {
         let meta = self.repo.meta().clone();
         let mut scan = RowScan::new(kind, self.opts.full, self.opts.sample);
         while let Some(page) = scan.next(&*meta).await? {
@@ -952,7 +959,12 @@ impl Verifier<'_> {
                 }
                 self.kstats(kind).checked += 1;
                 let expected = expected_blob_row(&data);
-                if expected != value {
+                let same = if kind == BLOB_KEYFRAMES {
+                    expected == value && expected.first() == Some(&1)
+                } else {
+                    expected == value || self.repo.same_blob_set(&value, &expected).await?
+                };
+                if !same {
                     self.row_mismatch(kind, &key, &value, &expected);
                     self.shadow_meta.set(kind, &key, expected);
                 }

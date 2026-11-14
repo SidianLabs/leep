@@ -175,7 +175,7 @@ fn run_verify_workflow(stores: &Stores, work: &Path) {
         "skiplist",
         "root_tree",
         "history-tree-v4",
-        "blob-trigrams-v1",
+        "blob-trigrams-v2",
         "tree-trigrams-v2",
         "blame-v2",
     ] {
@@ -271,8 +271,8 @@ fn run_verify_workflow(stores: &Stores, work: &Path) {
     put_row(stores, "skiplist", &tip, bad);
     // The search index covers the tip's files, so the newest version of the file.
     let blob_row_key = Hash::of_blob(format!("{ONE}// more\n").as_bytes());
-    let good_blob_row = get_row(stores, "blob-trigrams-v1", &blob_row_key);
-    put_row(stores, "blob-trigrams-v1", &blob_row_key, vec![0, 2]);
+    let good_blob_row = get_row(stores, "blob-trigrams-v2", &blob_row_key);
+    put_row(stores, "blob-trigrams-v2", &blob_row_key, vec![0, 2]);
     let v = json(stores, &["verify", "--full"], 1);
     let mut kinds: Vec<&str> = with_code(&v, "derived_mismatch")
         .iter()
@@ -281,7 +281,7 @@ fn run_verify_workflow(stores: &Stores, work: &Path) {
     kinds.sort();
     assert_eq!(
         kinds,
-        ["blob-trigrams-v1", "generation", "skiplist"],
+        ["blob-trigrams-v2", "generation", "skiplist"],
         "{v:#}"
     );
 
@@ -294,7 +294,7 @@ fn run_verify_workflow(stores: &Stores, work: &Path) {
             "--dry-run",
             "--kind",
             "skiplist",
-            "blob-trigrams-v1",
+            "blob-trigrams-v2",
         ],
         1,
     );
@@ -308,7 +308,7 @@ fn run_verify_workflow(stores: &Stores, work: &Path) {
             "rederive",
             "--kind",
             "skiplist",
-            "blob-trigrams-v1",
+            "blob-trigrams-v2",
         ],
         0,
     );
@@ -316,13 +316,16 @@ fn run_verify_workflow(stores: &Stores, work: &Path) {
         fixed["kind_reports"]["skiplist"]["overwritten"], 1,
         "{fixed:#}"
     );
-    assert_eq!(fixed["kind_reports"]["blob-trigrams-v1"]["overwritten"], 1);
+    assert_eq!(fixed["kind_reports"]["blob-trigrams-v2"]["overwritten"], 1);
     // The generation was repaired as skiplist's dependency.
     assert_eq!(get_row(stores, "generation", &tip), good_gen);
     assert_eq!(get_row(stores, "skiplist", &tip), good_skip);
-    assert_eq!(
-        get_row(stores, "blob-trigrams-v1", &blob_row_key),
-        good_blob_row
+    // Rewritten whole: the row it replaced may have been a patch on the
+    // previous version's keyframe (ADR 0102), and verify below checks it.
+    let repaired = get_row(stores, "blob-trigrams-v2", &blob_row_key);
+    assert!(
+        repaired == good_blob_row || repaired.first() == Some(&1),
+        "{repaired:?}"
     );
     json(stores, &["verify", "--full", "--rehash"], 0);
     // Nothing is wrong now. (Rows no query ever asked for may be filled in: for

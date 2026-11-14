@@ -10,8 +10,8 @@ use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
 use leep_core::{Changeset, ChangesetId, Error, FileChange, FileKind, Hash, RepoPath, TreeEntry};
 use regex::RegexBuilder;
 
-use super::index::{BLOB_KIND, KEYFRAME_KIND, TREE_KIND};
-use super::trigram::{BlobRow, Bloom, TreeRow, MAX_INDEXED_BYTES};
+use super::index::{BLOB_KEYFRAME_KIND, BLOB_KIND, KEYFRAME_KIND, TREE_KIND};
+use super::trigram::{BlobRow, Bloom, StoredBlob, TreeRow, MAX_INDEXED_BYTES};
 use super::{SearchQuery, MAX_LIMIT};
 
 use crate::Repo;
@@ -1503,10 +1503,17 @@ pub(crate) async fn assert_closed(r: &Repo, root: Hash, what: &str) -> usize {
             );
         }
         for (f, _) in &files {
+            let row = stored(meta, BLOB_KIND, f).await;
             assert!(
-                stored(meta, BLOB_KIND, f).await.is_some(),
+                row.is_some(),
                 "{what}: filter of {h} stored without the row of file {f}"
             );
+            if let Some(base) = row.and_then(|r| StoredBlob::parse(&r).unwrap().base()) {
+                assert!(
+                    stored(meta, BLOB_KEYFRAME_KIND, &base).await.is_some(),
+                    "{what}: row of file {f} stored without its keyframe {base}"
+                );
+            }
         }
     }
     n
@@ -1534,7 +1541,10 @@ pub(crate) async fn assert_rows_recomputed(r: &Repo, root: Hash, what: &str) {
                 } else {
                     BlobRow::of(&r.blobs().get(&f).await.unwrap().unwrap())
                 };
-                assert_eq!(row, want.encode(), "{what}: row of blob {f}");
+                assert!(
+                    r.same_blob_set(&row, &want.encode()).await.unwrap(),
+                    "{what}: row of blob {f}"
+                );
             }
         }
     }
@@ -2237,4 +2247,205 @@ async fn a_patch_without_its_keyframe_is_derived_again() {
         assert_closed(&r, root, "rederived").await;
         assert_rows_recomputed(&r, root, "rederived").await;
     }
+}
+
+// ---- blob rows as patches on keyframes (ADR 0102) ----
+
+/// Rows of `kind`, by key.
+async fn all_rows(r: &Repo, kind: &str) -> BTreeMap<Hash, Bytes> {
+    r.meta()
+        .list_derived(kind, None, usize::MAX)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect()
+}
+
+/// A long chain of small edits to a few source-like files stores at least
+/// five times fewer blob row bytes than whole rows (`blob-trigrams-v1`)
+/// would, keyframes included, and search answers as a scan throughout.
+#[tokio::test]
+async fn blob_patches_store_five_times_fewer_bytes_than_whole_rows() {
+    let mut rng = Rng(0x0102);
+    let r = repo();
+    let mut files = Files::new();
+    let mut live: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for d in 0..4 {
+        for f in 0..6 {
+            let path = format!("src/d{d}/f{f}.rs");
+            let body = noisy_text(&mut rng, 6_000, 30);
+            live.insert(path.clone(), body.clone());
+            files.insert(path, (body, FileKind::Regular));
+        }
+    }
+    let mut head = commit_files(&r, &[], &files).await;
+    r.derive_search(head).await.unwrap();
+    let before = all_rows(&r, BLOB_KIND).await;
+    let busy = ["src/d0/f1.rs", "src/d2/f3.rs", "src/d3/f0.rs"];
+    for land in 0..120 {
+        let path = rng.pick(&busy).to_string();
+        let body = live.get_mut(&path).unwrap();
+        // A few words replaced, as a small edit does.
+        let at = rng.below(body.len() - 80);
+        let words = noisy_text(&mut rng, 12, 30);
+        body.splice(at..at + 12, words);
+        let one = Files::from([(path, (body.clone(), FileKind::Regular))]);
+        head = commit_files(&r, &[head], &one).await;
+        r.derive_search(head).await.unwrap();
+        if land % 30 == 29 {
+            let texts: Vec<String> = live
+                .values()
+                .filter_map(|b| String::from_utf8(b.clone()).ok())
+                .collect();
+            for _ in 0..6 {
+                let q = random_query(&mut rng, &texts);
+                let want = oracle(&r, head, &q).await;
+                let got = r.search(head, &q).await.unwrap();
+                assert_eq!((render(&got), got.truncated), want, "land {land} {q:?}");
+            }
+        }
+    }
+    let (after, keyframes) = (
+        all_rows(&r, BLOB_KIND).await,
+        all_rows(&r, BLOB_KEYFRAME_KIND).await,
+    );
+    let (mut stored_bytes, mut whole_bytes, mut patches) = (0, 0, 0);
+    for (h, row) in &after {
+        if before.contains_key(h) {
+            continue;
+        }
+        stored_bytes += row.len();
+        let data = r.blobs().get(h).await.unwrap().unwrap();
+        whole_bytes += BlobRow::of(&data).encode().len();
+        patches += matches!(StoredBlob::parse(row), Ok(StoredBlob::Patch(_))) as usize;
+    }
+    stored_bytes += keyframes.values().map(Bytes::len).sum::<usize>();
+    eprintln!(
+        "120 lands: whole rows {whole_bytes} bytes, patches and {} keyframes {stored_bytes} \
+         bytes ({:.1}x), {patches} patches",
+        keyframes.len(),
+        whole_bytes as f64 / stored_bytes as f64
+    );
+    assert!(patches >= 100, "{patches} patches");
+    assert!(
+        whole_bytes >= 5 * stored_bytes,
+        "{whole_bytes} bytes whole, {stored_bytes} patched"
+    );
+    let root = r.root_tree(head).await.unwrap();
+    assert_closed(&r, root, "chain").await;
+    assert_rows_recomputed(&r, root, "chain").await;
+}
+
+/// A store an older server indexed holds only `blob-trigrams-v1` rows. An
+/// upgraded server searches it without deriving a blob row, and the next
+/// land's row patches on the v1 row's set, promoted to a keyframe.
+#[tokio::test]
+async fn v1_blob_rows_are_read_until_v2_rows_exist() {
+    let mut files = Files::new();
+    for d in 0..3 {
+        for f in 0..4 {
+            let mut body = format!("fn d{d}_f{f}() {{ needle_{d}_{f} }}\n").repeat(40);
+            body.push_str(&format!("// tail {d} {f}\n"));
+            files.insert(
+                format!("src/d{d}/f{f}.rs"),
+                (body.into_bytes(), FileKind::Regular),
+            );
+        }
+    }
+    let r = repo();
+    let base = commit_files(&r, &[], &files).await;
+    r.derive_search(base).await.unwrap();
+    // What an older server leaves: the same whole rows under the old name.
+    for (h, row) in all_rows(&r, BLOB_KIND).await {
+        assert_eq!(row[0], 1, "an import's rows are whole");
+        r.meta()
+            .put_derived(super::index::RETIRED_BLOB_KIND, &h, row)
+            .await
+            .unwrap();
+        r.meta()
+            .delete_derived_keys(&[BLOB_KIND], &[h])
+            .await
+            .unwrap();
+    }
+    let fresh = Repo::new(r.blobs().clone(), r.meta().clone());
+    let got = fresh
+        .search(base, &SearchQuery::new("needle_1_2"))
+        .await
+        .unwrap();
+    assert_eq!(hits(&got).len(), 40);
+    assert_eq!(got.stats.blob_rows_derived, 0, "read the v1 rows");
+    assert!(all_rows(&r, BLOB_KIND).await.is_empty());
+
+    let path = "src/d1/f2.rs";
+    let old = files[path].0.clone();
+    let mut body = old.clone();
+    body.extend(b"fn added() { needle_new }\n");
+    let edit = Files::from([(path.to_string(), (body.clone(), FileKind::Regular))]);
+    let head = commit_files(&fresh, &[base], &edit).await;
+    fresh.derive_search(head).await.unwrap();
+    let new_row = stored(r.meta().as_ref(), BLOB_KIND, &Hash::of_blob(&body))
+        .await
+        .unwrap();
+    let StoredBlob::Patch(p) = StoredBlob::parse(&new_row).unwrap() else {
+        panic!("a patch on the v1 row's set")
+    };
+    assert_eq!(p.base, Hash::of_blob(&old));
+    assert!(stored(r.meta().as_ref(), BLOB_KEYFRAME_KIND, &p.base)
+        .await
+        .is_some());
+    let got = fresh
+        .search(head, &SearchQuery::new("needle_new"))
+        .await
+        .unwrap();
+    assert_eq!(hits(&got), [(path.to_string(), 42)]);
+    let root = r.root_tree(head).await.unwrap();
+    assert_rows_recomputed(&r, root, "upgraded").await;
+}
+
+/// A blob patch whose keyframe was deleted (a `repair drop` racing a
+/// derivation) counts as not stored: search derives the row again, whole.
+#[tokio::test]
+async fn a_blob_patch_without_its_keyframe_is_derived_again() {
+    let r = repo();
+    let path = "src/main.rs";
+    let v1 = "fn main() { let alpha = 1; }\n".repeat(30);
+    let base = commit_files(
+        &r,
+        &[],
+        &Files::from([(
+            path.to_string(),
+            (v1.clone().into_bytes(), FileKind::Regular),
+        )]),
+    )
+    .await;
+    r.derive_search(base).await.unwrap();
+    let v2 = format!("{v1}fn beta() {{ needle }}\n");
+    let head = commit_files(
+        &r,
+        &[base],
+        &Files::from([(
+            path.to_string(),
+            (v2.clone().into_bytes(), FileKind::Regular),
+        )]),
+    )
+    .await;
+    r.derive_search(head).await.unwrap();
+    let key = Hash::of_blob(v2.as_bytes());
+    let row = stored(r.meta().as_ref(), BLOB_KIND, &key).await.unwrap();
+    let base_blob = StoredBlob::parse(&row).unwrap().base().expect("a patch");
+    let gone = r
+        .meta()
+        .delete_derived_keys(&[BLOB_KEYFRAME_KIND], &[base_blob])
+        .await
+        .unwrap();
+    assert_eq!(gone, 1);
+    let fresh = Repo::new(r.blobs().clone(), r.meta().clone());
+    let got = fresh
+        .search(head, &SearchQuery::new("needle"))
+        .await
+        .unwrap();
+    assert_eq!(hits(&got), [(path.to_string(), 31)]);
+    assert_eq!(got.stats.blob_rows_derived, 1);
+    let row = stored(r.meta().as_ref(), BLOB_KIND, &key).await.unwrap();
+    assert_eq!(row[0], 1, "rewritten whole");
 }

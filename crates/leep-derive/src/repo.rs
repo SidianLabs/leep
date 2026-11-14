@@ -183,6 +183,10 @@ pub struct Repo {
     /// Search derivations in flight, by tree root, shared by clones (see
     /// `Repo::tree_row_unstored`).
     pub(crate) search_flights: Arc<crate::search::index::Flights>,
+    /// Whether `blob-trigrams-v1` rows may be stored, for the fallback
+    /// read of blobs without a `blob-trigrams-v2` row (ADR 0102), shared by
+    /// clones.
+    pub(crate) retired_blob_rows: Arc<crate::search::index::RetiredBlobRows>,
     /// Blames running detached, by changeset and path, shared by clones
     /// (ADR 0078).
     pub(crate) blame_flights: Arc<crate::blame_flight::BlameFlights>,
@@ -699,6 +703,7 @@ impl Repo {
             )),
             search_pool: None,
             search_flights: Arc::default(),
+            retired_blob_rows: Arc::default(),
             blame_flights: Arc::default(),
             blame_checkpoint_every: crate::blame::CHECKPOINT_EVERY,
             blame_tracker: Arc::default(),

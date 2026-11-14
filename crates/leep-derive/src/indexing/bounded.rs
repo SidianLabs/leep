@@ -497,7 +497,7 @@ impl Repo {
                         self.tree_row(*tree, &counters).await.map(|_| ())
                     }
                     Some(SearchStart::File { content, size }) => self
-                        .blob_row_bytes(*content, *size, &counters)
+                        .blob_row_stored(*content, *size, &counters)
                         .await
                         .map(|_| ()),
                 };
@@ -698,6 +698,10 @@ impl Repo {
                 *size > crate::search::MAX_INDEXED_BYTES
                     || meta
                         .get_derived(crate::search::BLOB_KIND, content)
+                        .await?
+                        .is_some()
+                    || meta
+                        .get_derived(crate::search::RETIRED_BLOB_KIND, content)
                         .await?
                         .is_some()
             }

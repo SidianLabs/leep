@@ -21,6 +21,24 @@ pub fn blob_trigrams_row(data: &[u8]) {
     let _ = junk.blob(data);
     let _ = junk.tree(data, None);
 
+    // A `blob-trigrams-v2` row (ADR 0102): a patch applies to a keyframe or
+    // is rejected, and probes as the set it stands for.
+    let keyframe = BlobRow::of(b"abcd keyframe text, xyz").encode();
+    let _ = junk.blob_stored(data, Some(&keyframe));
+    if let Ok(BlobRow::Trigrams(set)) = BlobRow::of_stored(data, Some(&keyframe)) {
+        assert!(set.windows(2).all(|w| w[0] < w[1]), "sorted and distinct");
+        let mut codes = probe_codes(&set);
+        codes.extend([0x61_6263, 0x78_797a]);
+        let probe = Probe::new(codes.clone());
+        let present = probe
+            .blob_stored(data, Some(&keyframe))
+            .expect("a row that applies must probe")
+            .expect("an indexed row");
+        for c in codes {
+            assert_eq!(present.has(c), set.binary_search(&c).is_ok(), "code {c:#x}");
+        }
+    }
+
     let Ok(row) = BlobRow::decode(data) else {
         return;
     };

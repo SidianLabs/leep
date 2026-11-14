@@ -26,7 +26,8 @@ use crate::derived::{DerivedKind, HistoryTree};
 use crate::search::index::{same_keyframe, TreeRowMemo};
 use crate::search::trigram::SATURATED_ROW;
 use crate::search::{
-    BLOB_KIND as BLOB_TRIGRAMS, KEYFRAME_KIND as TREE_KEYFRAMES, TREE_KIND as TREE_TRIGRAMS,
+    BLOB_KEYFRAME_KIND as BLOB_KEYFRAMES, BLOB_KIND as BLOB_TRIGRAMS,
+    KEYFRAME_KIND as TREE_KEYFRAMES, TREE_KIND as TREE_TRIGRAMS,
 };
 use crate::Repo;
 
@@ -219,9 +220,15 @@ pub async fn rederive(
         notes
             .push("--ref has no effect: rows keyed by content are always rederived in full".into());
     }
+    // Keyframes first, so the patches on a repaired keyframe are checked
+    // against it and rewritten whole if they no longer fit.
+    if all.contains(&BLOB_KEYFRAMES) {
+        r.progress.info("repair: blob-trigrams-keyframe-v2 rows");
+        r.blob_trigrams(BLOB_KEYFRAMES).await?;
+    }
     if all.contains(&BLOB_TRIGRAMS) {
-        r.progress.info("repair: blob-trigrams-v1 rows");
-        r.blob_trigrams().await?;
+        r.progress.info("repair: blob-trigrams-v2 rows");
+        r.blob_trigrams(BLOB_TRIGRAMS).await?;
     }
     // Keyframes first, so the patches on a repaired keyframe are checked
     // against it and rewritten whole if they no longer fit.
@@ -281,8 +288,9 @@ impl Rederive<'_> {
         }
     }
 
-    async fn blob_trigrams(&mut self) -> Result<()> {
-        let kind = BLOB_TRIGRAMS;
+    /// Rows are compared by the set they stand for (ADR 0102); one that
+    /// differs is rewritten whole. A keyframe must be the whole row.
+    async fn blob_trigrams(&mut self, kind: &'static str) -> Result<()> {
         let meta = self.real.meta().clone();
         let mut scan = RowScan::new(kind, true, 0);
         while let Some(page) = scan.next(&*meta).await? {
@@ -302,8 +310,31 @@ impl Rederive<'_> {
                     Err(e) => return Err(e),
                 };
                 let expected = expected_blob_row(&data);
-                if expected == value {
+                let same = if kind == BLOB_KEYFRAMES {
+                    expected == value
+                } else {
+                    expected == value || self.real.same_blob_set(&value, &expected).await?
+                };
+                if same {
                     self.report(kind).matched += 1;
+                } else if kind == BLOB_KEYFRAMES && expected.first() != Some(&1) {
+                    // A keyframe is always a whole set, and this blob is
+                    // not indexed: no keyframe is right. The patches on it
+                    // no longer match their blobs and are rewritten whole by
+                    // the blob-trigrams-v2 pass that follows.
+                    self.report(kind).failed += 1;
+                    self.log.push(
+                        Problem::new(
+                            "derived",
+                            "rederive_failed",
+                            format!(
+                                "the {kind} row of {key} is wrong, and its blob is not indexed, \
+                                 which a keyframe cannot hold; it was left as it is"
+                            ),
+                        )
+                        .kind(kind)
+                        .key(&key),
+                    );
                 } else {
                     self.report(kind).overwritten += 1;
                     self.write(kind, &key, expected).await?;

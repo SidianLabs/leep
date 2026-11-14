@@ -80,7 +80,8 @@ impl IndexGroup {
             }
             k if k == crate::search::TREE_KIND
                 || k == crate::search::KEYFRAME_KIND
-                || k == crate::search::BLOB_KIND =>
+                || k == crate::search::BLOB_KIND
+                || k == crate::search::BLOB_KEYFRAME_KIND =>
             {
                 Some(IndexGroup::Search)
             }

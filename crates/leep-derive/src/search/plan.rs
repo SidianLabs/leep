@@ -235,10 +235,11 @@ impl Gate {
     /// Whether a blob row admits the expression; `None` for a row that
     /// records "not indexed". Stops early like [`Gate::tree`], with the same
     /// caveat about a corrupt tail.
-    pub fn blob(&self, probe: &Probe, row: &[u8]) -> Result<Option<bool>> {
+    /// A `blob-trigrams-v2` patch needs its keyframe row (ADR 0102).
+    pub fn blob(&self, probe: &Probe, row: &[u8], keyframe: Option<&[u8]>) -> Result<Option<bool>> {
         let mut unindexed = false;
         let admitted = self.admits(|absent| {
-            unindexed = probe.blob_absent(row, absent)?.is_none();
+            unindexed = probe.blob_absent(row, keyframe, absent)?.is_none();
             Ok(())
         })?;
         Ok((!unindexed).then_some(admitted))
@@ -334,10 +335,16 @@ impl Compiled {
         self.gate.tree(&self.probe, row, keyframe)
     }
 
-    /// Whether a `blob-trigrams-v1` row admits the query, `None` if the row
+    /// Whether a whole blob row admits the query, `None` if the row
     /// records "not indexed"; see [`Gate::blob`].
     pub fn admits_blob(&self, row: &[u8]) -> Result<Option<bool>> {
-        self.gate.blob(&self.probe, row)
+        self.gate.blob(&self.probe, row, None)
+    }
+
+    /// [`Compiled::admits_blob`] of a `blob-trigrams-v2` row: a patch needs
+    /// its keyframe row (ADR 0102).
+    pub fn admits_stored_blob(&self, row: &[u8], keyframe: Option<&[u8]>) -> Result<Option<bool>> {
+        self.gate.blob(&self.probe, row, keyframe)
     }
 
     /// Append the matching lines of `text`, at most `max` of them.

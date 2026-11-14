@@ -35,7 +35,8 @@ pub enum Skip {
     TooLarge,
 }
 
-/// Value of `blob-trigrams-v1`.
+/// Value of `blob-trigrams-v1`, and the whole rows and keyframes of
+/// `blob-trigrams-v2` (ADR 0102), which use the same encoding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlobRow {
     NotIndexed(Skip),
@@ -150,6 +151,226 @@ impl BlobRow {
         } else {
             BlobRow::Trigrams(extract(data))
         }
+    }
+
+    /// The set a `blob-trigrams-v2` row stands for (ADR 0102): a whole or
+    /// "not indexed" row as it is, a patch applied to its keyframe row.
+    pub fn of_stored(row: &[u8], keyframe: Option<&[u8]>) -> Result<Self> {
+        match StoredBlob::parse(row)? {
+            StoredBlob::Whole(_) => BlobRow::decode(row),
+            StoredBlob::Patch(p) => Ok(BlobRow::Trigrams(p.apply(blob_keyframe_of(keyframe)?)?)),
+        }
+    }
+
+    /// Length of [`BlobRow::encode`]'s output, without building it.
+    pub fn encoded_len(&self) -> usize {
+        match self {
+            BlobRow::NotIndexed(_) => 2,
+            BlobRow::Trigrams(set) => 1 + deltas_len(set),
+        }
+    }
+
+    /// The `blob-trigrams-v2` row for this set given the keyframe its
+    /// predecessor's row is on (ADR 0102): a patch on `base` when it is
+    /// shorter than the whole row and the keyframe rule allows it; else
+    /// [`BlobEncoding::Keyframe`] (start a new keyframe) for a set large
+    /// enough to be worth one; else the whole row. Without a base, and for a
+    /// blob that is not indexed, the whole row.
+    pub fn encode_after(&self, base: Option<(&Hash, &[u32])>) -> BlobEncoding {
+        let (BlobRow::Trigrams(set), Some((key, bits))) = (self, base) else {
+            return BlobEncoding::Whole;
+        };
+        let whole = self.encoded_len();
+        let patch = blob_patch_on(set, key, bits);
+        if patch.len() < whole && patch.len() * patch.len() <= BLOB_PATCH_BUDGET * whole {
+            return BlobEncoding::Patch(patch);
+        }
+        if whole >= BLOB_KEYFRAME_MIN {
+            BlobEncoding::Keyframe
+        } else {
+            BlobEncoding::Whole
+        }
+    }
+}
+
+/// Tag of a `blob-trigrams-v2` patch row; tags 0 and 1 are `blob-trigrams-v1`'s.
+const BLOB_PATCH: u8 = 2;
+
+/// The blob keyframe rule (ADR 0102), ADR 0094's with its own constant: a
+/// patch of `p` bytes replaces a whole row of `w` bytes while `p * p <=
+/// BLOB_PATCH_BUDGET * w`. The bytes per version are least when the
+/// constant is twice the bytes a patch grows by per version (ADR 0037).
+/// Replayed over Leep's own history (whole commits, `d` in the hundreds) the
+/// best constant is 256; over small single-file edits (`d` about 15) it is
+/// 32. 128 is within 14% of the best of both.
+pub const BLOB_PATCH_BUDGET: usize = 128;
+
+/// Whole rows shorter than this never start a keyframe: the keyframe and
+/// the empty patch on it would cost more than writing the row whole again.
+pub const BLOB_KEYFRAME_MIN: usize = 128;
+
+/// How [`BlobRow::encode_after`] says to store a set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlobEncoding {
+    /// [`BlobRow::encode`].
+    Whole,
+    /// A patch on the base it was given.
+    Patch(Vec<u8>),
+    /// A new keyframe: the whole row as the blob's
+    /// `blob-trigrams-keyframe-v2` row, and the empty patch on it
+    /// ([`blob_patch_on`] of the set on itself) as its `blob-trigrams-v2` row.
+    Keyframe,
+}
+
+/// `set` as a patch on `base`, the keyframe of the blob `key`: the byte
+/// length of the added codes' list, the codes in `set` and not in `base`,
+/// then those in `base` and not in `set`, each list strictly increasing as
+/// delta varints.
+pub fn blob_patch_on(set: &[u32], key: &Hash, base: &[u32]) -> Vec<u8> {
+    let (mut adds, mut removes) = (Vec::new(), Vec::new());
+    let (mut i, mut j) = (0, 0);
+    loop {
+        match (set.get(i), base.get(j)) {
+            (Some(a), Some(b)) if a == b => {
+                i += 1;
+                j += 1;
+            }
+            (Some(&a), Some(&b)) if a < b => {
+                adds.push(a);
+                i += 1;
+            }
+            (Some(&a), None) => {
+                adds.push(a);
+                i += 1;
+            }
+            (_, Some(&b)) => {
+                removes.push(b);
+                j += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    let mut list = Vec::new();
+    put_deltas(&mut list, adds.into_iter());
+    let mut out = Vec::with_capacity(1 + 32 + 5 + list.len() + 2 * removes.len());
+    out.push(BLOB_PATCH);
+    out.extend_from_slice(key.as_bytes());
+    put_varint(&mut out, list.len() as u32);
+    out.extend_from_slice(&list);
+    put_deltas(&mut out, removes.into_iter());
+    out
+}
+
+fn deltas_len(sorted: &[u32]) -> usize {
+    let mut prev = 0u32;
+    sorted
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            let n = varint_len(if i == 0 { v } else { v - prev });
+            prev = v;
+            n
+        })
+        .sum()
+}
+
+/// A `blob-trigrams-v2` row by tag.
+#[derive(Clone, Copy, Debug)]
+pub enum StoredBlob<'a> {
+    /// A `blob-trigrams-v1` encoding, "not indexed" or the whole set.
+    Whole(&'a [u8]),
+    Patch(BlobPatch<'a>),
+}
+
+/// Codes added to and removed from a blob keyframe, as encoded.
+#[derive(Clone, Copy, Debug)]
+pub struct BlobPatch<'a> {
+    /// The blob whose `blob-trigrams-keyframe-v2` row this patches.
+    pub base: Hash,
+    adds: &'a [u8],
+    removes: &'a [u8],
+}
+
+impl<'a> StoredBlob<'a> {
+    /// Splits a row by tag, without validating a whole row's values.
+    pub fn parse(b: &'a [u8]) -> Result<Self> {
+        match b {
+            [NOT_INDEXED | INDEXED, ..] => Ok(StoredBlob::Whole(b)),
+            [BLOB_PATCH, rest @ ..] if rest.len() >= 33 => {
+                let base = Hash(rest[..32].try_into().expect("32 bytes"));
+                let mut at = 32;
+                let n = get_varint(rest, &mut at)? as usize;
+                let lists = &rest[at..];
+                if n > lists.len() {
+                    return Err(Error::Encoding("blob-trigrams patch list overruns".into()));
+                }
+                Ok(StoredBlob::Patch(BlobPatch {
+                    base,
+                    adds: &lists[..n],
+                    removes: &lists[n..],
+                }))
+            }
+            _ => Err(Error::Encoding("bad blob-trigrams row".into())),
+        }
+    }
+
+    /// The keyframe a patch needs; `None` for a whole row.
+    pub fn base(&self) -> Option<Hash> {
+        match self {
+            StoredBlob::Patch(p) => Some(p.base),
+            StoredBlob::Whole(_) => None,
+        }
+    }
+}
+
+/// The keyframe row a blob patch was given, which must be a whole indexed
+/// set: a patch on anything else is corrupt. Returns its encoded values.
+fn blob_keyframe_of(keyframe: Option<&[u8]>) -> Result<&[u8]> {
+    match keyframe {
+        Some([INDEXED, rest @ ..]) => Ok(rest),
+        Some(_) => Err(Error::Encoding(
+            "a blob-trigrams patch's keyframe is not a whole trigram set".into(),
+        )),
+        None => Err(Error::Encoding(
+            "a blob-trigrams patch was read without its keyframe".into(),
+        )),
+    }
+}
+
+impl BlobPatch<'_> {
+    /// The keyframe's set (its encoded values) with this patch applied.
+    /// Every removed code must be in it and every added one not, so a set
+    /// has one patch on a given keyframe.
+    pub fn apply(&self, keyframe: &[u8]) -> Result<Vec<u32>> {
+        let bad = || Error::Encoding("blob-trigrams patch does not fit its keyframe".into());
+        let base = get_deltas(keyframe, 1 << 24)?;
+        let adds = get_deltas(self.adds, 1 << 24)?;
+        let removes = get_deltas(self.removes, 1 << 24)?;
+        let mut out = Vec::with_capacity(base.len() + adds.len());
+        let (mut a, mut r) = (
+            adds.iter().copied().peekable(),
+            removes.iter().copied().peekable(),
+        );
+        for &v in &base {
+            while let Some(x) = a.next_if(|&x| x < v) {
+                out.push(x);
+            }
+            if a.peek() == Some(&v) {
+                return Err(bad());
+            }
+            match r.peek() {
+                Some(&x) if x < v => return Err(bad()),
+                Some(&x) if x == v => {
+                    r.next();
+                }
+                _ => out.push(v),
+            }
+        }
+        if r.next().is_some() {
+            return Err(bad());
+        }
+        out.extend(a);
+        Ok(out)
     }
 }
 
@@ -687,16 +908,51 @@ impl Probe {
 
     /// Reports to `absent` the index of each probed code a blob row lacks,
     /// stopping when it breaks. `None` for a row that records "not indexed".
+    /// A `blob-trigrams-v2` patch needs its keyframe row (ADR 0102).
     pub fn blob_absent(
         &self,
         row: &[u8],
-        absent: impl FnMut(usize) -> ControlFlow<()>,
+        keyframe: Option<&[u8]>,
+        mut absent: impl FnMut(usize) -> ControlFlow<()>,
     ) -> Result<Option<()>> {
         match row {
             [NOT_INDEXED, 1 | 2] => Ok(None),
             [INDEXED, rest @ ..] => absent_sorted(rest, &self.codes, absent).map(Some),
+            [BLOB_PATCH, ..] => {
+                for (i, has) in self
+                    .blob_patch_flags(row, keyframe)?
+                    .into_iter()
+                    .enumerate()
+                {
+                    if !has && absent(i).is_break() {
+                        break;
+                    }
+                }
+                Ok(Some(()))
+            }
             _ => Err(Error::Encoding("bad blob-trigrams row".into())),
         }
+    }
+
+    /// Whether each probed code is in the set a blob patch stands for: the
+    /// keyframe's answers at the probed codes, with the patch's removed and
+    /// added codes among them applied. Nothing else is decoded twice.
+    fn blob_patch_flags(&self, row: &[u8], keyframe: Option<&[u8]>) -> Result<Vec<bool>> {
+        let StoredBlob::Patch(p) = StoredBlob::parse(row)? else {
+            return Err(Error::Encoding("not a blob-trigrams patch".into()));
+        };
+        let mut flags = vec![false; self.codes.len()];
+        find_sorted(blob_keyframe_of(keyframe)?, &self.codes, &mut flags)?;
+        let mut hit = vec![false; self.codes.len()];
+        find_sorted(p.removes, &self.codes, &mut hit)?;
+        for (f, h) in flags.iter_mut().zip(&mut hit) {
+            *f &= !std::mem::take(h);
+        }
+        find_sorted(p.adds, &self.codes, &mut hit)?;
+        for (f, h) in flags.iter_mut().zip(hit) {
+            *f |= h;
+        }
+        Ok(flags)
     }
 
     /// Reports to `absent`, once each, the index of each probed code a
@@ -789,19 +1045,27 @@ impl Probe {
 
     /// `None` for a row that records "not indexed".
     pub fn blob(&self, row: &[u8]) -> Result<Option<Present<'_>>> {
-        match row {
-            [NOT_INDEXED, 1 | 2] => Ok(None),
+        self.blob_stored(row, None)
+    }
+
+    /// [`Probe::blob`] of a `blob-trigrams-v2` row: a patch needs its
+    /// keyframe row.
+    pub fn blob_stored(&self, row: &[u8], keyframe: Option<&[u8]>) -> Result<Option<Present<'_>>> {
+        let flags = match row {
+            [NOT_INDEXED, 1 | 2] => return Ok(None),
             [INDEXED, rest @ ..] => {
                 let mut flags = vec![false; self.codes.len()];
                 find_sorted(rest, &self.codes, &mut flags)?;
-                Ok(Some(Present {
-                    probe: self,
-                    flags,
-                    tree: false,
-                }))
+                flags
             }
-            _ => Err(Error::Encoding("bad blob-trigrams row".into())),
-        }
+            [BLOB_PATCH, ..] => self.blob_patch_flags(row, keyframe)?,
+            _ => return Err(Error::Encoding("bad blob-trigrams row".into())),
+        };
+        Ok(Some(Present {
+            probe: self,
+            flags,
+            tree: false,
+        }))
     }
 
     /// A patch row needs its keyframe row.
@@ -1091,6 +1355,172 @@ mod tests {
         assert!(Bloom::decode(&[9]).is_err());
     }
 
+    /// Every `blob-trigrams-v2` tag, byte for byte (ADR 0102, FORMATS.md).
+    /// Whole and "not indexed" rows are `blob-trigrams-v1`'s bytes.
+    #[test]
+    fn blob_v2_row_golden_bytes() {
+        let keyframe = BlobRow::of(b"abcabc\n");
+        let whole = [
+            0x01, 0xe3, 0xc4, 0x85, 0x03, 0xa7, 0x81, 0x04, 0x57, 0x81, 0xfc, 0x03,
+        ];
+        assert_eq!(keyframe.encode(), whole);
+        assert_eq!(BlobRow::of_stored(&whole, None).unwrap(), keyframe);
+        assert_eq!(
+            BlobRow::of_stored(&[0x00, 0x01], None).unwrap(),
+            BlobRow::NotIndexed(Skip::Binary)
+        );
+        let BlobRow::Trigrams(base) = &keyframe else {
+            unreachable!()
+        };
+        // Patch: the keyframe's blob, the byte length of the added codes,
+        // the added codes ("bcd"), then the removed ones ("bc\n", "bca",
+        // "cab"), each list as deltas from zero.
+        let BlobRow::Trigrams(set) = BlobRow::of(b"abcd") else {
+            unreachable!()
+        };
+        let mut patch = vec![0x02];
+        patch.extend([7; 32]);
+        patch.push(4);
+        patch.extend([0xe4, 0xc6, 0x89, 0x03]);
+        patch.extend([0x8a, 0xc6, 0x89, 0x03, 0x57, 0x81, 0xfc, 0x03]);
+        assert_eq!(blob_patch_on(&set, &Hash([7; 32]), base), patch);
+        assert_eq!(
+            BlobRow::of_stored(&patch, Some(&whole)).unwrap(),
+            BlobRow::Trigrams(set.clone())
+        );
+        // A patch on itself is the empty patch: a new keyframe's row.
+        let mut empty = vec![0x02];
+        empty.extend([7; 32]);
+        empty.push(0);
+        assert_eq!(blob_patch_on(base, &Hash([7; 32]), base), empty);
+        assert_eq!(BlobRow::of_stored(&empty, Some(&whole)).unwrap(), keyframe);
+    }
+
+    #[test]
+    fn blob_v2_rows_reject_malformed_bytes() {
+        let BlobRow::Trigrams(base) = BlobRow::of(b"the quick brown fox") else {
+            unreachable!()
+        };
+        let BlobRow::Trigrams(set) = BlobRow::of(b"the quick red fox") else {
+            unreachable!()
+        };
+        let key = Hash([1; 32]);
+        let keyframe = BlobRow::Trigrams(base.clone()).encode();
+        let patch = blob_patch_on(&set, &key, &base);
+        // A patch needs a whole indexed keyframe ...
+        assert!(BlobRow::of_stored(&patch, None).is_err());
+        assert!(BlobRow::of_stored(&patch, Some(&[0x00, 0x01])).is_err());
+        assert!(BlobRow::of_stored(&patch, Some(&patch)).is_err());
+        // ... that it fits: adding a code there or removing one absent is
+        // corrupt.
+        let other = BlobRow::Trigrams(set.clone()).encode();
+        assert!(BlobRow::of_stored(&patch, Some(&other)).is_err());
+        assert!(BlobRow::of_stored(&blob_patch_on(&base, &key, &[1, 2]), Some(&keyframe)).is_err());
+        for bad in [
+            &[][..],
+            &[0x02],
+            &[0x02; 33], // no list length
+            &[0x03],     // unknown tag
+            &[0x00, 0x03],
+        ] {
+            assert!(BlobRow::of_stored(bad, Some(&keyframe)).is_err(), "{bad:?}");
+        }
+        let mut long = vec![0x02];
+        long.extend([0; 32]);
+        long.push(4);
+        long.push(1);
+        assert!(StoredBlob::parse(&long).is_err());
+        // An older reader refuses a patch rather than misreading it.
+        assert!(BlobRow::decode(&patch).is_err());
+    }
+
+    /// The blob keyframe rule: a patch replaces a whole row of `w` bytes
+    /// while it is shorter and at most `sqrt(BLOB_PATCH_BUDGET * w)` bytes;
+    /// then a new keyframe, or the whole row for a small set.
+    #[test]
+    fn blob_keyframe_rule() {
+        let base: Vec<u32> = (0..2_000u32).map(|i| i * 4_001).collect();
+        let key = Hash([2; 32]);
+        let mut set = base.clone();
+        let mut next = 1u32;
+        let mut patches = 0;
+        loop {
+            let row = BlobRow::Trigrams(set.clone());
+            match row.encode_after(Some((&key, &base))) {
+                BlobEncoding::Patch(p) => {
+                    assert!(p.len() * p.len() <= BLOB_PATCH_BUDGET * row.encoded_len());
+                    let keyframe = BlobRow::Trigrams(base.clone()).encode();
+                    assert_eq!(BlobRow::of_stored(&p, Some(&keyframe)).unwrap(), row);
+                    patches += 1;
+                }
+                BlobEncoding::Keyframe => break,
+                BlobEncoding::Whole => panic!("a large set starts a keyframe"),
+            }
+            for _ in 0..10 {
+                set.push(next);
+                next += 4_001;
+            }
+            set.sort_unstable();
+            set.dedup();
+        }
+        assert!(patches > 5, "{patches} patches");
+        let row = BlobRow::Trigrams(set);
+        assert_eq!(
+            row.encode_after(None),
+            BlobEncoding::Whole,
+            "no base: whole"
+        );
+        assert_eq!(
+            BlobRow::NotIndexed(Skip::Binary).encode_after(Some((&key, &base))),
+            BlobEncoding::Whole
+        );
+        // A small set is cheaper whole than as a keyframe and empty patch.
+        let small = BlobRow::Trigrams(vec![5, 6]);
+        assert_eq!(small.encode_after(Some((&key, &base))), BlobEncoding::Whole);
+        assert_eq!(small.encoded_len(), small.encode().len());
+    }
+
+    /// A probe of a patch answers what a probe of the whole row it stands
+    /// for answers.
+    #[test]
+    fn probe_of_blob_patch_agrees_with_whole_row() {
+        let old = b"fn main() {\n    println!(\"hello\");\n}\n";
+        let new = b"fn main() {\n    eprintln!(\"goodbye\");\n}\n";
+        let (BlobRow::Trigrams(base), BlobRow::Trigrams(set)) =
+            (BlobRow::of(old), BlobRow::of(new))
+        else {
+            unreachable!()
+        };
+        let keyframe = BlobRow::Trigrams(base.clone()).encode();
+        let patch = blob_patch_on(&set, &Hash([3; 32]), &base);
+        let whole = BlobRow::Trigrams(set.clone()).encode();
+        let mut codes = extract(b"println goodbye hello eprintln zzzq main");
+        codes.extend([0, 1 << 23]);
+        let probe = Probe::new(codes.clone());
+        let a = probe.blob_stored(&patch, Some(&keyframe)).unwrap().unwrap();
+        let b = probe.blob(&whole).unwrap().unwrap();
+        for c in codes {
+            assert_eq!(a.has(c), b.has(c), "{c:x}");
+            assert_eq!(a.has(c), set.binary_search(&c).is_ok(), "{c:x}");
+        }
+        let mut seen_patch = Vec::new();
+        probe
+            .blob_absent(&patch, Some(&keyframe), |i| {
+                seen_patch.push(i);
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        let mut seen_whole = Vec::new();
+        probe
+            .blob_absent(&whole, None, |i| {
+                seen_whole.push(i);
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(seen_patch, seen_whole);
+        assert!(probe.blob_stored(&patch, None).is_err());
+    }
+
     #[test]
     fn probe_agrees_with_decoding() {
         let text = b"the quick brown fox\njumps over the lazy dog\n";
@@ -1335,14 +1765,14 @@ mod tests {
                 let codes = row_values(rng, &probe.codes, keep, 20, 1 << 24, cap);
                 let row = sparse(INDEXED, &codes);
                 assert_eq!(
-                    gate.blob(&probe, &row).unwrap(),
+                    gate.blob(&probe, &row, None).unwrap(),
                     full_blob(e, &probe, &row),
                     "case {case} row {r} blob: {e:?}"
                 );
             }
             // Empty rows: every needed value is absent.
             assert_eq!(
-                gate.blob(&probe, &[INDEXED]).unwrap(),
+                gate.blob(&probe, &[INDEXED], None).unwrap(),
                 full_blob(e, &probe, &[INDEXED])
             );
             assert_eq!(
@@ -1350,7 +1780,7 @@ mod tests {
                 full_tree(e, &probe, &[SPARSE])
             );
             assert_eq!(
-                gate.blob(&probe, &BlobRow::NotIndexed(Skip::Binary).encode())
+                gate.blob(&probe, &BlobRow::NotIndexed(Skip::Binary).encode(), None)
                     .unwrap(),
                 None
             );
@@ -1448,12 +1878,16 @@ mod tests {
             let probe = Probe::new(both.trigrams());
             assert!(probe.blob(&corrupt).is_err());
             assert_eq!(
-                Gate::new(&both, &probe).blob(&probe, &corrupt).unwrap(),
+                Gate::new(&both, &probe)
+                    .blob(&probe, &corrupt, None)
+                    .unwrap(),
                 Some(false),
                 "decided by the prefix"
             );
             assert!(
-                Gate::new(&either, &probe).blob(&probe, &corrupt).is_err(),
+                Gate::new(&either, &probe)
+                    .blob(&probe, &corrupt, None)
+                    .is_err(),
                 "not decided by the prefix"
             );
         }
