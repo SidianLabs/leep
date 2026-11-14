@@ -933,7 +933,10 @@ fn verify_exact(tag: &str, stores: &Stores, shared: &Shared) {
         let mut messages: HashMap<String, u32> = HashMap::new();
         while let Some(id) = stack.pop() {
             let cs = repo.get_changeset(id).await.unwrap();
-            *messages.entry(cs.message).or_default() += 1;
+            // History a test planted before the agents started.
+            if !cs.message.starts_with(PLANTED_MSG) {
+                *messages.entry(cs.message).or_default() += 1;
+            }
             for p in cs.parents {
                 if seen.insert(p) {
                     stack.push(p);
@@ -963,11 +966,28 @@ fn verify_exact(tag: &str, stores: &Stores, shared: &Shared) {
                 .unwrap_or_else(|| panic!("[{tag}] {} is missing at main", s.path));
             assert_eq!(&data[..], s.body.as_bytes(), "[{tag}] {}", s.path);
         }
-        let moves = repo
+        let mut moves = repo
             .meta()
             .ref_log(Some("main"), None, usize::MAX >> 1)
             .await
             .unwrap();
+        // Not the move that put planted history on `main`.
+        let mut lands = Vec::new();
+        for m in moves.drain(..) {
+            let planted = match m.new {
+                Some(id) => repo
+                    .get_changeset(id)
+                    .await
+                    .unwrap()
+                    .message
+                    .starts_with(PLANTED_MSG),
+                None => false,
+            };
+            if !planted {
+                lands.push(m);
+            }
+        }
+        let moves = lands;
         assert_eq!(
             moves.len(),
             confirmed.len(),
@@ -1078,7 +1098,7 @@ fn killed_server_with_eager_auto_repack_loses_nothing_postgres() {
 }
 
 /// ADR 0101: the automatic changeset compaction looks every second, over
-/// a store that starts with 300 changesets on a side ref (rows a
+/// a store that starts with 300 changesets on `main` (rows a
 /// dictionary pays for), in batches of eight, so kills land while it
 /// trains, stores a dictionary or rewrites rows (each server's first pass
 /// covers every row), beside lands. Nothing is lost and every store
@@ -1115,8 +1135,14 @@ fn compacted(stores: &Stores) {
     );
 }
 
-/// 300 changesets on ref `seed` with messages like real ones, so a
-/// dictionary pays for itself.
+/// The start of the messages of changesets [`plant_compactable`] writes,
+/// which [`verify_exact`] does not count as lands.
+const PLANTED_MSG: &str = "planted: ";
+
+/// 300 changesets on `main`, with messages like real ones, so a
+/// dictionary pays for itself. On `main`, not a side ref: the CLI agents
+/// create `main` only in an empty repository (ADR 0036), so a store with
+/// some other ref and no `main` would refuse their first land.
 fn plant_compactable(stores: &Stores) -> Vec<ChangesetId> {
     gc_ok("plant", stores, &["--dry-run"]);
     let repo = open_repo(stores);
@@ -1129,7 +1155,7 @@ fn plant_compactable(stores: &Stores) -> Vec<ChangesetId> {
             &format!("seed/mod{}/f{}.rs", i % 7, i % 23),
             &format!("fn f{i}() {{}}\n"),
             &format!(
-                "mod{}: rework f{i} so it no longer allocates\n\nThe old version \
+                "{PLANTED_MSG}mod{}: rework f{i} so it no longer allocates\n\nThe old version \
                  copied its input on every call; this one borrows it.\n\n\
                  Signed-off-by: Dev {} <dev{}@example.org>\n",
                 i % 7,
@@ -1140,7 +1166,7 @@ fn plant_compactable(stores: &Stores) -> Vec<ChangesetId> {
         made.push(id);
         tip = Some(id);
     }
-    common_block_on(repo.meta().cas_ref("seed", None, tip)).unwrap();
+    common_block_on(repo.meta().cas_ref("main", None, tip)).unwrap();
     made
 }
 
