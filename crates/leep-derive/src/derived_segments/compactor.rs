@@ -64,6 +64,17 @@ impl std::fmt::Display for Mode {
 /// row delete of every process; idempotent.
 pub type FeatureHook = Arc<dyn Fn() -> BoxFuture<'static, Result<()>> + Send + Sync>;
 
+/// Called at named points of a pass ("seal-stored", "merge-stored",
+/// "retire-deleted"); a crash test's server stops there to be killed.
+#[derive(Clone)]
+pub struct PauseHook(pub Arc<dyn Fn(&'static str) -> BoxFuture<'static, ()> + Send + Sync>);
+
+impl std::fmt::Debug for PauseHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PauseHook")
+    }
+}
+
 /// Limits of a pass. The defaults are ADR 0104's starting values.
 #[derive(Clone, Debug)]
 pub struct CompactOptions {
@@ -89,6 +100,8 @@ pub struct CompactOptions {
     /// Rest after each delete step, as a multiple of how long it took
     /// (ADR 0052's bounded steps).
     pub rest_factor: u32,
+    /// For crash tests only.
+    pub pause: Option<PauseHook>,
 }
 
 impl Default for CompactOptions {
@@ -105,6 +118,7 @@ impl Default for CompactOptions {
             retire_after: super::RETIRE_AFTER,
             batch: 1000,
             rest_factor: 1,
+            pause: None,
         }
     }
 }
@@ -124,6 +138,7 @@ impl CompactOptions {
             retire_after: Duration::ZERO,
             batch: 7,
             rest_factor: 0,
+            pause: None,
         }
     }
 
@@ -495,6 +510,7 @@ impl<'a> Pass<'a> {
                     continue;
                 }
                 self.store(&enc).await?;
+                self.pause("seal-stored").await;
                 self.man.live.push(enc.seg);
                 self.write().await?;
                 state.live_since.insert(enc.seg.index, Instant::now());
@@ -503,6 +519,12 @@ impl<'a> Pass<'a> {
             }
         }
         Ok(())
+    }
+
+    async fn pause(&self, at: &'static str) {
+        if let Some(p) = &self.opts.pause {
+            (p.0)(at).await;
+        }
     }
 
     /// Make both blobs durable before anything names them. Written like
@@ -598,6 +620,7 @@ impl<'a> Pass<'a> {
             if enc.seg.rows > 0 {
                 self.store(&enc).await?;
             }
+            self.pause("merge-stored").await;
             let mut next = self.man.live[..at].to_vec();
             if enc.seg.rows > 0 {
                 next.push(enc.seg);
@@ -697,6 +720,7 @@ impl<'a> Pass<'a> {
                     .delete_derived_keys(&[kind], &del)
                     .await?;
                 self.report.retired_rows += n;
+                self.pause("retire-deleted").await;
                 metrics::counter!("leep_derived_segment_rows_retired_total", "kind" => kind)
                     .increment(n);
                 let rest = started.elapsed() * self.opts.rest_factor;

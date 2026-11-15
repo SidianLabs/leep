@@ -1327,6 +1327,213 @@ fn killed_auto_compaction_mid_pass_loses_nothing_postgres() {
 }
 
 // ---------------------------------------------------------------------------
+// Derived segments (ADR 0104)
+
+/// Every `skiplist` and `history-tree-v4` value of `ids` as a new process
+/// reads it (rows, then segments), history parts by their content.
+fn segment_values(stores: &Stores, ids: &[ChangesetId]) -> Vec<Option<Vec<u8>>> {
+    let repo = open_repo(stores);
+    let keys: Vec<Hash> = ids.iter().map(|i| i.0).collect();
+    common_block_on(async {
+        let mut out: Vec<Option<Vec<u8>>> = repo
+            .meta()
+            .get_derived_many("skiplist", &keys)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|v| v.map(|b| b.to_vec()))
+            .collect();
+        for v in repo
+            .meta()
+            .get_derived_many("history-tree-v4", &keys)
+            .await
+            .unwrap()
+        {
+            out.push(v.map(|b| {
+                leep_derive::derived::history_pack::canonical(&b)
+                    .unwrap()
+                    .into_owned()
+            }));
+        }
+        out
+    })
+}
+
+/// How many of `ids` a live segment holds both values of, and the rows of
+/// the two kinds left.
+fn segment_coverage(stores: &Stores, ids: &[ChangesetId]) -> (usize, u64) {
+    use leep_derive::derived_segments::{self as ds, COL_HISTORY_TREE, COL_SKIPLIST};
+    let repo = open_repo(stores);
+    common_block_on(async {
+        let (raw, _) = ds::read_manifest(&repo).await.unwrap();
+        repo.segments().apply(raw).await.unwrap();
+        let held = ids
+            .iter()
+            .filter(|id| {
+                repo.segments().holds(&id.0, COL_SKIPLIST)
+                    && repo.segments().holds(&id.0, COL_HISTORY_TREE)
+            })
+            .count();
+        let rows = repo.row_meta().count_derived("skiplist").await.unwrap()
+            + repo
+                .row_meta()
+                .count_derived("history-tree-v4")
+                .await
+                .unwrap();
+        (held, rows)
+    })
+}
+
+/// A server SIGKILLed at `point` of a derived segments pass in `mode`: the
+/// store verifies, every value reads as before, and the next server
+/// finishes the work. For `merge-stored` the store is first sealed into
+/// many small segments in-process, so the server's pass merges them.
+fn run_segments_kill(backend: &str, meta_url: Option<String>, mode: &str, point: &str) {
+    use leep_derive::derived_segments::{compact_pass, CompactOptions, CompactState, Mode};
+    let _g = serial();
+    let _w = Watchdog::start();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stores = match meta_url {
+        Some(url) => Stores::with_meta(&root.join("data"), url),
+        None => Stores::sqlite(&root.join("data")),
+    };
+    let made = plant_compactable(&stores);
+    let repo = open_repo(&stores);
+    common_block_on(leep_derive::derived::derive::<
+        leep_derive::derived::HistoryTree,
+    >(&repo, *made.last().unwrap()))
+    .unwrap();
+    if point == "merge-stored" {
+        let opts = CompactOptions {
+            seal_rows: 1,
+            idle_rows: 1,
+            max_rows: 8,
+            ..CompactOptions::small(Mode::Build)
+        };
+        common_block_on(compact_pass(
+            &repo,
+            &opts,
+            &mut CompactState::default(),
+            None,
+        ))
+        .unwrap()
+        .expect("lease");
+    }
+    drop(repo);
+    let want = segment_values(&stores, &made);
+    assert!(want.iter().all(Option::is_some));
+    let tag = format!("{backend}, derived segments {mode} killed at {point}");
+    let common_args = [
+        "--derived-segments",
+        mode,
+        "--debug-derived-segments-small",
+        "--debug-derived-segments-first",
+        "0s",
+        "--derived-segments-interval",
+        "1s",
+    ];
+    let mut args = common_args.to_vec();
+    args.extend(["--debug-derived-segments-pause-at", point]);
+    let mut server = Server::start_with(free_port(), &stores, root, &args);
+    let line = format!("leep-derived-segments: paused at {point}");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !server.log_text().contains(&line) {
+        assert!(
+            Instant::now() < deadline,
+            "[{tag}] never paused\n{}",
+            server.log_text()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    server.kill();
+    let (held, rows) = segment_coverage(&stores, &made);
+    progress!("[{tag}] SIGKILLed: {held} changesets sealed, {rows} rows left");
+    verify_clean(&format!("{tag}, after SIGKILL"), &stores, &["--full"]);
+    assert_eq!(
+        segment_values(&stores, &made),
+        want,
+        "[{tag}] after the kill"
+    );
+    if mode == "retire" {
+        use sqlx::Connection;
+        let features: Vec<String> = common_block_on(async {
+            if stores.meta.starts_with("sqlite:") {
+                let mut c = sqlx::SqliteConnection::connect(&stores.meta).await.unwrap();
+                sqlx::query_scalar("SELECT name FROM store_features")
+                    .fetch_all(&mut c)
+                    .await
+                    .unwrap()
+            } else {
+                let mut c = sqlx::PgConnection::connect(&stores.meta).await.unwrap();
+                sqlx::query_scalar("SELECT name FROM store_features")
+                    .fetch_all(&mut c)
+                    .await
+                    .unwrap()
+            }
+        });
+        assert!(
+            features.iter().any(|f| f == "derived-segments"),
+            "[{tag}] rows were deleted before the feature was recorded: {features:?}"
+        );
+        assert!(rows < 2 * made.len() as u64, "[{tag}] no row was deleted");
+    }
+    // The next server finishes the work.
+    let server = Server::start_with(free_port(), &stores, root, &common_args);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let (held, rows) = segment_coverage(&stores, &made);
+        let done = held == made.len() && (mode != "retire" || rows == 0);
+        if done {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "[{tag}] the work was not finished: {held} sealed, {rows} rows\n{}",
+            server.log_text()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    drop(server);
+    verify_clean(
+        &format!("{tag}, after the next server"),
+        &stores,
+        &["--full"],
+    );
+    assert_eq!(
+        segment_values(&stores, &made),
+        want,
+        "[{tag}] after the next server"
+    );
+}
+
+#[test]
+fn killed_derived_segment_passes_lose_nothing_sqlite() {
+    for (mode, point) in [
+        ("build", "seal-stored"),
+        ("build", "merge-stored"),
+        ("retire", "retire-deleted"),
+    ] {
+        run_segments_kill("sqlite", None, mode, point);
+    }
+}
+
+#[test]
+fn killed_derived_segment_passes_lose_nothing_postgres() {
+    for (mode, point) in [
+        ("build", "seal-stored"),
+        ("build", "merge-stored"),
+        ("retire", "retire-deleted"),
+    ] {
+        let Some(db) = PgDb::create("leep_e2e") else {
+            return;
+        };
+        run_segments_kill("postgres", Some(db.url.clone()), mode, point);
+        drop(db);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Several servers coordinating lands (ADR 0056)
 
 /// The lease's TTL the servers run with, and how soon after a leader's

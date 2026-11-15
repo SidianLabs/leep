@@ -13,6 +13,7 @@ pub mod checks;
 pub mod conn;
 mod context;
 pub mod coord;
+pub mod derived_segments;
 pub mod errors;
 pub mod events;
 pub mod fingerprint;

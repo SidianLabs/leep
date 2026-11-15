@@ -217,3 +217,52 @@ pub fn skiplist_row(data: &[u8]) {
     }
     assert_eq!(again, data);
 }
+
+/// Derived segments (ADR 0104): the manifest, and an index and data blob
+/// pair parsed without their address checks so mutations reach the
+/// parsers. A pair that decodes re-encodes to a segment holding the same
+/// values (those that decode as their kind).
+pub fn derived_segment(data: &[u8]) {
+    use leep_derive::derived_segments::codec;
+    let Some((&k, rest)) = data.split_first() else {
+        return;
+    };
+    if k % 2 == 0 {
+        if let Ok(m) = codec::Manifest::decode(rest) {
+            assert_eq!(&m.encode()[..], rest, "a decoded manifest is its bytes");
+        }
+        return;
+    }
+    let Some((len, rest)) = rest.split_first_chunk::<2>() else {
+        return;
+    };
+    let n = (u16::from_be_bytes(*len) as usize).min(rest.len());
+    let (index, blob) = rest.split_at(n);
+    let Ok(values) = codec::read_unchecked(index, blob) else {
+        return;
+    };
+    let mut rows: std::collections::BTreeMap<leep_core::Hash, Vec<(u8, bytes::Bytes)>> =
+        Default::default();
+    for (key, col, v) in &values {
+        rows.entry(*key).or_default().push((*col, v.clone()));
+    }
+    let seal: Vec<codec::SealRow> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(g, (key, values))| codec::SealRow {
+            key,
+            generation: g as u64,
+            values,
+        })
+        .collect();
+    let Ok((enc, bad)) = codec::encode(codec::FAMILY_CHANGESET, &seal, 1) else {
+        return;
+    };
+    let again = codec::read_unchecked(&enc.index.1, &enc.data.1).expect("re-encoded segment");
+    assert_eq!(again.len() + bad.len(), values.len());
+    for (key, col, v) in again {
+        assert!(values.iter().any(|(k, c, w)| *k == key
+            && *c == col
+            && (w == &v || leep_derive::derived::history_pack::same_part(w, &v))));
+    }
+}

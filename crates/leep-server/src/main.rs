@@ -518,6 +518,35 @@ struct Args {
     /// for in the ref log's times (default 5 minutes).
     #[arg(long, hide = true, value_parser = parse_interval)]
     debug_search_retention_skew: Option<std::time::Duration>,
+    /// Derived segments (ADR 0104): `build` seals `skiplist` and
+    /// `history-tree-v4` rows into immutable segments in the blob store in
+    /// the background and keeps the rows (free to roll back); `retire` also
+    /// deletes rows a live segment holds the same value for. `retire` is the
+    /// one-way door: it records the store feature `derived-segments` before
+    /// the first delete, and binaries older than this release then refuse
+    /// the store. `off` runs no passes; existing segments are still read.
+    /// Passes run under a store-wide lease, one server at a time, in the
+    /// index lane.
+    #[arg(long, env = "LEEP_DERIVED_SEGMENTS", default_value = "build", value_parser = parse_derived_segments)]
+    derived_segments: leep_derive::derived_segments::Mode,
+    /// How often a derived segments pass runs (ADR 0104).
+    #[arg(long, env = "LEEP_DERIVED_SEGMENTS_INTERVAL", default_value = "5m", value_parser = parse_interval)]
+    derived_segments_interval: std::time::Duration,
+    /// Testing only: when the first derived segments pass runs after start
+    /// (default 2 minutes, plus up to 1 of jitter).
+    #[arg(long, hide = true, value_parser = parse_interval)]
+    debug_derived_segments_first: Option<std::time::Duration>,
+    /// Testing only: small limits (seal at 4 changesets, segments of at
+    /// most 64, rows retired at once) so small histories seal, merge and
+    /// retire.
+    #[arg(long, hide = true)]
+    debug_derived_segments_small: bool,
+    /// Testing only: stop the derived segments task for good at a point of
+    /// a pass (`seal-stored`, `merge-stored`, `retire-deleted`), printing
+    /// `leep-derived-segments: paused at <point>`, so a crash test can kill
+    /// the server there.
+    #[arg(long, hide = true)]
+    debug_derived_segments_pause_at: Option<String>,
     /// Testing only: stop the automatic compaction for good after this many
     /// batches of rows were rewritten, printing `leep-compact: paused at
     /// batch N`, so a crash test can kill the server inside a pass.
@@ -1200,6 +1229,10 @@ fn parse_expires_in(s: &str) -> Result<std::time::Duration, String> {
     Ok(d)
 }
 
+fn parse_derived_segments(s: &str) -> Result<leep_derive::derived_segments::Mode, String> {
+    s.parse().map_err(|e: leep_core::Error| e.to_string())
+}
+
 /// `--events-retention` is at most a day: an event names paths of a
 /// session, which are deleted a day after it ends
 /// (`PATHS_RETENTION_SECS`), so an older event would point a reader at
@@ -1270,6 +1303,11 @@ async fn run_gc(
         outln!("kept (recently claimed): {}", r.kept_by_claim);
         outln!("mark segments: {}", r.mark_segments);
         outln!("retired mark segments condemned: {}", r.segments_condemned);
+        outln!("derived segments: {}", r.derived_segments);
+        outln!(
+            "retired derived segment blobs condemned: {}",
+            r.derived_segments_condemned
+        );
     }
     if let Some(r) = collect {
         let verb = if dry { "would delete" } else { "deleted" };
@@ -1283,8 +1321,76 @@ async fn run_gc(
             "collect: retired mark segments deleted: {}",
             r.segments_deleted
         );
+        outln!(
+            "collect: retired derived segment blobs deleted: {}",
+            r.derived_segments_deleted
+        );
     }
     Ok(())
+}
+
+/// Start the derived segments task (ADR 0104) as the flags say.
+fn start_derived_segments(args: &Args, repo: &Repo) {
+    use leep_derive::derived_segments::{self as ds, CompactOptions, Mode, PauseHook};
+    let mode = args.derived_segments;
+    let mut pass = if args.debug_derived_segments_small {
+        CompactOptions::small(mode)
+    } else {
+        CompactOptions {
+            mode,
+            ..CompactOptions::default()
+        }
+    };
+    if let Some(at) = args.debug_derived_segments_pause_at.clone() {
+        pass.pause = Some(PauseHook(Arc::new(move |point| {
+            let stop = point == at;
+            Box::pin(async move {
+                if stop {
+                    outln!("leep-derived-segments: paused at {point}");
+                    std::future::pending::<()>().await;
+                }
+            })
+        })));
+    }
+    let url = args.meta.clone();
+    let schema = if NO_MIGRATE.load(std::sync::atomic::Ordering::Relaxed) {
+        leep_meta::SchemaMode::RequireCurrent
+    } else {
+        leep_meta::SchemaMode::Migrate
+    };
+    let feature: ds::FeatureHook = Arc::new(move || {
+        let url = url.clone();
+        Box::pin(async move {
+            leep_meta::features::add_store_feature(&url, schema, ds::FEATURE).await?;
+            tracing::warn!(
+                "recorded the store feature {}: binaries older than this release now refuse \
+                 this store (ADR 0104)",
+                ds::FEATURE
+            );
+            Ok(())
+        })
+    });
+    let mut schedule = leep_server::derived_segments::Schedule {
+        interval: args.derived_segments_interval,
+        pass,
+        feature: Some(feature),
+        ..Default::default()
+    };
+    if let Some(first) = args.debug_derived_segments_first {
+        schedule.first = first;
+        schedule.jitter = std::time::Duration::ZERO;
+    }
+    match leep_server::derived_segments::spawn(repo.clone(), schedule) {
+        Some(_) => tracing::info!(
+            mode = %mode,
+            interval_s = args.derived_segments_interval.as_secs_f64(),
+            "sealing skiplist and history-tree-v4 rows into derived segments (ADR 0104)"
+        ),
+        None if mode == Mode::Off => {
+            tracing::info!("derived segments off (--derived-segments off); segments still read")
+        }
+        None => {}
+    }
 }
 
 /// `gc --retire-mark-rows` (ADR 0103): import the rows into a segment, then
@@ -1682,6 +1788,10 @@ mod feature_name_tests {
         assert_eq!(
             leep_derive::gc_segments::MARK_ROWS_RETIRED_FEATURE,
             leep_meta::features::GC_MARK_SEGMENTS
+        );
+        assert_eq!(
+            leep_derive::derived_segments::FEATURE,
+            leep_meta::features::DERIVED_SEGMENTS
         );
     }
 }
@@ -2442,6 +2552,7 @@ async fn run() -> anyhow::Result<()> {
             tracing::info!("search row retention off (--search-retention off)")
         }
     }
+    start_derived_segments(&args, &repo);
     let coordination = match args.land_coordination {
         Coordination::Off => None,
         Coordination::On => Some(land_coordination(&args, repo.meta().clone())?),

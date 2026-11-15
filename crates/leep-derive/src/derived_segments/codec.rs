@@ -606,6 +606,31 @@ pub fn decode_index(hash: &Hash, bytes: &[u8]) -> Result<SegmentIndex> {
     if Hash::of_blob(bytes) != *hash {
         return Err(bad("index address mismatch"));
     }
+    parse_index(hash, bytes)
+}
+
+/// Decode an index blob and its data blob without checking addresses or
+/// that the index names this data blob, then every value: for fuzzing the
+/// parsers past the checksums. Never used to read a store.
+#[doc(hidden)]
+pub fn read_unchecked(index: &[u8], data: &[u8]) -> Result<Vec<(Hash, u8, Bytes)>> {
+    let mut idx = parse_index(&Hash::of_blob(index), index)?;
+    idx.data = Hash::of_blob(data);
+    idx.data_len = data.len() as u64;
+    for c in &idx.columns {
+        if c.blocks.iter().any(|b| {
+            b.offset
+                .checked_add(b.len as u64)
+                .is_none_or(|e| e > idx.data_len)
+        }) {
+            return Err(bad("block past the data blob"));
+        }
+    }
+    let d = decode_data(&idx, &idx.data.clone(), Bytes::copy_from_slice(data))?;
+    read_all(&idx, &d)
+}
+
+fn parse_index(hash: &Hash, bytes: &[u8]) -> Result<SegmentIndex> {
     let p = prefix(INDEX_KIND);
     if !bytes.starts_with(&p) {
         return Err(bad("not an index blob"));

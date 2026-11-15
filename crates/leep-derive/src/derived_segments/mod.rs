@@ -25,7 +25,9 @@ use bytes::Bytes;
 use leep_core::{Error, Hash, LeaseKey, Result};
 
 pub use codec::{Manifest, SegmentRef, COL_HISTORY_TREE, COL_SKIPLIST};
-pub use compactor::{compact_pass, CompactOptions, CompactState, FeatureHook, Mode, PassReport};
+pub use compactor::{
+    compact_pass, CompactOptions, CompactState, FeatureHook, Mode, PassReport, PauseHook,
+};
 pub use view::{ManifestRead, SegmentView};
 
 use crate::gc_lease::{self, GcLease};

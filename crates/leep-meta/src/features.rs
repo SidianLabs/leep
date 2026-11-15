@@ -19,8 +19,14 @@ pub const CHANGESET_ZSTD_DICT: &str = "changeset-zstd-dict";
 /// predates segments would trust what is left of the rows.
 pub const GC_MARK_SEGMENTS: &str = "gc-mark-segments";
 
+/// `skiplist` and `history-tree-v4` rows are being or have been deleted
+/// once a derived segment in the blob store holds their values (ADR 0104,
+/// `--derived-segments retire`). A binary that predates segments would
+/// derive whole histories again, and its `gc` would delete live segments.
+pub const DERIVED_SEGMENTS: &str = "derived-segments";
+
 /// Every feature this binary can read.
-pub const KNOWN: &[&str] = &[CHANGESET_ZSTD_DICT, GC_MARK_SEGMENTS];
+pub const KNOWN: &[&str] = &[CHANGESET_ZSTD_DICT, GC_MARK_SEGMENTS, DERIVED_SEGMENTS];
 
 /// Record `name` in the store at `url` (idempotent). `mem://` stores are
 /// never shared with another binary, so there is nothing to record.
@@ -72,6 +78,7 @@ mod tests {
         check(&[]).unwrap();
         check(&[CHANGESET_ZSTD_DICT.to_string()]).unwrap();
         check(&[GC_MARK_SEGMENTS.to_string()]).unwrap();
+        check(&[DERIVED_SEGMENTS.to_string()]).unwrap();
         let err = check(&[
             CHANGESET_ZSTD_DICT.to_string(),
             "tree-zstd".to_string(),

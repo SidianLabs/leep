@@ -45,6 +45,7 @@ targets! {
     trigram_codec => rows::trigram_codec,
     gc_rows => rows::gc_rows,
     skiplist_row => rows::skiplist_row,
+    derived_segment => rows::derived_segment,
     api_json => api::api_json,
     server_router => api::server_router,
     owners => config::owners,
