@@ -1611,7 +1611,7 @@ rollout log.
 
 ## LeepDerivedSegmentPassesFailing
 
-**Meaning.** The derived segment compactor (ADR 0104; OPERATIONS.md,
+**Meaning.** The derived segment compactor (ADR 0104, 0105; OPERATIONS.md,
 "Derived segments") failed more than three passes in an hour
 (`leep_derived_segment_passes_total{outcome="error"}`), or a pass in mode
 `retire` kept rows that differ from the value of the segment holding them
@@ -1624,12 +1624,20 @@ kept row costs its bytes. Repeated `leep_derived_segment_errors_total` mean
 reads derive values again, which costs time on deep histories.
 
 **Diagnose.** The server log's `derived segments pass failed` warnings give
-the error. Then `leep-server verify --derived skiplist --derived
-history-tree-v4` (`--full` to recompute every value):
+the error and the family (`changeset-v1` holds `skiplist` and
+`history-tree-v4`; `changeset-v2` holds `generation`, `last_merge-v1`,
+`root_tree` and `log-filter-v1`); a failing family does not stop the other.
+Then `leep-server verify --derived <the family's kinds>` (`--full` to
+recompute every value):
 
-- `the derived-segments-v1 row does not decode`: the manifest is damaged
-  (`bad_derived_manifest`). In mode `build` the next pass replaces it; in
-  `retire` passes refuse to, and `gc` refuses to run.
+- `the derived-segments-v1 row of family ... does not decode`: that family's
+  manifest is damaged (`bad_derived_manifest`). In mode `build` the next
+  pass replaces it unless the family's store feature (`derived-segments`,
+  `derived-segments-2`) is recorded; then passes refuse to, and `gc`
+  refuses to run.
+- `a derived-segments-v1 row of a derived segment family this leep-server
+  does not know`: a newer `leep-server` wrote a family this one cannot read.
+  `gc` refuses to run with it; run the newer `gc`.
 - `bad_derived_segment`, or a note that a segment is not stored: a segment
   blob was lost or damaged (a disk, a restore whose blob copy finished
   before the segment was sealed, an older `gc` that collected it).
@@ -1641,10 +1649,12 @@ history-tree-v4` (`--full` to recompute every value):
 
 **Mitigate / fix.**
 
-- A damaged manifest after `retire`: `repair drop --kind skiplist --kind
-  history-tree-v4` replaces it with an empty one and drops the rows, which
-  then derive again on demand (or at once with `repair rederive --kind
-  history-tree-v4 --missing`). Expect a long derivation on a large store.
+- A damaged manifest after `retire`: `repair drop` of the family's kinds
+  (`--kind skiplist --kind history-tree-v4`, or `--kind generation --kind
+  last_merge-v1 --kind root_tree --kind log-filter-v1`) replaces it with an
+  empty one and drops the rows, which then derive again on demand (or at
+  once with `repair rederive --missing`). Expect a long derivation on a
+  large store.
 - A lost or damaged segment: nothing is needed for correctness; the next
   pass drops it and seals the rows again. After `retire`, run `repair
   rederive --kind skiplist --kind history-tree-v4 --missing` to write the
@@ -1657,8 +1667,9 @@ history-tree-v4` (`--full` to recompute every value):
   `retire`: it names the only copy of the deleted rows.
 
 **Escalate / collect.** The pass warnings from the log, the `verify`
-report, and the `derived-segments-v1` row (`SELECT encode(value, 'hex')
-FROM derived WHERE kind = 'derived-segments-v1'`).
+report, and the `derived-segments-v1` rows, one per family (`SELECT
+encode(key, 'hex'), encode(value, 'hex') FROM derived WHERE kind =
+'derived-segments-v1'`).
 
 ## LeepMirrorDown
 
@@ -2208,8 +2219,9 @@ unreferenced blobs and only GC reclaims them.
    - `the metadata store uses format features this server cannot read
      (gc-mark-segments)`: someone ran `gc --retire-mark-rows` (ADR 0103) and the
      cron job runs an older `leep-server`. Upgrade the binary the job uses. The
-     same with `derived-segments`: a server runs `--derived-segments retire`
-     (ADR 0104);
+     same with `derived-segments` or `derived-segments-2`: a server runs
+     `--derived-segments retire` (ADR 0104, 0105; an ADR 0104 binary refuses
+     a store with `derived-segments-2`);
    - `the derived-segments-v1 row does not decode, so garbage collection
      cannot tell live derived segments from orphans`: see
      [LeepDerivedSegmentPassesFailing](#leepderivedsegmentpassesfailing).

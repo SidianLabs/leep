@@ -114,8 +114,8 @@ async fn values(r: &Repo, ids: &[ChangesetId]) -> Vec<Option<Vec<u8>>> {
 
 async fn pass(r: &Repo, mode: Mode, state: &mut CompactState) -> PassReport {
     let hook = Features {
-        record: Arc::new(|| Box::pin(async { Ok(()) })),
-        recorded: Arc::new(|| Box::pin(async { Ok(true) })),
+        record: Arc::new(|_| Box::pin(async { Ok(()) })),
+        recorded: Arc::new(|_| Box::pin(async { Ok(true) })),
     };
     compact_pass(r, &CompactOptions::small(mode), state, Some(&hook))
         .await

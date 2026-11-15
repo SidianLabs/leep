@@ -1,5 +1,6 @@
 # 0104. Derived segments: skiplists and history roots leave the database
-Status: Accepted
+Status: Accepted; amended by [0105](0105-derived-segment-families.md)
+(families, forward compatibility, GC over every family)
 Date: 2026-11-15
 
 Amends [0045](0045-history-packs.md) (where part 0 of a history pack, the

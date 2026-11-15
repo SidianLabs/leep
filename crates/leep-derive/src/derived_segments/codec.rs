@@ -1,19 +1,25 @@
-//! Bytes of derived segments (ADR 0104): the index blob, the data blob and
-//! the manifest row. FORMATS.md has the same layouts.
+//! Bytes of derived segments (ADR 0104, 0105): the index blob, the data
+//! blob and the manifest row. FORMATS.md has the same layouts.
 //!
 //! A segment is a lossless container of derived rows that already exist:
 //! a read gives back the bytes a row read would (`skiplist` byte for byte,
 //! `history-tree-v4` the same part by ADR 0045's definition). Inside it,
-//! changeset ids the rows name are positions: the keys are numbered by
-//! `(generation, id)`, so an ancestor in the same segment is a small
-//! backwards distance, and anything else an index into one table of
-//! external ids per segment.
+//! changeset ids the rows name are positions: the keys are numbered by a
+//! sort key (the generation, in both families), so an ancestor in the same
+//! segment is a small backwards distance, and anything else an index into
+//! one table of external ids per segment.
+//!
+//! Families and their columns are one table, [`FAMILIES`]; each column has
+//! a codec: its encoding, its decoding, and the equality a row is compared
+//! by before it is deleted.
 
 use bytes::Bytes;
 use leep_core::{ChangesetId, Error, Hash, Result};
 
 use crate::derived::history_pack;
-use crate::derived::{DerivedKind, HistoryTree, Skiplist};
+use crate::derived::{
+    DerivedKind, FilterRow, Generation, HistoryTree, LastMerge, LogFilterIndex, RootTree, Skiplist,
+};
 
 /// Object kind whose preimage prefix starts every index blob, so no upload
 /// can take its address (ADR 0041).
@@ -25,15 +31,162 @@ pub const DATA_KIND: &str = "derived-segment-data-v1";
 pub const FAMILY_CHANGESET: u8 = 1;
 /// Name of [`FAMILY_CHANGESET`], hashed into its manifest key.
 pub const FAMILY_CHANGESET_NAME: &str = "changeset-v1";
+/// Family `changeset-v2` (ADR 0105): keys are changeset ids; a column this
+/// binary does not know is ignored, never read as damage.
+pub const FAMILY_CHANGESET_V2: u8 = 2;
+pub const FAMILY_CHANGESET_V2_NAME: &str = "changeset-v2";
 
 /// Column numbers of `changeset-v1`, fixed forever: a later kind takes a
 /// new number and every stored segment stays valid.
 pub const COL_SKIPLIST: u8 = 1;
 pub const COL_HISTORY_TREE: u8 = 2;
 
+/// Column numbers of `changeset-v2`, fixed forever.
+pub const COL_GENERATION: u8 = 1;
+pub const COL_LAST_MERGE: u8 = 2;
+pub const COL_ROOT_TREE: u8 = 3;
+pub const COL_LOG_FILTER: u8 = 4;
+
+/// Turns a changeset id a row names into its id reference.
+pub(crate) type Refer<'a> = &'a mut dyn FnMut(&Hash) -> u64;
+/// Reads an id reference back into the id it stands for.
+pub(crate) type Resolve<'a, 'b> = &'a mut dyn FnMut(&mut Reader<'b>) -> Result<Hash>;
+
+type EncodeFn = fn(Hash, &[u8], Refer) -> std::result::Result<Vec<u8>, String>;
+type DecodeFn = for<'b> fn(Hash, &mut Reader<'b>, Resolve<'_, 'b>) -> Result<Bytes>;
+
+/// One column: the kind it holds and its codec.
+pub struct Column {
+    pub id: u8,
+    pub kind: &'static str,
+    /// The row's encoding in a segment; `Err` for a value that does not
+    /// decode as its kind (never sealed: the row stays).
+    encode: EncodeFn,
+    /// The row's value from its encoding, all of which it reads.
+    decode: DecodeFn,
+    /// Whether a row and a segment value are the same, checked before the
+    /// row is deleted.
+    pub equal: fn(&[u8], &[u8]) -> bool,
+}
+
+/// A family: its columns, and the store feature that guards its rows.
+pub struct Family {
+    pub id: u8,
+    pub name: &'static str,
+    pub columns: &'static [Column],
+    /// Recorded before the first row of the family is deleted, so binaries
+    /// that cannot read the family refuse the store.
+    pub feature: &'static str,
+    /// Whether an index blob may name columns this binary does not know:
+    /// they are ignored, never merged and never dropped (ADR 0105).
+    /// `changeset-v1` cannot be: ADR 0104 binaries read an unknown column as
+    /// damage and drop the segment.
+    pub tolerant: bool,
+}
+
+impl Family {
+    pub fn column(&self, col: u8) -> Option<&'static Column> {
+        self.columns.iter().find(|c| c.id == col)
+    }
+
+    /// Bit `c` for every column this binary knows.
+    pub fn mask(&self) -> u64 {
+        self.columns.iter().fold(0, |m, c| m | 1 << c.id)
+    }
+
+    /// Key of the family's manifest row.
+    pub fn manifest_key(&self) -> Hash {
+        Hash::of_object("derived-segment-family", self.name.as_bytes())
+    }
+
+    /// The column holding `kind`.
+    pub fn column_of(&self, kind: &str) -> Option<u8> {
+        self.columns.iter().find(|c| c.kind == kind).map(|c| c.id)
+    }
+}
+
+fn bytes_equal(a: &[u8], b: &[u8]) -> bool {
+    a == b
+}
+
+/// Every family this binary reads and writes.
+pub static FAMILIES: &[Family] = &[
+    Family {
+        id: FAMILY_CHANGESET,
+        name: FAMILY_CHANGESET_NAME,
+        columns: &[
+            Column {
+                id: COL_SKIPLIST,
+                kind: Skiplist::NAME,
+                encode: encode_skiplist,
+                decode: decode_skiplist,
+                equal: bytes_equal,
+            },
+            Column {
+                id: COL_HISTORY_TREE,
+                kind: HistoryTree::NAME,
+                encode: encode_history,
+                decode: decode_history,
+                equal: history_pack::same_part,
+            },
+        ],
+        feature: super::FEATURE,
+        tolerant: false,
+    },
+    Family {
+        id: FAMILY_CHANGESET_V2,
+        name: FAMILY_CHANGESET_V2_NAME,
+        columns: &[
+            Column {
+                id: COL_GENERATION,
+                kind: Generation::NAME,
+                encode: encode_u64,
+                decode: decode_u64,
+                equal: bytes_equal,
+            },
+            Column {
+                id: COL_LAST_MERGE,
+                kind: LastMerge::NAME,
+                encode: encode_u64,
+                decode: decode_u64,
+                equal: bytes_equal,
+            },
+            Column {
+                id: COL_ROOT_TREE,
+                kind: RootTree::NAME,
+                encode: encode_hash,
+                decode: decode_hash,
+                equal: bytes_equal,
+            },
+            Column {
+                id: COL_LOG_FILTER,
+                kind: LogFilterIndex::NAME,
+                encode: encode_log_filter,
+                decode: decode_log_filter,
+                // A merge over the side budget stores a superset (ADR 0047),
+                // so two right rows of one changeset may differ: only the
+                // same bytes let a row go.
+                equal: bytes_equal,
+            },
+        ],
+        feature: super::FEATURE_2,
+        tolerant: true,
+    },
+];
+
+/// The family numbered `id`, if this binary knows it.
+pub fn family(id: u8) -> Option<&'static Family> {
+    FAMILIES.iter().find(|f| f.id == id)
+}
+
+/// The number of the family named `name`.
+pub fn family_by_name(name: &str) -> Option<u8> {
+    FAMILIES.iter().find(|f| f.name == name).map(|f| f.id)
+}
+
 /// Columns this binary can decode, per family.
-fn known_column(family: u8, col: u8) -> bool {
-    family == FAMILY_CHANGESET && matches!(col, COL_SKIPLIST | COL_HISTORY_TREE)
+fn known_column(family_id: u8, col: u8) -> bool {
+    family(family_id).is_some_and(|f| f.column(col).is_some())
 }
 
 const VERSION: u8 = 1;
@@ -77,7 +230,7 @@ impl<'a> Reader<'a> {
         Reader { b, pos: 0 }
     }
 
-    fn left(&self) -> usize {
+    pub(crate) fn left(&self) -> usize {
         self.b.len() - self.pos
     }
 
@@ -104,7 +257,7 @@ impl<'a> Reader<'a> {
     }
 
     /// A count of items each at least `each` bytes long.
-    fn count(&mut self, each: usize) -> Result<usize> {
+    pub(crate) fn count(&mut self, each: usize) -> Result<usize> {
         let n = self.varint()?;
         if n.saturating_mul(each as u64) > self.left() as u64 {
             return Err(bad("count past the end"));
@@ -121,7 +274,7 @@ impl<'a> Reader<'a> {
         Ok(s)
     }
 
-    fn hash(&mut self) -> Result<Hash> {
+    pub(crate) fn hash(&mut self) -> Result<Hash> {
         Ok(Hash(self.take(32)?.try_into().expect("32 bytes")))
     }
 
@@ -270,7 +423,7 @@ impl Manifest {
             return Err(newer("unknown flags"));
         }
         let family = body[2];
-        if family != FAMILY_CHANGESET {
+        if self::family(family).is_none() {
             return Err(newer("unknown family"));
         }
         let mut at = 3;
@@ -338,12 +491,13 @@ impl Manifest {
 
 // --- encoding a segment ----------------------------------------------------
 
-/// One key to seal: its generation (which orders the segment) and the
-/// values of the columns it has, as read from rows.
+/// One key to seal: its sort key (which orders the segment: the
+/// generation, so ancestors come first) and the values of the columns it
+/// has, as read from rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealRow {
     pub key: Hash,
-    pub generation: u64,
+    pub order: u64,
     pub values: Vec<(u8, Bytes)>,
 }
 
@@ -367,14 +521,14 @@ pub struct BadValue {
 /// not decode as their column's kind are left out and returned, so a
 /// damaged row is never copied into a segment.
 pub fn encode(family: u8, rows: &[SealRow], nonce: u64) -> Result<(Encoded, Vec<BadValue>)> {
-    if family != FAMILY_CHANGESET {
+    let Some(fam) = self::family(family) else {
         return Err(Error::Invalid(format!(
             "unknown derived segment family {family}"
         )));
-    }
-    // Ordinals: `(generation, key)` order, so ancestors come first.
+    };
+    // Ordinals: `(order, key)` order, so ancestors come first.
     let mut by_ord: Vec<&SealRow> = rows.iter().collect();
-    by_ord.sort_by_key(|r| (r.generation, r.key));
+    by_ord.sort_by_key(|r| (r.order, r.key));
     if by_ord.windows(2).any(|w| w[0].key == w[1].key) {
         return Err(Error::Invalid(
             "a key is sealed twice in one segment".into(),
@@ -393,9 +547,9 @@ pub fn encode(family: u8, rows: &[SealRow], nonce: u64) -> Result<(Encoded, Vec<
     for (o, r) in by_ord.iter().enumerate() {
         let mut seen = 0u64;
         for (col, value) in &r.values {
-            if !known_column(family, *col) || seen & (1 << col) != 0 {
+            let Some(column) = fam.column(*col).filter(|_| seen & (1 << col) == 0) else {
                 return Err(Error::Invalid(format!("bad column {col} for {}", r.key)));
-            }
+            };
             seen |= 1 << col;
             let mut refer = |id: &Hash| -> u64 {
                 match ord_of.get(id) {
@@ -403,10 +557,7 @@ pub fn encode(family: u8, rows: &[SealRow], nonce: u64) -> Result<(Encoded, Vec<
                     _ => 2 * ext.index(*id) + 1,
                 }
             };
-            let enc = match *col {
-                COL_SKIPLIST => encode_skiplist(r.key, value, &mut refer),
-                _ => encode_history(r.key, value, &mut refer),
-            };
+            let enc = (column.encode)(r.key, value, &mut refer);
             match enc {
                 Ok(e) => cols.entry(*col).or_insert_with(|| vec![None; n])[o] = Some(e),
                 Err(why) => bad_values.push(BadValue {
@@ -531,11 +682,7 @@ impl Externals {
 }
 
 /// `count, id reference*, first generation, (previous - this)*`.
-fn encode_skiplist(
-    key: Hash,
-    value: &[u8],
-    refer: &mut dyn FnMut(&Hash) -> u64,
-) -> std::result::Result<Vec<u8>, String> {
+fn encode_skiplist(key: Hash, value: &[u8], refer: Refer) -> std::result::Result<Vec<u8>, String> {
     let list = Skiplist::decode_of(ChangesetId(key), value).map_err(|e| e.to_string())?;
     let mut out = Vec::with_capacity(4 + 3 * list.len());
     put_varint(&mut out, list.len() as u64);
@@ -555,11 +702,7 @@ fn encode_skiplist(
 
 /// `table length, id reference*, then part 0's bytes after its table`. The
 /// checksum is left out: it is a function of the key and those bytes.
-fn encode_history(
-    key: Hash,
-    value: &[u8],
-    refer: &mut dyn FnMut(&Hash) -> u64,
-) -> std::result::Result<Vec<u8>, String> {
+fn encode_history(key: Hash, value: &[u8], refer: Refer) -> std::result::Result<Vec<u8>, String> {
     let cs = ChangesetId(key);
     history_pack::decode_root(cs, value).map_err(|e| e.to_string())?;
     let rest = history_pack::canonical(value).map_err(|e| e.to_string())?;
@@ -573,6 +716,88 @@ fn encode_history(
     }
     out.extend_from_slice(&rest[r.pos..]);
     Ok(out)
+}
+
+/// `generation` and `last_merge-v1`: the eight big-endian bytes as they
+/// are. In generation order they compress to about one byte a row, better
+/// than varints would (ADR 0105, measured).
+fn encode_u64(_: Hash, value: &[u8], _: Refer) -> std::result::Result<Vec<u8>, String> {
+    if value.len() != 8 {
+        return Err(format!("{} bytes, not 8", value.len()));
+    }
+    Ok(value.to_vec())
+}
+
+/// `root_tree`: the 32 bytes as they are.
+fn encode_hash(_: Hash, value: &[u8], _: Refer) -> std::result::Result<Vec<u8>, String> {
+    if value.len() != 32 {
+        return Err(format!("{} bytes, not 32", value.len()));
+    }
+    Ok(value.to_vec())
+}
+
+/// `log-filter-v1`: the row as it is, if it decodes and is the one encoding
+/// of what it decodes to (its varints are not checked minimal on read).
+fn encode_log_filter(_: Hash, value: &[u8], _: Refer) -> std::result::Result<Vec<u8>, String> {
+    let row = FilterRow::decode(value).map_err(|e| e.to_string())?;
+    if row.encode() != value {
+        return Err("not the canonical encoding".into());
+    }
+    Ok(value.to_vec())
+}
+
+fn decode_skiplist<'b>(_: Hash, r: &mut Reader<'b>, id: Resolve<'_, 'b>) -> Result<Bytes> {
+    let k = r.count(2)?;
+    let mut ids = Vec::with_capacity(k);
+    for _ in 0..k {
+        ids.push(id(r)?);
+    }
+    let mut out = Vec::with_capacity(40 * k);
+    let mut prev: Option<u64> = None;
+    for i in ids {
+        let g = match prev {
+            None => r.varint()?,
+            Some(p) => {
+                let d = r.varint()?;
+                if d == 0 || d > p {
+                    return Err(bad("skiplist generations do not descend"));
+                }
+                p - d
+            }
+        };
+        prev = Some(g);
+        out.extend_from_slice(&i.0);
+        out.extend_from_slice(&g.to_be_bytes());
+    }
+    Ok(Bytes::from(out))
+}
+
+fn decode_history<'b>(key: Hash, r: &mut Reader<'b>, id: Resolve<'_, 'b>) -> Result<Bytes> {
+    let t = r.count(1)?;
+    let mut rest = Vec::with_capacity(r.left() + 32 * t);
+    put_varint(&mut rest, t as u64);
+    for _ in 0..t {
+        rest.extend_from_slice(&id(r)?.0);
+    }
+    rest.extend_from_slice(r.take(r.left())?);
+    Ok(history_pack::part0_from_rest(ChangesetId(key), &rest))
+}
+
+fn decode_u64<'b>(_: Hash, r: &mut Reader<'b>, _: Resolve<'_, 'b>) -> Result<Bytes> {
+    Ok(Bytes::copy_from_slice(r.take(8)?))
+}
+
+fn decode_hash<'b>(_: Hash, r: &mut Reader<'b>, _: Resolve<'_, 'b>) -> Result<Bytes> {
+    Ok(Bytes::copy_from_slice(&r.hash()?.0))
+}
+
+fn decode_log_filter<'b>(_: Hash, r: &mut Reader<'b>, _: Resolve<'_, 'b>) -> Result<Bytes> {
+    let row = r.take(r.left())?;
+    let decoded = FilterRow::decode(row).map_err(|e| bad(&format!("log-filter-v1: {e}")))?;
+    if decoded.encode() != row {
+        return Err(bad("log-filter-v1 row not canonical"));
+    }
+    Ok(Bytes::copy_from_slice(row))
 }
 
 // --- decoding --------------------------------------------------------------
@@ -641,11 +866,15 @@ pub fn decode_index(hash: &Hash, bytes: &[u8]) -> Result<SegmentIndex> {
     parse_index(hash, bytes)
 }
 
+/// A value a segment holds: its key, column and bytes.
+pub type Value = (Hash, u8, Bytes);
+
 /// Decode an index blob and its data blob without checking addresses or
 /// that the index names this data blob, then every value: for fuzzing the
-/// parsers past the checksums. Never used to read a store.
+/// parsers past the checksums. Never used to read a store. Gives the
+/// family too.
 #[doc(hidden)]
-pub fn read_unchecked(index: &[u8], data: &[u8]) -> Result<Vec<(Hash, u8, Bytes)>> {
+pub fn read_unchecked(index: &[u8], data: &[u8]) -> Result<(u8, Vec<Value>)> {
     let mut idx = parse_index(&Hash::of_blob(index), index)?;
     idx.data = Hash::of_blob(data);
     idx.data_len = data.len() as u64;
@@ -659,7 +888,7 @@ pub fn read_unchecked(index: &[u8], data: &[u8]) -> Result<Vec<(Hash, u8, Bytes)
         }
     }
     let d = decode_data(&idx, &idx.data.clone(), Bytes::copy_from_slice(data))?;
-    read_all(&idx, &d)
+    Ok((idx.family, read_all(&idx, &d)?))
 }
 
 fn parse_index(hash: &Hash, bytes: &[u8]) -> Result<SegmentIndex> {
@@ -673,9 +902,9 @@ fn parse_index(hash: &Hash, bytes: &[u8]) -> Result<SegmentIndex> {
     }
     let nonce = u64::from_be_bytes(r.take(8)?.try_into().unwrap());
     let family = u8::try_from(r.varint()?).map_err(|_| bad("unknown family"))?;
-    if family != FAMILY_CHANGESET {
+    let Some(fam) = self::family(family) else {
         return Err(bad("unknown family"));
-    }
+    };
     let n = r.count(33)?;
     if n as u64 > ROWS_MAX {
         return Err(bad("too many keys"));
@@ -701,7 +930,8 @@ fn parse_index(hash: &Hash, bytes: &[u8]) -> Result<SegmentIndex> {
     let mut columns: Vec<ColumnIndex> = Vec::with_capacity(c);
     for _ in 0..c {
         let id = u8::try_from(r.varint()?).map_err(|_| bad("column out of range"))?;
-        if !known_column(family, id) {
+        // A column number is a bit of the manifest's mask.
+        if id >= 64 || (!fam.tolerant && fam.column(id).is_none()) {
             return Err(bad("unknown column"));
         }
         if columns.last().is_some_and(|l| l.id >= id) {
@@ -801,6 +1031,14 @@ impl SegmentIndex {
     /// Bit `c` for each column `c` it holds.
     pub fn column_mask(&self) -> u64 {
         self.columns.iter().fold(0, |m, c| m | 1 << c.id)
+    }
+
+    /// Whether it holds a column this binary does not know (ADR 0105: such
+    /// a segment is never merged or dropped by this binary).
+    pub fn has_unknown_columns(&self) -> bool {
+        self.columns
+            .iter()
+            .any(|c| !known_column(self.family, c.id))
     }
 
     /// Where `key`'s value of `col` is, if the segment has one.
@@ -975,8 +1213,11 @@ pub fn row_value(
     row: &[u8],
 ) -> Result<Bytes> {
     let key = idx.key_of(ord);
+    let column = self::family(idx.family)
+        .and_then(|f| f.column(col))
+        .ok_or_else(|| bad("unknown column"))?;
     let mut r = Reader::new(row);
-    let id = |r: &mut Reader| -> Result<Hash> {
+    let mut id = |r: &mut Reader| -> Result<Hash> {
         let v = r.varint()?;
         let id = if v & 1 == 0 {
             let back = v >> 1;
@@ -995,56 +1236,26 @@ pub fn row_value(
         }
         Ok(id)
     };
-    match col {
-        COL_SKIPLIST => {
-            let k = r.count(2)?;
-            let mut ids = Vec::with_capacity(k);
-            for _ in 0..k {
-                ids.push(id(&mut r)?);
-            }
-            let mut out = Vec::with_capacity(40 * k);
-            let mut prev: Option<u64> = None;
-            for i in ids {
-                let g = match prev {
-                    None => r.varint()?,
-                    Some(p) => {
-                        let d = r.varint()?;
-                        if d == 0 || d > p {
-                            return Err(bad("skiplist generations do not descend"));
-                        }
-                        p - d
-                    }
-                };
-                prev = Some(g);
-                out.extend_from_slice(&i.0);
-                out.extend_from_slice(&g.to_be_bytes());
-            }
-            if r.pos != row.len() {
-                return Err(bad("trailing bytes in a skiplist row"));
-            }
-            Ok(Bytes::from(out))
-        }
-        COL_HISTORY_TREE => {
-            let t = r.count(1)?;
-            let mut rest = Vec::with_capacity(row.len() + 32 * t);
-            put_varint(&mut rest, t as u64);
-            for _ in 0..t {
-                rest.extend_from_slice(&id(&mut r)?.0);
-            }
-            rest.extend_from_slice(&row[r.pos..]);
-            Ok(history_pack::part0_from_rest(ChangesetId(key), &rest))
-        }
-        _ => Err(bad("unknown column")),
+    let value = (column.decode)(key, &mut r, &mut id)?;
+    if r.pos != row.len() {
+        return Err(bad("trailing bytes in a row"));
     }
+    Ok(value)
 }
 
 /// Every value in the segment: `(key, column, value)`, by column then
-/// ordinal. For merges, `verify` and tests.
+/// ordinal. For merges, `verify` and tests. A column this binary does not
+/// know (in a family that allows them) has its blocks checked and no value
+/// given.
 pub fn read_all(idx: &SegmentIndex, data: &SegmentData) -> Result<Vec<(Hash, u8, Bytes)>> {
     let mut out = Vec::with_capacity(idx.len() * idx.columns.len());
     for (ci, c) in idx.columns.iter().enumerate() {
+        let known = known_column(idx.family, c.id);
         for bi in 0..c.blocks.len() {
             let block = read_block(idx, data, ci, bi)?;
+            if !known {
+                continue;
+            }
             let end = c.blocks.get(bi + 1).map_or(idx.len() as u32, |b| b.first);
             let mut rank = 0;
             for o in c.blocks[bi].first..end {
@@ -1060,20 +1271,14 @@ pub fn read_all(idx: &SegmentIndex, data: &SegmentData) -> Result<Vec<(Hash, u8,
     Ok(out)
 }
 
-/// The kind each column of `changeset-v1` holds.
-pub fn column_kind(col: u8) -> Option<&'static str> {
-    match col {
-        COL_SKIPLIST => Some(Skiplist::NAME),
-        COL_HISTORY_TREE => Some(HistoryTree::NAME),
-        _ => None,
-    }
+/// The kind column `col` of `family` holds.
+pub fn column_kind(family: u8, col: u8) -> Option<&'static str> {
+    self::family(family)?.column(col).map(|c| c.kind)
 }
 
-/// The column of `changeset-v1` holding `kind`.
-pub fn kind_column(kind: &str) -> Option<u8> {
-    match kind {
-        k if k == Skiplist::NAME => Some(COL_SKIPLIST),
-        k if k == HistoryTree::NAME => Some(COL_HISTORY_TREE),
-        _ => None,
-    }
+/// The family and column holding `kind`, if a segment may hold it.
+pub fn kind_column(kind: &str) -> Option<(u8, u8)> {
+    FAMILIES
+        .iter()
+        .find_map(|f| f.column_of(kind).map(|c| (f.id, c)))
 }

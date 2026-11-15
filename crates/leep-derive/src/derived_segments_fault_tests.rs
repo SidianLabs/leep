@@ -1,4 +1,5 @@
-//! Derived segments (ADR 0104) under faults and kills: lands, the warmer,
+//! Derived segments (ADR 0104, 0105; every family) under faults and kills:
+//! lands, the warmer,
 //! compactor passes (seal, merge, retire) killed at random points with
 //! their writes failing before or after landing, blob GC and the changeset
 //! sweep, interleaved. After every round, through a fault-free handle:
@@ -8,10 +9,11 @@
 
 use super::*;
 use crate::changeset_sweep::{self, SweepOptions};
-use crate::derived::{derive, DerivedKind, HistoryTree, Skiplist};
+use crate::derived::{derive, DerivedKind, Generation, HistoryTree, LogFilterIndex, Skiplist};
 use crate::derived_segments::view::{Found, ManifestRead};
 use crate::derived_segments::{
-    self as ds, codec, compact_pass, CompactOptions, CompactState, Features, Mode,
+    self as ds, codec, compact_pass, CompactOptions, CompactState, Features, Mode, FAMILIES,
+    FAMILY_CHANGESET, FAMILY_CHANGESET_V2,
 };
 
 const DAY: i64 = 86_400;
@@ -43,8 +45,8 @@ fn compact_opts(rng: &mut Rng, mode: Mode) -> CompactOptions {
 
 fn no_feature() -> Features {
     Features {
-        record: Arc::new(|| Box::pin(async { Ok(()) })),
-        recorded: Arc::new(|| Box::pin(async { Ok(true) })),
+        record: Arc::new(|_| Box::pin(async { Ok(()) })),
+        recorded: Arc::new(|_| Box::pin(async { Ok(true) })),
     }
 }
 
@@ -80,70 +82,79 @@ async fn change(
     retry(seed, "commit", || repo.create_changeset(cs.clone())).await
 }
 
-/// The invariants above, through a fresh fault-free handle.
+/// The invariants above, for every family, through a fresh fault-free
+/// handle.
 async fn check(seed: u64, step: usize, w: &World) {
     let clean = Repo::new(w.blobs.clone(), w.meta.clone());
-    let (raw, read) = ds::read_manifest(&clean).await.unwrap();
-    let m = match read {
-        ManifestRead::Absent => codec::Manifest::new(codec::FAMILY_CHANGESET),
-        ManifestRead::Read(m) => m,
-        ManifestRead::Damaged | ManifestRead::Newer => {
-            panic!("seed {seed} step {step}: the manifest does not decode")
+    for fam in FAMILIES {
+        let (raw, read) = ds::read_manifest(&clean, fam.id).await.unwrap();
+        let m = match read {
+            ManifestRead::Absent => codec::Manifest::new(fam.id),
+            ManifestRead::Read(m) => m,
+            ManifestRead::Damaged | ManifestRead::Newer => {
+                panic!(
+                    "seed {seed} step {step}: the {} manifest does not decode",
+                    fam.name
+                )
+            }
+        };
+        for s in &m.live {
+            let idx = ds::view::load_index(&*w.blobs, fam.id, s)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| {
+                    panic!("seed {seed} step {step}: live segment {} lost", s.index)
+                });
+            let data = w
+                .blobs
+                .get(&s.data)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("seed {seed} step {step}: data of {} lost", s.index));
+            let data = codec::decode_data(&idx, &s.data, data).unwrap();
+            codec::read_all(&idx, &data).unwrap();
         }
-    };
-    for s in &m.live {
-        let idx = ds::view::load_index(&*w.blobs, s)
-            .await
-            .unwrap()
-            .unwrap_or_else(|| panic!("seed {seed} step {step}: live segment {} lost", s.index));
-        let data = w
-            .blobs
-            .get(&s.data)
-            .await
-            .unwrap()
-            .unwrap_or_else(|| panic!("seed {seed} step {step}: data of {} lost", s.index));
-        let data = codec::decode_data(&idx, &s.data, data).unwrap();
-        codec::read_all(&idx, &data).unwrap();
+        clean.segments().family(fam.id).apply(raw).await.unwrap();
     }
-    clean.segments().apply(raw).await.unwrap();
     let (oracle_meta, ids) = without_derived(&clean).await;
     let oracle = Repo::new(w.blobs.clone(), oracle_meta);
     for id in ids {
-        for (col, kind) in [
-            (codec::COL_SKIPLIST, Skiplist::NAME),
-            (codec::COL_HISTORY_TREE, HistoryTree::NAME),
-        ] {
-            let row = w.meta.get_derived(kind, &id.0).await.unwrap();
-            let seg = match clean.segments().lookup(&id.0, col).await.unwrap() {
-                Found::Yes(v) => Some(v),
-                Found::No => None,
-                Found::Gone(h) => panic!("seed {seed} step {step}: segment {h} unreadable"),
-            };
-            if kind == HistoryTree::NAME && row.is_none() && seg.is_none() {
-                // Not derived yet: the warmer is allowed to lag.
-                continue;
-            }
-            assert!(
-                row.is_some() || seg.is_some(),
-                "seed {seed} step {step}: the {kind} row of {id} is gone and no live segment \
-                 holds it"
-            );
-            let want = if kind == Skiplist::NAME {
-                derive::<Skiplist>(&oracle, id).await.unwrap()
-            } else {
-                derive::<HistoryTree>(&oracle, id).await.unwrap()
-            };
-            for (what, v) in [("row", row), ("segment", seg)] {
-                let Some(v) = v else { continue };
-                let same = if kind == Skiplist::NAME {
-                    v == want
-                } else {
-                    crate::derived::history_pack::same_part(&v, &want)
+        for fam in FAMILIES {
+            for column in fam.columns {
+                let (col, kind) = (column.id, column.kind);
+                let row = w.meta.get_derived(kind, &id.0).await.unwrap();
+                let seg = match clean
+                    .segments()
+                    .family(fam.id)
+                    .lookup(&id.0, col)
+                    .await
+                    .unwrap()
+                {
+                    Found::Yes(v) => Some(v),
+                    Found::No => None,
+                    Found::Gone(h) => panic!("seed {seed} step {step}: segment {h} unreadable"),
                 };
+                // Written with the changeset: never missing. The others
+                // are the warmer's or a query's, which may lag.
+                let with_changeset = [Skiplist::NAME, Generation::NAME, "root_tree"];
+                if !with_changeset.contains(&kind) && row.is_none() && seg.is_none() {
+                    continue;
+                }
                 assert!(
-                    same,
-                    "seed {seed} step {step}: the {kind} {what} of {id} is wrong"
+                    row.is_some() || seg.is_some(),
+                    "seed {seed} step {step}: the {kind} row of {id} is gone and no live \
+                     segment holds it"
                 );
+                let want = crate::integrity::rows::derive_kind(kind, &oracle, id)
+                    .await
+                    .unwrap();
+                for (what, v) in [("row", row), ("segment", seg)] {
+                    let Some(v) = v else { continue };
+                    assert!(
+                        (column.equal)(&v, &want),
+                        "seed {seed} step {step}: the {kind} {what} of {id} is wrong"
+                    );
+                }
             }
         }
     }
@@ -209,6 +220,9 @@ async fn segments_under_faults(seed: u64) {
         for id in std::iter::once(tip).chain(side) {
             if rng.below(4) > 0 {
                 retry(seed, "warm", || derive::<HistoryTree>(&client, id)).await;
+            }
+            if rng.below(4) > 0 {
+                retry(seed, "warm", || derive::<LogFilterIndex>(&client, id)).await;
             }
         }
         // A pass, killed at a random point.
@@ -283,24 +297,28 @@ async fn segments_under_faults(seed: u64) {
         .await
         .unwrap();
     check(seed, 99, &w).await;
-    // The sweep exercised what it means to: segments, and in mode retire
-    // rows deleted.
-    let ManifestRead::Read(m) = ds::read_manifest(&clean).await.unwrap().1 else {
-        panic!("seed {seed}: no manifest after the clean passes")
-    };
-    assert!(!m.live.is_empty(), "seed {seed}");
+    // The sweep exercised what it means to: segments of both families,
+    // and in mode retire rows deleted.
+    for family in [FAMILY_CHANGESET, FAMILY_CHANGESET_V2] {
+        let ManifestRead::Read(m) = ds::read_manifest(&clean, family).await.unwrap().1 else {
+            panic!("seed {seed}: no manifest of family {family} after the clean passes")
+        };
+        assert!(!m.live.is_empty(), "seed {seed} family {family}");
+    }
     if opts.mode == Mode::Retire {
-        let rows = w.meta.count_derived(Skiplist::NAME).await.unwrap();
         let stored = w
             .meta
             .list_changesets(None, usize::MAX)
             .await
             .unwrap()
             .len() as u64;
-        assert!(
-            rows * 4 < stored,
-            "seed {seed}: {rows} of {stored} rows left"
-        );
+        for kind in [Skiplist::NAME, Generation::NAME, LogFilterIndex::NAME] {
+            let rows = w.meta.count_derived(kind).await.unwrap();
+            assert!(
+                rows * 4 < stored,
+                "seed {seed}: {rows} {kind} rows of {stored} changesets left"
+            );
+        }
     }
 }
 

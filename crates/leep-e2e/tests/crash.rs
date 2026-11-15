@@ -1327,10 +1327,13 @@ fn killed_auto_compaction_mid_pass_loses_nothing_postgres() {
 }
 
 // ---------------------------------------------------------------------------
-// Derived segments (ADR 0104)
+// Derived segments (ADR 0104, 0105)
 
-/// Every `skiplist` and `history-tree-v4` value of `ids` as a new process
-/// reads it (rows, then segments), history parts by their content.
+/// The kinds of family `changeset-v2` (ADR 0105).
+const V2_KINDS: [&str; 4] = ["generation", "last_merge-v1", "root_tree", "log-filter-v1"];
+
+/// Every value of the kinds both segment families hold, of `ids`, as a new
+/// process reads it (rows, then segments), history parts by their content.
 fn segment_values(stores: &Stores, ids: &[ChangesetId]) -> Vec<Option<Vec<u8>>> {
     let repo = open_repo(stores);
     let keys: Vec<Hash> = ids.iter().map(|i| i.0).collect();
@@ -1355,39 +1358,54 @@ fn segment_values(stores: &Stores, ids: &[ChangesetId]) -> Vec<Option<Vec<u8>>> 
                     .into_owned()
             }));
         }
+        for kind in V2_KINDS {
+            out.extend(
+                repo.meta()
+                    .get_derived_many(kind, &keys)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|v| v.map(|b| b.to_vec())),
+            );
+        }
         out
     })
 }
 
-/// How many of `ids` a live segment holds both values of, and the rows of
-/// the two kinds left.
+/// How many of `ids` live segments of both families hold (`skiplist` and
+/// `history-tree-v4`; `generation` and `root_tree`, which every changeset
+/// has), and the rows of the six kinds left.
 fn segment_coverage(stores: &Stores, ids: &[ChangesetId]) -> (usize, u64) {
-    use leep_derive::derived_segments::{self as ds, COL_HISTORY_TREE, COL_SKIPLIST};
+    use leep_derive::derived_segments::{
+        self as ds, COL_GENERATION, COL_HISTORY_TREE, COL_ROOT_TREE, COL_SKIPLIST,
+    };
     let repo = open_repo(stores);
     common_block_on(async {
-        let (raw, _) = ds::read_manifest(&repo).await.unwrap();
-        repo.segments().apply(raw).await.unwrap();
+        repo.segments().refresh(&**repo.row_meta()).await.unwrap();
+        let v1 = repo.segments().family(ds::FAMILY_CHANGESET).clone();
+        let v2 = repo.segments().family(ds::FAMILY_CHANGESET_V2).clone();
         let held = ids
             .iter()
             .filter(|id| {
-                repo.segments().holds(&id.0, COL_SKIPLIST)
-                    && repo.segments().holds(&id.0, COL_HISTORY_TREE)
+                v1.holds(&id.0, COL_SKIPLIST)
+                    && v1.holds(&id.0, COL_HISTORY_TREE)
+                    && v2.holds(&id.0, COL_GENERATION)
+                    && v2.holds(&id.0, COL_ROOT_TREE)
             })
             .count();
-        let rows = repo.row_meta().count_derived("skiplist").await.unwrap()
-            + repo
-                .row_meta()
-                .count_derived("history-tree-v4")
-                .await
-                .unwrap();
+        let mut rows = 0;
+        for kind in ["skiplist", "history-tree-v4"].into_iter().chain(V2_KINDS) {
+            rows += repo.row_meta().count_derived(kind).await.unwrap();
+        }
         (held, rows)
     })
 }
 
-/// A server SIGKILLed at `point` of a derived segments pass in `mode`: the
-/// store verifies, every value reads as before, and the next server
-/// finishes the work. For `merge-stored` the store is first sealed into
-/// many small segments in-process, so the server's pass merges them.
+/// A server SIGKILLed at `point` of a derived segments pass in `mode` (a
+/// point of family `changeset-v2` after `changeset-v2:`): the store
+/// verifies, every value reads as before, and the next server finishes the
+/// work. For `merge-stored` the store is first sealed into many small
+/// segments in-process, so the server's pass merges them.
 fn run_segments_kill(backend: &str, meta_url: Option<String>, mode: &str, point: &str) {
     use leep_derive::derived_segments::{compact_pass, CompactOptions, CompactState, Mode};
     let _g = serial();
@@ -1404,7 +1422,12 @@ fn run_segments_kill(backend: &str, meta_url: Option<String>, mode: &str, point:
         leep_derive::derived::HistoryTree,
     >(&repo, *made.last().unwrap()))
     .unwrap();
-    if point == "merge-stored" {
+    // As the server's warmer would, so values do not change under the test.
+    common_block_on(leep_derive::derived::derive::<
+        leep_derive::derived::LogFilterIndex,
+    >(&repo, *made.last().unwrap()))
+    .unwrap();
+    if point.ends_with("merge-stored") {
         let opts = CompactOptions {
             seal_rows: 1,
             idle_rows: 1,
@@ -1422,7 +1445,8 @@ fn run_segments_kill(backend: &str, meta_url: Option<String>, mode: &str, point:
     }
     drop(repo);
     let want = segment_values(&stores, &made);
-    assert!(want.iter().all(Option::is_some));
+    assert!(want[..2 * made.len()].iter().all(Option::is_some));
+    let (_, rows_before) = segment_coverage(&stores, &made);
     let tag = format!("{backend}, derived segments {mode} killed at {point}");
     let common_args = [
         "--derived-segments",
@@ -1472,11 +1496,20 @@ fn run_segments_kill(backend: &str, meta_url: Option<String>, mode: &str, point:
                     .unwrap()
             }
         });
+        // Family changeset-v1 runs first: by a changeset-v2 point both
+        // families have deleted rows, and each recorded its feature first.
         assert!(
             features.iter().any(|f| f == "derived-segments"),
             "[{tag}] rows were deleted before the feature was recorded: {features:?}"
         );
-        assert!(rows < 2 * made.len() as u64, "[{tag}] no row was deleted");
+        if point.starts_with("changeset-v2:") {
+            assert!(
+                features.iter().any(|f| f == "derived-segments-2"),
+                "[{tag}] changeset-v2 rows were deleted before its feature was recorded: \
+                 {features:?}"
+            );
+        }
+        assert!(rows < rows_before, "[{tag}] no row was deleted");
     }
     // The next server finishes the work.
     let server = Server::start_with(free_port(), &stores, root, &common_args);
@@ -1507,24 +1540,29 @@ fn run_segments_kill(backend: &str, meta_url: Option<String>, mode: &str, point:
     );
 }
 
+/// Kill points of both families: before and after a seal's manifest
+/// swap, before a merge's swap, and after a retirement's delete.
+const SEGMENT_KILLS: [(&str, &str); 8] = [
+    ("build", "seal-stored"),
+    ("build", "seal-swapped"),
+    ("build", "merge-stored"),
+    ("retire", "retire-deleted"),
+    ("build", "changeset-v2:seal-stored"),
+    ("build", "changeset-v2:seal-swapped"),
+    ("build", "changeset-v2:merge-stored"),
+    ("retire", "changeset-v2:retire-deleted"),
+];
+
 #[test]
 fn killed_derived_segment_passes_lose_nothing_sqlite() {
-    for (mode, point) in [
-        ("build", "seal-stored"),
-        ("build", "merge-stored"),
-        ("retire", "retire-deleted"),
-    ] {
+    for (mode, point) in SEGMENT_KILLS {
         run_segments_kill("sqlite", None, mode, point);
     }
 }
 
 #[test]
 fn killed_derived_segment_passes_lose_nothing_postgres() {
-    for (mode, point) in [
-        ("build", "seal-stored"),
-        ("build", "merge-stored"),
-        ("retire", "retire-deleted"),
-    ] {
+    for (mode, point) in SEGMENT_KILLS {
         let Some(db) = PgDb::create("leep_e2e") else {
             return;
         };

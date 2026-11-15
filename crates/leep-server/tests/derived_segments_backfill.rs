@@ -78,8 +78,8 @@ async fn measure_backfill_and_retire() {
     }
     eprintln!("{n} changesets written in {:.1?}", started.elapsed());
     let hook = Features {
-        record: Arc::new(|| Box::pin(async { Ok(()) })),
-        recorded: Arc::new(|| Box::pin(async { Ok(true) })),
+        record: Arc::new(|_| Box::pin(async { Ok(()) })),
+        recorded: Arc::new(|_| Box::pin(async { Ok(true) })),
     };
     let mut state = CompactState::default();
     for (mode, retire_after) in [

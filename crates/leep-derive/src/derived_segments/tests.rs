@@ -1,6 +1,6 @@
-//! Tests of derived segments (ADR 0104): the codec, the read path, the
-//! compactor, and that a store whose rows were sealed and retired answers
-//! every query exactly as the row-only store does.
+//! Tests of derived segments (ADR 0104, 0105): the codec, the read path,
+//! the compactor over every family, and that a store whose rows were sealed
+//! and retired answers every query exactly as the row-only store does.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,13 +17,34 @@ use super::codec::{self, Manifest, SealRow, SegmentRef, COL_HISTORY_TREE, COL_SK
 use super::compactor::Pass;
 use super::*;
 use crate::derived::history_pack::same_part;
-use crate::derived::{derive, DerivedKind, Generation, HistoryTree, Skiplist};
+use crate::derived::{
+    derive, DerivedKind, Generation, HistoryTree, LastMerge, LogFilterIndex, RootTree, Skiplist,
+};
 use crate::tests::commit;
 use crate::Repo;
 
 fn h(b: u8) -> Hash {
     Hash([b; 32])
 }
+
+/// The `changeset-v1` part of a pass's report: the tests written for ADR
+/// 0104 count that family's segments.
+fn v1(p: &PassReport) -> PassReport {
+    p.family(codec::FAMILY_CHANGESET_NAME).cloned().unwrap()
+}
+
+/// The `changeset-v2` part of a pass's report.
+fn v2(p: &PassReport) -> PassReport {
+    p.family(codec::FAMILY_CHANGESET_V2_NAME).cloned().unwrap()
+}
+
+/// The kinds of family `changeset-v2`, in column order.
+const V2_KINDS: [&str; 4] = [
+    Generation::NAME,
+    LastMerge::NAME,
+    RootTree::NAME_STR,
+    LogFilterIndex::NAME,
+];
 
 /// A small deterministic PRNG (xorshift), so failures reproduce.
 pub(crate) struct Rng(pub(crate) u64);
@@ -56,7 +77,8 @@ type Each<'a> = &'a mut (dyn FnMut() -> BoxFuture<'static, ()> + Send);
 
 /// A history with a linear stretch, side branches merged back, deletions
 /// and a criss-cross (two branches merging each other). Runs `each` after
-/// every few changesets, with history-tree-v4 derived up to the newest.
+/// every few changesets, with history-tree-v4 and log-filter-v1 derived up
+/// to the newest (as the warmer does).
 /// Deterministic: the same calls build the same ids.
 pub(crate) async fn build(r: &Repo, mut each: Option<Each<'_>>) -> Vec<ChangesetId> {
     let mut all = Vec::new();
@@ -101,12 +123,14 @@ pub(crate) async fn build(r: &Repo, mut each: Option<Each<'_>>) -> Vec<Changeset
         all.push(head);
         if i % 3 == 2 {
             derive::<HistoryTree>(r, head).await.unwrap();
+            derive::<LogFilterIndex>(r, head).await.unwrap();
             if let Some(f) = each.as_mut() {
                 f().await;
             }
         }
     }
     derive::<HistoryTree>(r, head).await.unwrap();
+    derive::<LogFilterIndex>(r, head).await.unwrap();
     all
 }
 
@@ -132,7 +156,7 @@ async fn seal_rows(r: &Repo) -> Vec<SealRow> {
         }
         out.push(SealRow {
             key: *k,
-            generation: g,
+            order: g,
             values,
         });
     }
@@ -225,7 +249,7 @@ async fn arbitrary_rows_round_trip() {
             }
             rows.push(SealRow {
                 key: s.key,
-                generation: rng.below(40),
+                order: rng.below(40),
                 values,
             });
         }
@@ -256,7 +280,7 @@ async fn arbitrary_rows_round_trip() {
             }
             rows.push(SealRow {
                 key: Hash(key),
-                generation: rng.next(),
+                order: rng.next(),
                 values: vec![(COL_SKIPLIST, Skiplist::encode(&list))],
             });
         }
@@ -287,7 +311,7 @@ async fn damaged_values_are_not_sealed() {
     // A skiplist naming its own changeset is damage too.
     let own = SealRow {
         key: h(9),
-        generation: 3,
+        order: 3,
         values: vec![(
             COL_SKIPLIST,
             Skiplist::encode(&[crate::derived::SkipEntry {
@@ -308,17 +332,17 @@ pub(crate) fn golden_rows() -> Vec<SealRow> {
     vec![
         SealRow {
             key: h(1),
-            generation: 1,
+            order: 1,
             values: vec![(COL_SKIPLIST, Bytes::new())],
         },
         SealRow {
             key: h(2),
-            generation: 2,
+            order: 2,
             values: vec![(COL_SKIPLIST, Skiplist::encode(&[e(1, 1)]))],
         },
         SealRow {
             key: h(3),
-            generation: 3,
+            order: 3,
             values: vec![(COL_SKIPLIST, Skiplist::encode(&[e(2, 2), e(7, 1)]))],
         },
     ]
@@ -381,7 +405,7 @@ fn golden_bytes() {
     assert_eq!(v.len(), 3 + 8 + 4 + 80 + 4 + 32 + 32);
     assert_eq!(Manifest::decode(&v).unwrap(), m);
     assert_eq!(
-        manifest_key(),
+        manifest_key(FAMILY_CHANGESET),
         Hash::of_object("derived-segment-family", b"changeset-v1")
     );
     assert_eq!(
@@ -479,16 +503,16 @@ fn manifest_retired_list_is_bounded_and_never_names_a_live_blob() {
 pub(crate) fn feature_hook(log: Arc<Mutex<Vec<&'static str>>>) -> Features {
     let seen = log.clone();
     Features {
-        record: Arc::new(move || {
+        record: Arc::new(move |name| {
             let log = log.clone();
             Box::pin(async move {
-                log.lock().unwrap().push("feature");
+                log.lock().unwrap().push(name);
                 Ok(())
             })
         }),
-        recorded: Arc::new(move || {
+        recorded: Arc::new(move |name| {
             let seen = seen.clone();
-            Box::pin(async move { Ok(!seen.lock().unwrap().is_empty()) })
+            Box::pin(async move { Ok(seen.lock().unwrap().contains(&name)) })
         }),
     }
 }
@@ -529,8 +553,8 @@ pub(crate) async fn settle(
     panic!("passes kept finding work");
 }
 
-/// Every value of both kinds of `ids`, read through a new handle; history
-/// parts as their content.
+/// Every value of every segmented kind of `ids`, read through a new
+/// handle; history parts as their content.
 pub(crate) async fn values(r: &Repo, ids: &[ChangesetId]) -> Vec<Option<Bytes>> {
     let f = fresh(r);
     let keys: Vec<Hash> = ids.iter().map(|i| i.0).collect();
@@ -553,6 +577,9 @@ pub(crate) async fn values(r: &Repo, ids: &[ChangesetId]) -> Vec<Option<Bytes>> 
             )
         })
     }));
+    for kind in V2_KINDS {
+        out.extend(f.meta().get_derived_many(kind, &keys).await.unwrap());
+    }
     out
 }
 
@@ -613,7 +640,8 @@ pub(crate) fn passes_while_building(
 }
 
 /// A store sealed and retired by the compactor answers every query, and
-/// every read of the two kinds, exactly as the row-only store does.
+/// every read of the six kinds of both families, exactly as the row-only
+/// store does.
 #[tokio::test]
 async fn sealed_and_retired_store_answers_as_rows_do() {
     let plain = repo();
@@ -644,30 +672,44 @@ async fn sealed_and_retired_store_answers_as_rows_do() {
         rows(&sealed, HistoryTree::NAME).await.len(),
         rows(&plain, HistoryTree::NAME).await.len()
     );
+    for kind in V2_KINDS {
+        assert_eq!(
+            rows(&sealed, kind).await,
+            rows(&plain, kind).await,
+            "{kind}"
+        );
+    }
     let want_values = values(&plain, &ids).await;
     let want = answers(&plain, &ids).await;
     assert_eq!(values(&sealed, &ids).await, want_values);
 
-    // Retire: the feature first, then the rows go; the answers stay.
+    // Retire: each family's feature first, then its rows go; the answers
+    // stay.
     let log = Arc::new(Mutex::new(Vec::new()));
     let hook = feature_hook(log.clone());
     let retire = CompactOptions::small(Mode::Retire);
     let done = settle(&sealed, &retire, &mut state, Some(&hook)).await;
-    assert!(done.retired_rows > 100, "{done:?}");
+    assert!(done.retired_rows > 300, "{done:?}");
     assert_eq!(done.mismatched, 0);
-    assert_eq!(*log.lock().unwrap(), ["feature"]);
+    assert_eq!(*log.lock().unwrap(), [FEATURE, FEATURE_2]);
     assert!(rows(&sealed, Skiplist::NAME).await.is_empty());
     assert!(rows(&sealed, HistoryTree::NAME).await.is_empty());
+    for kind in V2_KINDS {
+        assert!(rows(&sealed, kind).await.is_empty(), "{kind}");
+    }
     assert_eq!(values(&sealed, &ids).await, want_values);
     // Nothing is derived again to answer the queries.
     let probe = fresh(&sealed);
     assert_eq!(answers(&probe, &ids).await, want);
     assert_eq!(probe.derived_count(), 0);
     // Counting sees the sealed keys.
-    assert_eq!(
-        probe.meta().count_derived(Skiplist::NAME).await.unwrap(),
-        ids.len() as u64
-    );
+    for kind in [Skiplist::NAME, Generation::NAME, RootTree::NAME_STR] {
+        assert_eq!(
+            probe.meta().count_derived(kind).await.unwrap(),
+            ids.len() as u64,
+            "{kind}"
+        );
+    }
     assert!(
         probe
             .meta()
@@ -697,17 +739,21 @@ async fn a_stale_pass_loses_the_swap() {
     build(&r, None).await;
     let opts = CompactOptions::small(Mode::Build);
     let none = None;
-    let mut stale = Pass::load(&r, &opts, &none, None).await.unwrap();
-    let mut first = Pass::load(&r, &opts, &none, None).await.unwrap();
+    let mut stale = Pass::load(&r, &FAMILIES[0], &opts, &none, None)
+        .await
+        .unwrap();
+    let mut first = Pass::load(&r, &FAMILIES[0], &opts, &none, None)
+        .await
+        .unwrap();
     first.run(&mut CompactState::default()).await.unwrap();
-    let (after, _) = read_manifest(&r).await.unwrap();
+    let (after, _) = read_manifest(&r, FAMILY_CHANGESET).await.unwrap();
     assert!(after.is_some());
     let err = stale
         .run(&mut CompactState::default())
         .await
         .expect_err("stale");
     assert!(matches!(err, Error::Conflict(_)), "{err}");
-    assert_eq!(read_manifest(&r).await.unwrap().0, after);
+    assert_eq!(read_manifest(&r, FAMILY_CHANGESET).await.unwrap().0, after);
 }
 
 /// One pass at a time: a second server finds the lease held and skips.
@@ -746,28 +792,49 @@ async fn seals_wait_for_enough_rows_or_quiet() {
         ..CompactOptions::small(Mode::Build)
     };
     let mut st = CompactState::default();
-    // Skiplists only: lone, and too few.
+    // Skiplists only: lone, and too few. (`changeset-v2` likewise: no
+    // log filter yet.)
     assert_eq!(pass(&r, &opts, &mut st, None).await.sealed_segments, 0);
     tokio::time::advance(Duration::from_secs(400)).await;
     // Lone long enough, but not quiet long enough.
     assert_eq!(pass(&r, &opts, &mut st, None).await.sealed_segments, 0);
     tokio::time::advance(Duration::from_secs(300)).await;
     let p = pass(&r, &opts, &mut st, None).await;
-    assert_eq!((p.sealed_segments, p.sealed_keys), (1, 3), "{p:?}");
+    assert_eq!(
+        (v1(&p).sealed_segments, v1(&p).sealed_keys),
+        (1, 3),
+        "{p:?}"
+    );
+    assert_eq!(
+        (v2(&p).sealed_segments, v2(&p).sealed_keys),
+        (1, 3),
+        "{p:?}"
+    );
     // Their history rows arrive later and seal in a segment of their own:
     // their skiplists are sealed, so they need not wait.
     derive::<HistoryTree>(&r, c).await.unwrap();
     pass(&r, &opts, &mut st, None).await;
     tokio::time::advance(Duration::from_secs(700)).await;
     let p = pass(&r, &opts, &mut st, None).await;
-    assert_eq!((p.live_segments, p.unsealed_rows), (2, 0), "{p:?}");
+    assert_eq!(
+        (v1(&p).live_segments, v1(&p).unsealed_rows),
+        (2, 0),
+        "{p:?}"
+    );
     let v = fresh(&r);
-    v.segments()
-        .apply(read_manifest(&v).await.unwrap().0)
-        .await
-        .unwrap();
-    assert!(v.segments().holds(&c.0, COL_HISTORY_TREE));
-    assert!(v.segments().holds(&a.0, COL_SKIPLIST));
+    v.segments().refresh(&**v.row_meta()).await.unwrap();
+    assert!(v
+        .segments()
+        .family(FAMILY_CHANGESET)
+        .holds(&c.0, COL_HISTORY_TREE));
+    assert!(v
+        .segments()
+        .family(FAMILY_CHANGESET)
+        .holds(&a.0, COL_SKIPLIST));
+    assert!(v
+        .segments()
+        .family(FAMILY_CHANGESET_V2)
+        .holds(&a.0, COL_GENERATION));
 }
 
 /// Retirement waits until a segment was live long enough, and keeps a row
@@ -841,7 +908,7 @@ async fn a_lost_segment_reads_as_missing_rows() {
         Some(&hook),
     )
     .await;
-    let (_, ManifestRead::Read(m)) = read_manifest(&r).await.unwrap() else {
+    let (_, ManifestRead::Read(m)) = read_manifest(&r, FAMILY_CHANGESET).await.unwrap() else {
         panic!("no manifest")
     };
     let lost = m.live[0];
@@ -867,7 +934,7 @@ async fn a_lost_segment_reads_as_missing_rows() {
     assert_eq!(p.dropped, 0, "{p:?}");
     let p = pass(&r, &CompactOptions::small(Mode::Build), &mut st, None).await;
     assert_eq!(p.dropped, 1, "{p:?}");
-    let (_, ManifestRead::Read(m)) = read_manifest(&r).await.unwrap() else {
+    let (_, ManifestRead::Read(m)) = read_manifest(&r, FAMILY_CHANGESET).await.unwrap() else {
         panic!()
     };
     assert!(!m.live.iter().any(|s| s.index == lost.index));
@@ -876,9 +943,10 @@ async fn a_lost_segment_reads_as_missing_rows() {
     assert_eq!(values(&r, &ids).await, want);
 }
 
-/// A view reads the manifest again only for a miss, at most every
-/// `REFRESH`: in mode build (every row there) never; a batched read of
-/// several kinds carries it in the same call.
+/// A view reads the manifests again only for a miss, at most every
+/// `REFRESH`: in mode build (every row there) never; a single-row read's
+/// miss reads each family's with a single-row read (two families), and a
+/// batched read of several kinds carries them all in the same call.
 #[tokio::test(start_paused = true)]
 async fn the_manifest_is_read_only_for_misses() {
     let r = repo();
@@ -913,7 +981,7 @@ async fn the_manifest_is_read_only_for_misses() {
         .await
         .unwrap();
     assert!(got.is_some());
-    assert_eq!((counter.calls() - base, counter.manifest_reads()), (2, 1));
+    assert_eq!((counter.calls() - base, counter.manifest_reads()), (3, 2));
     v.meta()
         .get_derived_many(HistoryTree::NAME, &[ids[3].0, ids[4].0])
         .await
@@ -922,14 +990,16 @@ async fn the_manifest_is_read_only_for_misses() {
         .get_derived(Generation::NAME, &ids[3].0)
         .await
         .unwrap();
-    assert_eq!((counter.calls() - base, counter.manifest_reads()), (4, 1));
+    // `generation` is sealed too (family changeset-v2): its miss finds the
+    // manifest read above.
+    assert_eq!((counter.calls() - base, counter.manifest_reads()), (5, 2));
     tokio::time::advance(view::REFRESH).await;
     let keys = [ids[3].0];
     v.meta()
         .get_derived_kinds(&[(Skiplist::NAME, &keys), (Generation::NAME, &keys)])
         .await
         .unwrap();
-    assert_eq!((counter.calls() - base, counter.manifest_reads()), (5, 2));
+    assert_eq!((counter.calls() - base, counter.manifest_reads()), (6, 3));
 }
 
 /// Counts derived reads, and those that bring the manifest.
@@ -1062,10 +1132,20 @@ async fn gc_keeps_live_segments_and_collects_merged_ones() {
     );
     let ids = build(&r, Some(&mut each)).await;
     drop(each);
-    let (_, ManifestRead::Read(m)) = read_manifest(&r).await.unwrap() else {
-        panic!("no manifest")
-    };
-    assert!(!m.retired.is_empty(), "merges retired segments");
+    // Every family's segments: GC unions the manifests.
+    let mut m = Manifest::new(FAMILY_CHANGESET);
+    for fam in FAMILIES {
+        let (_, ManifestRead::Read(fm)) = read_manifest(&r, fam.id).await.unwrap() else {
+            panic!("no manifest of {}", fam.name)
+        };
+        assert!(
+            !fm.retired.is_empty(),
+            "merges retired segments of {}",
+            fam.name
+        );
+        m.live.extend(fm.live);
+        m.retired.extend(fm.retired);
+    }
     let retired: Vec<Hash> = m.retired.clone();
     let want = values(&r, &ids).await;
     let opts = GcOptions {
@@ -1102,17 +1182,40 @@ async fn gc_keeps_live_segments_and_collects_merged_ones() {
         None,
     )
     .await;
-    let (_, ManifestRead::Read(m)) = read_manifest(&r).await.unwrap() else {
-        panic!()
-    };
-    assert!(m.retired.is_empty(), "{:?}", m.retired);
-    // A damaged manifest stops GC: it cannot tell live segments from
-    // orphans.
+    for fam in FAMILIES {
+        let (_, ManifestRead::Read(m)) = read_manifest(&r, fam.id).await.unwrap() else {
+            panic!()
+        };
+        assert!(m.retired.is_empty(), "{:?}", m.retired);
+    }
+    // A damaged manifest of either family stops GC: it cannot tell live
+    // segments from orphans.
+    for fam in FAMILIES {
+        let (good, _) = read_manifest(&r, fam.id).await.unwrap();
+        r.row_meta()
+            .put_derived(
+                MANIFEST_KIND,
+                &manifest_key(fam.id),
+                Bytes::from_static(b"junk"),
+            )
+            .await
+            .unwrap();
+        assert!(gc::run(&r, &opts, &clock).await.is_err(), "{}", fam.name);
+        r.row_meta()
+            .put_derived(MANIFEST_KIND, &manifest_key(fam.id), good.unwrap())
+            .await
+            .unwrap();
+    }
+    assert!(gc::run(&r, &opts, &clock).await.is_ok());
+    // So does a manifest row of a family this binary does not know: a
+    // newer binary's live segments are not orphans.
+    let unknown = Hash::of_object("derived-segment-family", b"content-v1");
     r.row_meta()
-        .put_derived(MANIFEST_KIND, &manifest_key(), Bytes::from_static(b"junk"))
+        .put_derived(MANIFEST_KIND, &unknown, Bytes::from_static(b"x"))
         .await
         .unwrap();
-    assert!(gc::run(&r, &opts, &clock).await.is_err());
+    let err = gc::run(&r, &opts, &clock).await.unwrap_err();
+    assert!(err.to_string().contains("does not know"), "{err}");
 }
 
 /// `repair drop` of a kind stops segments answering for it (its values
@@ -1128,7 +1231,7 @@ async fn repair_drop_clears_columns_and_damage_is_handled() {
     crate::integrity::drop_kinds(&r, &[Skiplist::NAME], false, &crate::integrity::Quiet)
         .await
         .unwrap();
-    let (_, ManifestRead::Read(m)) = read_manifest(&r).await.unwrap() else {
+    let (_, ManifestRead::Read(m)) = read_manifest(&r, FAMILY_CHANGESET).await.unwrap() else {
         panic!()
     };
     assert!(!m.live.is_empty());
@@ -1151,7 +1254,11 @@ async fn repair_drop_clears_columns_and_damage_is_handled() {
     assert_eq!(values(&r, &ids).await, want);
     // Damage.
     r.row_meta()
-        .put_derived(MANIFEST_KIND, &manifest_key(), Bytes::from_static(b"junk"))
+        .put_derived(
+            MANIFEST_KIND,
+            &manifest_key(FAMILY_CHANGESET),
+            Bytes::from_static(b"junk"),
+        )
         .await
         .unwrap();
     assert!(
@@ -1162,7 +1269,7 @@ async fn repair_drop_clears_columns_and_damage_is_handled() {
     let p = pass(&r, &CompactOptions::small(Mode::Build), &mut st, None).await;
     assert!(p.damaged_manifest);
     assert!(matches!(
-        read_manifest(&r).await.unwrap().1,
+        read_manifest(&r, FAMILY_CHANGESET).await.unwrap().1,
         ManifestRead::Read(_)
     ));
     assert_eq!(values(&r, &ids).await, want);
@@ -1191,7 +1298,7 @@ async fn verify_checks_the_manifest_and_segments() {
     assert!(rep.problems.is_empty(), "{:?}", rep.problems);
     let checked = rep.derived.get(Skiplist::NAME).map_or(0, |k| k.checked);
     assert!(checked > 40, "segment values are checked: {checked}");
-    let (_, ManifestRead::Read(m)) = read_manifest(&r).await.unwrap() else {
+    let (_, ManifestRead::Read(m)) = read_manifest(&r, FAMILY_CHANGESET).await.unwrap() else {
         panic!()
     };
     let bad = m.live[0];
@@ -1218,7 +1325,11 @@ async fn verify_checks_the_manifest_and_segments() {
         rep.notes
     );
     r.row_meta()
-        .put_derived(MANIFEST_KIND, &manifest_key(), Bytes::from_static(b"junk"))
+        .put_derived(
+            MANIFEST_KIND,
+            &manifest_key(FAMILY_CHANGESET),
+            Bytes::from_static(b"junk"),
+        )
         .await
         .unwrap();
     let rep = verify(&fresh(&r), &opts, &Quiet).await.unwrap();
@@ -1258,7 +1369,7 @@ async fn an_unreadable_segment_is_tried_again_after_a_refresh() {
         Some(&hook),
     )
     .await;
-    let (_, ManifestRead::Read(m)) = read_manifest(&r).await.unwrap() else {
+    let (_, ManifestRead::Read(m)) = read_manifest(&r, FAMILY_CHANGESET).await.unwrap() else {
         panic!("no manifest")
     };
     let seg = m.live[0];
@@ -1323,8 +1434,8 @@ impl leep_core::BlobStore for Flaky {
 
 fn recorded_features() -> Features {
     Features {
-        record: Arc::new(|| Box::pin(async { Ok(()) })),
-        recorded: Arc::new(|| Box::pin(async { Ok(true) })),
+        record: Arc::new(|_| Box::pin(async { Ok(()) })),
+        recorded: Arc::new(|_| Box::pin(async { Ok(true) })),
     }
 }
 
@@ -1338,7 +1449,7 @@ async fn a_damaged_manifest_is_kept_once_the_feature_is_recorded() {
     settle(&r, &CompactOptions::small(Mode::Build), &mut st, None).await;
     let junk = Bytes::from_static(b"junk");
     r.row_meta()
-        .put_derived(MANIFEST_KIND, &manifest_key(), junk.clone())
+        .put_derived(MANIFEST_KIND, &manifest_key(FAMILY_CHANGESET), junk.clone())
         .await
         .unwrap();
     let f = recorded_features();
@@ -1346,7 +1457,10 @@ async fn a_damaged_manifest_is_kept_once_the_feature_is_recorded() {
         .await
         .expect_err("refused");
     assert!(err.to_string().contains("not replaced"), "{err}");
-    assert_eq!(read_manifest(&r).await.unwrap().0, Some(junk));
+    assert_eq!(
+        read_manifest(&r, FAMILY_CHANGESET).await.unwrap().0,
+        Some(junk)
+    );
     // Without the feature, build replaces it.
     let p = pass(&r, &CompactOptions::small(Mode::Build), &mut st, None).await;
     assert!(p.damaged_manifest);
@@ -1369,26 +1483,47 @@ async fn a_newer_manifest_is_left_alone() {
         Err(codec::ManifestFault::Newer(_))
     ));
     r.row_meta()
-        .put_derived(MANIFEST_KIND, &manifest_key(), newer.clone())
+        .put_derived(
+            MANIFEST_KIND,
+            &manifest_key(FAMILY_CHANGESET),
+            newer.clone(),
+        )
         .await
         .unwrap();
     for mode in [Mode::Build, Mode::Retire] {
-        let p = pass(
+        let p = compact_pass(
             &r,
             &CompactOptions::small(mode),
             &mut CompactState::default(),
             None,
         )
         .await;
+        // The other family goes on (and in mode retire, without a way to
+        // record its feature, fails on its own).
+        let p = match p {
+            Ok(Some(p)) => p,
+            Err(e) => {
+                assert_eq!(mode, Mode::Retire, "{e}");
+                continue;
+            }
+            Ok(None) => panic!("lease"),
+        };
+        let p = v1(&p);
         assert!(p.newer_manifest && p.sealed_segments == 0 && p.retired_rows == 0);
     }
-    assert_eq!(read_manifest(&r).await.unwrap().0, Some(newer.clone()));
+    assert_eq!(
+        read_manifest(&r, FAMILY_CHANGESET).await.unwrap().0,
+        Some(newer.clone())
+    );
     assert!(
         crate::integrity::drop_kinds(&r, &[Skiplist::NAME], false, &crate::integrity::Quiet)
             .await
             .is_err()
     );
-    assert_eq!(read_manifest(&r).await.unwrap().0, Some(newer));
+    assert_eq!(
+        read_manifest(&r, FAMILY_CHANGESET).await.unwrap().0,
+        Some(newer)
+    );
     assert!(values(&r, &ids).await.iter().all(Option::is_some));
 }
 
@@ -1407,7 +1542,7 @@ async fn transient_errors_drop_nothing_and_losses_need_two_passes() {
     let f = recorded_features();
     let mut st = CompactState::default();
     settle(&r, &CompactOptions::small(Mode::Retire), &mut st, Some(&f)).await;
-    let (before, ManifestRead::Read(m)) = read_manifest(&r).await.unwrap() else {
+    let (before, ManifestRead::Read(m)) = read_manifest(&r, FAMILY_CHANGESET).await.unwrap() else {
         panic!()
     };
     let seg = m.live[0];
@@ -1429,7 +1564,7 @@ async fn transient_errors_drop_nothing_and_losses_need_two_passes() {
     )
     .await
     .is_err());
-    assert_eq!(read_manifest(&r).await.unwrap().0, before);
+    assert_eq!(read_manifest(&r, FAMILY_CHANGESET).await.unwrap().0, before);
     flaky.failing.lock().unwrap().clear();
     // Lost for real: the first pass suspects it, the second drops it.
     let data = blobs.get(&seg.data).await.unwrap().unwrap();
@@ -1478,7 +1613,7 @@ async fn a_stale_manifest_is_not_applied_over_a_newer_one() {
     build(&r, None).await;
     let mut st = CompactState::default();
     pass(&r, &CompactOptions::small(Mode::Build), &mut st, None).await;
-    let (old, _) = read_manifest(&r).await.unwrap();
+    let (old, _) = read_manifest(&r, FAMILY_CHANGESET).await.unwrap();
     let state = Arc::new(tokio::sync::Mutex::new(st));
     let mut each = passes_while_building(
         &r,
@@ -1493,15 +1628,26 @@ async fn a_stale_manifest_is_not_applied_over_a_newer_one() {
     }
     derive::<HistoryTree>(&r, next).await.unwrap();
     each().await;
-    let (new, ManifestRead::Read(nm)) = read_manifest(&r).await.unwrap() else {
+    let (new, ManifestRead::Read(nm)) = read_manifest(&r, FAMILY_CHANGESET).await.unwrap() else {
         panic!()
     };
     assert_ne!(old, new);
     let v = fresh(&r);
-    v.segments().apply(new.clone()).await.unwrap();
-    v.segments().apply(old).await.unwrap();
-    assert_eq!(v.segments().raw(), new);
-    assert_eq!(v.segments().segments().len(), nm.live.len());
+    v.segments()
+        .family(FAMILY_CHANGESET)
+        .apply(new.clone())
+        .await
+        .unwrap();
+    v.segments()
+        .family(FAMILY_CHANGESET)
+        .apply(old)
+        .await
+        .unwrap();
+    assert_eq!(v.segments().family(FAMILY_CHANGESET).raw(), new);
+    assert_eq!(
+        v.segments().family(FAMILY_CHANGESET).segments().len(),
+        nm.live.len()
+    );
 }
 
 /// Two handles: one holds a manifest read before a segment was sealed,
@@ -1519,7 +1665,8 @@ async fn a_stale_handle_still_reads_right_values() {
     // The stale handle reads its (empty) manifest now.
     stale
         .segments()
-        .apply(read_manifest(&r).await.unwrap().0)
+        .family(FAMILY_CHANGESET)
+        .apply(read_manifest(&r, FAMILY_CHANGESET).await.unwrap().0)
         .await
         .unwrap();
     let opts = CompactOptions {
@@ -1554,19 +1701,19 @@ async fn build_mode_lists_rows_only_when_they_grew() {
         ..CompactOptions::small(Mode::Build)
     };
     let mut st = CompactState::default();
-    assert!(pass(&r, &opts, &mut st, None).await.listed);
-    assert!(!pass(&r, &opts, &mut st, None).await.listed);
+    assert!(v1(&pass(&r, &opts, &mut st, None).await).listed);
+    assert!(!v1(&pass(&r, &opts, &mut st, None).await).listed);
     let mut tip = *ids.last().unwrap();
     for i in 0..3 {
         tip = commit(&r, &[tip], &[("g", Some(&format!("{i}")))], "g").await;
     }
     derive::<HistoryTree>(&r, tip).await.unwrap();
     // Six more rows: at least `seal_rows`.
-    let p = pass(&r, &opts, &mut st, None).await;
+    let p = v1(&pass(&r, &opts, &mut st, None).await);
     assert!(p.listed && p.sealed_keys == 3, "{p:?}");
-    assert!(!pass(&r, &opts, &mut st, None).await.listed);
+    assert!(!v1(&pass(&r, &opts, &mut st, None).await).listed);
     tokio::time::advance(Duration::from_secs(600)).await;
-    assert!(pass(&r, &opts, &mut st, None).await.listed);
+    assert!(v1(&pass(&r, &opts, &mut st, None).await).listed);
 }
 
 /// Four small segments of one tier, sealed without merging.
@@ -1583,7 +1730,7 @@ async fn four_segments(r: &Repo, st: &mut CompactState) -> Vec<SegmentRef> {
         derive::<HistoryTree>(r, tip).await.unwrap();
         pass(r, &opts, st, None).await;
     }
-    let (_, ManifestRead::Read(m)) = read_manifest(r).await.unwrap() else {
+    let (_, ManifestRead::Read(m)) = read_manifest(r, FAMILY_CHANGESET).await.unwrap() else {
         panic!()
     };
     assert_eq!(m.live.len(), 4, "{m:?}");
@@ -1610,10 +1757,10 @@ async fn a_merge_over_an_unreadable_segment_ends_the_pass() {
     .expect("the pass ends")
     .unwrap()
     .expect("lease");
-    assert_eq!((p.merges, p.dropped), (0, 0), "{p:?}");
+    assert_eq!((v1(&p).merges, v1(&p).dropped), (0, 0), "{p:?}");
     // The lease was given up: the next pass runs, and agrees.
     let p = pass(&r, &merge, &mut st, Some(&f)).await;
-    assert_eq!(p.dropped, 1, "{p:?}");
+    assert_eq!(v1(&p).dropped, 1, "{p:?}");
 }
 
 /// In mode build, a segment verified earlier whose data later reads
@@ -1659,12 +1806,12 @@ async fn a_backfill_continues_promptly() {
         ..CompactOptions::small(Mode::Build)
     };
     let mut st = CompactState::default();
-    let p = pass(&r, &opts, &mut st, None).await;
+    let p = v1(&pass(&r, &opts, &mut st, None).await);
     assert!(p.listed && p.more && p.sealed_keys == 16, "{p:?}");
     let mut sealed = p.sealed_keys;
     for _ in 0..20 {
         // The following passes go on with the listing's candidates.
-        let p = pass(&r, &opts, &mut st, None).await;
+        let p = v1(&pass(&r, &opts, &mut st, None).await);
         assert!(!p.listed && p.sealed_keys > 0, "{p:?}");
         sealed += p.sealed_keys;
         if !p.more {
@@ -1672,7 +1819,7 @@ async fn a_backfill_continues_promptly() {
         }
     }
     assert_eq!(sealed as usize, ids.len());
-    let p = pass(&r, &opts, &mut st, None).await;
+    let p = v1(&pass(&r, &opts, &mut st, None).await);
     assert!(!p.more && p.sealed_keys == 0, "{p:?}");
 }
 
@@ -1696,7 +1843,7 @@ async fn a_backfill_reads_generations_over_several_passes() {
     let mut passes = 0;
     let mut sealed = 0;
     loop {
-        let p = pass(&r, &opts, &mut st, None).await;
+        let p = v1(&pass(&r, &opts, &mut st, None).await);
         passes += 1;
         sealed += p.sealed_keys;
         if !p.more {
@@ -1706,13 +1853,16 @@ async fn a_backfill_reads_generations_over_several_passes() {
     }
     assert_eq!(sealed as usize, ids.len());
     assert!(passes > ids.len() / 16, "{passes}");
-    let (_, ManifestRead::Read(m)) = read_manifest(&r).await.unwrap() else {
+    let (_, ManifestRead::Read(m)) = read_manifest(&r, FAMILY_CHANGESET).await.unwrap() else {
         panic!()
     };
     // Sealed oldest first: each segment's keys are older than the next's.
     let mut gens = Vec::new();
     for s in &m.live {
-        let idx = view::load_index(&**r.blobs(), s).await.unwrap().unwrap();
+        let idx = view::load_index(&**r.blobs(), FAMILY_CHANGESET, s)
+            .await
+            .unwrap()
+            .unwrap();
         let mut g = Vec::new();
         for k in idx.keys() {
             g.push(r.generation(ChangesetId(*k)).await.unwrap());
@@ -1738,15 +1888,15 @@ async fn a_carried_backfill_is_dropped_when_another_server_seals() {
     };
     let mut mine = CompactState::default();
     let mut theirs = CompactState::default();
-    let p = pass(&r, &opts, &mut mine, None).await;
+    let p = v1(&pass(&r, &opts, &mut mine, None).await);
     assert!(p.more && p.sealed_keys == 8, "{p:?}");
-    let p = pass(&r, &opts, &mut theirs, None).await;
+    let p = v1(&pass(&r, &opts, &mut theirs, None).await);
     assert!(p.listed && p.sealed_keys == 8, "{p:?}");
-    let p = pass(&r, &opts, &mut mine, None).await;
+    let p = v1(&pass(&r, &opts, &mut mine, None).await);
     assert!(p.listed, "{p:?}");
     let mut sealed = 16 + p.sealed_keys;
     for _ in 0..20 {
-        let p = pass(&r, &opts, &mut mine, None).await;
+        let p = v1(&pass(&r, &opts, &mut mine, None).await);
         sealed += p.sealed_keys;
         if !p.more {
             break;
@@ -1764,6 +1914,7 @@ async fn a_lost_index_blob_is_noticed_while_the_view_holds_it() {
     let live = four_segments(&r, &mut st).await;
     assert!(r
         .segments()
+        .family(FAMILY_CHANGESET)
         .segments()
         .iter()
         .any(|l| l.r.index == live[1].index));
@@ -1772,9 +1923,9 @@ async fn a_lost_index_blob_is_noticed_while_the_view_holds_it() {
         fanout: 64,
         ..CompactOptions::small(Mode::Build)
     };
-    let p = pass(&r, &opts, &mut st, None).await;
+    let p = v1(&pass(&r, &opts, &mut st, None).await);
     assert_eq!(p.dropped, 1, "{p:?}");
-    let (_, ManifestRead::Read(m)) = read_manifest(&r).await.unwrap() else {
+    let (_, ManifestRead::Read(m)) = read_manifest(&r, FAMILY_CHANGESET).await.unwrap() else {
         panic!()
     };
     assert!(m.live.iter().all(|s| s.index != live[1].index));
@@ -1811,7 +1962,7 @@ async fn undecodable_rows_ahead_of_good_ones_do_not_keep_passes_busy() {
     let mut bad_values = 0;
     for i in 0.. {
         assert!(i < 20, "passes kept saying there is more");
-        let p = pass(&r, &opts, &mut st, Some(&hook)).await;
+        let p = v1(&pass(&r, &opts, &mut st, Some(&hook)).await);
         bad_values += p.bad_values;
         if !p.more {
             break;
@@ -1819,7 +1970,7 @@ async fn undecodable_rows_ahead_of_good_ones_do_not_keep_passes_busy() {
     }
     assert_eq!(bad_values as usize, bad.len());
     for _ in 0..3 {
-        let p = pass(&r, &opts, &mut st, Some(&hook)).await;
+        let p = v1(&pass(&r, &opts, &mut st, Some(&hook)).await);
         // Every good row is held; the bad ones are not candidates.
         assert!(p.listed && !p.more && p.unsealed_rows == 0, "{p:?}");
         assert_eq!((p.sealed_keys, p.bad_values), (0, 0), "{p:?}");
@@ -1872,9 +2023,9 @@ async fn a_retirement_step_stops_at_an_unreadable_value() {
         fanout: 64,
         ..CompactOptions::small(Mode::Build)
     };
-    let p = pass(&r, &opts, &mut st, None).await;
+    let p = v1(&pass(&r, &opts, &mut st, None).await);
     assert_eq!(p.sealed_segments, 1, "{p:?}");
-    let (_, ManifestRead::Read(m)) = read_manifest(&r).await.unwrap() else {
+    let (_, ManifestRead::Read(m)) = read_manifest(&r, FAMILY_CHANGESET).await.unwrap() else {
         panic!()
     };
     let seg = m.live[0];
@@ -1892,13 +2043,13 @@ async fn a_retirement_step_stops_at_an_unreadable_value() {
         ..CompactOptions::small(Mode::Retire)
     };
     let hook = feature_hook(Arc::default());
-    let p = pass(&r, &retire, &mut st, Some(&hook)).await;
+    let p = v1(&pass(&r, &retire, &mut st, Some(&hook)).await);
     assert_eq!(
         (p.retired_rows, p.mismatched, p.more),
         (0, 0, false),
         "{p:?}"
     );
     assert_eq!(blobs.gets.lock().unwrap().get(&seg.data), Some(&1));
-    let p = pass(&r, &retire, &mut st, Some(&hook)).await;
+    let p = v1(&pass(&r, &retire, &mut st, Some(&hook)).await);
     assert_eq!(p.dropped, 1, "{p:?}");
 }

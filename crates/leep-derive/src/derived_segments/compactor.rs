@@ -1,9 +1,15 @@
-//! The compactor (ADR 0104, section "The compactor"): one pass seals rows
-//! not yet in a live segment, merges segments by tiers of four, and in mode
-//! `retire` deletes rows a live segment holds the same value for. Passes
-//! hold the `derived-segments` lease, so one server at a time runs one;
-//! every manifest write is a compare-and-swap from the bytes the pass last
-//! read or wrote, and blobs are durable before the manifest names them.
+//! The compactor (ADR 0104, section "The compactor"; ADR 0105): one pass,
+//! for each family in turn, seals rows not yet in a live segment, merges
+//! segments by tiers of four, and in mode `retire` deletes rows a live
+//! segment holds the same value for. Passes hold the `derived-segments`
+//! lease, so one server at a time runs one; every manifest write is a
+//! compare-and-swap from the bytes the pass last read or wrote, and blobs
+//! are durable before the manifest names them.
+//!
+//! Families are driven by their table ([`codec::FAMILIES`]): the kinds they
+//! hold, and the columns a key is expected to have before it is sealed
+//! without waiting. What a process carries between passes (a backfill, a
+//! retirement, the segments it accounts for) is kept per family.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -15,11 +21,10 @@ use leep_core::{ChangesetId, Error, Hash, Result};
 use tokio::time::Instant;
 
 use super::codec::{
-    self, Block, Loc, Manifest, SealRow, SegmentData, SegmentRef, COL_HISTORY_TREE, COL_SKIPLIST,
+    self, Block, Family, Loc, Manifest, SealRow, SegmentData, SegmentRef, FAMILIES,
 };
 use super::view::{load_indexes, Live, ManifestRead};
 use super::{lease_key, read_manifest, swap_manifest, MANIFEST_KIND};
-use crate::derived::history_pack::same_part;
 use crate::derived::{decode_u64, DerivedKind, Generation};
 use crate::gc_lease::{self, GcLease};
 use crate::Repo;
@@ -61,16 +66,16 @@ impl std::fmt::Display for Mode {
     }
 }
 
-/// Records the store feature [`super::FEATURE`] (the server does it by URL,
-/// since `leep-derive` names no concrete store). Called before the first
-/// row delete of every process; idempotent.
-pub type FeatureHook = Arc<dyn Fn() -> BoxFuture<'static, Result<()>> + Send + Sync>;
+/// Records a store feature, a family's [`Family::feature`] (the server does
+/// it by URL, since `leep-derive` names no concrete store). Called before
+/// the first row delete of the family in every process; idempotent.
+pub type FeatureHook = Arc<dyn Fn(&'static str) -> BoxFuture<'static, Result<()>> + Send + Sync>;
 
-/// Whether the store has the feature [`super::FEATURE`] recorded: rows may
-/// have been deleted, whatever this process's mode.
-pub type FeatureProbe = Arc<dyn Fn() -> BoxFuture<'static, Result<bool>> + Send + Sync>;
+/// Whether the store has a family's feature recorded: rows of the family
+/// may have been deleted, whatever this process's mode.
+pub type FeatureProbe = Arc<dyn Fn(&'static str) -> BoxFuture<'static, Result<bool>> + Send + Sync>;
 
-/// The store feature, as a pass needs it. Without one (memory stores,
+/// The store features, as a pass needs them. Without them (memory stores,
 /// tests) a store is taken to have no feature recorded, and mode `retire`
 /// refuses to delete.
 #[derive(Clone)]
@@ -79,8 +84,9 @@ pub struct Features {
     pub recorded: FeatureProbe,
 }
 
-/// Called at named points of a pass ("seal-stored", "merge-stored",
-/// "retire-deleted"); a crash test's server stops there to be killed.
+/// Called at named points of a pass ("seal-stored", "seal-swapped",
+/// "merge-stored", "retire-deleted"; for `changeset-v2` the same names
+/// after `changeset-v2:`); a crash test's server stops there to be killed.
 #[derive(Clone)]
 pub struct PauseHook(pub Arc<dyn Fn(&'static str) -> BoxFuture<'static, ()> + Send + Sync>);
 
@@ -99,8 +105,8 @@ pub struct CompactOptions {
     /// ...or this many, once none arrived for `idle`.
     pub idle_rows: usize,
     pub idle: Duration,
-    /// A changeset with one of the two rows waits this long for the other
-    /// before it is sealed with the one.
+    /// A key without a row of every column its family expects waits this
+    /// long for the others before it is sealed with what it has.
     pub lone_wait: Duration,
     /// Most keys in one segment, and most bytes of its data blob: a segment
     /// is read whole with one `get`.
@@ -199,10 +205,18 @@ impl CompactOptions {
     }
 }
 
-/// What a process remembers between passes.
+/// What a process remembers between passes, per family: carried work
+/// (a backfill, a retirement) and the live segments it accounts for are
+/// one family's, so another family's segments never invalidate it.
 #[derive(Default)]
 pub struct CompactState {
-    /// Keys with one of the two rows, since first seen so.
+    families: HashMap<u8, FamilyState>,
+}
+
+#[derive(Default)]
+struct FamilyState {
+    /// Keys missing a row of a column the family expects, since first seen
+    /// so.
     lone_since: HashMap<Hash, Instant>,
     /// Live segments, since first seen live (or published) by this process.
     live_since: HashMap<Hash, Instant>,
@@ -240,9 +254,9 @@ pub struct CompactState {
     /// Rows a retirement that hit its bound has still to compare, by
     /// holding segment: the following passes go on without listing again.
     retire_left: Option<RetireWork>,
-    /// The live segments (with their column masks) the carried work above
-    /// accounts for: those live at its listing, and those this process
-    /// published since. A live segment outside it (another server's pass,
+    /// The family's live segments (with their column masks) the carried work
+    /// above accounts for: those live at its listing, and those this
+    /// process published since. A live segment outside it (another server's pass,
     /// a `repair drop`), or a dropped one, makes a pass forget the work
     /// and list again.
     known: HashMap<Hash, u64>,
@@ -254,11 +268,12 @@ type RetireWork = VecDeque<(Hash, Vec<(Hash, u8)>)>;
 
 /// Seal candidates carried across passes.
 struct Backfill {
-    /// Candidates whose generation is not read yet.
-    pending: Vec<(Hash, u8)>,
+    /// Candidates (and the columns to seal) whose generation is not read
+    /// yet.
+    pending: Vec<(Hash, u64)>,
     /// Candidates with their generations; sorted by `(generation, id)` once
     /// `pending` is empty, then sealed from `next` on.
-    order: Vec<(u64, Hash, u8)>,
+    order: Vec<(u64, Hash, u64)>,
     sorted: bool,
     next: usize,
 }
@@ -277,25 +292,29 @@ impl Backfill {
 #[derive(Clone, Copy)]
 struct RowKey {
     /// Bit `c`: it has a row of column `c`.
-    have: u8,
-    /// Per column (by [`slot`]), the position in the manifest's live list
-    /// of its newest holding segment, or [`NONE`].
-    holder: [u32; 2],
+    have: u64,
+    /// Per column number, the position in the manifest's live list of its
+    /// newest holding segment, or [`NONE`].
+    holder: [u32; SLOTS],
 }
 
 const NONE: u32 = u32::MAX;
 
+/// Column numbers a family this binary writes may use (`codec` tests check
+/// every known column is below it).
+pub(crate) const SLOTS: usize = 8;
+
 fn slot(col: u8) -> usize {
-    usize::from(col != COL_SKIPLIST)
+    col as usize
 }
 
-/// What one pass did.
+/// What one pass did: totals over every family, and each family's own.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PassReport {
-    /// Rows not in a live segment when the pass looked (both kinds).
+    /// Rows not in a live segment when the pass looked (every kind).
     pub unsealed_rows: u64,
     pub sealed_segments: u64,
-    /// Changesets sealed.
+    /// Keys (changesets) sealed.
     pub sealed_keys: u64,
     pub merges: u64,
     /// Segments merges replaced.
@@ -321,28 +340,48 @@ pub struct PassReport {
     /// backfill's candidates beyond its pages or time, rows beyond its
     /// retire bound): the next pass should run soon.
     pub more: bool,
+    /// Each family's report, by name (only in the total a pass returns).
+    pub families: Vec<(&'static str, PassReport)>,
 }
 
-const KINDS: [(u8, &str); 2] = [
-    (COL_SKIPLIST, crate::derived::Skiplist::NAME),
-    (COL_HISTORY_TREE, crate::derived::HistoryTree::NAME),
-];
+impl PassReport {
+    fn add(&mut self, r: &PassReport) {
+        self.unsealed_rows += r.unsealed_rows;
+        self.sealed_segments += r.sealed_segments;
+        self.sealed_keys += r.sealed_keys;
+        self.merges += r.merges;
+        self.merged_away += r.merged_away;
+        self.dropped += r.dropped;
+        self.retired_rows += r.retired_rows;
+        self.mismatched += r.mismatched;
+        self.bad_values += r.bad_values;
+        self.live_segments += r.live_segments;
+        self.live_bytes += r.live_bytes;
+        self.damaged_manifest |= r.damaged_manifest;
+        self.newer_manifest |= r.newer_manifest;
+        self.listed |= r.listed;
+        self.more |= r.more;
+    }
 
-fn other(col: u8) -> u8 {
-    if col == COL_SKIPLIST {
-        COL_HISTORY_TREE
-    } else {
-        COL_SKIPLIST
+    /// The report of family `name`, if the pass ran it.
+    pub fn family(&self, name: &str) -> Option<&PassReport> {
+        self.families
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, r)| r)
     }
 }
 
-fn bit(col: u8) -> u8 {
+fn bit(col: u8) -> u64 {
     1 << col
 }
 
-/// One pass under [`lease_key`]'s lease; `None` when another server holds
-/// it. `features` records and reads [`super::FEATURE`]; mode `retire`
-/// refuses to delete without it.
+/// One pass under [`lease_key`]'s lease, every family in turn; `None` when
+/// another server holds the lease. `features` records and reads each
+/// family's store feature; mode `retire` refuses to delete without it. A
+/// family whose pass fails does not stop the others (a damaged manifest of
+/// one must not freeze the rest); the first error is returned once all
+/// ran, except a lost lease or manifest swap, which stops at once.
 pub async fn compact_pass(
     repo: &Repo,
     opts: &CompactOptions,
@@ -358,23 +397,60 @@ pub async fn compact_pass(
         Err(e) => return Err(e),
     };
     let result = async {
-        let mut p = Pass::load(repo, opts, &lease, features).await?;
-        p.run(state).await?;
-        Ok(p.report)
+        let mut total = PassReport::default();
+        let mut failed = None;
+        for fam in FAMILIES {
+            let run = async {
+                let mut p = Pass::load(repo, fam, opts, &lease, features).await?;
+                p.run(state).await?;
+                Ok::<_, Error>(p.report)
+            }
+            .await;
+            match run {
+                Ok(r) => {
+                    total.add(&r);
+                    total.families.push((fam.name, r));
+                }
+                Err(e @ Error::Conflict(_)) => return Err(e),
+                Err(e) => {
+                    tracing::warn!(family = fam.name, error = %e, "derived segments pass failed");
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(total),
+        }
     }
     .await;
     gc_lease::release(lease, result).await.map(Some)
 }
 
-async fn feature_recorded(features: Option<&Features>) -> Result<bool> {
+async fn feature_recorded(features: Option<&Features>, name: &'static str) -> Result<bool> {
     match features {
-        Some(f) => (f.recorded)().await,
+        Some(f) => (f.recorded)(name).await,
         None => Ok(false),
+    }
+}
+
+/// The name of pause point `at` of `fam`, as the pause hook is given it.
+fn point(fam: &Family, at: &'static str) -> &'static str {
+    if fam.id == codec::FAMILY_CHANGESET {
+        return at;
+    }
+    match at {
+        "seal-stored" => "changeset-v2:seal-stored",
+        "seal-swapped" => "changeset-v2:seal-swapped",
+        "merge-stored" => "changeset-v2:merge-stored",
+        "retire-deleted" => "changeset-v2:retire-deleted",
+        other => other,
     }
 }
 
 pub(crate) struct Pass<'a> {
     repo: &'a Repo,
+    fam: &'static Family,
     opts: &'a CompactOptions,
     lease: &'a Option<GcLease>,
     features: Option<&'a Features>,
@@ -387,7 +463,7 @@ pub(crate) struct Pass<'a> {
     /// reads many).
     data: HashMap<Hash, Arc<SegmentData>>,
     blocks: HashMap<(Hash, usize, usize), Arc<Block>>,
-    /// Keys with rows, and which of the two kinds they have rows of.
+    /// Keys with rows, and which of the family's kinds they have rows of.
     rows: Option<HashMap<Hash, RowKey>>,
     /// Live segments whose decoded index came from the read view, not from
     /// a read of its blob by this pass.
@@ -403,45 +479,52 @@ pub(crate) struct Pass<'a> {
 impl<'a> Pass<'a> {
     pub(crate) async fn load(
         repo: &'a Repo,
+        fam: &'static Family,
         opts: &'a CompactOptions,
         lease: &'a Option<GcLease>,
         features: Option<&'a Features>,
     ) -> Result<Pass<'a>> {
-        let (raw, read) = read_manifest(repo).await?;
+        let (raw, read) = read_manifest(repo, fam.id).await?;
         let mut report = PassReport::default();
         let man = match read {
-            ManifestRead::Absent => Manifest::new(codec::FAMILY_CHANGESET),
+            ManifestRead::Absent => Manifest::new(fam.id),
             ManifestRead::Read(m) => m,
             ManifestRead::Newer => {
                 // Never damage: a newer binary's format. Touch nothing.
                 tracing::warn!(
+                    family = fam.name,
                     "the {MANIFEST_KIND} row was written by a newer leep-server; this one \
-                     runs no derived segment pass"
+                     runs no derived segment pass for the family"
                 );
                 report.newer_manifest = true;
-                Manifest::new(codec::FAMILY_CHANGESET)
+                Manifest::new(fam.id)
             }
             ManifestRead::Damaged => {
                 report.damaged_manifest = true;
                 // Replaced only where every row is certainly still stored:
                 // this process is in mode build and the store has never
-                // recorded the feature (another server may have retired).
-                if opts.mode == Mode::Retire || feature_recorded(features).await? {
+                // recorded the family's feature (another server may have
+                // retired).
+                if opts.mode == Mode::Retire || feature_recorded(features, fam.feature).await? {
                     return Err(Error::Other(format!(
-                        "the {MANIFEST_KIND} row does not decode, and rows may have been \
-                         retired (the store feature {} is recorded, or this server runs \
-                         retire), so it may name the only copy of deleted rows; it is not \
-                         replaced automatically (see LeepDerivedSegmentPassesFailing in \
+                        "the {MANIFEST_KIND} row of family {} does not decode, and rows may \
+                         have been retired (the store feature {} is recorded, or this server \
+                         runs retire), so it may name the only copy of deleted rows; it is \
+                         not replaced automatically (see LeepDerivedSegmentPassesFailing in \
                          RUNBOOKS.md)",
-                        super::FEATURE
+                        fam.name, fam.feature
                     )));
                 }
-                tracing::warn!("the {MANIFEST_KIND} row does not decode; replacing it");
-                Manifest::new(codec::FAMILY_CHANGESET)
+                tracing::warn!(
+                    family = fam.name,
+                    "the {MANIFEST_KIND} row does not decode; replacing it"
+                );
+                Manifest::new(fam.id)
             }
         };
         let mut p = Pass {
             repo,
+            fam,
             opts,
             lease,
             features,
@@ -472,6 +555,7 @@ impl<'a> Pass<'a> {
         let held: HashMap<Hash, Arc<codec::SegmentIndex>> = self
             .repo
             .segments()
+            .family(self.fam.id)
             .segments()
             .into_iter()
             .map(|l| (l.r.index, l.idx.clone()))
@@ -500,7 +584,7 @@ impl<'a> Pass<'a> {
             .filter(|s| !self.segs.contains_key(&s.index))
             .copied()
             .collect();
-        for (h, idx) in load_indexes(&**self.repo.blobs(), &missing).await? {
+        for (h, idx) in load_indexes(&**self.repo.blobs(), self.fam.id, &missing).await? {
             if let (Some(idx), Some(r)) = (idx, self.man.live.iter().find(|s| s.index == h)) {
                 self.segs.insert(h, Arc::new(Live { r: *r, idx }));
             }
@@ -526,6 +610,7 @@ impl<'a> Pass<'a> {
         if self.report.newer_manifest {
             return Ok(());
         }
+        let state = state.families.entry(self.fam.id).or_default();
         self.check_live(state).await?;
         let now = Instant::now();
         let live: HashSet<Hash> = self.man.live.iter().map(|s| s.index).collect();
@@ -565,7 +650,7 @@ impl<'a> Pass<'a> {
     /// wrong, a read the store reports corrupt); any other error fails the
     /// pass. A segment read whole once in this process is later only checked
     /// for presence, as is an index taken from the read view.
-    async fn probe(&mut self, s: &SegmentRef, state: &mut CompactState) -> Result<bool> {
+    async fn probe(&mut self, s: &SegmentRef, state: &mut FamilyState) -> Result<bool> {
         let Some(live) = self.segs.get(&s.index).cloned() else {
             // `load_indexes` gives `None` only for definite loss or damage.
             return Ok(false);
@@ -598,21 +683,23 @@ impl<'a> Pass<'a> {
     /// stored, and replace a manifest that did not decode. On a store with
     /// the feature recorded a segment is dropped only when this pass and the
     /// last both found it unreadable.
-    async fn check_live(&mut self, state: &mut CompactState) -> Result<()> {
+    async fn check_live(&mut self, state: &mut FamilyState) -> Result<()> {
         let mut bad = Vec::new();
         for s in self.man.live.clone() {
             if !self.probe(&s, state).await? {
                 bad.push(s);
             }
         }
-        let careful =
-            !bad.is_empty() && (state.feature_recorded || feature_recorded(self.features).await?);
+        let careful = !bad.is_empty()
+            && (state.feature_recorded
+                || feature_recorded(self.features, self.fam.feature).await?);
         let mut gone = Vec::new();
         let mut suspect = HashSet::new();
         for s in bad {
             if careful && !state.suspect.contains(&s.index) {
                 tracing::warn!(
                     segment = %s.index,
+                    family = self.fam.name,
                     "a derived segment cannot be read; dropping it if the next pass agrees"
                 );
                 suspect.insert(s.index);
@@ -632,6 +719,7 @@ impl<'a> Pass<'a> {
         if !gone.is_empty() {
             tracing::warn!(
                 segments = gone.len(),
+                family = self.fam.name,
                 "derived segments named by the manifest cannot be read; dropping them, their \
                  rows seal again"
             );
@@ -676,7 +764,8 @@ impl<'a> Pass<'a> {
         let sealed: usize = self.man.live.iter().map(|s| s.rows as usize).sum();
         if rows.len().saturating_mul(self.man.live.len()) <= sealed {
             for (k, r) in rows.iter_mut() {
-                for (col, _) in KINDS {
+                for c in self.fam.columns {
+                    let col = c.id;
                     r.holder[slot(col)] = if r.have & bit(col) != 0 {
                         self.holder(k, col)
                     } else {
@@ -687,13 +776,14 @@ impl<'a> Pass<'a> {
             return;
         }
         for r in rows.values_mut() {
-            r.holder = [NONE; 2];
+            r.holder = [NONE; SLOTS];
         }
         for (i, s) in self.man.live.iter().enumerate().rev() {
             let Some(l) = self.segs.get(&s.index) else {
                 continue;
             };
-            for (col, _) in KINDS {
+            for c in self.fam.columns {
+                let col = c.id;
                 if !s.has(col) {
                     continue;
                 }
@@ -712,7 +802,7 @@ impl<'a> Pass<'a> {
     /// rest of the pass, and read whole by the next pass's probe (which
     /// drops it, or on a store with the feature counts it toward the two
     /// passes that must agree).
-    fn mark_unreadable(&mut self, index: Hash, state: &mut CompactState) {
+    fn mark_unreadable(&mut self, index: Hash, state: &mut FamilyState) {
         if self.unreadable.insert(index) {
             tracing::warn!(segment = %index, "a derived segment's data cannot be read now");
         }
@@ -768,17 +858,17 @@ impl<'a> Pass<'a> {
             .and_then(|row| codec::row_value(&live.idx, &data, col, loc.ord, row).ok()))
     }
 
-    /// The keys with rows of either kind: listed again in mode `retire`
-    /// unless a retirement is carried over (only unsealed rows remain), in
-    /// mode `build` once their estimated count grew by `seal_rows` or
-    /// `list_every` passed.
-    async fn list_rows(&mut self, state: &mut CompactState) -> Result<()> {
+    /// The keys with rows of the family's kinds: listed again in mode
+    /// `retire` unless a retirement is carried over (only unsealed rows
+    /// remain), in mode `build` once their estimated count grew by
+    /// `seal_rows` or `list_every` passed.
+    async fn list_rows(&mut self, state: &mut FamilyState) -> Result<()> {
         if self.rows.is_some() {
             return Ok(());
         }
         let mut estimate = 0;
-        for (_, kind) in KINDS {
-            estimate += self.repo.row_meta().estimate_derived(kind).await?.rows;
+        for c in self.fam.columns {
+            estimate += self.repo.row_meta().estimate_derived(c.kind).await?.rows;
         }
         let due = match state.listed {
             None => true,
@@ -803,7 +893,8 @@ impl<'a> Pass<'a> {
         state.listed = Some((Instant::now(), estimate));
         self.report.listed = true;
         let mut rows: HashMap<Hash, RowKey> = HashMap::new();
-        for (col, kind) in KINDS {
+        for c in self.fam.columns {
+            let (col, kind) = (c.id, c.kind);
             let mut after = None;
             loop {
                 let page = self
@@ -820,7 +911,7 @@ impl<'a> Pass<'a> {
                         rows.entry(k)
                             .or_insert(RowKey {
                                 have: 0,
-                                holder: [NONE; 2],
+                                holder: [NONE; SLOTS],
                             })
                             .have |= bit(col);
                     }
@@ -835,17 +926,21 @@ impl<'a> Pass<'a> {
     }
 
     /// The keys to seal from a fresh listing, once there are enough of
-    /// them: rows no live segment holds, a lone one once it waited.
-    fn seal_candidates(&mut self, state: &mut CompactState) -> Vec<(Hash, u8)> {
+    /// them: rows no live segment holds, a key missing a row of a column
+    /// its family expects once it waited.
+    fn seal_candidates(&mut self, state: &mut FamilyState) -> Vec<(Hash, u64)> {
         let now = Instant::now();
         let mut rows = self.rows.take().unwrap_or_default();
         self.place_holders(&mut rows);
         let mut unsealed_rows = 0u64;
         let mut lone_now: HashSet<Hash> = HashSet::new();
-        let mut cands: Vec<(Hash, u8)> = Vec::new();
+        let mut cands: Vec<(Hash, u64)> = Vec::new();
+        let expected = self.fam.mask();
         for (k, r) in &rows {
-            let mut open = 0u8;
-            for (col, _) in KINDS {
+            let mut open = 0u64;
+            let mut present = r.have;
+            for c in self.fam.columns {
+                let col = c.id;
                 if r.have & bit(col) != 0 && r.holder[slot(col)] == NONE {
                     open |= bit(col);
                 }
@@ -854,27 +949,18 @@ impl<'a> Pass<'a> {
                 continue;
             }
             unsealed_rows += open.count_ones() as u64;
-            let both = bit(COL_SKIPLIST) | bit(COL_HISTORY_TREE);
-            if open == both {
+            // Columns with no row may be sealed already.
+            for c in self.fam.columns {
+                if present & bit(c.id) == 0 && self.holder(k, c.id) != NONE {
+                    present |= bit(c.id);
+                }
+            }
+            if present & expected == expected {
                 cands.push((*k, open));
                 continue;
             }
-            let col = if open == bit(COL_SKIPLIST) {
-                COL_SKIPLIST
-            } else {
-                COL_HISTORY_TREE
-            };
-            let other_held = if r.have & bit(other(col)) != 0 {
-                r.holder[slot(other(col))] != NONE
-            } else {
-                self.holder(k, other(col)) != NONE
-            };
-            if other_held {
-                cands.push((*k, open));
-                continue;
-            }
-            // The other row is not derived yet (the warmer is behind):
-            // wait for it a while, then seal the one.
+            // A row is not derived yet (the warmer, or a query, is behind):
+            // wait for it a while, then seal what there is.
             lone_now.insert(*k);
             let since = *state.lone_since.entry(*k).or_insert(now);
             if now.duration_since(since) >= self.opts.lone_wait {
@@ -903,7 +989,7 @@ impl<'a> Pass<'a> {
     /// backfill the following passes go on with, without listing again:
     /// first their generations (in batches, within `max_seal_time`), then,
     /// sorted by `(generation, id)`, at most `max_seal_pages` pages a pass.
-    async fn seal(&mut self, state: &mut CompactState) -> Result<()> {
+    async fn seal(&mut self, state: &mut FamilyState) -> Result<()> {
         if state.backfill.is_none() {
             self.list_rows(state).await?;
             if !self.report.listed {
@@ -977,12 +1063,13 @@ impl<'a> Pass<'a> {
     /// not decode is remembered and not listed again for a while.
     async fn seal_page(
         &mut self,
-        page: &[(u64, Hash, u8)],
-        state: &mut CompactState,
+        page: &[(u64, Hash, u64)],
+        state: &mut FamilyState,
     ) -> Result<()> {
         let mut seal: Vec<SealRow> = Vec::with_capacity(page.len());
         let mut values: HashMap<Hash, Vec<(u8, Bytes)>> = HashMap::new();
-        for (col, kind) in KINDS {
+        for c in self.fam.columns {
+            let (col, kind) = (c.id, c.kind);
             let keys: Vec<Hash> = page
                 .iter()
                 .filter(|(_, _, m)| m & bit(col) != 0)
@@ -1001,7 +1088,7 @@ impl<'a> Pass<'a> {
             if let Some(v) = values.remove(k) {
                 seal.push(SealRow {
                     key: *k,
-                    generation: *g,
+                    order: *g,
                     values: v,
                 });
             }
@@ -1010,10 +1097,16 @@ impl<'a> Pass<'a> {
             return Ok(());
         }
         let mut out = Vec::new();
-        encode_capped(self.opts.max_bytes, &seal, &mut out)?;
+        encode_capped(self.fam.id, self.opts.max_bytes, &seal, &mut out)?;
         for (enc, bad) in out {
             for b in &bad {
-                tracing::warn!(key = %b.key, column = b.col, "derived row not sealed: {}", b.why);
+                tracing::warn!(
+                    key = %b.key,
+                    family = self.fam.name,
+                    column = b.col,
+                    "derived row not sealed: {}",
+                    b.why
+                );
                 state.bad.insert((b.key, b.col));
             }
             self.report.bad_values += bad.len() as u64;
@@ -1024,6 +1117,7 @@ impl<'a> Pass<'a> {
             self.pause("seal-stored").await;
             self.man.live.push(enc.seg);
             self.write().await?;
+            self.pause("seal-swapped").await;
             state.known.insert(enc.seg.index, enc.seg.columns);
             state.live_since.insert(enc.seg.index, Instant::now());
             state.verified.insert(enc.seg.index);
@@ -1035,7 +1129,7 @@ impl<'a> Pass<'a> {
 
     async fn pause(&self, at: &'static str) {
         if let Some(p) = &self.opts.pause {
-            (p.0)(at).await;
+            (p.0)(point(self.fam, at)).await;
         }
     }
 
@@ -1052,7 +1146,7 @@ impl<'a> Pass<'a> {
     /// one tier while their keys and bytes fit the caps. Adjacent, so a key
     /// in several segments still answers from the newest. Keys of
     /// changesets no longer stored (the changeset sweep) are left out.
-    async fn merge(&mut self, state: &mut CompactState) -> Result<()> {
+    async fn merge(&mut self, state: &mut FamilyState) -> Result<()> {
         let f = self.opts.fanout.max(2);
         // Each round merges (the live list shrinks) or skips a segment (the
         // skip set grows), so it ends; the bound is defense in depth.
@@ -1075,9 +1169,15 @@ impl<'a> Pass<'a> {
             let found = (0..live.len().saturating_sub(f - 1)).find_map(|i| {
                 let run = &live[i..i + f];
                 let t = self.opts.tier(run[0].rows);
+                // A segment holding a column this binary does not know is
+                // never merged: the merge could not carry the column (ADR
+                // 0105). A newer binary merges it.
                 if !run.iter().all(|s| {
                     self.opts.tier(s.rows) == t
-                        && self.segs.contains_key(&s.index)
+                        && self
+                            .segs
+                            .get(&s.index)
+                            .is_some_and(|l| !l.idx.has_unknown_columns())
                         && !self.unreadable.contains(&s.index)
                 }) {
                     return None;
@@ -1119,18 +1219,19 @@ impl<'a> Pass<'a> {
             let mut rows = Vec::with_capacity(keys.len());
             for (key, g) in keys.iter().zip(gens) {
                 let Some(g) = g else { continue };
-                let mut v: Vec<(u8, Bytes)> = KINDS
+                let v: Vec<(u8, Bytes)> = self
+                    .fam
+                    .columns
                     .iter()
-                    .filter_map(|(c, _)| values.remove(&(*key, *c)).map(|b| (*c, b)))
+                    .filter_map(|c| values.remove(&(*key, c.id)).map(|b| (c.id, b)))
                     .collect();
-                v.sort_by_key(|(c, _)| *c);
                 rows.push(SealRow {
                     key: *key,
-                    generation: g,
+                    order: g,
                     values: v,
                 });
             }
-            let (enc, bad) = codec::encode(codec::FAMILY_CHANGESET, &rows, codec::nonce())?;
+            let (enc, bad) = codec::encode(self.fam.id, &rows, codec::nonce())?;
             self.report.bad_values += bad.len() as u64;
             if enc.seg.data_len as usize > self.opts.max_bytes {
                 state.oversize.insert(run.iter().map(|s| s.index).collect());
@@ -1167,7 +1268,7 @@ impl<'a> Pass<'a> {
     /// lease, compares every row with its segment value, and deletes a row
     /// only if it still holds the bytes compared (one statement), so a row
     /// `repair` rewrote meanwhile stays.
-    async fn retire(&mut self, state: &mut CompactState) -> Result<()> {
+    async fn retire(&mut self, state: &mut FamilyState) -> Result<()> {
         let now = Instant::now();
         let ripe: HashSet<Hash> = state
             .live_since
@@ -1178,7 +1279,7 @@ impl<'a> Pass<'a> {
         if ripe.is_empty() {
             return Ok(());
         }
-        let (raw, _) = read_manifest(self.repo).await?;
+        let (raw, _) = read_manifest(self.repo, self.fam.id).await?;
         if raw != self.raw {
             return Err(Error::Conflict(format!(
                 "the {MANIFEST_KIND} row changed under this pass; stopping before deleting rows"
@@ -1224,12 +1325,10 @@ impl<'a> Pass<'a> {
                     .filter_map(|(k, _)| l.idx.locate(k, col).map(|loc| (*k, loc)))
                     .collect();
                 i = j;
-                let kind = if col == COL_SKIPLIST {
-                    KINDS[0].1
-                } else {
-                    KINDS[1].1
+                let Some(column) = self.fam.column(col) else {
+                    continue;
                 };
-                let n = self.retire_chunk(&l, col, kind, &chunk, state).await?;
+                let n = self.retire_chunk(&l, column, &chunk, state).await?;
                 progress |= n > 0;
             }
             self.forget_data();
@@ -1243,14 +1342,15 @@ impl<'a> Pass<'a> {
     async fn retire_work(
         &mut self,
         ripe: &HashSet<Hash>,
-        state: &mut CompactState,
+        state: &mut FamilyState,
     ) -> Result<RetireWork> {
         self.list_rows(state).await?;
         let mut rows = self.rows.take().unwrap_or_default();
         self.place_holders(&mut rows);
         let mut by_seg: HashMap<Hash, Vec<(Hash, u8)>> = HashMap::new();
         for (k, r) in &rows {
-            for (col, _) in KINDS {
+            for c in self.fam.columns {
+                let col = c.id;
                 let at = r.holder[slot(col)];
                 if r.have & bit(col) == 0 || at == NONE {
                     continue;
@@ -1282,11 +1382,11 @@ impl<'a> Pass<'a> {
     async fn retire_chunk(
         &mut self,
         live: &Arc<Live>,
-        col: u8,
-        kind: &'static str,
+        column: &'static codec::Column,
         chunk: &[(Hash, Loc)],
-        state: &mut CompactState,
+        state: &mut FamilyState,
     ) -> Result<u64> {
+        let (col, kind, family) = (column.id, column.kind, self.fam.name);
         if chunk.is_empty() {
             return Ok(0);
         }
@@ -1301,19 +1401,17 @@ impl<'a> Pass<'a> {
                 self.mark_unreadable(live.r.index, state);
                 break;
             };
-            let equal = if col == COL_HISTORY_TREE {
-                same_part(&row, &value)
-            } else {
-                row == value
-            };
-            if equal {
+            if (column.equal)(&row, &value) {
                 del.push((*k, row));
             } else {
                 unequal += 1;
                 self.report.mismatched += 1;
                 state.mismatched.insert((*k, col), live.r.index);
-                metrics::counter!("leep_derived_segment_mismatch_total", "kind" => kind)
-                    .increment(1);
+                metrics::counter!(
+                    "leep_derived_segment_mismatch_total",
+                    "kind" => kind, "family" => family
+                )
+                .increment(1);
                 tracing::warn!(
                     key = %k,
                     kind,
@@ -1333,7 +1431,7 @@ impl<'a> Pass<'a> {
                         .into(),
                 ));
             };
-            (f.record)().await?;
+            (f.record)(self.fam.feature).await?;
             state.feature_recorded = true;
         }
         gc_lease::check(self.lease)?;
@@ -1344,7 +1442,11 @@ impl<'a> Pass<'a> {
             .await?;
         self.report.retired_rows += n;
         self.pause("retire-deleted").await;
-        metrics::counter!("leep_derived_segment_rows_retired_total", "kind" => kind).increment(n);
+        metrics::counter!(
+            "leep_derived_segment_rows_retired_total",
+            "kind" => kind, "family" => family
+        )
+        .increment(n);
         let rest = started.elapsed() * self.opts.rest_factor;
         if !rest.is_zero() {
             tokio::time::sleep(rest).await;
@@ -1357,27 +1459,32 @@ impl<'a> Pass<'a> {
 /// a page until each fits. The depth is log2 of the page: not a history
 /// walk.
 fn encode_capped(
+    family: u8,
     max_bytes: usize,
     rows: &[SealRow],
     out: &mut Vec<(codec::Encoded, Vec<codec::BadValue>)>,
 ) -> Result<()> {
-    let (enc, bad) = codec::encode(codec::FAMILY_CHANGESET, rows, codec::nonce())?;
+    let (enc, bad) = codec::encode(family, rows, codec::nonce())?;
     if enc.seg.data_len as usize > max_bytes && rows.len() > 1 {
         let (a, b) = rows.split_at(rows.len() / 2);
-        encode_capped(max_bytes, a, out)?;
-        return encode_capped(max_bytes, b, out);
+        encode_capped(family, max_bytes, a, out)?;
+        return encode_capped(family, max_bytes, b, out);
     }
     out.push((enc, bad));
     Ok(())
 }
 
-/// The generations of `ids`: stored rows in batches, a missing one derived.
-/// `None` for a changeset that is no longer stored.
+/// The generations of `ids`, which order a segment: stored rows in
+/// batches, read through the view so that once `generation` itself is
+/// sealed and its rows retired (family `changeset-v2`) they come from the
+/// segments; a missing one derived. `None` for a changeset that is no
+/// longer stored. Any order decodes correctly; this one makes references
+/// small.
 async fn generations(repo: &Repo, ids: &[Hash], batch: usize) -> Result<Vec<Option<u64>>> {
     let mut out = Vec::with_capacity(ids.len());
     for chunk in ids.chunks(batch.max(1)) {
         let rows = repo
-            .row_meta()
+            .meta()
             .get_derived_many(Generation::NAME, chunk)
             .await?;
         for (id, row) in chunk.iter().zip(rows) {

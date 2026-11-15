@@ -22,9 +22,11 @@
 //! no `gc-mark-v1` row is written (ADR 0103).
 //!
 //! Then a server in `--derived-segments retire` (its waits cut to zero)
-//! seals the `skiplist` and `history-tree-v4` rows into derived segments
-//! and deletes them (ADR 0104): it checks the segment bytes per changeset
-//! and their share of what the rows took.
+//! seals the `skiplist` and `history-tree-v4` rows (family `changeset-v1`,
+//! ADR 0104) and the `generation`, `last_merge-v1`, `root_tree` and
+//! `log-filter-v1` rows (family `changeset-v2`, ADR 0105) into derived
+//! segments and deletes them: it checks the segment bytes per changeset and
+//! their share of what the rows took.
 //!
 //! The budgets keep 25% or more over the worst value measured when they were
 //! set (docs/PERFORMANCE.md, "Storage size guard"). If a change trips one on
@@ -71,10 +73,13 @@ struct Budgets {
     /// Database bytes that `gc` added, per mark.
     gc_db_per_mark: f64,
     /// Derived segment bytes (index and data blobs) per sealed changeset,
-    /// and their share of the key and value bytes of the rows they replace
-    /// (ADR 0104); the same on both backends.
+    /// and their share of the key and value bytes of the rows they replace,
+    /// for family `changeset-v1` (ADR 0104) and `changeset-v2` (ADR 0105);
+    /// the same on both backends.
     segment_per_changeset: f64,
     segment_share: f64,
+    segment2_per_changeset: f64,
+    segment2_share: f64,
 }
 
 // Measured when set (ADR 0101, two runs each): blobs 469-474 bytes a land on
@@ -103,6 +108,8 @@ const SQLITE: Budgets = Budgets {
     gc_db_per_mark: 12.0,
     segment_per_changeset: SEGMENT_PER_CHANGESET,
     segment_share: SEGMENT_SHARE,
+    segment2_per_changeset: SEGMENT2_PER_CHANGESET,
+    segment2_share: SEGMENT2_SHARE,
 };
 
 const POSTGRES: Budgets = Budgets {
@@ -116,6 +123,8 @@ const POSTGRES: Budgets = Budgets {
     gc_db_per_mark: 28.0,
     segment_per_changeset: SEGMENT_PER_CHANGESET,
     segment_share: SEGMENT_SHARE,
+    segment2_per_changeset: SEGMENT2_PER_CHANGESET,
+    segment2_share: SEGMENT2_SHARE,
 };
 
 /// Key and value bytes of the code search blob rows, retired kind included,
@@ -144,6 +153,17 @@ const MARK_BYTES: f64 = 40.0;
 /// of the 64.5 KB of rows; the budgets keep 25% over the worst run.
 const SEGMENT_PER_CHANGESET: f64 = 75.0;
 const SEGMENT_SHARE: f64 = 0.14;
+
+/// The same for family `changeset-v2` (`generation`, `last_merge-v1`,
+/// `root_tree`, `log-filter-v1`; ADR 0105). Measured when set (six runs,
+/// both backends): 73.5 bytes a changeset every run, 0.316 of the 27.9 KB
+/// of rows; most of it is each changeset's 32-byte key and root tree,
+/// which do not compress. The budgets keep 25% over the worst run.
+const SEGMENT2_PER_CHANGESET: f64 = 92.0;
+const SEGMENT2_SHARE: f64 = 0.40;
+
+const V1_KINDS: &str = "'skiplist', 'history-tree-v4'";
+const V2_KINDS: &str = "'generation', 'last_merge-v1', 'root_tree', 'log-filter-v1'";
 
 /// One-file lands after the measurement, each waiting for the warmer: all
 /// but at most one must store their blob row as a patch.
@@ -492,30 +512,39 @@ fn gc_record(stores: &Stores) -> (i64, Option<leep_derive::gc_segments::Manifest
     (rows, manifest)
 }
 
-/// Rows and key and value bytes of `skiplist` and `history-tree-v4`.
-fn two_kinds(stores: &Stores) -> (i64, i64) {
+/// Rows and key and value bytes of `kinds` (a quoted SQL list).
+fn segmented_kinds(stores: &Stores, kinds: &str) -> (i64, i64) {
     use sqlx::Connection;
-    const Q: &str =
+    let q = format!(
         "SELECT COUNT(*), CAST(COALESCE(SUM(LENGTH(key) + LENGTH(value)), 0) AS BIGINT) \
-                     FROM derived WHERE kind IN ('skiplist', 'history-tree-v4')";
+         FROM derived WHERE kind IN ({kinds})"
+    );
+    let q = q.as_str();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    rt.block_on(async {
+    let counted: (i64, i64) = rt.block_on(async {
         if stores.meta.starts_with("sqlite:") {
             let mut c = sqlx::SqliteConnection::connect(&stores.meta).await.unwrap();
-            sqlx::query_as(Q).fetch_one(&mut c).await.unwrap()
+            sqlx::query_as(sqlx::AssertSqlSafe(q.to_string()))
+                .fetch_one(&mut c)
+                .await
+                .unwrap()
         } else {
             let mut c = sqlx::PgConnection::connect(&stores.meta).await.unwrap();
-            sqlx::query_as(Q).fetch_one(&mut c).await.unwrap()
+            sqlx::query_as(sqlx::AssertSqlSafe(q.to_string()))
+                .fetch_one(&mut c)
+                .await
+                .unwrap()
         }
-    })
+    });
+    counted
 }
 
-/// Live derived segments: changesets they hold, and their index and data
-/// blob bytes.
-fn derived_segment_bytes(stores: &Stores) -> (u64, u64, usize) {
+/// Live derived segments of each family: changesets they hold, their index
+/// and data blob bytes, and how many there are.
+fn derived_segment_bytes(stores: &Stores) -> Vec<(&'static str, u64, u64, usize)> {
     use leep_derive::derived_segments::{self as ds, ManifestRead};
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -525,16 +554,21 @@ fn derived_segment_bytes(stores: &Stores) -> (u64, u64, usize) {
         let blobs = leep_store::open_blob_store(&stores.blobs).unwrap();
         let meta = leep_meta::open_meta_store(&stores.meta).await.unwrap();
         let repo = leep_derive::Repo::new(blobs, meta);
-        let ManifestRead::Read(m) = ds::read_manifest(&repo).await.unwrap().1 else {
-            return (0, 0, 0);
-        };
-        let mut bytes = 0;
-        for s in &m.live {
-            bytes += repo.blobs().get(&s.index).await.unwrap().unwrap().len() as u64;
-            bytes += s.data_len as u64;
+        let mut out = Vec::new();
+        for fam in ds::FAMILIES {
+            let ManifestRead::Read(m) = ds::read_manifest(&repo, fam.id).await.unwrap().1 else {
+                out.push((fam.name, 0, 0, 0));
+                continue;
+            };
+            let mut bytes = 0;
+            for s in &m.live {
+                bytes += repo.blobs().get(&s.index).await.unwrap().unwrap().len() as u64;
+                bytes += s.data_len as u64;
+            }
+            let keys = m.live.iter().map(|s| s.rows as u64).sum();
+            out.push((fam.name, keys, bytes, m.live.len()));
         }
-        let keys = m.live.iter().map(|s| s.rows as u64).sum();
-        (keys, bytes, m.live.len())
+        out
     })
 }
 
@@ -836,9 +870,12 @@ fn storage_stays_within_its_budgets() {
         budgets.gc_db_per_mark
     );
 
-    // Derived segments (ADR 0104): a server in mode retire, its waits cut,
-    // seals both kinds and deletes their rows.
-    let (rows, row_bytes) = two_kinds(&stores);
+    // Derived segments (ADR 0104, 0105): a server in mode retire, its waits
+    // cut, seals the kinds of both families and deletes their rows.
+    let (rows1, row_bytes1) = segmented_kinds(&stores, V1_KINDS);
+    let (rows2, row_bytes2) = segmented_kinds(&stores, V2_KINDS);
+    let (rows, row_bytes) = (rows1 + rows2, row_bytes1 + row_bytes2);
+    let all_kinds = format!("{V1_KINDS}, {V2_KINDS}");
     let db_before_retire = sizes(&stores).db;
     let mut flags = FLAGS.to_vec();
     flags.extend([
@@ -852,37 +889,54 @@ fn storage_stays_within_its_budgets() {
     ]);
     let server = Server::start_with(free_port(), &stores, work, &flags);
     let deadline = Instant::now() + Duration::from_secs(60);
-    while two_kinds(&stores).0 > 0 {
+    while segmented_kinds(&stores, &all_kinds).0 > 0 {
         assert!(
             Instant::now() < deadline,
             "rows were not retired: {:?}\n{}",
-            two_kinds(&stores),
+            segmented_kinds(&stores, &all_kinds),
             server.log_text()
         );
         std::thread::sleep(Duration::from_millis(200));
     }
     drop(server);
     let db_after_retire = sizes(&stores).db;
-    let (keys, seg_bytes, segments) = derived_segment_bytes(&stores);
+    let families = derived_segment_bytes(&stores);
+    let (_, keys, seg_bytes, segments) = families[0];
+    let (_, keys2, seg_bytes2, segments2) = families[1];
     let per_changeset = seg_bytes as f64 / keys.max(1) as f64;
-    let share = seg_bytes as f64 / row_bytes.max(1) as f64;
+    let share = seg_bytes as f64 / row_bytes1.max(1) as f64;
+    let per_changeset2 = seg_bytes2 as f64 / keys2.max(1) as f64;
+    let share2 = seg_bytes2 as f64 / row_bytes2.max(1) as f64;
     let report = format!(
-        "{report}; derived segments: {rows} rows of {row_bytes} bytes became {segments} \
-         segment(s) of {seg_bytes} bytes for {keys} changesets ({per_changeset:.1} a \
-         changeset, {share:.3} of the rows), database {db_before_retire} -> \
+        "{report}; derived segments: {rows} rows of {row_bytes} bytes; changeset-v1: \
+         {rows1} rows of {row_bytes1} bytes became {segments} segment(s) of {seg_bytes} \
+         bytes for {keys} changesets ({per_changeset:.1} a changeset, {share:.3} of the \
+         rows); changeset-v2: {rows2} rows of {row_bytes2} bytes became {segments2} \
+         segment(s) of {seg_bytes2} bytes for {keys2} changesets ({per_changeset2:.1} a \
+         changeset, {share2:.3} of the rows); database {db_before_retire} -> \
          {db_after_retire} in use"
     );
     println!("{report}");
-    assert!(keys > 0, "nothing was sealed: {report}");
+    assert!(keys > 0 && keys2 > 0, "nothing was sealed: {report}");
     assert!(
         per_changeset <= budgets.segment_per_changeset,
-        "derived segment bytes per changeset over {}: {report}",
+        "changeset-v1 segment bytes per changeset over {}: {report}",
         budgets.segment_per_changeset
     );
     assert!(
         share <= budgets.segment_share,
-        "derived segments over {} of their rows: {report}",
+        "changeset-v1 segments over {} of their rows: {report}",
         budgets.segment_share
+    );
+    assert!(
+        per_changeset2 <= budgets.segment2_per_changeset,
+        "changeset-v2 segment bytes per changeset over {}: {report}",
+        budgets.segment2_per_changeset
+    );
+    assert!(
+        share2 <= budgets.segment2_share,
+        "changeset-v2 segments over {} of their rows: {report}",
+        budgets.segment2_share
     );
     let out = server_cmd(&stores, &["verify", "--full"]);
     assert_ok(&out, "leep-server verify --full");

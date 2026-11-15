@@ -84,7 +84,7 @@ pub struct Repo {
     /// compactor seals from and deletes in.
     rows: Arc<dyn MetaStore>,
     /// The live derived segments this handle reads, shared by clones.
-    pub(crate) segments: Arc<crate::derived_segments::SegmentView>,
+    pub(crate) segments: Arc<crate::derived_segments::Segments>,
     /// Per-ref queues that group concurrent lands into batches (see `land`).
     pub(crate) land_queues: Arc<crate::land::LandQueues>,
     /// How long a ref's queue may grow before lands are refused (ADR 0060,
@@ -679,7 +679,7 @@ impl Repo {
         // A view of its own on the store under any view, so handles never
         // stack two and a new one starts cold.
         let rows = meta.view_base().unwrap_or(meta);
-        let segments = Arc::new(crate::derived_segments::SegmentView::new(blobs.clone()));
+        let segments = Arc::new(crate::derived_segments::Segments::new(blobs.clone()));
         let meta: Arc<dyn MetaStore> = Arc::new(crate::derived_segments::view::SegmentedMeta::new(
             rows.clone(),
             segments.clone(),
@@ -1059,7 +1059,7 @@ impl Repo {
     }
 
     /// The derived segments this handle reads.
-    pub fn segments(&self) -> &Arc<crate::derived_segments::SegmentView> {
+    pub fn segments(&self) -> &Arc<crate::derived_segments::Segments> {
         &self.segments
     }
 

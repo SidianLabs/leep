@@ -342,17 +342,17 @@ fn rows(out: &mut Out) {
         let rows = vec![
             codec::SealRow {
                 key: id(1).0,
-                generation: 1,
+                order: 1,
                 values: vec![(codec::COL_SKIPLIST, bytes::Bytes::new())],
             },
             codec::SealRow {
                 key: id(2).0,
-                generation: 2,
+                order: 2,
                 values: vec![(codec::COL_SKIPLIST, entry(1, 1).into())],
             },
             codec::SealRow {
                 key: id(3).0,
-                generation: 3,
+                order: 3,
                 values: vec![(
                     codec::COL_SKIPLIST,
                     [entry(2, 2), entry(7, 1)].concat().into(),
@@ -372,6 +372,57 @@ fn rows(out: &mut Out) {
             retired: vec![Hash([4; 32])],
         };
         out.add("derived_segment", "manifest", with_prefix(0, &m.encode()));
+
+        // Family changeset-v2 (ADR 0105): every column, and a merge's
+        // log filter with a stop.
+        use leep_derive::derived::{FilterRow, Level};
+        let filter = |depth: u64, stop: Option<u8>| {
+            FilterRow {
+                depth,
+                last_merge: 0,
+                levels: (0..leep_derive::derived::level_count(depth))
+                    .map(|j| Level::of(vec![7 + j as u64, 1 << 40]))
+                    .collect(),
+                stops: stop.map(|b| vec![Some((1, id(b)))]).unwrap_or_default(),
+            }
+            .encode()
+        };
+        let rows: Vec<codec::SealRow> = (1u8..=3)
+            .map(|b| codec::SealRow {
+                key: id(b).0,
+                order: b as u64,
+                values: vec![
+                    (
+                        codec::COL_GENERATION,
+                        (b as u64).to_be_bytes().to_vec().into(),
+                    ),
+                    (codec::COL_LAST_MERGE, 0u64.to_be_bytes().to_vec().into()),
+                    (codec::COL_ROOT_TREE, Hash([b; 32]).0.to_vec().into()),
+                    (
+                        codec::COL_LOG_FILTER,
+                        filter(b as u64 - 1, (b == 3).then_some(9)),
+                    ),
+                ],
+            })
+            .collect();
+        let (enc, bad) = codec::encode(codec::FAMILY_CHANGESET_V2, &rows, 7).unwrap();
+        assert!(bad.is_empty());
+        let mut pair = vec![1u8];
+        pair.extend_from_slice(&(enc.index.1.len() as u16).to_be_bytes());
+        pair.extend_from_slice(&enc.index.1);
+        pair.extend_from_slice(&enc.data.1);
+        out.add("derived_segment", "changeset-v2", pair);
+        let m = codec::Manifest {
+            family: codec::FAMILY_CHANGESET_V2,
+            seq: 4,
+            live: vec![enc.seg],
+            retired: vec![],
+        };
+        out.add(
+            "derived_segment",
+            "manifest-changeset-v2",
+            with_prefix(0, &m.encode()),
+        );
     }
 
     let mut skip = Vec::new();

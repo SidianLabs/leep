@@ -15,12 +15,15 @@
 //! `root_tree`, `log-filter-v1`) and the code search kinds, zstd -9 of 64 KiB
 //! blocks of the rows in segment order: verbatim, and with the generation and
 //! last merge as varints (a candidate codec), plus an estimate of the key
-//! index.
+//! index, and the bytes of a segment holding them as this binary encodes
+//! it (ADR 0105's codecs: generations and last merges as their eight bytes,
+//! which compress better than varints in generation order).
 
 use std::collections::{BTreeMap, HashMap};
 
 use bytes::Bytes;
 use leep_core::{Hash, MetaStore};
+use leep_derive::derived_segments::codec::{self, SealRow};
 
 const BLOCK: usize = 64 << 10;
 
@@ -234,6 +237,47 @@ async fn main() {
         index + all_codec,
         (index + all_codec) as f64 / all_pg.max(1.0)
     );
+    // As this binary encodes it, when it knows the family.
+    if let Some(family) = codec::family_by_name("changeset-v2") {
+        let cols: Vec<(u8, &str)> = codec::family(family)
+            .unwrap()
+            .columns
+            .iter()
+            .map(|c| (c.id, c.kind))
+            .collect();
+        let by: Vec<HashMap<Hash, &Bytes>> = cols
+            .iter()
+            .map(|(_, k)| rows_of(k).iter().map(|(h, v)| (*h, v)).collect())
+            .collect();
+        let seal: Vec<SealRow> = keys
+            .iter()
+            .map(|k| SealRow {
+                key: *k,
+                order: gens.get(k).copied().unwrap_or(0),
+                values: cols
+                    .iter()
+                    .zip(&by)
+                    .filter_map(|((c, _), m)| m.get(k).map(|v| (*c, (*v).clone())))
+                    .collect(),
+            })
+            .filter(|r| !r.values.is_empty())
+            .collect();
+        let (mut idx, mut data, mut segs, mut bad) = (0, 0, 0, 0);
+        for chunk in seal.chunks(16_384) {
+            let (enc, b) = codec::encode(family, chunk, 1).unwrap();
+            idx += enc.index.1.len();
+            data += enc.data.1.len();
+            segs += 1;
+            bad += b.len();
+        }
+        println!(
+            "encoded by this binary: {segs} segment(s), index {idx} + data {data} = {} bytes \
+             ({:.1} a key), {bad} values refused",
+            idx + data,
+            (idx + data) as f64 / n.max(1) as f64
+        );
+    }
+
     // Code search kinds, verbatim in key order.
     println!("\ncode search, verbatim rows in key order");
     for kind in [
@@ -261,16 +305,17 @@ async fn main() {
     }
 
     // What the blob store holds of derived segments now.
-    if let Ok((_, leep_derive::derived_segments::ManifestRead::Read(m))) = async {
-        let repo = leep_derive::Repo::new(blobs.clone(), meta.clone());
-        leep_derive::derived_segments::read_manifest(&repo).await
-    }
-    .await
-    {
-        let data: u64 = m.live.iter().map(|s| s.data_len as u64).sum();
-        println!(
-            "\nderived segments of changeset-v1: {} live, {data} bytes of data",
-            m.live.len()
-        );
+    let repo = leep_derive::Repo::new(blobs.clone(), meta.clone());
+    for fam in leep_derive::derived_segments::FAMILIES {
+        if let Ok((_, leep_derive::derived_segments::ManifestRead::Read(m))) =
+            leep_derive::derived_segments::read_manifest(&repo, fam.id).await
+        {
+            let data: u64 = m.live.iter().map(|s| s.data_len as u64).sum();
+            println!(
+                "derived segments of {}: {} live, {data} bytes of data",
+                fam.name,
+                m.live.len()
+            );
+        }
     }
 }
