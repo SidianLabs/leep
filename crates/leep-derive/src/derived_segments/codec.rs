@@ -788,6 +788,16 @@ impl SegmentIndex {
         &self.keys
     }
 
+    /// The keys with a value of `col`, ascending.
+    pub fn keys_with(&self, col: u8) -> impl Iterator<Item = &Hash> + '_ {
+        let c = self.columns.iter().find(|c| c.id == col);
+        self.keys
+            .iter()
+            .zip(&self.ord_of)
+            .filter(move |(_, o)| c.is_some_and(|c| c.has(**o)))
+            .map(|(k, _)| k)
+    }
+
     /// Bit `c` for each column `c` it holds.
     pub fn column_mask(&self) -> u64 {
         self.columns.iter().fold(0, |m, c| m | 1 << c.id)

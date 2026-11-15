@@ -141,11 +141,23 @@ pass), and:
    at most 16,384 and encoded (halved until the data fits 4 MiB); both blobs
    are made durable (`put_rescuing_many_loose`), and only then is the
    manifest swapped to name them. A backfill is the same step, restartable
-   anywhere, since "already sealed" is read from the manifest; a pass seals
-   at most four pages and gives the lease up, so a long backfill does not
-   keep `repair` waiting; a pass that left candidates says so, lists again
-   next time and is followed 5 s later instead of after the interval. Keys whose changeset is no longer stored are
-   remembered and skipped until the next periodic listing.
+   anywhere, since "already sealed" is read from the manifest. A listing's
+   candidates are carried to the following passes, which go on without
+   listing again: first their generations, in batches, then, sorted, their
+   pages. A pass spends at most a minute on them (finishing the page it is
+   on) and seals at most four pages, then gives the lease up, so a long
+   backfill does not keep `repair` waiting, says it has more and is
+   followed 5 s later instead of after the interval. The carried work is
+   dropped, and the rows listed again, when a live segment appears that it
+   does not account for (another server's pass, a `repair drop`) or one is
+   dropped. The holder of each listed key is found by walking every live
+   segment's keys once, newest first (for few keys, by looking each up),
+   so a backfill costs one listing and one generation read per changeset,
+   not one per pass ("Backfill cost" below). Keys whose changeset is no
+   longer stored, and rows whose value does not decode, are remembered and
+   skipped until the next periodic listing. A pass says it has more only
+   if it made progress (generations read, a page consumed, rows deleted or
+   found unequal), so nothing can keep passes 5 s apart for ever.
 2. **Merges** runs of four adjacent live segments of one tier (`floor(log4(keys
    / 1,024))`), the longest prefix of the run that fits the caps (two or
    more), so a row is rewritten about three times at most. Adjacent, so a key
@@ -164,8 +176,12 @@ pass), and:
    again while the same segment holds the key. The store feature
    `derived-segments` is recorded before the first delete of each process.
    Candidates are taken one holding segment at a time, so one data blob is
-   in memory at once. A pass deletes at most 65,536 rows or for at most a
-   minute, then gives the lease up and is followed 5 s later.
+   in memory at once; a segment value that cannot be read ends the step
+   (the rows compared before it are still deleted). A pass deletes at most
+   65,536 rows or for at most a minute, then gives the lease up and is
+   followed 5 s later, carrying the rest of its candidates (dropped like a
+   backfill's). No retirement runs while a seal backfill is under way:
+   each pass would list every row again to find the few newly ripe ones.
 
 It probes every live segment itself: the index blob, and the data blob read
 whole and decoded the first time this process sees the segment (only its
@@ -179,8 +195,9 @@ once this process has retired rows). Any other read error fails the pass
 and drops nothing. A segment whose data a merge or a retirement cannot read
 is left alone for the rest of the pass (a merge never picks it again, so
 the pass ends) and read whole by the next pass's probe. Decoded indexes the
-read view already holds are reused (immutable, checked by address); its
-segment list and broken set are not. Retired
+read view already holds are reused (immutable, checked by address), and
+the pass still checks that their index blobs are stored, so a lost one is
+noticed; the view's segment list and broken set are not reused. Retired
 blobs no longer stored are forgotten. A manifest that does not decode is
 replaced only by a pass in mode `build` on a store without the feature
 recorded (asked of the store, not this process's flag: another server may
@@ -324,7 +341,22 @@ the operating system only on `VACUUM FULL derived` (or `pg_repack`) and
   live segment bytes in the meantime.
 - In mode `build` a pass lists every key of both kinds whenever they grew
   by 1,024 or 10 minutes passed (2.4 million keys on a Linux-sized store);
-  in mode `retire` only the unsealed ones remain to list, every pass.
+  in mode `retire` only the unsealed ones remain to list, every pass but
+  those carrying a retirement on.
+- **Backfill cost.** A first seal of a store with history lists every key
+  once and reads every changeset's generation once (batches of 1,000,
+  until a minute after the pass started), then seals 65,536 changesets a
+  pass, 5 s apart, without listing again; finding each key's holder walks
+  the live segments' keys once. The listing is the one step not bounded
+  in time. Measured on Postgres 16 with synthetic chains of one kind
+  (`crates/leep-server/tests/derived_segments_backfill.rs`): 500,000
+  changesets seal in 8 passes, the first 6.2 s and each after it 0.4 to
+  0.6 s (10.1 s of passes; listing again every pass, as first released,
+  took 4.4 to 5.1 s a pass, 37.4 s, and grew with the store); 2,000,000
+  in 31 passes, the first 19.8 s and each after it about 0.8 s (44.7 s).
+  Retiring is bound by its deletes and the equal rest after each: 45 s of
+  passes for 500,000 rows, 106 s for 2,000,000, at most 5.7 s a pass.
+  Every pass stays far below the two minutes `repair` waits for the lease.
 
 ## Consequences
 - `leep-server --derived-segments build` (the default) seals in the
@@ -342,6 +374,14 @@ the operating system only on `VACUUM FULL derived` (or `pg_repack`) and
   again forever with the lease held); backfills and long retirements are
   bounded per pass and continued 5 s later; passes reuse the view's decoded
   indexes; the Postgres conditional delete locks rows in key order.
+- Changed after a third review: a backfill's and a retirement's candidates
+  are carried across passes instead of listed again by each (which made a
+  backfill quadratic), generations are read once and within a time bound,
+  holders are found in one walk of the segments' keys; a pass says it has
+  more only if it made progress, and rows that do not decode are skipped
+  like unstored ones; reused indexes have their blobs probed; a
+  retirement step stops at a value it cannot read; both Postgres
+  `derived` deletes by key lock rows in `(kind, key)` order.
 - Changed after review, before release: the manifest gained its sequence
   number; a damaged manifest is replaced only where the store has no
   `derived-segments` feature, and a newer one never; passes load and probe

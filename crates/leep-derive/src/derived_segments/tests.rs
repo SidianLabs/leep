@@ -1660,15 +1660,245 @@ async fn a_backfill_continues_promptly() {
     };
     let mut st = CompactState::default();
     let p = pass(&r, &opts, &mut st, None).await;
-    assert!(p.more && p.sealed_keys == 16, "{p:?}");
+    assert!(p.listed && p.more && p.sealed_keys == 16, "{p:?}");
     let mut sealed = p.sealed_keys;
     for _ in 0..20 {
+        // The following passes go on with the listing's candidates.
         let p = pass(&r, &opts, &mut st, None).await;
-        assert!(p.listed || p.sealed_keys == 0, "{p:?}");
+        assert!(!p.listed && p.sealed_keys > 0, "{p:?}");
         sealed += p.sealed_keys;
         if !p.more {
             break;
         }
     }
     assert_eq!(sealed as usize, ids.len());
+    let p = pass(&r, &opts, &mut st, None).await;
+    assert!(!p.more && p.sealed_keys == 0, "{p:?}");
+}
+
+/// A backfill whose generations take longer than a pass may spend reads
+/// them over several passes, then seals in `(generation, id)` order.
+#[tokio::test]
+async fn a_backfill_reads_generations_over_several_passes() {
+    let r = repo();
+    let ids = build(&r, None).await;
+    let opts = CompactOptions {
+        max_rows: 8,
+        max_seal_pages: 2,
+        // One batch of generations a pass (16 of 1 key), then out of time.
+        batch: 1,
+        max_seal_time: Duration::ZERO,
+        list_every: Duration::from_secs(600),
+        fanout: 64,
+        ..CompactOptions::small(Mode::Build)
+    };
+    let mut st = CompactState::default();
+    let mut passes = 0;
+    let mut sealed = 0;
+    loop {
+        let p = pass(&r, &opts, &mut st, None).await;
+        passes += 1;
+        sealed += p.sealed_keys;
+        if !p.more {
+            break;
+        }
+        assert!(passes < 40, "{p:?}");
+    }
+    assert_eq!(sealed as usize, ids.len());
+    assert!(passes > ids.len() / 16, "{passes}");
+    let (_, ManifestRead::Read(m)) = read_manifest(&r).await.unwrap() else {
+        panic!()
+    };
+    // Sealed oldest first: each segment's keys are older than the next's.
+    let mut gens = Vec::new();
+    for s in &m.live {
+        let idx = view::load_index(&**r.blobs(), s).await.unwrap().unwrap();
+        let mut g = Vec::new();
+        for k in idx.keys() {
+            g.push(r.generation(ChangesetId(*k)).await.unwrap());
+        }
+        gens.push((*g.iter().min().unwrap(), *g.iter().max().unwrap()));
+    }
+    assert!(gens.windows(2).all(|w| w[0].1 <= w[1].0), "{gens:?}");
+}
+
+/// Work carried across passes is forgotten when a live segment appears
+/// that it does not account for (another server's pass): the next pass
+/// lists again and seals nothing twice.
+#[tokio::test]
+async fn a_carried_backfill_is_dropped_when_another_server_seals() {
+    let r = repo();
+    let ids = build(&r, None).await;
+    let opts = CompactOptions {
+        max_rows: 8,
+        max_seal_pages: 1,
+        list_every: Duration::from_secs(600),
+        fanout: 64,
+        ..CompactOptions::small(Mode::Build)
+    };
+    let mut mine = CompactState::default();
+    let mut theirs = CompactState::default();
+    let p = pass(&r, &opts, &mut mine, None).await;
+    assert!(p.more && p.sealed_keys == 8, "{p:?}");
+    let p = pass(&r, &opts, &mut theirs, None).await;
+    assert!(p.listed && p.sealed_keys == 8, "{p:?}");
+    let p = pass(&r, &opts, &mut mine, None).await;
+    assert!(p.listed, "{p:?}");
+    let mut sealed = 16 + p.sealed_keys;
+    for _ in 0..20 {
+        let p = pass(&r, &opts, &mut mine, None).await;
+        sealed += p.sealed_keys;
+        if !p.more {
+            break;
+        }
+    }
+    assert_eq!(sealed as usize, ids.len());
+}
+
+/// An index the pass takes from the read view is probed too: a lost index
+/// blob is noticed, and its segment dropped.
+#[tokio::test(start_paused = true)]
+async fn a_lost_index_blob_is_noticed_while_the_view_holds_it() {
+    let r = repo();
+    let mut st = CompactState::default();
+    let live = four_segments(&r, &mut st).await;
+    assert!(r
+        .segments()
+        .segments()
+        .iter()
+        .any(|l| l.r.index == live[1].index));
+    r.blobs().delete(&live[1].index).await.unwrap();
+    let opts = CompactOptions {
+        fanout: 64,
+        ..CompactOptions::small(Mode::Build)
+    };
+    let p = pass(&r, &opts, &mut st, None).await;
+    assert_eq!(p.dropped, 1, "{p:?}");
+    let (_, ManifestRead::Read(m)) = read_manifest(&r).await.unwrap() else {
+        panic!()
+    };
+    assert!(m.live.iter().all(|s| s.index != live[1].index));
+}
+
+/// Rows whose values do not decode, ahead of good ones in generation
+/// order: the backfill goes past them and ends, and they are not made
+/// candidates again by every listing (mode `retire` lists every pass).
+#[tokio::test(start_paused = true)]
+async fn undecodable_rows_ahead_of_good_ones_do_not_keep_passes_busy() {
+    let r = repo();
+    let ids = build(&r, None).await;
+    let bad: Vec<Hash> = ids[..24].iter().map(|i| i.0).collect();
+    r.row_meta()
+        .delete_derived_keys(&[HistoryTree::NAME], &bad)
+        .await
+        .unwrap();
+    for k in &bad {
+        r.row_meta()
+            .put_derived(Skiplist::NAME, k, Bytes::from_static(b"bad"))
+            .await
+            .unwrap();
+    }
+    let opts = CompactOptions {
+        max_rows: 8,
+        max_seal_pages: 2,
+        retire_after: Duration::from_secs(600),
+        fanout: 64,
+        list_every: Duration::from_secs(600),
+        ..CompactOptions::small(Mode::Retire)
+    };
+    let hook = feature_hook(Arc::default());
+    let mut st = CompactState::default();
+    let mut bad_values = 0;
+    for i in 0.. {
+        assert!(i < 20, "passes kept saying there is more");
+        let p = pass(&r, &opts, &mut st, Some(&hook)).await;
+        bad_values += p.bad_values;
+        if !p.more {
+            break;
+        }
+    }
+    assert_eq!(bad_values as usize, bad.len());
+    for _ in 0..3 {
+        let p = pass(&r, &opts, &mut st, Some(&hook)).await;
+        // Every good row is held; the bad ones are not candidates.
+        assert!(p.listed && !p.more && p.unsealed_rows == 0, "{p:?}");
+        assert_eq!((p.sealed_keys, p.bad_values), (0, 0), "{p:?}");
+    }
+}
+
+/// A blob store counting reads of each blob.
+struct CountingBlobs {
+    inner: Arc<dyn leep_core::BlobStore>,
+    gets: Mutex<std::collections::HashMap<Hash, usize>>,
+}
+
+#[async_trait]
+impl leep_core::BlobStore for CountingBlobs {
+    async fn put_with_hash(&self, hash: Hash, data: Bytes) -> leep_core::Result<()> {
+        self.inner.put_with_hash(hash, data).await
+    }
+    async fn contains(&self, hash: &Hash) -> leep_core::Result<bool> {
+        self.inner.contains(hash).await
+    }
+    async fn get(&self, hash: &Hash) -> leep_core::Result<Option<Bytes>> {
+        *self.gets.lock().unwrap().entry(*hash).or_default() += 1;
+        self.inner.get(hash).await
+    }
+    async fn list_page(
+        &self,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> leep_core::Result<Vec<leep_core::BlobMeta>> {
+        self.inner.list_page(after, limit).await
+    }
+    async fn delete(&self, hash: &Hash) -> leep_core::Result<()> {
+        self.inner.delete(hash).await
+    }
+}
+
+/// A retirement step whose segment value cannot be read stops at the
+/// first such row (the data blob is read once), deletes nothing it did
+/// not compare, and leaves the segment to the next pass's probe.
+#[tokio::test(start_paused = true)]
+async fn a_retirement_step_stops_at_an_unreadable_value() {
+    let blobs = Arc::new(CountingBlobs {
+        inner: Arc::new(MemoryBlobStore::new()),
+        gets: Mutex::default(),
+    });
+    let r = Repo::new(blobs.clone(), Arc::new(MemoryMetaStore::new()));
+    build(&r, None).await;
+    let mut st = CompactState::default();
+    let opts = CompactOptions {
+        fanout: 64,
+        ..CompactOptions::small(Mode::Build)
+    };
+    let p = pass(&r, &opts, &mut st, None).await;
+    assert_eq!(p.sealed_segments, 1, "{p:?}");
+    let (_, ManifestRead::Read(m)) = read_manifest(&r).await.unwrap() else {
+        panic!()
+    };
+    let seg = m.live[0];
+    r.blobs().delete(&seg.data).await.unwrap();
+    r.blobs()
+        .put_with_hash(
+            seg.data,
+            Bytes::from_static(b"leep:derived-segment-data-v1\0x"),
+        )
+        .await
+        .unwrap();
+    blobs.gets.lock().unwrap().clear();
+    let retire = CompactOptions {
+        fanout: 64,
+        ..CompactOptions::small(Mode::Retire)
+    };
+    let hook = feature_hook(Arc::default());
+    let p = pass(&r, &retire, &mut st, Some(&hook)).await;
+    assert_eq!(
+        (p.retired_rows, p.mismatched, p.more),
+        (0, 0, false),
+        "{p:?}"
+    );
+    assert_eq!(blobs.gets.lock().unwrap().get(&seg.data), Some(&1));
+    let p = pass(&r, &retire, &mut st, Some(&hook)).await;
+    assert_eq!(p.dropped, 1, "{p:?}");
 }
