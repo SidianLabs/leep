@@ -1969,6 +1969,11 @@ already written, and an older binary would fail on them anyway.
 `leep-server verify` and backups behave the same way, and backups carry the
 table.
 
+`gc --retire-mark-rows` records `gc-mark-segments` (ADR 0103) before it
+deletes the `gc-mark-v1` rows, because a `gc` from before ADR 0103 would
+trust what is left of them half way; run it only after every binary is
+upgraded.
+
 The check only protects against binaries that have it. **Servers from
 before this release do not read the table**, and those from before ADR 0053
 cannot read compressed rows. So for this release the rule above still
@@ -2343,10 +2348,39 @@ the `--request-timeout` and `--meta-statement-timeout` it is given (or their
 when the fence is too short. If you raise `--request-timeout`, raise
 `--fence` with it, or set a short `--meta-statement-timeout` such as `30s`.
 
-Marking is incremental (ADR 0033): each run records what it marked in
-`gc-mark-v1` rows and the next one walks only changesets stored since, so a
-run costs a listing of changesets and blobs plus the new history, not a walk
-of all of it. The first run after an upgrade walks everything once. The
+Marking is incremental (ADR 0033): each run records what it marked and the
+next one walks only changesets stored since, so a run costs a listing of
+changesets and blobs plus the new history, not a walk of all of it. The
+first run after an upgrade walks everything once. Since ADR 0103 the record
+is a few sorted segments of 32-byte hashes in the blob store (blobs whose
+bytes start with `leep:gc-mark-segment-v1`, which uploads cannot write;
+merged geometrically, packed and backed up like any blob) named by one
+`gc-mark-segments-v1` row, instead of one `gc-mark-v1` row per object: 32
+bytes a mark instead of about 167 on Postgres. A run loads the segments into
+memory (32 bytes a mark). The report's `mark segments` counts them; merged
+ones are collected like orphans a grace and a fence later (`retired mark
+segments condemned`/`deleted`, not counted with the blobs). A lost or
+damaged segment only makes the next run walk more, and `verify` notes or
+reports it.
+
+**Retiring the `gc-mark-v1` rows of an upgraded store.** A store GC'd before
+ADR 0103 keeps its rows, and new binaries still trust them (and never write
+new ones). Once every server, importer and cron job runs this release or a
+later one, run once, beside running servers:
+
+```sh
+leep-server --meta "$META" --blobs "$BLOBS" gc --retire-mark-rows
+```
+
+It copies the rows into one segment, records the store feature
+`gc-mark-segments`, then deletes the rows in bounded steps, printing
+progress. **This is the one-way point:** from then on every binary older
+than this release refuses the store (see [Format features](#format-features)),
+so a rollback means restoring a backup from before it. Before it, rolling
+back is free: an older `gc` ignores the segments (and collects them as
+orphans; the next new run walks more). Killed part way, run it again; it
+skips the import once done. On Postgres the space comes back after
+autovacuum (or `VACUUM`). The
 report's `changesets walked` and `referenced blobs and trees marked by this
 run` show the walk; `referenced blobs marked by earlier runs` the rest.
 Moving, deleting or recreating refs and tags never needs a full walk, because
@@ -2355,8 +2389,9 @@ walks everything and rewrites it. It is never needed for safety; it costs a
 walk of all of history (about 10 s per phase per 20,000 commits on Postgres,
 see `docs/PERFORMANCE.md`), and because it reads every tree node again it also
 fails loudly on a tree node lost from the store, which `verify` reports too.
-`repair drop` refuses `gc-mark-v1`: dropping part of it could let a collect
-delete a referenced blob. On a loose filesystem store the blob
+`repair drop` refuses `gc-mark-v1` and `gc-mark-segments-v1`: dropping part
+of the rows could let a collect delete a referenced blob, and the manifest
+says whether the rows still count. On a loose filesystem store the blob
 listing then dominates a run (about 40 us per loose object); `repack` makes it
 about 7 us per object.
 
@@ -2970,6 +3005,7 @@ history, trees and blobs first, derived rows after.
 | `corrupt_history_node`, `missing_history_node` | A part of a history pack fails its checksum or does not decode, a `history-node-v4` row holds another part than its key says, a split node's chunk does not fit its list, a patch does not fit its keyframe, or a `history-tree-v4` row, chunk list or patch points at nothing | `repair rederive --kind history-tree-v4` rewrites the packs. Or `repair drop --kind history-tree-v4` and let the index rebuild on the next path query (slow on a long history: it derives the whole index at once) |
 | `bad_attestation`, `invalid_signature` | A signature or review row does not decode, does not belong to any changeset, or a signature does not verify | These are not derived from history and are never rewritten by `repair`. Restore the row from a backup, or delete it with SQL if it is junk, and have the author sign again |
 | `bad_rebased_origin`, `bad_gc_row` | Bookkeeping rows that are malformed or name changesets that do not exist (a rebased-origin row may name a swept original, but must agree with its copy's `leep.rebased_from`) | Restore from a backup. A bad GC row can be deleted with SQL while no `gc` runs; `repair` refuses to touch them |
+| `bad_gc_segment` | A GC mark segment the manifest names does not decode, or holds a different number of marks (ADR 0103). One that is not stored is only a note (normal after restoring a backup taken while `gc` ran) | Nothing is lost: the next `gc` trusts only the segments before it, walks the rest and stops naming it. Run `gc` (or `gc --full`) |
 | `reflog_divergence` | A ref's newest ref log entry does not say where the ref is now | Someone changed the `refs` table or the log directly, or a restore mixed two points in time. Decide which is right: if the ref is right, the log is merely incomplete and nothing breaks; if the log is right, `leep undo`-style recovery is `POST /v1/refs/{name}` to the logged value. `repair` never edits either |
 | `reflog_chain_break` | An entry's `new` does not equal the next entry's `old`: an entry was removed or edited | The log is the record of what happened; restore it from a backup if you need it complete. Refs are unaffected |
 
@@ -3050,8 +3086,8 @@ their patches read.
 Kinds that cannot be rederived (and so are refused by `drop` with an
 explanation and exit status 2): `signature-v1`, `review-v1` and `review-source-v1` (clients wrote
 them), `rebased-origin-v1` (written by rebase; `land`'s retry detection depends
-on it), `blob-claim-v1`, `blob-condemned-v1`, `blob-rescue-v1`, `blob-doom-v1`, `gc-mark-v1` (the GC
-fence, ADR 0012), `history-node-v4` (or `-v3`, `-v2`, `-v1`) and
+on it), `blob-claim-v1`, `blob-condemned-v1`, `blob-rescue-v1`, `blob-doom-v1`, `gc-mark-v1`,
+`gc-mark-segments-v1` (the GC fence and marks, ADR 0012, 0033, 0103), `history-node-v4` (or `-v3`, `-v2`, `-v1`) and
 `tree-trigrams-keyframe-v2` on their own, and the ref log. The full table
 with reasons is in ADR 0025. `blame-v2` can be dropped but not rederived: its rows
 are keyed by a hash of (changeset, path) and cannot be listed.

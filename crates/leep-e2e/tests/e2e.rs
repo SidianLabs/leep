@@ -704,6 +704,116 @@ fn server_gc(stores: &Stores, args: &[&str]) -> String {
     stdout(&out)
 }
 
+/// Run `sql` statements against a SQLite store, returning the first column
+/// of the last statement's rows as bytes.
+fn sqlite_rows(meta: &str, sql: &[&str]) -> Vec<Vec<u8>> {
+    use sqlx::{Connection, Row};
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut c = sqlx::SqliteConnection::connect(meta).await.unwrap();
+        let mut out = Vec::new();
+        for q in sql {
+            // Test statements built from hashes this test read itself.
+            out = sqlx::query(sqlx::AssertSqlSafe(q.to_string()))
+                .fetch_all(&mut c)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| {
+                    r.try_get::<Vec<u8>, _>(0)
+                        .unwrap_or_else(|_| r.get::<String, _>(0).into_bytes())
+                })
+                .collect();
+        }
+        out
+    })
+}
+
+/// ADR 0103: a store GC'd before mark segments has `gc-mark-v1` rows and no
+/// manifest. A new `gc` trusts the rows; `gc --retire-mark-rows` copies them
+/// into a segment, records the store feature and deletes them, after which
+/// `gc` still walks nothing old and the store verifies.
+#[test]
+fn legacy_mark_rows_are_trusted_then_retired() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stores = Stores::sqlite(&root.join("data"));
+    let server = Server::start(&stores, root);
+    let client = Client::new(&server.url, &root.join("cache"));
+    let wc = root.join("wc");
+    client.ok(root, &["init", wc.to_str().unwrap()]);
+    for i in 0..3 {
+        write(&wc, &format!("d{i}/e/f.txt"), &format!("file {i}\n"));
+        client.ok(&wc, &["commit", "-m", &format!("c{i}")]);
+        client.ok(&wc, &["land"]);
+    }
+    drop(server);
+    let gc = ["--grace", "0", "--fence", "0s", "--unsafe-no-fence"];
+    let first = server_gc(&stores, &gc);
+    assert!(first.contains("mark segments: 1"), "{first}");
+
+    // Turn it into what a gc from before ADR 0103 leaves: a row per mark,
+    // no manifest, no segments.
+    let blobs_dir = root.join("data/blobs");
+    let mut marks = Vec::new();
+    for f in mark_segment_files(&blobs_dir) {
+        let data = fs::read(&f).unwrap();
+        let hashes =
+            leep_derive::gc_segments::decode_segment(&leep_core::Hash::of_blob(&data), &data)
+                .unwrap();
+        marks.extend(hashes.iter().map(|h| h.to_hex()));
+        fs::remove_file(f).unwrap();
+    }
+    assert!(marks.len() > 10, "{marks:?}");
+    let mut sql: Vec<String> =
+        vec!["DELETE FROM derived WHERE kind = 'gc-mark-segments-v1'".into()];
+    for m in &marks {
+        sql.push(format!(
+            "INSERT INTO derived (kind, key, value) VALUES ('gc-mark-v1', X'{m}', X'01')"
+        ));
+    }
+    let refs: Vec<&str> = sql.iter().map(String::as_str).collect();
+    sqlite_rows(&stores.meta, &refs);
+
+    let trusted = server_gc(&stores, &gc);
+    assert!(trusted.contains("changesets walked: 0"), "{trusted}");
+    assert!(trusted.contains("mark segments: 0"), "{trusted}");
+
+    let retire = server_gc(&stores, &["--retire-mark-rows"]);
+    assert!(
+        retire.contains(&format!("copied into a segment: {}", marks.len())),
+        "{retire}"
+    );
+    assert!(
+        retire.contains(&format!("rows deleted: {}", marks.len())),
+        "{retire}"
+    );
+    let rows = sqlite_rows(
+        &stores.meta,
+        &["SELECT CAST(COUNT(*) AS TEXT) FROM derived WHERE kind = 'gc-mark-v1'"],
+    );
+    assert_eq!(rows, [b"0".to_vec()]);
+    let features = sqlite_rows(&stores.meta, &["SELECT name FROM store_features"]);
+    assert!(
+        features.contains(&b"gc-mark-segments".to_vec()),
+        "{features:?}"
+    );
+
+    let after = server_gc(&stores, &gc);
+    assert!(after.contains("changesets walked: 0"), "{after}");
+    assert!(after.contains("mark segments: 1"), "{after}");
+    let again = server_gc(&stores, &["--retire-mark-rows"]);
+    assert!(again.contains("already retired"), "{again}");
+    assert_ok(
+        &server_cmd(&stores, &["verify", "--full"]),
+        "leep-server verify --full",
+    );
+}
+
 /// Write `data` straight into a filesystem blob store, as an upload whose
 /// commit never came (and that nothing has claimed).
 fn plant_orphan(blobs_dir: &Path, data: &[u8]) -> PathBuf {
@@ -783,10 +893,10 @@ fn fenced_gc_removes_orphans_and_keeps_live_data() {
     client.ok(&wc, &["land"]);
 
     let blobs_dir = root.join("data/blobs");
-    let live_files = count_files(&blobs_dir);
+    let live_files = count_objects(&blobs_dir);
     let orphan_a = plant_orphan(&blobs_dir, b"orphan a");
     let orphan_b = plant_orphan(&blobs_dir, b"orphan b");
-    assert_eq!(count_files(&blobs_dir), live_files + 2);
+    assert_eq!(count_objects(&blobs_dir), live_files + 2);
 
     // Dry run reports and writes nothing; condemn deletes nothing.
     let dry = server_gc(&stores, &["--dry-run", "--grace", "0"]);
@@ -804,7 +914,9 @@ fn fenced_gc_removes_orphans_and_keeps_live_data() {
     let done = server_gc(&stores, &["collect", "--fence", "0s", "--unsafe-no-fence"]);
     assert!(done.contains("deleted: 2 blobs"), "{done}");
     assert!(!orphan_a.exists() && !orphan_b.exists());
-    assert_eq!(count_files(&blobs_dir), live_files);
+    // Besides the content, `gc` keeps its marks as segments (ADR 0103).
+    assert_eq!(count_objects(&blobs_dir), live_files);
+    assert!(!mark_segment_files(&blobs_dir).is_empty());
 
     // The combined command (condemn, wait, collect) and a refused zero fence.
     let orphan_c = plant_orphan(&blobs_dir, b"orphan c");

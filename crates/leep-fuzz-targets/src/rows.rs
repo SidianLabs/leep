@@ -173,6 +173,26 @@ pub fn gc_rows(data: &[u8]) {
     let Some((&k, value)) = data.split_first() else {
         return;
     };
+    // Past the row kinds: the mark manifest and a mark segment (ADR 0103).
+    match k as usize % (kinds.len() + 2) {
+        4 => {
+            if let Ok(m) = leep_derive::gc_segments::Manifest::decode(value) {
+                assert_eq!(&m.encode()[..], value, "a decoded manifest is its bytes");
+            }
+            return;
+        }
+        5 => {
+            let addr = leep_core::Hash::of_blob(value);
+            if let Ok(hashes) = leep_derive::gc_segments::decode_segment(&addr, value) {
+                let at = leep_derive::gc_segments::SEGMENT_HEADER - 8;
+                let nonce = u64::from_be_bytes(value[at..at + 8].try_into().unwrap());
+                let (again, bytes) = leep_derive::gc_segments::encode_segment(&hashes, nonce);
+                assert_eq!((again, &bytes[..]), (addr, value));
+            }
+            return;
+        }
+        _ => {}
+    }
     let kind = kinds[k as usize % kinds.len()];
     let Ok((time, state)) = gc::decode_row(kind, value) else {
         return;

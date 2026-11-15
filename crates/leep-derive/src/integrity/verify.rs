@@ -1583,6 +1583,81 @@ impl Verifier<'_> {
                 self.tick();
             }
         }
+        if self.has(crate::gc_segments::GC_MARK_SEGMENTS) {
+            self.check_mark_segments().await?;
+        }
+        Ok(())
+    }
+
+    /// The mark manifest decodes and every live segment it names decodes
+    /// (ADR 0103); a segment that is not stored is a note. A bad segment
+    /// costs only walking; a bad manifest makes the next `gc` walk
+    /// everything.
+    async fn check_mark_segments(&mut self) -> Result<()> {
+        use crate::gc_segments::{self, ManifestRead, GC_MARK_SEGMENTS, MANIFEST_KEY};
+        let kind = GC_MARK_SEGMENTS;
+        let m = match gc_segments::read_manifest(self.repo).await? {
+            ManifestRead::Absent => return Ok(()),
+            ManifestRead::Read(m) => m,
+            ManifestRead::Damaged => {
+                self.kstats(kind).checked += 1;
+                self.kstats(kind).mismatched += 1;
+                self.log.push(
+                    Problem::new(
+                        "attestation",
+                        "bad_gc_row",
+                        format!("{kind} row does not decode; the next gc walks everything"),
+                    )
+                    .kind(kind)
+                    .key(&MANIFEST_KEY),
+                );
+                return Ok(());
+            }
+        };
+        self.kstats(kind).checked += 1;
+        for s in &m.live {
+            let problem = match self.repo.blobs().get(&s.hash).await {
+                // A read error (a corrupt packed copy) makes every
+                // incremental gc fail until `gc --full` replaces the record.
+                Err(e) => Some(("bad_gc_segment", format!("cannot be read: {e}"))),
+                // Expected after restoring a backup whose blob copy finished
+                // before a gc published it, or after an older gc collected
+                // it: a note, since it costs only walking.
+                Ok(None) => {
+                    self.notes.push(format!(
+                        "gc mark segment {} is not stored; the next gc trusts only the \
+                         segments before it and walks the rest",
+                        s.hash
+                    ));
+                    None
+                }
+                Ok(Some(data)) => match gc_segments::decode_segment(&s.hash, &data) {
+                    Ok(h) if h.len() as u64 == s.marks => None,
+                    Ok(h) => Some((
+                        "bad_gc_segment",
+                        format!("holds {} marks, the manifest says {}", h.len(), s.marks),
+                    )),
+                    Err(e) => Some(("bad_gc_segment", e.to_string())),
+                },
+            };
+            if let Some((code, what)) = problem {
+                self.kstats(kind).mismatched += 1;
+                self.log.push(
+                    Problem::new(
+                        "attestation",
+                        code,
+                        format!(
+                            "gc mark segment {} {what}; the next gc trusts only the \
+                             segments before it and walks the rest",
+                            s.hash
+                        ),
+                    )
+                    .kind(kind)
+                    .key(&s.hash),
+                );
+            }
+            self.tick();
+        }
         Ok(())
     }
 

@@ -453,6 +453,39 @@ pub fn count_files(dir: &Path) -> usize {
         .sum()
 }
 
+/// Loose garbage collection mark segments under a filesystem blob store
+/// (ADR 0103): bookkeeping `gc` writes, not content.
+pub fn mark_segment_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir(dir) else {
+        return out;
+    };
+    for shard in rd.flatten() {
+        let name = shard.file_name().to_string_lossy().into_owned();
+        if name.len() != 2 || !shard.path().is_dir() {
+            continue;
+        }
+        for f in fs::read_dir(shard.path()).unwrap().flatten() {
+            let rest = f.file_name().to_string_lossy().into_owned();
+            let Ok(hash) = format!("{name}{rest}").parse::<leep_core::Hash>() else {
+                continue;
+            };
+            let Ok(data) = fs::read(f.path()) else {
+                continue;
+            };
+            if leep_derive::gc_segments::is_segment(&hash, &data) {
+                out.push(f.path());
+            }
+        }
+    }
+    out
+}
+
+/// [`count_files`] without the mark segments.
+pub fn count_objects(dir: &Path) -> usize {
+    count_files(dir) - mark_segment_files(dir).len()
+}
+
 /// A throwaway `leep_e2e_*` database, dropped on `Drop`, a failing test's
 /// included: `PgDb::create("leep_e2e")`, `None` (after printing a note)
 /// when `LEEP_TEST_POSTGRES_URL` is unset.

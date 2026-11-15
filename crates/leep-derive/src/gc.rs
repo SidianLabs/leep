@@ -11,8 +11,10 @@
 //! The mark set holds one 32-byte hash per live blob and tree node, so memory
 //! grows linearly with the number of distinct live blobs (roughly 50 bytes
 //! each). Subtrees shared between snapshots are walked once. Each mark
-//! records what it walked ([`GC_MARK`]), so the next one walks only what is
-//! new (ADR 0033).
+//! records what it walked, so the next one walks only what is new (ADR
+//! 0033), as sorted segments in the blob store ([`crate::gc_segments`], ADR
+//! 0103); stores marked before that keep [`GC_MARK`] rows, which count until
+//! they are retired.
 
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,6 +24,7 @@ use bytes::Bytes;
 use futures_util::future::{join_all, try_join_all};
 use leep_core::{ChangesetId, DerivedRow, Error, FileChange, Hash, Result, TreeEntry};
 
+use crate::gc_segments::MarkRecord;
 use crate::Repo;
 
 /// Page size for changeset and blob listings.
@@ -590,6 +593,11 @@ pub struct CondemnReport {
     /// Unreferenced old blobs kept because a client was recently told they
     /// exist and may be about to reference them.
     pub kept_by_claim: u64,
+    /// Live mark segments after this run (ADR 0103). They are not counted
+    /// in `blobs_scanned`.
+    pub mark_segments: u64,
+    /// Retired mark segments newly condemned. Not counted in `condemned`.
+    pub segments_condemned: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -612,6 +620,11 @@ pub struct CollectReport {
     /// Blobs deleted, or that would be in a dry run.
     pub deleted: u64,
     pub deleted_bytes: u64,
+    /// Live mark segments after this run (ADR 0103). Segments are not
+    /// counted in the fields above.
+    pub mark_segments: u64,
+    /// Retired mark segments deleted, or that would be in a dry run.
+    pub segments_deleted: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -676,11 +689,11 @@ pub enum Mark {
 /// Derived-data kind recording what earlier marks covered (ADR 0033). Keyed
 /// by a changeset id, a tree node hash or a blob hash; the value is
 /// [`MARK_VALUE`]. A row says the object is referenced by a stored
-/// changeset, and is written only after rows for everything below it: a
+/// changeset, and was written only after rows for everything below it: a
 /// changeset's row after its `Modify` contents and root tree, a tree node's
 /// after its entries. So a row always vouches for the whole closure under it,
-/// and a run may stop walking there. Changesets are never deleted, so a row
-/// never goes stale.
+/// and a run may stop walking there. No longer written (ADR 0103): read as
+/// marks until the mark manifest says the rows are retired.
 pub const GC_MARK: &str = "gc-mark-v1";
 
 /// The only value a [`GC_MARK`] row is written with.
@@ -713,20 +726,28 @@ struct MarkStats {
 }
 
 /// What a mark found: the objects this run walked, plus, when it trusted the
-/// rows of earlier runs, those rows for everything else.
+/// record of earlier runs, that record for everything else.
 struct Marked {
     walked: HashSet<Hash>,
-    rows: bool,
+    record: MarkRecord,
 }
 
 impl Marked {
-    /// Whether each of `hashes` is referenced by a stored changeset, with one
-    /// batched read for the ones this run did not walk. Also returns how many
-    /// were known only from earlier runs.
+    /// Whether each of `hashes` is referenced by a stored changeset: walked
+    /// by this run, in a trusted segment, or (until they are retired) with a
+    /// `gc-mark-v1` row, read in one batch. Also returns how many were known
+    /// only from earlier runs.
     async fn which(&self, repo: &Repo, hashes: &[Hash]) -> Result<(Vec<bool>, u64)> {
         let mut out: Vec<bool> = hashes.iter().map(|h| self.walked.contains(h)).collect();
-        if !self.rows {
-            return Ok((out, 0));
+        let mut earlier = 0;
+        for (h, m) in hashes.iter().zip(out.iter_mut()) {
+            if !*m && self.record.contains(h) {
+                *m = true;
+                earlier += 1;
+            }
+        }
+        if !self.record.rows {
+            return Ok((out, earlier));
         }
         let ask: Vec<Hash> = hashes
             .iter()
@@ -735,29 +756,33 @@ impl Marked {
             .map(|(h, _)| *h)
             .collect();
         if ask.is_empty() {
-            return Ok((out, 0));
+            return Ok((out, earlier));
         }
         let rows = repo.meta().get_derived_many(GC_MARK, &ask).await?;
-        let earlier: HashSet<Hash> = ask
+        let from_rows: HashSet<Hash> = ask
             .into_iter()
             .zip(rows)
             .filter(|(_, v)| is_mark(v))
             .map(|(h, _)| h)
             .collect();
         for (h, m) in hashes.iter().zip(out.iter_mut()) {
-            *m = *m || earlier.contains(h);
+            *m = *m || from_rows.contains(h);
         }
-        Ok((out, earlier.len() as u64))
+        Ok((out, earlier + from_rows.len() as u64))
     }
 }
 
-/// Rows waiting to be written, in the order that keeps every row's closure
-/// written first. Flushed in batches; `put_derived_many` stores a prefix on
-/// failure, so a crash never leaves a row without the rows below it.
+/// Marks waiting to be published, in the order that keeps every mark's
+/// closure published first (post-order). Published as a segment every
+/// [`CHECKPOINT_MARKS`](crate::gc_segments::CHECKPOINT_MARKS) marks and at
+/// the end: a segment holds a prefix of the run's marks, so a crash never
+/// leaves a mark without the marks below it (ADR 0103).
 struct MarkWriter<'a> {
     repo: &'a Repo,
+    lease: &'a Option<crate::gc_lease::GcLease>,
     write: bool,
-    rows: Vec<DerivedRow>,
+    pending: Vec<Hash>,
+    record: MarkRecord,
 }
 
 impl MarkWriter<'_> {
@@ -765,29 +790,42 @@ impl MarkWriter<'_> {
         if !self.write {
             return Ok(());
         }
-        self.rows.push(DerivedRow::new(
-            GC_MARK,
-            key,
-            Bytes::from_static(MARK_VALUE),
-        ));
-        if self.rows.len() >= PAGE {
+        self.pending.push(key);
+        if self.pending.len() >= crate::gc_segments::CHECKPOINT_MARKS {
             self.flush().await?;
         }
         Ok(())
     }
 
     async fn flush(&mut self) -> Result<()> {
-        if !self.rows.is_empty() {
-            self.repo.meta().put_derived_many(&self.rows).await?;
-            self.rows.clear();
+        let marks = std::mem::take(&mut self.pending);
+        self.record.publish(self.repo, self.lease, marks).await
+    }
+
+    /// Which of `hashes` earlier runs marked. Segments are in memory and
+    /// always asked; rows only when `rows` (a first run's pages skip them:
+    /// not asking is always safe).
+    async fn known(&self, rows: bool, hashes: &[Hash]) -> Result<HashSet<Hash>> {
+        let mut out: HashSet<Hash> = hashes
+            .iter()
+            .filter(|h| self.record.contains(h))
+            .copied()
+            .collect();
+        if rows && self.record.rows {
+            let ask: Vec<Hash> = hashes
+                .iter()
+                .filter(|h| !out.contains(*h))
+                .copied()
+                .collect();
+            out.extend(marked_rows(self.repo, &ask).await?);
         }
-        Ok(())
+        Ok(out)
     }
 }
 
-/// Which of `hashes` earlier runs marked, or none if rows are not consulted.
-async fn marked_rows(repo: &Repo, check: bool, hashes: &[Hash]) -> Result<HashSet<Hash>> {
-    if !check || hashes.is_empty() {
+/// Which of `hashes` have a `gc-mark-v1` row.
+async fn marked_rows(repo: &Repo, hashes: &[Hash]) -> Result<HashSet<Hash>> {
+    if hashes.is_empty() {
         return Ok(HashSet::new());
     }
     let rows = repo.meta().get_derived_many(GC_MARK, hashes).await?;
@@ -803,20 +841,25 @@ async fn marked_rows(repo: &Repo, check: bool, hashes: &[Hash]) -> Result<HashSe
 /// run walks, plus (incrementally) those earlier runs recorded. Any error
 /// aborts before anything is condemned or deleted, so an incomplete mark
 /// never loses a blob. Unless `write` is false, records what it walked for
-/// the next run.
+/// the next run as segments (ADR 0103).
 async fn mark(
     repo: &Repo,
     mode: Mark,
     write: bool,
     stats: &mut MarkStats,
     extra_roots: &[Hash],
+    lease: &Option<crate::gc_lease::GcLease>,
 ) -> Result<Marked> {
-    let trust = mode == Mark::Incremental;
+    let record = MarkRecord::load(repo, mode == Mark::Incremental, write).await?;
+    // A damaged manifest makes even an incremental run trust nothing.
+    let trust = mode == Mark::Incremental && record.trusts_earlier();
     let mut walked: HashSet<Hash> = HashSet::new();
     let mut out = MarkWriter {
         repo,
+        lease,
         write,
-        rows: Vec::new(),
+        pending: Vec::new(),
+        record,
     };
     let mut after: Option<ChangesetId> = None;
     loop {
@@ -827,7 +870,11 @@ async fn mark(
         after = Some(last);
         stats.changesets_scanned += page.len() as u64;
         let keys: Vec<Hash> = page.iter().map(|id| id.0).collect();
-        let covered = marked_rows(repo, trust, &keys).await?;
+        let covered = if trust {
+            out.known(true, &keys).await?
+        } else {
+            HashSet::new()
+        };
         let todo: Vec<ChangesetId> = page
             .into_iter()
             .filter(|id| !covered.contains(&id.0))
@@ -836,8 +883,8 @@ async fn mark(
             continue;
         }
         // A page with nothing covered is a first run (or close to one): its
-        // trees are almost all new, so asking about them would only add
-        // reads. Not asking is always safe.
+        // trees are almost all new, so asking the rows about them would only
+        // add reads. Not asking is always safe.
         let check = trust && !covered.is_empty();
         stats.changesets_walked += todo.len() as u64;
         let changesets = repo.meta().get_changesets(&todo).await?;
@@ -854,7 +901,11 @@ async fn mark(
         tops.retain(|h| !walked.contains(h));
         tops.sort_unstable();
         tops.dedup();
-        let known = marked_rows(repo, check, &tops).await?;
+        let known = if trust {
+            out.known(check, &tops).await?
+        } else {
+            HashSet::new()
+        };
         for ((id, cs), root) in todo.iter().zip(changesets).zip(roots) {
             let cs = cs.ok_or_else(|| Error::NotFound(format!("changeset {id}")))?;
             for change in cs.changes.values() {
@@ -865,25 +916,22 @@ async fn mark(
                 }
             }
             if !known.contains(&root) {
-                walk_tree(repo, root, check, &mut walked, &mut out).await?;
+                walk_tree(repo, root, trust, check, &mut walked, &mut out).await?;
             }
             out.push(id.0).await?;
         }
     }
     out.flush().await?;
+    out.record.finish(repo, lease).await?;
     // Trees of recently deleted changesets, kept but not recorded: they
     // are live only until the backup fence passes.
-    let mut quiet = MarkWriter {
-        repo,
-        write: false,
-        rows: Vec::new(),
-    };
+    out.write = false;
     for root in extra_roots {
         if walked.contains(root) {
             continue;
         }
         // Stopping at marked nodes is safe: a marked node is kept anyway.
-        match walk_tree(repo, *root, trust, &mut walked, &mut quiet).await {
+        match walk_tree(repo, *root, trust, trust, &mut walked, &mut out).await {
             Ok(()) => {}
             // Already gone (an earlier full collect, before this tombstone's
             // fence was set): nothing of it is left to keep.
@@ -893,7 +941,7 @@ async fn mark(
     }
     Ok(Marked {
         walked,
-        rows: trust,
+        record: out.record,
     })
 }
 
@@ -916,12 +964,12 @@ async fn backup_roots(repo: &Repo, opts: &GcOptions, started_at: i64) -> Result<
 #[cfg(test)]
 pub(crate) async fn check_incremental_mark(r: &Repo) -> std::result::Result<u64, String> {
     let mut stats = MarkStats::default();
-    let full = mark(r, Mark::Full, false, &mut stats, &[])
+    let full = mark(r, Mark::Full, false, &mut stats, &[], &None)
         .await
         .map_err(|e| e.to_string())?
         .walked;
     let mut stats = MarkStats::default();
-    let inc = mark(r, Mark::Incremental, true, &mut stats, &[])
+    let inc = mark(r, Mark::Incremental, true, &mut stats, &[], &None)
         .await
         .map_err(|e| e.to_string())?;
     let mut all: Vec<Hash> = r
@@ -960,17 +1008,28 @@ pub(crate) async fn check_incremental_mark(r: &Repo) -> std::result::Result<u64,
             return Err(format!("row {key} names nothing referenced"));
         }
     }
+    // Every mark in a segment the next run would trust names a referenced
+    // object or a stored changeset.
+    let next = MarkRecord::load(r, true, false)
+        .await
+        .map_err(|e| e.to_string())?;
+    for key in next.all_hashes() {
+        if !(full.contains(key) || ids.contains(key)) {
+            return Err(format!("segment mark {key} names nothing referenced"));
+        }
+    }
     Ok(stats.changesets_walked)
 }
 
-/// Mark `root` and everything below it that is not marked yet, writing rows
-/// in post-order: a node's row follows its entries' rows. Iterative, with an
+/// Mark `root` and everything below it that is not marked yet, emitting
+/// marks in post-order: a node's mark follows its entries' marks. Iterative, with an
 /// explicit stack. A node joins `walked` when it is expanded, so a node in
 /// `walked` but not yet written is on the current path, which content
 /// addressing makes impossible below itself.
 async fn walk_tree(
     repo: &Repo,
     root: Hash,
+    trust: bool,
     check: bool,
     walked: &mut HashSet<Hash>,
     out: &mut MarkWriter<'_>,
@@ -995,7 +1054,11 @@ async fn walk_tree(
             })
             .filter(|h| !walked.contains(h))
             .collect();
-        let known = marked_rows(repo, check, &fresh).await?;
+        let known = if trust {
+            out.known(check, &fresh).await?
+        } else {
+            HashSet::new()
+        };
         for entry in entries.into_values() {
             match entry {
                 TreeEntry::File { content, .. } => {
@@ -1047,45 +1110,59 @@ async fn condemn_leased(
     let started_at = clock.now();
     let mut stats = MarkStats::default();
     let extra = backup_roots(repo, opts, started_at).await?;
-    let marked = mark(repo, mode, !opts.dry_run, &mut stats, &extra).await?;
+    let mut marked = mark(repo, mode, !opts.dry_run, &mut stats, &extra, lease).await?;
     report.changesets_scanned = stats.changesets_scanned;
     report.changesets_walked = stats.changesets_walked;
     report.marked = marked.walked.len() as u64;
+    report.mark_segments = marked.record.live_count();
+    // Live segments are the record itself; retired ones are collected like
+    // orphans but reported apart (ADR 0103).
+    let live = marked.record.live();
+    let retired = marked.record.retired();
+    let mut retired_stored: HashSet<Hash> = HashSet::new();
     let grace = secs(opts.grace);
     let cutoff = started_at.saturating_sub(grace);
     let mut after: Option<Hash> = None;
     loop {
         let page = repo.blobs().list_page(after, PAGE).await?;
         let Some(last) = page.last().map(|m| m.hash) else {
-            return Ok(report);
+            break;
         };
         after = Some(last);
         let hashes: Vec<Hash> = page.iter().map(|b| b.hash).collect();
         let (referenced, earlier) = marked.which(repo, &hashes).await?;
         report.marked_earlier += earlier;
         for (blob, referenced) in page.into_iter().zip(referenced) {
-            report.blobs_scanned += 1;
+            if live.contains(&blob.hash) {
+                continue;
+            }
+            let segment = retired.contains(&blob.hash);
+            if segment {
+                retired_stored.insert(blob.hash);
+            } else {
+                report.blobs_scanned += 1;
+            }
             if referenced {
                 continue;
             }
             match blob.modified {
                 Some(t) if t > cutoff => {
-                    report.kept_by_grace += 1;
+                    report.kept_by_grace += u64::from(!segment);
                     continue;
                 }
                 None if grace > 0 => {
-                    report.kept_unknown_mtime += 1;
+                    report.kept_unknown_mtime += u64::from(!segment);
                     continue;
                 }
                 _ => {}
             }
             if repo.claimed_since(&blob.hash, cutoff).await? {
-                report.kept_by_claim += 1;
+                report.kept_by_claim += u64::from(!segment);
                 continue;
             }
             let state = repo.fence_state(&blob.hash).await?;
             if state.is_condemned() {
-                report.already_condemned += 1;
+                report.already_condemned += u64::from(!segment);
                 continue;
             }
             if !opts.dry_run {
@@ -1097,10 +1174,21 @@ async fn condemn_leased(
                     .put_derived(BLOB_CONDEMNED, &blob.hash, time_value(at))
                     .await?;
             }
-            report.condemned += 1;
-            report.condemned_bytes += blob.size;
+            if segment {
+                report.segments_condemned += 1;
+            } else {
+                report.condemned += 1;
+                report.condemned_bytes += blob.size;
+            }
         }
     }
+    // The listing saw every stored blob: a retired segment it did not see
+    // is gone and need not be remembered.
+    marked
+        .record
+        .prune_retired(repo, lease, |h| retired_stored.contains(h))
+        .await?;
+    Ok(report)
 }
 
 /// Phase two: delete blobs whose condemnation is at least `fence` older than
@@ -1140,15 +1228,21 @@ async fn collect_leased(
     let eligible_before = started_at.saturating_sub(secs(opts.fence));
     let mut stats = MarkStats::default();
     let extra = backup_roots(repo, opts, started_at).await?;
-    let marked = mark(repo, mode, !opts.dry_run, &mut stats, &extra).await?;
+    let mut marked = mark(repo, mode, !opts.dry_run, &mut stats, &extra, lease).await?;
     report.changesets_scanned = stats.changesets_scanned;
     report.changesets_walked = stats.changesets_walked;
     report.marked = marked.walked.len() as u64;
+    // Mark segments are tallied apart: a live one counts as referenced, a
+    // retired one is collected like an orphan (ADR 0103).
+    let live = marked.record.live();
+    let retired = marked.record.retired();
+    let mut retired_stored: HashSet<Hash> = HashSet::new();
+    let mut seg = CollectReport::default();
     let mut after: Option<Hash> = None;
     loop {
         let page = repo.blobs().list_page(after, PAGE).await?;
         let Some(last) = page.last().map(|m| m.hash) else {
-            return Ok(report);
+            break;
         };
         after = Some(last);
         // Condemnation rows for the whole page in one read; only blobs that
@@ -1160,6 +1254,11 @@ async fn collect_leased(
             .await?;
         let mut candidates = Vec::new();
         for (blob, row) in page.into_iter().zip(rows) {
+            let segment = live.contains(&blob.hash) || retired.contains(&blob.hash);
+            if retired.contains(&blob.hash) {
+                retired_stored.insert(blob.hash);
+            }
+            let report = if segment { &mut seg } else { &mut report };
             report.blobs_scanned += 1;
             if row.is_none() {
                 continue;
@@ -1172,11 +1271,15 @@ async fn collect_leased(
                 report.fence_pending += 1;
                 continue;
             }
-            candidates.push((blob, state, c));
+            candidates.push((blob, state, c, segment));
         }
-        let hashes: Vec<Hash> = candidates.iter().map(|(b, _, _)| b.hash).collect();
+        let hashes: Vec<Hash> = candidates.iter().map(|(b, _, _, _)| b.hash).collect();
         let (referenced, _) = marked.which(repo, &hashes).await?;
-        for ((blob, state, c), is_marked) in candidates.into_iter().zip(referenced) {
+        for ((blob, state, c, segment), is_marked) in candidates.into_iter().zip(referenced) {
+            // A live segment is referenced: an older `gc` that does not know
+            // segments may have condemned it.
+            let is_marked = is_marked || live.contains(&blob.hash);
+            let report = if segment { &mut seg } else { &mut report };
             report.condemned += 1;
             if !state.is_condemned() {
                 if !is_marked {
@@ -1231,8 +1334,20 @@ async fn collect_leased(
                 .await?;
             report.deleted += 1;
             report.deleted_bytes += blob.size;
+            if segment {
+                retired_stored.remove(&blob.hash);
+            }
         }
     }
+    report.segments_deleted = seg.deleted;
+    report.mark_segments = marked.record.live_count();
+    if !opts.dry_run {
+        marked
+            .record
+            .prune_retired(repo, lease, |h| retired_stored.contains(h))
+            .await?;
+    }
+    Ok(report)
 }
 
 /// Parse `0`, `90s`, `30m`, `24h` or `7d`. A bare number is seconds.
@@ -1445,6 +1560,18 @@ mod tests {
         repo.list_files(base, "").await.unwrap();
     }
 
+    /// Stored blobs and tree nodes, leaving out mark segments (ADR 0103).
+    async fn objects(blobs: &MemoryBlobStore) -> usize {
+        let mut n = 0;
+        for m in blobs.list_page(None, usize::MAX).await.unwrap() {
+            let data = blobs.get(&m.hash).await.unwrap().unwrap();
+            if !crate::gc_segments::is_segment(&m.hash, &data) {
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Age every blob in the store past any grace window.
     async fn age_all(blobs: &MemoryBlobStore) {
         for m in blobs.list_page(None, usize::MAX).await.unwrap() {
@@ -1525,7 +1652,7 @@ mod tests {
         // Unlanded changeset: stored but referenced by no ref.
         let unlanded = commit(&r, &[ids[0]], &[("only-here.txt", Some("unlanded\n"))]).await;
         let before = read_everything(&r).await;
-        let blobs_before = blobs.len();
+        let blobs_before = objects(&blobs).await;
         assert!(before.iter().any(|(_, p, _)| p == "gone.txt"));
         age_all(&blobs).await;
 
@@ -1536,7 +1663,7 @@ mod tests {
         assert_eq!(report.condemn.changesets_scanned, 8);
         assert_eq!(report.condemn.blobs_scanned as usize, blobs_before);
         assert_eq!(report.condemn.marked as usize, blobs_before);
-        assert_eq!(blobs.len(), blobs_before);
+        assert_eq!(objects(&blobs).await, blobs_before);
 
         // Add garbage of every kind, then collect.
         let orphan = r.blobs().put(Bytes::from("orphan upload")).await.unwrap();
@@ -1577,7 +1704,7 @@ mod tests {
         age_all(&blobs).await;
         let report = gc(&r, 24, false).await;
         assert_eq!(report.collect.deleted, 3, "{report:?}");
-        assert_eq!(blobs.len(), blobs_before);
+        assert_eq!(objects(&blobs).await, blobs_before);
         assert!(!blobs.contains(&orphan).await.unwrap());
         assert!(!blobs.contains(&orphan_tree.hash()).await.unwrap());
 
@@ -1684,14 +1811,14 @@ mod tests {
         commit(&r, &[], &[("a.txt", Some("a\n"))]).await;
         let orphan = r.blobs().put(Bytes::from("orphan")).await.unwrap();
         age_all(&blobs).await;
-        let n = blobs.len();
+        let n = objects(&blobs).await;
         let report = gc(&r, 0, true).await;
         assert_eq!(
             (report.condemn.condemned, report.condemn.condemned_bytes),
             (1, 6)
         );
         assert_eq!(report.collect, CollectReport::default());
-        assert_eq!(blobs.len(), n);
+        assert_eq!(objects(&blobs).await, n);
         for kind in [BLOB_CONDEMNED, BLOB_RESCUE, BLOB_DOOM] {
             assert!(r.meta().get_derived(kind, &orphan).await.unwrap().is_none());
         }
@@ -1705,7 +1832,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((dry.deleted, dry.deleted_bytes), (1, 6));
-        assert_eq!(blobs.len(), n);
+        assert_eq!(objects(&blobs).await, n);
         assert!(r
             .meta()
             .get_derived(BLOB_DOOM, &orphan)
@@ -1715,7 +1842,7 @@ mod tests {
 
         let report = gc_at(&r, 0, false, t + 100).await;
         assert_eq!(report.collect.deleted, 1);
-        assert_eq!(blobs.len(), n - 1);
+        assert_eq!(objects(&blobs).await, n - 1);
     }
 
     #[tokio::test]
@@ -1749,7 +1876,7 @@ mod tests {
         let report = gc(&r, 1, false).await;
         assert_eq!(report.collect.deleted as usize, PAGE * 2 + 17);
         assert_eq!(report.condemn.blobs_scanned as usize, PAGE * 2 + 17 + 2);
-        assert_eq!(blobs.len(), 2);
+        assert_eq!(objects(&blobs).await, 2);
     }
 
     #[tokio::test]
@@ -2427,7 +2554,7 @@ mod tests {
     /// What a full mark finds, writing nothing: the oracle.
     async fn full_mark(r: &Repo) -> HashSet<Hash> {
         let mut stats = MarkStats::default();
-        mark(r, Mark::Full, false, &mut stats, &[])
+        mark(r, Mark::Full, false, &mut stats, &[], &None)
             .await
             .unwrap()
             .walked
@@ -2453,14 +2580,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((first.changesets_walked, first.marked_earlier), (7, 0));
-        assert_eq!(first.marked as usize, blobs.len());
+        assert_eq!(first.marked as usize, objects(&blobs).await);
 
         // Nothing new: nothing walked, every blob known from the record.
         let again = condemn(&r, &opts(1, false), &TestClock::at(t + 1))
             .await
             .unwrap();
         assert_eq!((again.changesets_walked, again.marked), (0, 0));
-        assert_eq!(again.marked_earlier as usize, blobs.len());
+        assert_eq!(again.marked_earlier as usize, objects(&blobs).await);
         assert_eq!(again.condemned, 0);
 
         // One new changeset deep in the tree: only its new path is walked.
@@ -2491,7 +2618,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(f.changesets_walked as usize, all_ids(&r).await.len());
-        assert_eq!((f.marked as usize, f.marked_earlier), (blobs.len(), 0));
+        assert_eq!(
+            (f.marked as usize, f.marked_earlier),
+            (objects(&blobs).await, 0)
+        );
     }
 
     #[tokio::test]
@@ -2502,13 +2632,322 @@ mod tests {
         let d = condemn(&r, &opts(1, true), &TestClock::at(now()))
             .await
             .unwrap();
-        assert_eq!(d.marked as usize, blobs.len());
+        assert_eq!(d.marked as usize, objects(&blobs).await);
         assert!(r
             .meta()
             .list_derived(GC_MARK, None, 10)
             .await
             .unwrap()
             .is_empty());
+        assert_eq!(
+            crate::gc_segments::read_manifest(&r).await.unwrap(),
+            crate::gc_segments::ManifestRead::Absent
+        );
+        assert!(stored_segments(&blobs).await.is_empty());
+    }
+
+    // --- mark segments (ADR 0103) -------------------------------------------
+
+    async fn manifest(r: &Repo) -> crate::gc_segments::Manifest {
+        match crate::gc_segments::read_manifest(r).await.unwrap() {
+            crate::gc_segments::ManifestRead::Read(m) => m,
+            other => panic!("manifest: {other:?}"),
+        }
+    }
+
+    /// Segment blobs in the store.
+    async fn stored_segments(blobs: &MemoryBlobStore) -> HashSet<Hash> {
+        let mut out = HashSet::new();
+        for m in blobs.list_page(None, usize::MAX).await.unwrap() {
+            let data = blobs.get(&m.hash).await.unwrap().unwrap();
+            if crate::gc_segments::is_segment(&m.hash, &data) {
+                out.insert(m.hash);
+            }
+        }
+        out
+    }
+
+    /// The rows a `gc` from before segments leaves: one per referenced
+    /// object and stored changeset.
+    async fn write_legacy_rows(r: &Repo) -> u64 {
+        let mut keys: Vec<Hash> = full_mark(r).await.into_iter().collect();
+        keys.extend(all_ids(r).await.into_iter().map(|id| id.0));
+        let rows: Vec<DerivedRow> = keys
+            .iter()
+            .map(|k| DerivedRow::new(GC_MARK, *k, Bytes::from_static(MARK_VALUE)))
+            .collect();
+        r.meta().put_derived_many(&rows).await.unwrap();
+        keys.len() as u64
+    }
+
+    #[tokio::test]
+    async fn marks_are_segments_merged_geometrically() {
+        let (r, blobs) = setup();
+        let mut ids = build_history(&r).await;
+        age_all(&blobs).await;
+        let t = now();
+        for i in 0..12 {
+            let path = format!("s/{i}/f.txt");
+            let text = format!("{i}\n");
+            let tip = commit(&r, &[*ids.last().unwrap()], &[(&path, Some(&text))]).await;
+            ids.push(tip);
+            let c = condemn(&r, &opts(1, false), &TestClock::at(t + i))
+                .await
+                .unwrap();
+            let walked = if i == 0 { ids.len() } else { 1 };
+            assert_eq!(
+                (c.condemned, c.changesets_walked as usize),
+                (0, walked),
+                "{c:?}"
+            );
+            assert_marks_agree(&r, &format!("round {i}")).await;
+            let m = manifest(&r).await;
+            assert_eq!(c.mark_segments, m.live.len() as u64);
+            assert!(!m.rows_retired);
+            for w in m.live.windows(2) {
+                assert!(w[1].marks * 2 < w[0].marks, "round {i}: {:?}", m.live);
+            }
+        }
+        // No row is written any more.
+        assert!(r
+            .meta()
+            .list_derived(GC_MARK, None, 1)
+            .await
+            .unwrap()
+            .is_empty());
+        let m = manifest(&r).await;
+        assert!(!m.retired.is_empty());
+        // Merged-away segments are collected like orphans, reported apart.
+        let late = t + 3 * HOUR;
+        let c = condemn(&r, &opts(1, false), &TestClock::at(late))
+            .await
+            .unwrap();
+        assert_eq!(c.condemned, 0, "{c:?}");
+        assert!(c.segments_condemned > 0, "{c:?}");
+        let k = collect(&r, &opts(1, false), &TestClock::at(late + FENCE + 1))
+            .await
+            .unwrap();
+        assert_eq!((k.deleted, k.segments_deleted), (0, c.segments_condemned));
+        let m = manifest(&r).await;
+        assert!(m.retired.is_empty(), "{m:?}");
+        let live: HashSet<Hash> = m.live.iter().map(|s| s.hash).collect();
+        assert_eq!(stored_segments(&blobs).await, live);
+        assert_marks_agree(&r, "after collecting retired segments").await;
+        for id in ids {
+            r.list_files(id, "").await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_rows_count_until_imported_and_retired() {
+        let (r, blobs) = setup();
+        let ids = build_history(&r).await;
+        age_all(&blobs).await;
+        let rows = write_legacy_rows(&r).await;
+        let t = now();
+        let e = crate::gc_segments::delete_mark_rows(&r, &mut |_| {})
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("not retired"), "{e}");
+        let c = condemn(&r, &opts(1, false), &TestClock::at(t))
+            .await
+            .unwrap();
+        assert_eq!((c.changesets_walked, c.condemned), (0, 0), "{c:?}");
+        // A new commit is walked, and its segment rests on the rows.
+        commit(&r, &[ids[6]], &[("d/e/n.txt", Some("n\n"))]).await;
+        let c = condemn(&r, &opts(1, false), &TestClock::at(t + 1))
+            .await
+            .unwrap();
+        assert_eq!((c.changesets_walked, c.condemned), (1, 0), "{c:?}");
+        let before = manifest(&r).await;
+        assert!(!before.rows_retired && !before.live.is_empty());
+        assert_marks_agree(&r, "rows and segments").await;
+
+        let rep = crate::gc_segments::import_mark_rows(&r).await.unwrap();
+        assert_eq!((rep.imported, rep.already_retired), (rows, false));
+        let m = manifest(&r).await;
+        assert!(m.rows_retired);
+        assert_eq!(m.live[0].marks, rows);
+        assert_eq!(&m.live[1..], &before.live[..]);
+        let again = crate::gc_segments::import_mark_rows(&r).await.unwrap();
+        assert!(again.already_retired);
+
+        let mut steps = 0;
+        let deleted = crate::gc_segments::delete_mark_rows(&r, &mut |_| steps += 1)
+            .await
+            .unwrap();
+        assert_eq!(deleted, rows);
+        assert!(steps > 0);
+        assert!(r
+            .meta()
+            .list_derived(GC_MARK, None, 1)
+            .await
+            .unwrap()
+            .is_empty());
+        let c = condemn(&r, &opts(1, false), &TestClock::at(t + 2))
+            .await
+            .unwrap();
+        assert_eq!((c.changesets_walked, c.condemned), (0, 0), "{c:?}");
+        assert_marks_agree(&r, "rows retired").await;
+    }
+
+    /// Rows written after the rows are retired (an older `gc` that ignored
+    /// the lease) are ignored, never trusted.
+    #[tokio::test]
+    async fn retired_rows_are_ignored() {
+        let (r, blobs) = setup();
+        let ids = build_history(&r).await;
+        age_all(&blobs).await;
+        crate::gc_segments::import_mark_rows(&r).await.unwrap();
+        assert!(manifest(&r).await.rows_retired);
+        write_legacy_rows(&r).await;
+        let c = condemn(&r, &opts(1, false), &TestClock::at(now()))
+            .await
+            .unwrap();
+        assert_eq!(c.changesets_walked as usize, ids.len());
+        assert_eq!(c.marked_earlier, 0);
+    }
+
+    #[tokio::test]
+    async fn a_lost_or_damaged_segment_only_means_more_walking() {
+        let (r, blobs) = setup();
+        let mut ids = build_history(&r).await;
+        age_all(&blobs).await;
+        let t = now();
+        condemn(&r, &opts(1, false), &TestClock::at(t))
+            .await
+            .unwrap();
+        for i in 0..3 {
+            let path = format!("x{i}/y.txt");
+            ids.push(commit(&r, &[ids[6]], &[(&path, Some("y\n"))]).await);
+            condemn(&r, &opts(1, false), &TestClock::at(t + 1 + i))
+                .await
+                .unwrap();
+        }
+        let before = read_everything(&r).await;
+        let m = manifest(&r).await;
+        assert!(m.live.len() >= 2, "{m:?}");
+        // Damage the newest, then lose the oldest: each ends the prefix a
+        // run trusts there.
+        let newest = m.live.last().unwrap().hash;
+        blobs.delete(&newest).await.unwrap();
+        blobs
+            .put_with_hash(newest, Bytes::from_static(b"\x01not a segment"))
+            .await
+            .unwrap();
+        let c = condemn(&r, &opts(1, false), &TestClock::at(t + 10))
+            .await
+            .unwrap();
+        assert!(c.changesets_walked > 0, "{c:?}");
+        assert_eq!(c.condemned, 0, "{c:?}");
+        assert!(!manifest(&r).await.live.iter().any(|s| s.hash == newest));
+        assert_marks_agree(&r, "damaged newest").await;
+
+        let oldest = manifest(&r).await.live[0].hash;
+        blobs.delete(&oldest).await.unwrap();
+        let c = condemn(&r, &opts(1, false), &TestClock::at(t + 20))
+            .await
+            .unwrap();
+        assert_eq!(c.changesets_walked as usize, ids.len(), "{c:?}");
+        assert_eq!(c.condemned, 0, "{c:?}");
+        let k = collect(&r, &opts(1, false), &TestClock::at(t + 30 + FENCE))
+            .await
+            .unwrap();
+        assert_eq!(k.deleted, 0, "{k:?}");
+        assert_eq!(read_everything(&r).await, before);
+        assert_marks_agree(&r, "lost oldest").await;
+    }
+
+    /// A manifest that does not decode says nothing, not even whether the
+    /// rows were retired: the run walks everything, ignores the rows, and
+    /// replaces it.
+    #[tokio::test]
+    async fn a_damaged_manifest_is_replaced_by_a_full_walk() {
+        let (r, blobs) = setup();
+        let ids = build_history(&r).await;
+        age_all(&blobs).await;
+        write_legacy_rows(&r).await;
+        r.meta()
+            .put_derived(
+                crate::gc_segments::GC_MARK_SEGMENTS,
+                &crate::gc_segments::MANIFEST_KEY,
+                Bytes::from_static(b"junk"),
+            )
+            .await
+            .unwrap();
+        let c = condemn(&r, &opts(1, false), &TestClock::at(now()))
+            .await
+            .unwrap();
+        assert_eq!(c.changesets_walked as usize, ids.len());
+        assert_eq!((c.marked_earlier, c.condemned), (0, 0));
+        let m = manifest(&r).await;
+        assert!(m.rows_retired);
+        assert_eq!(m.live.len(), 1);
+        assert_marks_agree(&r, "replaced manifest").await;
+    }
+
+    /// `gc --full` replaces the record with one segment of its own, closed
+    /// without the rows; what it replaced is retired.
+    #[tokio::test]
+    async fn a_full_mark_replaces_the_record() {
+        let (r, blobs) = setup();
+        let ids = build_history(&r).await;
+        age_all(&blobs).await;
+        let t = now();
+        condemn(&r, &opts(1, false), &TestClock::at(t))
+            .await
+            .unwrap();
+        commit(&r, &[ids[6]], &[("late.txt", Some("late\n"))]).await;
+        condemn(&r, &opts(1, false), &TestClock::at(t + 1))
+            .await
+            .unwrap();
+        let old = manifest(&r).await;
+        let f = condemn_with(&r, &opts(1, false), Mark::Full, &TestClock::at(t + 2))
+            .await
+            .unwrap();
+        assert_eq!(f.condemned, 0);
+        let m = manifest(&r).await;
+        assert!(m.rows_retired);
+        assert_eq!(m.live.len(), 1);
+        assert_eq!(m.live[0].marks as usize, f.marked as usize + ids.len() + 1);
+        for s in &old.live {
+            assert!(m.retired.contains(&s.hash) || m.live[0].hash == s.hash);
+        }
+        assert_marks_agree(&r, "after full").await;
+    }
+
+    /// An older `gc` does not know segments and may condemn a live one; the
+    /// next collect keeps it and rescues it.
+    #[tokio::test]
+    async fn a_live_segment_condemned_by_an_older_gc_is_rescued() {
+        let (r, blobs) = setup();
+        build_history(&r).await;
+        age_all(&blobs).await;
+        let t = now();
+        condemn(&r, &opts(1, false), &TestClock::at(t))
+            .await
+            .unwrap();
+        let live = manifest(&r).await.live;
+        for s in &live {
+            r.meta()
+                .put_derived(BLOB_CONDEMNED, &s.hash, time_value(t))
+                .await
+                .unwrap();
+        }
+        let k = collect(&r, &opts(1, false), &TestClock::at(t + FENCE + 1))
+            .await
+            .unwrap();
+        assert_eq!((k.deleted, k.segments_deleted), (0, 0), "{k:?}");
+        for s in &live {
+            assert!(blobs.contains(&s.hash).await.unwrap());
+            assert!(r
+                .meta()
+                .get_derived(BLOB_RESCUE, &s.hash)
+                .await
+                .unwrap()
+                .is_some());
+        }
+        assert_marks_agree(&r, "rescued segments").await;
     }
 
     #[tokio::test]
@@ -2532,7 +2971,7 @@ mod tests {
         assert!(decode_mark(&[7]).is_err() && decode_mark(MARK_VALUE).is_ok());
         let stats = assert_marks_agree(&r, "damaged rows").await;
         assert_eq!(stats.changesets_walked, 0);
-        assert_eq!(blobs.len(), 3);
+        assert_eq!(objects(&blobs).await, 3);
         assert!(crate::integrity::kinds::check_droppable(GC_MARK).is_err());
     }
 

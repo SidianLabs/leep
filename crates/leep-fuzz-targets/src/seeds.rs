@@ -313,6 +313,24 @@ fn rows(out: &mut Out) {
         "negative-time",
         with_prefix(0, &(-5i64).to_be_bytes()),
     );
+    let manifest = leep_derive::gc_segments::Manifest {
+        live: vec![leep_derive::gc_segments::SegmentRef {
+            hash: leep_core::Hash([2; 32]),
+            marks: 3,
+        }],
+        rows_retired: true,
+        retired: vec![leep_core::Hash([4; 32])],
+    };
+    out.add(
+        "gc_rows",
+        "mark-manifest",
+        with_prefix(4, &manifest.encode()),
+    );
+    let (_, segment) = leep_derive::gc_segments::encode_segment(
+        &[leep_core::Hash([1; 32]), leep_core::Hash([5; 32])],
+        7,
+    );
+    out.add("gc_rows", "mark-segment", with_prefix(5, &segment));
 
     let mut skip = Vec::new();
     for (n, generation) in [(1u8, 7u64), (2, 6), (3, 4)] {

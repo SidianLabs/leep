@@ -779,6 +779,13 @@ enum Cmd {
         /// small host beside live servers.
         #[arg(long, requires = "unreachable")]
         exact_trees: bool,
+        /// Copy the `gc-mark-v1` rows of a store upgraded from before mark
+        /// segments into one segment, record the store feature
+        /// `gc-mark-segments`, and delete the rows (ADR 0103). One-way:
+        /// afterwards servers and `gc` binaries older than this one refuse
+        /// the store. Run it once every server and cron job is upgraded.
+        #[arg(long, conflicts_with_all = ["unreachable", "full", "dry_run"])]
+        retire_mark_rows: bool,
     },
     /// Pack every live blob and tree node of a filesystem or s3:// blob store
     /// into one delta-compressed pack (ADR 0029, ADR 0040; uses --meta and
@@ -1261,6 +1268,8 @@ async fn run_gc(
         outln!("kept (within grace): {}", r.kept_by_grace);
         outln!("kept (unknown age): {}", r.kept_unknown_mtime);
         outln!("kept (recently claimed): {}", r.kept_by_claim);
+        outln!("mark segments: {}", r.mark_segments);
+        outln!("retired mark segments condemned: {}", r.segments_condemned);
     }
     if let Some(r) = collect {
         let verb = if dry { "would delete" } else { "deleted" };
@@ -1270,7 +1279,58 @@ async fn run_gc(
         outln!("collect: rescued by reference: {}", r.rescued_by_reference);
         outln!("collect: rescued by newer write: {}", r.rescued_by_upload);
         outln!("{verb}: {} blobs, {} bytes", r.deleted, r.deleted_bytes);
+        outln!(
+            "collect: retired mark segments deleted: {}",
+            r.segments_deleted
+        );
     }
+    Ok(())
+}
+
+/// `gc --retire-mark-rows` (ADR 0103): import the rows into a segment, then
+/// record the feature that makes older binaries refuse the store, and only
+/// then delete the rows, so no older `gc` ever reads half of them.
+async fn run_retire_mark_rows(meta_url: &str, blobs: &str) -> anyhow::Result<()> {
+    use leep_derive::gc_segments;
+    let blobs = leep_store::open_blob_store(blobs).context("opening blob store")?;
+    let meta = open_meta(meta_url).await.context("opening meta store")?;
+    let repo = new_repo(blobs, meta);
+    let r = gc_segments::import_mark_rows(&repo).await?;
+    if r.already_retired {
+        outln!("gc-mark-v1 rows: already retired into segments");
+    } else {
+        outln!("gc-mark-v1 rows copied into a segment: {}", r.imported);
+    }
+    let mode = if NO_MIGRATE.load(std::sync::atomic::Ordering::Relaxed) {
+        leep_meta::SchemaMode::RequireCurrent
+    } else {
+        leep_meta::SchemaMode::Migrate
+    };
+    leep_meta::features::add_store_feature(meta_url, mode, gc_segments::MARK_ROWS_RETIRED_FEATURE)
+        .await
+        .context("recording the gc-mark-segments store feature")?;
+    outln!(
+        "store feature recorded: {}",
+        gc_segments::MARK_ROWS_RETIRED_FEATURE
+    );
+    let start = std::time::Instant::now();
+    let mut last = std::time::Instant::now();
+    let mut rows = 0u64;
+    let deleted = gc_segments::delete_mark_rows(&repo, &mut |s| {
+        rows += s.deleted.iter().sum::<u64>();
+        if last.elapsed() >= std::time::Duration::from_secs(10) {
+            last = std::time::Instant::now();
+            outln!(
+                "{:>8.0} s  {rows} rows deleted, {} of {} {}",
+                start.elapsed().as_secs_f64(),
+                s.done,
+                s.total,
+                s.unit
+            );
+        }
+    })
+    .await?;
+    outln!("gc-mark-v1 rows deleted: {deleted}");
     Ok(())
 }
 
@@ -1615,6 +1675,18 @@ fn ensure_local_dirs(meta: &str, blobs: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
+mod feature_name_tests {
+    /// `leep-derive` names the feature without depending on `leep-meta`.
+    #[test]
+    fn mark_segment_feature_names_agree() {
+        assert_eq!(
+            leep_derive::gc_segments::MARK_ROWS_RETIRED_FEATURE,
+            leep_meta::features::GC_MARK_SEGMENTS
+        );
+    }
+}
+
+#[cfg(test)]
 mod local_dirs_tests {
     use super::ensure_local_dirs;
 
@@ -1855,6 +1927,16 @@ async fn run() -> anyhow::Result<()> {
     match args.command {
         Some(Cmd::Migrate { dry_run, status }) => {
             return run_migrate(&args.meta, dry_run, status).await
+        }
+        Some(Cmd::Gc {
+            phase,
+            retire_mark_rows: true,
+            ..
+        }) => {
+            if phase.is_some() {
+                anyhow::bail!("--retire-mark-rows takes no phase");
+            }
+            return run_retire_mark_rows(&args.meta, &args.blobs).await;
         }
         Some(Cmd::Gc {
             phase,

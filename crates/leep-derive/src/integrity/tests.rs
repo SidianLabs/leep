@@ -961,6 +961,50 @@ async fn attestations_and_bookkeeping_rows_are_checked_for_structure() {
     );
 }
 
+/// The mark manifest and its segments (ADR 0103): a lost or damaged
+/// segment and a manifest that does not decode are reported.
+#[tokio::test]
+async fn gc_mark_segments_are_checked() {
+    use crate::gc_segments::{read_manifest, ManifestRead, GC_MARK_SEGMENTS, MANIFEST_KEY};
+    let w = world().await;
+    let opts = crate::gc::GcOptions {
+        grace: std::time::Duration::from_secs(3600),
+        ..crate::gc::GcOptions::default()
+    };
+    crate::gc::condemn(&w.repo, &opts, &crate::gc::SystemClock)
+        .await
+        .unwrap();
+    assert_clean(&w).await;
+    let ManifestRead::Read(m) = read_manifest(&w.repo).await.unwrap() else {
+        panic!("no manifest");
+    };
+    let seg = m.live[0].hash;
+    let data = w.blobs.get(&seg).await.unwrap().unwrap();
+    w.blobs.delete(&seg).await.unwrap();
+    let r = run_verify(&w, &VerifyOptions::default()).await;
+    assert!(r.problems.is_empty(), "{:?}", r.problems);
+    assert!(
+        r.notes.iter().any(|n| n.contains("is not stored")),
+        "{:?}",
+        r.notes
+    );
+    w.blobs
+        .put_with_hash(seg, Bytes::from(data[..data.len() - 1].to_vec()))
+        .await
+        .unwrap();
+    let r = run_verify(&w, &VerifyOptions::default()).await;
+    only(&r, "bad_gc_segment");
+    w.blobs.delete(&seg).await.unwrap();
+    w.blobs.put_with_hash(seg, data).await.unwrap();
+    assert_clean(&w).await;
+    put_row(&w, GC_MARK_SEGMENTS, &MANIFEST_KEY, vec![1, 2, 3]).await;
+    let r = run_verify(&w, &VerifyOptions::default()).await;
+    assert_eq!(
+        only(&r, "bad_gc_row").kind.as_deref(),
+        Some(GC_MARK_SEGMENTS)
+    );
+}
+
 /// A rebased-origin row must name what the copy's `leep.rebased_from` names,
 /// even when that other changeset is stored.
 #[tokio::test]

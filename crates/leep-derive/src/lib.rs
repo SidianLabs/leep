@@ -27,6 +27,7 @@ pub mod events;
 mod filter_log;
 pub mod gc;
 pub mod gc_lease;
+pub mod gc_segments;
 pub mod gc_unreachable;
 pub mod git_map;
 mod history;
