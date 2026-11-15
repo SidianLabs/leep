@@ -523,3 +523,438 @@ async fn verify_and_upgrade_see_sealed_keys_of_every_family() {
         }
     }
 }
+
+/// Every key a live segment of `family` holds a value of `col` for, with
+/// how many live segments hold it.
+async fn holders(r: &Repo, family: u8, col: u8) -> BTreeMap<Hash, usize> {
+    let (_, read) = read_manifest(r, family).await.unwrap();
+    let ManifestRead::Read(m) = read else {
+        return BTreeMap::new();
+    };
+    let mut out = BTreeMap::new();
+    for s in m.live.iter().filter(|s| s.has(col)) {
+        let idx = view::load_index(&**r.blobs(), family, s)
+            .await
+            .unwrap()
+            .unwrap();
+        for k in idx.keys_with(col) {
+            *out.entry(*k).or_insert(0) += 1;
+        }
+    }
+    out
+}
+
+/// Live segment indexes of `family`.
+async fn live(r: &Repo, family: u8) -> Vec<codec::SegmentRef> {
+    match read_manifest(r, family).await.unwrap().1 {
+        ManifestRead::Read(m) => m.live,
+        _ => Vec::new(),
+    }
+}
+
+/// A merge leaves out changesets no longer stored, in both families,
+/// although a sealed `changeset-v2` segment still answers their generation
+/// (ADR 0104 §4.2; ADR 0105 §6).
+#[tokio::test]
+async fn merges_shed_swept_changesets_in_every_family() {
+    let r = repo();
+    let ids = build(&r, None).await;
+    // A branch no ref keeps, its rows all derived.
+    let mut tip = ids[10];
+    let mut side = Vec::new();
+    for i in 0..6 {
+        let path = format!("side/{i}");
+        tip = crate::tests::commit(&r, &[tip], &[(&path, Some("s"))], "side").await;
+        side.push(tip);
+    }
+    crate::derived::derive::<crate::derived::HistoryTree>(&r, tip)
+        .await
+        .unwrap();
+    crate::derived::derive::<LogFilterIndex>(&r, tip)
+        .await
+        .unwrap();
+    // Sealed in many small segments, never merged, and retired.
+    let hook = feature_hook(Arc::default());
+    let mut st = CompactState::default();
+    let small = CompactOptions {
+        max_rows: 8,
+        fanout: 64,
+        ..CompactOptions::small(Mode::Retire)
+    };
+    settle(&r, &small, &mut st, Some(&hook)).await;
+    for fam in [FAMILY_CHANGESET, FAMILY_CHANGESET_V2] {
+        let col = codec::family(fam).unwrap().columns[0].id;
+        let held = holders(&r, fam, col).await;
+        assert!(side.iter().all(|s| held.contains_key(&s.0)), "{fam}");
+    }
+    // The changeset sweep deletes them, rows and all.
+    let kinds: Vec<&str> = FAMILIES
+        .iter()
+        .flat_map(|f| f.columns.iter().map(|c| c.kind))
+        .collect();
+    r.row_meta().delete_changesets(&side, &kinds).await.unwrap();
+    // Their generation still reads, from the segment.
+    assert!(fresh(&r)
+        .meta()
+        .get_derived(Generation::NAME, &side[0].0)
+        .await
+        .unwrap()
+        .is_some());
+    // Merges in both families: no merged segment names them.
+    let old: std::collections::HashSet<Hash> = live(&r, FAMILY_CHANGESET)
+        .await
+        .into_iter()
+        .chain(live(&r, FAMILY_CHANGESET_V2).await)
+        .map(|s| s.index)
+        .collect();
+    let merge = CompactOptions {
+        max_rows: 4096,
+        fanout: 2,
+        ..CompactOptions::small(Mode::Retire)
+    };
+    let p = super::tests::pass(&r, &merge, &mut st, Some(&hook)).await;
+    for name in [
+        codec::FAMILY_CHANGESET_NAME,
+        codec::FAMILY_CHANGESET_V2_NAME,
+    ] {
+        assert!(p.family(name).unwrap().merges > 0, "{name}: {p:?}");
+    }
+    for fam in [FAMILY_CHANGESET, FAMILY_CHANGESET_V2] {
+        for s in live(&r, fam)
+            .await
+            .iter()
+            .filter(|s| !old.contains(&s.index))
+        {
+            let idx = view::load_index(&**r.blobs(), fam, s)
+                .await
+                .unwrap()
+                .unwrap();
+            for id in &side {
+                assert!(idx.keys().binary_search(&id.0).is_err(), "{fam}: {id}");
+            }
+        }
+    }
+}
+
+/// The second one-way door (ADR 0105): a store with only
+/// `derived-segments` recorded, under `retire` that does not name
+/// `changeset-v2`, retires `changeset-v1` rows and neither records
+/// `derived-segments-2` nor deletes a `changeset-v2` row. Naming the family
+/// passes the door; so does a feature another server recorded.
+#[tokio::test]
+async fn retire_does_not_pass_a_new_familys_door_unless_named() {
+    let r = repo();
+    let ids = build(&r, None).await;
+    let log = Arc::new(Mutex::new(vec![FEATURE]));
+    let hook = feature_hook(log.clone());
+    let unnamed = CompactOptions {
+        retire_families: vec![codec::FAMILY_CHANGESET_NAME.to_string()],
+        ..CompactOptions::small(Mode::Retire)
+    };
+    let mut st = CompactState::default();
+    settle(&r, &unnamed, &mut st, Some(&hook)).await;
+    assert!(!log.lock().unwrap().contains(&FEATURE_2), "{log:?}");
+    assert_eq!(
+        r.row_meta()
+            .count_derived(crate::derived::Skiplist::NAME)
+            .await
+            .unwrap(),
+        0
+    );
+    for (_, kind) in V2 {
+        let n = r.row_meta().count_derived(kind).await.unwrap();
+        assert!(n as usize >= ids.len() / 2, "{kind}: {n}");
+    }
+    assert_eq!(
+        r.row_meta().count_derived(Generation::NAME).await.unwrap(),
+        ids.len() as u64
+    );
+    // The family still seals (build is free), only no row goes.
+    assert!(!live(&r, FAMILY_CHANGESET_V2).await.is_empty());
+    // Named: the feature first, then the rows.
+    let named = CompactOptions {
+        retire_families: CompactOptions::parse_retire_families("changeset-v2").unwrap(),
+        ..unnamed.clone()
+    };
+    settle(&r, &named, &mut st, Some(&hook)).await;
+    assert!(log.lock().unwrap().contains(&FEATURE_2), "{log:?}");
+    assert_eq!(
+        r.row_meta().count_derived(Generation::NAME).await.unwrap(),
+        0
+    );
+    // Another process, not naming it, goes on once the store has it.
+    let r2 = repo();
+    build(&r2, None).await;
+    let log2 = Arc::new(Mutex::new(vec![FEATURE, FEATURE_2]));
+    let hook2 = feature_hook(log2);
+    settle(&r2, &unnamed, &mut CompactState::default(), Some(&hook2)).await;
+    assert_eq!(
+        r2.row_meta().count_derived(Generation::NAME).await.unwrap(),
+        0
+    );
+    // The flag's parser.
+    assert_eq!(
+        CompactOptions::parse_retire_families("").unwrap(),
+        ["changeset-v1"]
+    );
+    assert_eq!(
+        CompactOptions::parse_retire_families("all").unwrap(),
+        ["changeset-v1", "changeset-v2"]
+    );
+    assert!(CompactOptions::parse_retire_families("content-v9").is_err());
+    assert_eq!(CompactOptions::default().retire_families, ["changeset-v1"]);
+}
+
+/// A transient error reading one family's index blob does not keep the
+/// other family's manifest from being applied.
+#[tokio::test]
+async fn one_familys_failing_index_does_not_freeze_the_other() {
+    let blobs: Arc<dyn leep_core::BlobStore> = Arc::new(MemoryBlobStore::new());
+    let flaky = Arc::new(super::tests::Flaky {
+        inner: blobs.clone(),
+        failing: Mutex::default(),
+    });
+    let meta: Arc<dyn leep_core::MetaStore> = Arc::new(MemoryMetaStore::new());
+    let r = Repo::new(blobs.clone(), meta.clone());
+    build(&r, None).await;
+    settle(
+        &r,
+        &CompactOptions::small(Mode::Build),
+        &mut CompactState::default(),
+        None,
+    )
+    .await;
+    let v1 = live(&r, FAMILY_CHANGESET).await;
+    flaky.failing.lock().unwrap().insert(v1[0].index);
+    let reader = Repo::new(flaky.clone(), meta.clone());
+    for single in [false, true] {
+        let segs = reader.segments();
+        let got = if single {
+            segs.refresh_singly(&**reader.row_meta()).await
+        } else {
+            segs.refresh(&**reader.row_meta()).await
+        };
+        assert!(got.is_err(), "single {single}");
+        assert_eq!(
+            segs.family(FAMILY_CHANGESET_V2).segments().len(),
+            live(&r, FAMILY_CHANGESET_V2).await.len(),
+            "single {single}"
+        );
+    }
+}
+
+/// `repair drop` of one kind while its family's manifest does not decode
+/// would empty the whole family: it is refused unless every kind of the
+/// family is named, and nothing is deleted.
+#[tokio::test]
+async fn repair_drop_with_a_damaged_manifest_needs_every_kind_of_the_family() {
+    let r = repo();
+    let ids = build(&r, None).await;
+    settle(
+        &r,
+        &CompactOptions::small(Mode::Build),
+        &mut CompactState::default(),
+        None,
+    )
+    .await;
+    r.row_meta()
+        .put_derived(
+            MANIFEST_KIND,
+            &manifest_key(FAMILY_CHANGESET_V2),
+            Bytes::from_static(b"junk"),
+        )
+        .await
+        .unwrap();
+    let q = crate::integrity::Quiet;
+    let err = crate::integrity::drop_kinds(&r, &[Generation::NAME], false, &q)
+        .await
+        .expect_err("one kind");
+    assert!(err.to_string().contains("drop them together"), "{err}");
+    assert_eq!(
+        r.row_meta().count_derived(Generation::NAME).await.unwrap(),
+        ids.len() as u64
+    );
+    let all: Vec<&str> = V2.iter().map(|(_, k)| *k).collect();
+    crate::integrity::drop_kinds(&r, &all, false, &q)
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_manifest(&r, FAMILY_CHANGESET_V2).await.unwrap().1,
+        ManifestRead::Read(m) if m.live.is_empty()
+    ));
+}
+
+/// `changeset-v1` seals and merges with generations that exist only in
+/// `changeset-v2` segments; and when that family's manifest is damaged or
+/// its segment lost, from derivations.
+#[tokio::test]
+async fn changeset_v1_bootstraps_from_sealed_or_lost_generations() {
+    for case in ["sealed", "damaged", "lost"] {
+        let r = repo();
+        let ids = build(&r, None).await;
+        let hook = feature_hook(Arc::default());
+        let mut st = CompactState::default();
+        settle(
+            &r,
+            &CompactOptions::small(Mode::Retire),
+            &mut st,
+            Some(&hook),
+        )
+        .await;
+        assert_eq!(
+            r.row_meta().count_derived(Generation::NAME).await.unwrap(),
+            0
+        );
+        // changeset-v1 starts over: no segment, its rows derived again.
+        let lease = acquire_for(&r, "test").await.unwrap();
+        drop_columns(
+            &r,
+            &lease,
+            FAMILY_CHANGESET,
+            &[COL_SKIPLIST, COL_HISTORY_TREE],
+        )
+        .await
+        .unwrap();
+        crate::gc_lease::release(lease, Ok(())).await.unwrap();
+        match case {
+            "damaged" => r
+                .row_meta()
+                .put_derived(
+                    MANIFEST_KIND,
+                    &manifest_key(FAMILY_CHANGESET_V2),
+                    Bytes::from_static(b"junk"),
+                )
+                .await
+                .unwrap(),
+            "lost" => {
+                for s in live(&r, FAMILY_CHANGESET_V2).await {
+                    r.blobs().delete(&s.data).await.unwrap();
+                }
+            }
+            _ => {}
+        }
+        let f = fresh(&r);
+        for id in &ids {
+            crate::derived::derive::<crate::derived::Skiplist>(&f, *id)
+                .await
+                .unwrap();
+            crate::derived::derive::<crate::derived::HistoryTree>(&f, *id)
+                .await
+                .unwrap();
+        }
+        let f = fresh(&r);
+        // Sealed in pages of 8 first, then merged.
+        let pages = CompactOptions {
+            max_rows: 8,
+            fanout: 64,
+            ..CompactOptions::small(Mode::Build)
+        };
+        let merging = CompactOptions::small(Mode::Build);
+        let mut st = CompactState::default();
+        let mut merges = 0;
+        for i in 0..20 {
+            let opts = if i < 10 { &pages } else { &merging };
+            let p = match compact_pass(&f, opts, &mut st, Some(&hook)).await {
+                Ok(Some(p)) => p,
+                // A damaged changeset-v2 manifest on a store with its
+                // feature fails that family's pass; changeset-v1 goes on.
+                Err(e) if case == "damaged" => {
+                    assert!(e.to_string().contains("changeset-v2"), "{e}");
+                    let held = holders(&f, FAMILY_CHANGESET, COL_SKIPLIST).await;
+                    if held.len() == ids.len() {
+                        break;
+                    }
+                    continue;
+                }
+                other => panic!("{case}: {other:?}"),
+            };
+            merges += p.family(codec::FAMILY_CHANGESET_NAME).unwrap().merges;
+            if i >= 10 && !p.more && p.sealed_segments + p.merges == 0 {
+                break;
+            }
+        }
+        let held = holders(&f, FAMILY_CHANGESET, COL_SKIPLIST).await;
+        assert_eq!(held.len(), ids.len(), "{case}");
+        if case != "damaged" {
+            assert!(merges > 0, "{case}");
+        }
+        // The values read as a row-only store's would.
+        let plain = repo();
+        build(&plain, None).await;
+        assert_eq!(
+            super::tests::values(&f, &ids).await[..2 * ids.len()],
+            super::tests::values(&plain, &ids).await[..2 * ids.len()],
+            "{case}"
+        );
+    }
+}
+
+/// Two processes alternating passes, each with its own carried state per
+/// family (small pages, so backfills carry): every key of both families is
+/// sealed, no value is held by two live segments of a family, and values
+/// read as rows did.
+#[tokio::test]
+async fn two_processes_alternating_passes_seal_each_key_once() {
+    let r = repo();
+    let ids = build(&r, None).await;
+    let want = super::tests::values(&r, &ids).await;
+    let a = r.clone();
+    let b = fresh(&r);
+    let opts = CompactOptions {
+        max_rows: 8,
+        max_seal_pages: 1,
+        fanout: 64,
+        list_every: std::time::Duration::from_secs(600),
+        ..CompactOptions::small(Mode::Build)
+    };
+    let (mut sa, mut sb) = (CompactState::default(), CompactState::default());
+    for i in 0..80 {
+        let (repo, st) = if i % 2 == 0 {
+            (&a, &mut sa)
+        } else {
+            (&b, &mut sb)
+        };
+        super::tests::pass(repo, &opts, st, None).await;
+    }
+    for fam in FAMILIES {
+        for c in fam
+            .columns
+            .iter()
+            .filter(|c| [COL_SKIPLIST, COL_GENERATION].contains(&c.id))
+        {
+            let held = holders(&r, fam.id, c.id).await;
+            assert_eq!(held.len(), ids.len(), "{} {}", fam.name, c.kind);
+            assert!(held.values().all(|n| *n == 1), "{} {}", fam.name, c.kind);
+        }
+    }
+    assert_eq!(super::tests::values(&fresh(&r), &ids).await, want);
+}
+
+/// A column this binary does not know, in a family that allows them, is not
+/// parsed at all: its blocks may be framed otherwise (here they are not
+/// zstd), and the segment still reads.
+#[test]
+fn an_unknown_columns_blocks_are_not_parsed() {
+    let (enc, _) = codec::encode(FAMILY_CHANGESET_V2, &golden_v2_rows(), 5).unwrap();
+    let (_, renamed) = rename_column(&enc, COL_LOG_FILTER, 9);
+    let idx = codec::decode_index(&Hash::of_blob(&renamed), &renamed).unwrap();
+    let col = idx.columns.iter().find(|c| c.id == 9).unwrap();
+    let mut data = enc.data.1.to_vec();
+    for b in &col.blocks {
+        for x in &mut data[b.offset as usize..(b.offset + b.len as u64) as usize] {
+            *x = 0xff;
+        }
+    }
+    let data_hash = Hash::of_blob(&data);
+    // The index ends with the data blob's address and its length.
+    let mut index = renamed.to_vec();
+    let mut len = Vec::new();
+    codec::put_varint(&mut len, data.len() as u64);
+    let at = index.len() - len.len() - 32;
+    index[at..at + 32].copy_from_slice(&data_hash.0);
+    let ih = Hash::of_blob(&index);
+    let idx = codec::decode_index(&ih, &index).unwrap();
+    let d = codec::decode_data(&idx, &data_hash, Bytes::from(data)).unwrap();
+    let all = codec::read_all(&idx, &d).unwrap();
+    assert_eq!(all.len(), 9, "{all:?}");
+}

@@ -1638,6 +1638,14 @@ recompute every value):
 - `a derived-segments-v1 row of a derived segment family this leep-server
   does not know`: a newer `leep-server` wrote a family this one cannot read.
   `gc` refuses to run with it; run the newer `gc`.
+- Not a failure: `--derived-segments retire deletes no changeset-v2 row`
+  (logged once at warn) means the family is held back until it is named in
+  `--derived-segments-retire-families` (ADR 0105); name it once every
+  binary runs this release and no older `gc` is running.
+- `a derived segment's blob is condemned by blob GC; its rows are not
+  retired`: a `gc` that cannot read the family (an older binary) condemned
+  a live segment. Stop that `gc`'s schedule; the next collect deletes the
+  segment and the next pass seals the rows again, or keeps it.
 - `bad_derived_segment`, or a note that a segment is not stored: a segment
   blob was lost or damaged (a disk, a restore whose blob copy finished
   before the segment was sealed, an older `gc` that collected it).
@@ -1649,10 +1657,11 @@ recompute every value):
 
 **Mitigate / fix.**
 
-- A damaged manifest after `retire`: `repair drop` of the family's kinds
-  (`--kind skiplist --kind history-tree-v4`, or `--kind generation --kind
-  last_merge-v1 --kind root_tree --kind log-filter-v1`) replaces it with an
-  empty one and drops the rows, which then derive again on demand (or at
+- A damaged manifest after `retire`: `repair drop` of all the family's
+  kinds together (`--kind skiplist --kind history-tree-v4`, or `--kind
+  generation --kind last_merge-v1 --kind root_tree --kind log-filter-v1`;
+  it refuses a subset, since the empty manifest stops every kind answering)
+  replaces it with an empty one and drops the rows, which then derive again on demand (or at
   once with `repair rederive --missing`). Expect a long derivation on a
   large store.
 - A lost or damaged segment: nothing is needed for correctness; the next

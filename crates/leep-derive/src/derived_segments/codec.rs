@@ -736,8 +736,10 @@ fn encode_hash(_: Hash, value: &[u8], _: Refer) -> std::result::Result<Vec<u8>, 
     Ok(value.to_vec())
 }
 
-/// `log-filter-v1`: the row as it is, if it decodes and is the one encoding
-/// of what it decodes to (its varints are not checked minimal on read).
+/// `log-filter-v1`: the row as it is. Sealed only if it decodes and is its
+/// own canonical encoding: a policy, so a segment never holds a value its
+/// kind would not write (its reader accepts non-minimal varints); decoding
+/// gives back the bytes without parsing them.
 fn encode_log_filter(_: Hash, value: &[u8], _: Refer) -> std::result::Result<Vec<u8>, String> {
     let row = FilterRow::decode(value).map_err(|e| e.to_string())?;
     if row.encode() != value {
@@ -791,13 +793,11 @@ fn decode_hash<'b>(_: Hash, r: &mut Reader<'b>, _: Resolve<'_, 'b>) -> Result<By
     Ok(Bytes::copy_from_slice(&r.hash()?.0))
 }
 
+/// The row's bytes as they are: the data blob is checked by address, and
+/// the kind's own reader checks the value where it is used, so a value
+/// that would not parse is never counted as segment damage.
 fn decode_log_filter<'b>(_: Hash, r: &mut Reader<'b>, _: Resolve<'_, 'b>) -> Result<Bytes> {
-    let row = r.take(r.left())?;
-    let decoded = FilterRow::decode(row).map_err(|e| bad(&format!("log-filter-v1: {e}")))?;
-    if decoded.encode() != row {
-        return Err(bad("log-filter-v1 row not canonical"));
-    }
-    Ok(Bytes::copy_from_slice(row))
+    Ok(Bytes::copy_from_slice(r.take(r.left())?))
 }
 
 // --- decoding --------------------------------------------------------------
@@ -1245,17 +1245,17 @@ pub fn row_value(
 
 /// Every value in the segment: `(key, column, value)`, by column then
 /// ordinal. For merges, `verify` and tests. A column this binary does not
-/// know (in a family that allows them) has its blocks checked and no value
-/// given.
+/// know (in a family that allows them) gives no value and its blocks are not
+/// parsed: a later column may frame its blocks otherwise; the index checked
+/// that they lie inside the data blob, past its header.
 pub fn read_all(idx: &SegmentIndex, data: &SegmentData) -> Result<Vec<(Hash, u8, Bytes)>> {
     let mut out = Vec::with_capacity(idx.len() * idx.columns.len());
     for (ci, c) in idx.columns.iter().enumerate() {
-        let known = known_column(idx.family, c.id);
+        if !known_column(idx.family, c.id) {
+            continue;
+        }
         for bi in 0..c.blocks.len() {
             let block = read_block(idx, data, ci, bi)?;
-            if !known {
-                continue;
-            }
             let end = c.blocks.get(bi + 1).map_or(idx.len() as u32, |b| b.first);
             let mut rank = 0;
             for o in c.blocks[bi].first..end {

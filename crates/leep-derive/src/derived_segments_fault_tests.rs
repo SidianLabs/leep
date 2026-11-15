@@ -15,6 +15,7 @@ use crate::derived_segments::{
     self as ds, codec, compact_pass, CompactOptions, CompactState, Features, Mode, FAMILIES,
     FAMILY_CHANGESET, FAMILY_CHANGESET_V2,
 };
+use leep_core::Hash;
 
 const DAY: i64 = 86_400;
 
@@ -43,10 +44,21 @@ fn compact_opts(rng: &mut Rng, mode: Mode) -> CompactOptions {
     }
 }
 
-fn no_feature() -> Features {
+/// Store features as a store records them: a pass reads back what it (or
+/// an earlier pass) recorded.
+type Recorded = Arc<std::sync::Mutex<std::collections::BTreeSet<&'static str>>>;
+
+fn recording_features(set: Recorded) -> Features {
+    let seen = set.clone();
     Features {
-        record: Arc::new(|_| Box::pin(async { Ok(()) })),
-        recorded: Arc::new(|_| Box::pin(async { Ok(true) })),
+        record: Arc::new(move |name| {
+            set.lock().unwrap().insert(name);
+            Box::pin(async { Ok(()) })
+        }),
+        recorded: Arc::new(move |name| {
+            let has = seen.lock().unwrap().contains(name);
+            Box::pin(async move { Ok(has) })
+        }),
     }
 }
 
@@ -83,9 +95,32 @@ async fn change(
 }
 
 /// The invariants above, for every family, through a fresh fault-free
-/// handle.
-async fn check(seed: u64, step: usize, w: &World) {
+/// handle; and no row of a family was deleted before its store feature was
+/// recorded.
+async fn check(seed: u64, step: usize, w: &World, recorded: &Recorded) {
     let clean = Repo::new(w.blobs.clone(), w.meta.clone());
+    let stored: Vec<Hash> = w
+        .meta
+        .list_changesets(None, usize::MAX)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| c.0)
+        .collect();
+    // Written with every changeset: all there until the family's door.
+    for (feature, kind) in [
+        (ds::FEATURE, Skiplist::NAME),
+        (ds::FEATURE_2, Generation::NAME),
+    ] {
+        if recorded.lock().unwrap().contains(feature) {
+            continue;
+        }
+        let rows = w.meta.get_derived_many(kind, &stored).await.unwrap();
+        assert!(
+            rows.iter().all(Option::is_some),
+            "seed {seed} step {step}: a {kind} row was deleted before {feature} was recorded"
+        );
+    }
     for fam in FAMILIES {
         let (raw, read) = ds::read_manifest(&clean, fam.id).await.unwrap();
         let m = match read {
@@ -195,7 +230,9 @@ async fn segments_under_faults(seed: u64) {
     let compactor = w.server_with(&compact_plan);
     let gc_repo = w.server_with(&gc_plan);
     let client = w.server_with(&client_plan);
-    let feature = no_feature();
+    let recorded = Recorded::default();
+    let feature = recording_features(recorded.clone());
+    let mut swept: std::collections::HashSet<Hash> = Default::default();
     let mut state = CompactState::default();
     let retire_from = 3 + rng.below(6);
     let mut t = now() + 1000;
@@ -256,6 +293,7 @@ async fn segments_under_faults(seed: u64) {
         // The changeset sweep now and then: unreferenced branches go,
         // rows and all; their keys stay in segments until a merge.
         if rng.below(4) == 0 {
+            let before = w.meta.list_changesets(None, usize::MAX).await.unwrap();
             let o = sweep_opts();
             let later = leep_core::store::unix_now() + 10 * DAY;
             let _ = changeset_sweep::condemn(&gc_repo, &o, &TestClock::at(later)).await;
@@ -265,13 +303,32 @@ async fn segments_under_faults(seed: u64) {
                 &TestClock::at(later + o.fence.as_secs() as i64 + 1),
             )
             .await;
+            let after: std::collections::HashSet<ChangesetId> = w
+                .meta
+                .list_changesets(None, usize::MAX)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+            swept.extend(
+                before
+                    .into_iter()
+                    .filter(|c| !after.contains(c))
+                    .map(|c| c.0),
+            );
         }
-        check(seed, step, &w).await;
+        check(seed, step, &w, &recorded).await;
     }
 
     // Fault-free passes finish what the dead ones left; with GC run after,
     // only live segments remain and every value still reads.
     let clean = Repo::new(w.blobs.clone(), w.meta.clone());
+    let mut live_before: std::collections::HashSet<Hash> = Default::default();
+    for fam in FAMILIES {
+        if let ManifestRead::Read(m) = ds::read_manifest(&clean, fam.id).await.unwrap().1 {
+            live_before.extend(m.live.iter().map(|s| s.index));
+        }
+    }
     let mut st = CompactState::default();
     let opts = CompactOptions::small(if !seed.is_multiple_of(3) {
         Mode::Retire
@@ -296,7 +353,25 @@ async fn segments_under_faults(seed: u64) {
     gc::collect(&clean, &gc_opts(), &TestClock::at(t))
         .await
         .unwrap();
-    check(seed, 99, &w).await;
+    check(seed, 99, &w, &recorded).await;
+    // Swept changesets stay in old segments until a merge; no segment
+    // written by the clean passes (a seal or a merge) holds one.
+    for fam in FAMILIES {
+        let ManifestRead::Read(m) = ds::read_manifest(&clean, fam.id).await.unwrap().1 else {
+            continue;
+        };
+        for s in m.live.iter().filter(|s| !live_before.contains(&s.index)) {
+            let idx = ds::view::load_index(&*w.blobs, fam.id, s)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !idx.keys().iter().any(|k| swept.contains(k)),
+                "seed {seed}: a segment of {} written after the sweep holds a swept changeset",
+                fam.name
+            );
+        }
+    }
     // The sweep exercised what it means to: segments of both families,
     // and in mode retire rows deleted.
     for family in [FAMILY_CHANGESET, FAMILY_CHANGESET_V2] {

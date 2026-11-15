@@ -52,8 +52,9 @@ blocks:
 | `log-filter-v1` | 5,577 | (verbatim) |
 | key index (32 bytes a key, ordinals, presence bits) | about 76,842 | |
 
-So about 1.65 MB (estimated) become a segment of about 0.16 MB (0.097),
-nearly half of it the key index and a third the root trees; eight-byte
+So about 1.65 MB of rows (the example's estimate with Postgres row
+overhead) become a segment of about 0.16 MB, a tenth of them, nearly half
+of it the key index and a third the root trees; eight-byte
 generations in generation order compress better than varints, so the codec
 keeps the eight bytes. The design's estimate was about 2.0 MB becoming
 about 0.2 MB, -1.75 MB (±0.25): measured, -1.5 MB, at the edge of that
@@ -100,7 +101,7 @@ numbered forever:
 | 1 | `generation` | the eight big-endian bytes | bytes |
 | 2 | `last_merge-v1` | the eight big-endian bytes | bytes |
 | 3 | `root_tree` | the 32 bytes | bytes |
-| 4 | `log-filter-v1` | the row, if it decodes and is its own canonical encoding (its reader accepts non-minimal varints, which would come back as other bytes) | bytes: a merge over the side budget stores one of several right supersets |
+| 4 | `log-filter-v1` | the row's bytes. Sealed only if it decodes and is its own canonical encoding, a policy: a segment never holds a value the kind would not write. Decoding takes the bytes without parsing them (the data blob is checked by address, and the kind's reader checks the value where it is used), so a value that would not parse is never counted as segment damage | bytes: a merge over the side budget stores one of several right supersets, so a row derived again may differ from a sealed one and stay (counted in `leep_derived_segment_mismatch_total{kind="log-filter-v1"}`, which is then not a sign of damage) |
 
 A key is expected to have all four; one missing a row (the warmer derives
 `log-filter-v1`, a query `last_merge-v1`) waits `lone_wait` (10 minutes),
@@ -110,12 +111,19 @@ pure function.
 
 ### 3. Forward compatibility (point 1)
 A family added after ADR 0104 tolerates unknown columns: an index naming a
-column this binary does not know parses; the column's blocks are checked
-for structure and give no value; a segment holding one is never merged
-(the merge could not carry it), never dropped for it, and `repair drop`
-keeps its bit. `changeset-v1` still reads an unknown column as damage, as
-ADR 0104 binaries do, so it never gains columns: later kinds take
-`changeset-v2` columns or a new family.
+column this binary does not know parses; the column gives no value and its
+blocks are not parsed (a later column may frame them otherwise; the index
+checks only that they lie inside the data blob, past its header); a segment
+holding one is never merged (the merge could not carry it), never dropped
+for it, and `repair drop` keeps its bit. `changeset-v1` still reads an
+unknown column as damage, as ADR 0104 binaries do, so it never gains
+columns: later kinds take `changeset-v2` columns or a new family.
+
+What tolerance does not cover is protected only by a store feature (which
+the change that makes it records before writing it): an index or data
+blob of another version, a column number of 64 or more (the manifest's
+mask has 64 bits), another row framing inside a known column, or a new
+family (whose manifest row an older `gc` refuses, section 5).
 
 ### 4. Mixed fleets: the store feature `derived-segments-2`
 Recorded before the first `changeset-v2` row is deleted (each family
@@ -127,6 +135,33 @@ orphans. `build` records nothing: rolling back from it is free (an ADR 0104
 there and the next pass seals again). A damaged `changeset-v2` manifest is
 replaced automatically only in `build` on a store without
 `derived-segments-2`.
+
+**A door is passed only on purpose.** A fleet already running
+`--derived-segments retire` would otherwise pass the second door just by
+upgrading, perhaps with an ADR 0104 server or cron job still about. So
+`retire` deletes a family's rows (and records its feature first) only if
+the family is named in `--derived-segments-retire-families` (a comma list
+of family names, or `all`; `changeset-v1` is always included, as ADR 0104's
+`retire` meant), or its feature is already recorded in the store (another
+server, or an earlier run, passed the door). Otherwise the family still
+seals and merges, and the server says once per process that it holds the
+family back. The flag takes Stage B's `content-v1` the same way.
+
+| Situation | What happens |
+|---|---|
+| Fresh store, `retire`, no list | As ADR 0104: `changeset-v1` records `derived-segments` and retires; `changeset-v2` seals only |
+| Fleet on `retire` (ADR 0104) upgrades to this release, no list | `changeset-v1` goes on; `changeset-v2` seals, records nothing, deletes nothing; ADR 0104 binaries still open the store |
+| The operator names `changeset-v2` (or `all`) once every binary runs this release | The server records `derived-segments-2`, then retires `changeset-v2` rows; ADR 0104 binaries refuse the store from then on |
+| Another server, not naming it, on a store with `derived-segments-2` | Retires `changeset-v2` too: the door is already passed |
+| Every binary rolled back to ADR 0104 while `changeset-v2` only built | Free: its manifest row is ignored, its segments are orphans |
+
+**Blob GC of a binary that cannot read a family.** Such a `gc`, started
+before the family's feature was recorded, could have condemned the family's
+live segments as orphans. A pass does not delete rows of a segment either of
+whose blobs carries a condemnation (`blob-condemned-v1`): they go after the
+next collect (if the segment survives it) or stay, the segment dropped and
+sealed again. The rest of the window is closed by the rule to set the flag
+only once every binary runs this release.
 
 ### 5. GC over every family (point 2)
 `gc_view` lists every `derived-segments-v1` row and unions the live and
@@ -146,10 +181,25 @@ use the family's expected-columns mask instead of the two-kind rule; rows
 carry a mask per column. A family whose pass fails (a damaged manifest with
 its feature recorded) does not stop the other; the pass returns the first
 error once all ran, except a lost lease or swap, which stops at once.
-Generations for ordering are read through the view, so once `generation` is
-sealed and retired they come from `changeset-v2` segments (and are derived
-only for changesets no row or segment holds). Pause points for crash tests
-gain `seal-swapped`, and `changeset-v2:` names for the second family.
+Whether a key's changeset is still stored is asked of the changesets
+themselves (`changesets_stored_at`, or `get_changesets` where a store cannot
+say when), in batches: a seal skips one that is not, and a merge leaves it
+out, so ADR 0104's rule that merges shed swept changesets holds in both
+families even though a sealed `changeset-v2` segment still answers the
+generation of a swept changeset. Generations are then read through the view
+only to order the stored ones, so once `generation` is sealed and retired
+they come from `changeset-v2` segments (and are derived only for changesets
+no row or segment holds).
+
+A pass's bounds hold over every family together: `max_seal_time` counts
+from the start of the pass, `max_retire_time` from its first delete, and
+`max_retire_rows` over both families, so a pass stays well under the two
+minutes `repair` waits for the lease. The family that goes first rotates
+each pass. A family's rows are listed again in mode `build` once their
+estimated count grew by `seal_rows` times its columns (1,024 changesets,
+whatever the family's width). Pause points for crash tests gain
+`seal-swapped` and `feature-recorded`, and `changeset-v2:` names for the
+second family.
 
 ### 7. Per-family view, manifest and drop (point 5)
 `Repo::segments()` holds one view per family over shared block and data
@@ -159,7 +209,13 @@ call, in one batched read for a batched miss, or, for a single-row read's
 miss, one single-row read per family (a single read never becomes a
 batched one, whose failure behaviour differs). `manifest_key(family)`,
 `read_manifest(repo, family)`, `drop_columns(repo, lease, family, cols)`;
-`repair drop` clears each family's columns of the dropped kinds.
+`repair drop` clears each family's columns of the dropped kinds. With a
+family's manifest damaged, replacing it with an empty one stops every
+kind of the family answering, so `repair drop` refuses unless all of the
+family's kinds are named (their rows go too, and derive again). Every
+family's manifest is applied whatever another's error (a transient read of
+one family's index blob does not freeze the other), and the first error is
+returned.
 
 ### 8. Listings and integrity (point 6)
 The moved kinds are per-changeset kinds: `verify` and `repair rederive`
@@ -188,6 +244,34 @@ live rows (the maintainer accepted the amendment to ADR 0102: a sealed row
 that becomes superseded waits for the segment's rewrite, at about a third
 dead). Its listing-based verify must see sealed keys in the same change.
 
+## Cost
+- **Backfill and retirement**, measured on Postgres 16 with
+  `crates/leep-server/tests/derived_segments_backfill.rs`: a chain of
+  stored changesets with their `skiplist` (`changeset-v1`) and
+  `generation` (`changeset-v2`) rows, default limits, both families:
+
+  | Changesets | Build passes | First pass | Each after | All | Retire passes | First | Each after | All |
+  |---|---|---|---|---|---|---|---|---|
+  | 200,000 | 4 | 5.9 s | 0.05 to 0.9 s | 7.7 s | 7 | 8.7 s | 0.3 to 1.7 s | 16.5 s |
+  | 500,000 | 8 | 15.4 s | 0.6 to 1.1 s | 22.1 s | 16 | 11.8 s | 0.4 to 2.7 s | 40.0 s |
+
+  ADR 0104 measured 6.2 s for the first pass and 10.1 s in all at 500,000
+  changesets of one family. The first pass of each mode lists every row of
+  both families (here one kind each; a real store lists six kinds) and
+  reads every changeset's generation and whether it is stored (one more
+  statement per 1,000 keys); later passes carry their candidates. Each
+  pass seals four pages a family and deletes at most 65,536 rows over both
+  families, then gives the lease up; every pass stayed far under the two
+  minutes `repair` waits.
+- **Listing in mode `build`**: each family lists its kinds once its rows
+  grew by 1,024 changesets' worth (`seal_rows` times its columns) or 10
+  minutes passed: on a Linux-sized store about 2.4 million keys of
+  `changeset-v1` and 4.8 million of `changeset-v2` at most every 10
+  minutes. In mode `retire` only unsealed rows remain to list.
+- **A seal or merge** asks whether each key's changeset is stored (batched,
+  one statement per 1,000 keys); a retirement asks for two
+  `blob-condemned-v1` rows per holding segment.
+
 ## Consequences
 - Measured on corpus B (reconstructed: 2,231 changesets, Git 6.35 MB after
   `git repack -adf`), import, a server with default flags until nothing
@@ -200,7 +284,7 @@ dead). Its listing-based verify must see sealed keys in the same change.
   | Backend | Before (x Git) | After (x Git) | Change |
   |---|---|---|---|
   | Postgres | 15.85 MB (8.94 db + 6.92 blobs; 2.50x) | 14.33 MB (7.26 + 7.07; 2.26x) | **-1.53 MB** |
-  | SQLite | 15.87 MB (8.95 + 6.92; 2.50x) | 14.69 MB (7.62 + 7.07; 2.31x) | **-1.17 MB** |
+  | SQLite | 15.87 MB (8.95 + 6.92; 2.50x) | 14.69 MB (7.62 + 7.07; 2.31x) | **-1.17 MB** (1,173,213 bytes) |
 
   Against ADR 0104's Git figure of 6.58 MB that is 2.41x to 2.18x on
   Postgres. The `changeset-v2` segment is 158,596 bytes (77,007 of index,
@@ -223,7 +307,17 @@ dead). Its listing-based verify must see sealed keys in the same change.
 - Deviations from the design: generations and last merges keep their eight
   bytes (measured better than varints under zstd); the view refreshes all
   families together rather than per family; a single-row miss refreshes
-  with single-row reads; `generation` is read through the view for
-  ordering (the pass's own segments decide liveness and deletes, as
-  before); one segment with an unknown column is not merged at all rather
-  than merged around.
+  with single-row reads; `generation` is read through the view only for
+  ordering, while whether a changeset is stored is asked of the changesets
+  (the pass's own segments decide liveness and deletes, as before); one
+  segment with an unknown column is not merged at all rather than merged
+  around; `retire` passes a new family's door only when the family is
+  named or its feature already recorded.
+- Changed after review, before release: merges shed swept changesets again
+  (an earlier draft took a sealed generation as proof a changeset was
+  stored); the retire-families gate; pass bounds shared by both families,
+  the first rotating; every family applied whatever another's error; the
+  `log-filter-v1` column read without parsing; unknown columns' blocks not
+  parsed; the listing trigger scaled by a family's columns; condemned
+  segments' rows not retired; `repair drop` with a damaged manifest needs
+  every kind of the family.

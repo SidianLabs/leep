@@ -691,7 +691,10 @@ async fn sealed_and_retired_store_answers_as_rows_do() {
     let done = settle(&sealed, &retire, &mut state, Some(&hook)).await;
     assert!(done.retired_rows > 300, "{done:?}");
     assert_eq!(done.mismatched, 0);
-    assert_eq!(*log.lock().unwrap(), [FEATURE, FEATURE_2]);
+    // Each family's feature, once (the order rotates with the families).
+    let mut got = log.lock().unwrap().clone();
+    got.sort_unstable();
+    assert_eq!(got, [FEATURE, FEATURE_2]);
     assert!(rows(&sealed, Skiplist::NAME).await.is_empty());
     assert!(rows(&sealed, HistoryTree::NAME).await.is_empty());
     for kind in V2_KINDS {
@@ -1404,9 +1407,9 @@ async fn an_unreadable_segment_is_tried_again_after_a_refresh() {
 // --- review fixes: store state over process flags, monotonic manifests ---
 
 /// A blob store that fails reads of chosen blobs with a transient error.
-struct Flaky {
-    inner: Arc<dyn leep_core::BlobStore>,
-    failing: Mutex<std::collections::HashSet<Hash>>,
+pub(crate) struct Flaky {
+    pub(crate) inner: Arc<dyn leep_core::BlobStore>,
+    pub(crate) failing: Mutex<std::collections::HashSet<Hash>>,
 }
 
 #[async_trait]
@@ -1689,8 +1692,8 @@ async fn a_stale_handle_still_reads_right_values() {
     assert_eq!(stale.derived_count(), 0);
 }
 
-/// In mode build the rows are listed again only once they grew by
-/// `seal_rows` or `list_every` passed.
+/// In mode build a family's rows are listed again only once they grew by
+/// `seal_rows` times its columns or `list_every` passed.
 #[tokio::test(start_paused = true)]
 async fn build_mode_lists_rows_only_when_they_grew() {
     let r = repo();
@@ -1708,9 +1711,13 @@ async fn build_mode_lists_rows_only_when_they_grew() {
         tip = commit(&r, &[tip], &[("g", Some(&format!("{i}")))], "g").await;
     }
     derive::<HistoryTree>(&r, tip).await.unwrap();
-    // Six more rows: at least `seal_rows`.
+    // Six more rows: under `seal_rows` times two columns.
+    assert!(!v1(&pass(&r, &opts, &mut st, None).await).listed);
+    tip = commit(&r, &[tip], &[("g", Some("3"))], "g").await;
+    derive::<HistoryTree>(&r, tip).await.unwrap();
+    // Eight: enough.
     let p = v1(&pass(&r, &opts, &mut st, None).await);
-    assert!(p.listed && p.sealed_keys == 3, "{p:?}");
+    assert!(p.listed && p.sealed_keys == 4, "{p:?}");
     assert!(!v1(&pass(&r, &opts, &mut st, None).await).listed);
     tokio::time::advance(Duration::from_secs(600)).await;
     assert!(v1(&pass(&r, &opts, &mut st, None).await).listed);

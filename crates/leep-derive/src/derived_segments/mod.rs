@@ -253,9 +253,11 @@ pub(crate) async fn acquire_for(repo: &Repo, job: &str) -> Result<Option<GcLease
 /// segment left with no column is retired), so nothing answers for the
 /// dropped rows and they derive again. A column this binary does not know
 /// keeps its bit (ADR 0105: never dropped). A manifest that does not decode
-/// is replaced by an empty one: the drop already asks for everything to
-/// derive again. Call with [`lease_key`]'s lease held across the row delete
-/// too, so no pass seals the rows being dropped.
+/// is replaced by an empty one, which stops the segments answering for
+/// every kind of the family, so it is refused unless `cols` names all of
+/// them (their rows are dropped too, and derive again). Call with
+/// [`lease_key`]'s lease held across the row delete too, so no pass seals
+/// the rows being dropped.
 pub(crate) async fn drop_columns(
     repo: &Repo,
     lease: &Option<GcLease>,
@@ -266,7 +268,24 @@ pub(crate) async fn drop_columns(
     let mut m = match read {
         ManifestRead::Absent => return Ok(0),
         ManifestRead::Read(m) => m,
-        ManifestRead::Damaged => Manifest::new(family),
+        ManifestRead::Damaged => {
+            let fam = codec::family(family).expect("a family this binary knows");
+            let missing: Vec<&str> = fam
+                .columns
+                .iter()
+                .filter(|c| !cols.contains(&c.id))
+                .map(|c| c.kind)
+                .collect();
+            if !missing.is_empty() {
+                return Err(Error::Invalid(format!(
+                    "the {MANIFEST_KIND} row of family {} does not decode; replacing it drops \
+                     every kind it holds, so drop them together (add --kind {})",
+                    fam.name,
+                    missing.join(" --kind ")
+                )));
+            }
+            Manifest::new(family)
+        }
         ManifestRead::Newer => {
             return Err(Error::Invalid(format!(
                 "the {MANIFEST_KIND} row was written by a newer leep-server; run its repair"

@@ -3759,8 +3759,8 @@ manifest row and store feature: `changeset-v1` (`skiplist`,
 `derived-segments-2`). A pass runs both in turn under the one lease; what
 follows applies to each family on its own (a family's backfill, retirement
 and failures never stop the other). On Leep's history plus 2,000 edits the
-second family takes its 1.5 MB of rows (with Postgres overhead) down to a
-segment of about 0.16 MB (docs/PERFORMANCE.md, "Derived segments, family
+second family takes its about 1.65 MB of rows (with Postgres overhead) down
+to a segment of about 0.16 MB (docs/PERFORMANCE.md, "Derived segments, family
 changeset-v2"). The storage target (at most twice Git) is met with
 `retire` and a `VACUUM FULL`: `build`, the default, keeps every row.
 
@@ -3768,6 +3768,7 @@ changeset-v2"). The storage target (at most twice Git) is met with
 |---|---|---|
 | `--derived-segments off\|build\|retire` / `LEEP_DERIVED_SEGMENTS` | `build` | `build`: seal and merge in the background, keep every row. `retire`: also delete rows a live segment holds the same value for (the one-way door below). `off`: no passes; segments already written are still read. |
 | `--derived-segments-interval D` / `LEEP_DERIVED_SEGMENTS_INTERVAL` | `5m` | How often a pass runs (the first 2 to 3 minutes after start). |
+| `--derived-segments-retire-families LIST` / `LEEP_DERIVED_SEGMENTS_RETIRE_FAMILIES` | empty (`changeset-v1`) | In `retire`, the families whose one-way door this server may pass: comma-separated names (`changeset-v2`) or `all`; `changeset-v1` always. A family not named deletes rows only once its store feature is already recorded (ADR 0105). |
 
 A pass holds the store-wide lease `maintenance` / `derived-segments`, so one
 server at a time runs it, in the index lane (it uses the index connections,
@@ -3787,7 +3788,14 @@ family's kinds, and:
 3. in mode `retire`, deletes rows whose segment has been live for 10
    minutes, after comparing each with the segment's value (an unequal row
    stays and wins, `leep_derived_segment_mismatch_total`), 1,000 a
-   statement, resting as long as each step took.
+   statement, resting as long as each step took. A `log-filter-v1` row
+   may be one of several right values (a merge over the side budget stores
+   a superset), so mismatches of that kind after merges are not damage.
+   Rows of a segment whose blobs `gc` condemned are not deleted.
+
+A pass's time and row bounds are shared by both families (the one going
+first rotates), so one pass stays well under `repair`'s two-minute wait.
+A merge leaves out changesets no longer stored, asked of the changesets.
 
 **Backfill cost.** The first pass on a store with history lists every key
 of both kinds once and reads every changeset's generation (in batches of
@@ -3832,9 +3840,18 @@ and seals again). The storage only comes back with `retire`:
 > server, importer and cron job runs this release or later, on one server
 > or all (passes take turns). The same holds for `derived-segments-2`
 > (ADR 0105), recorded before the first `changeset-v2` row is deleted:
-> from then on ADR 0104 binaries refuse the store too. A store retired by
-> an ADR 0104 server and then run in `build` by this release records
-> nothing new: rolling back from `build` stays free.
+> from then on ADR 0104 binaries refuse the store too. **Upgrading a fleet
+> that already runs `retire` does not pass it:** a family other than
+> `changeset-v1` deletes rows only when named in
+> `--derived-segments-retire-families` (or once its feature is recorded);
+> until then it seals and merges, and the server logs once that it holds
+> the family back. Name `changeset-v2` (or `all`) once every server,
+> importer and cron job runs this release. A store retired by an ADR 0104
+> server and then run in `build` by this release records nothing new:
+> rolling back from `build` stays free. No `gc` of an older binary may be
+> running when a family is named: a pass skips the rows of a segment
+> whose blobs a `gc` condemned (`blob-condemned-v1`), but a collect that
+> started before the feature was recorded is not otherwise stopped.
 
 Postgres and SQLite reuse the space of deleted rows for later rows, but
 return it to the operating system only on `VACUUM FULL derived` (or
@@ -3851,7 +3868,9 @@ that kind (its column is cleared in the manifest), then deletes the rows,
 so everything derives again. Both hold the derived-segments lease, waiting
 up to two minutes for a running pass. The same holds for the kinds of
 `changeset-v2` (`repair drop --kind generation` and so on clears their
-columns in that family's manifest) (a pass seals at most four pages of
+columns in that family's manifest). If a family's manifest does not decode,
+`repair drop` replaces it with an empty one, which stops every kind of the
+family answering, so it refuses unless all of the family's kinds are named (a pass seals at most four pages of
 16,384 changesets and deletes at most 65,536 rows or for at most a minute,
 then gives the lease up, and the next pass follows 5 s later while work is
 left); `repair drop` refuses

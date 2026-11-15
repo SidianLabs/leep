@@ -1456,6 +1456,8 @@ fn run_segments_kill(backend: &str, meta_url: Option<String>, mode: &str, point:
         "0s",
         "--derived-segments-interval",
         "1s",
+        "--derived-segments-retire-families",
+        "all",
     ];
     let mut args = common_args.to_vec();
     args.extend(["--debug-derived-segments-pause-at", point]);
@@ -1509,7 +1511,11 @@ fn run_segments_kill(backend: &str, meta_url: Option<String>, mode: &str, point:
                  {features:?}"
             );
         }
-        assert!(rows < rows_before, "[{tag}] no row was deleted");
+        // Killed between recording changeset-v1's feature and its first
+        // delete, nothing need be deleted yet.
+        if point != "feature-recorded" {
+            assert!(rows < rows_before, "[{tag}] no row was deleted");
+        }
     }
     // The next server finishes the work.
     let server = Server::start_with(free_port(), &stores, root, &common_args);
@@ -1541,15 +1547,18 @@ fn run_segments_kill(backend: &str, meta_url: Option<String>, mode: &str, point:
 }
 
 /// Kill points of both families: before and after a seal's manifest
-/// swap, before a merge's swap, and after a retirement's delete.
-const SEGMENT_KILLS: [(&str, &str); 8] = [
+/// swap, before a merge's swap, between recording the store feature and
+/// the first delete, and after a retirement's delete.
+const SEGMENT_KILLS: [(&str, &str); 10] = [
     ("build", "seal-stored"),
     ("build", "seal-swapped"),
     ("build", "merge-stored"),
+    ("retire", "feature-recorded"),
     ("retire", "retire-deleted"),
     ("build", "changeset-v2:seal-stored"),
     ("build", "changeset-v2:seal-swapped"),
     ("build", "changeset-v2:merge-stored"),
+    ("retire", "changeset-v2:feature-recorded"),
     ("retire", "changeset-v2:retire-deleted"),
 ];
 

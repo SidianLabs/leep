@@ -310,6 +310,10 @@ async fn run(args: Args) -> Result<bool> {
                     "5s",
                     "--derived-segments-interval",
                     "5s",
+                    // Every family passes its door (ADR 0105): a soak's
+                    // store is its own.
+                    "--derived-segments-retire-families",
+                    "all",
                 ]
                 .map(String::from),
             );

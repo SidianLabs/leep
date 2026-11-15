@@ -4498,20 +4498,24 @@ filesystem blob store; `VACUUM FULL` / `VACUUM` after the last `gc`.
 | Backend | Before (x Git) | After (x Git) | Change |
 |---|---|---|---|
 | Postgres | 15.85 MB (2.50x) | 14.33 MB (2.26x) | -1.53 MB |
-| SQLite | 15.87 MB (2.50x) | 14.69 MB (2.31x) | -1.17 MB |
+| SQLite | 15.87 MB (2.50x) | 14.69 MB (2.31x) | -1.17 MB (1,173,213 bytes) |
 
 - Against ADR 0104's Git figure for B (6.58 MB), 2.41x becomes 2.18x on
   Postgres. The ≤2x target (judged in `retire` after `VACUUM FULL`) needs
   the code search rows too (ADR 0105, Stage B).
 - The four kinds' rows (2,231 each; `log-filter-v1` 149 bytes a row) took
-  about 1.65 MB on Postgres by the `derived_breakdown` example's estimate;
+  about 1.65 MB on Postgres (the `derived_breakdown` example's estimate,
+  with row overhead);
   after, one segment of 158,596 bytes (77,007 of index, 81,589 of data, 71
   bytes a changeset), of which the root trees (73.6 KB under zstd) and the
   key index are nearly all. Generations and last merges compress to about
   one byte a row in generation order.
 - Statements: the same per operation (both manifests ride on the first
   batched read; `budget_tests` "create sealed" 13 metadata calls), plus two
-  blob reads per process for the second family's segment.
+  blob reads per process for the second family's segment. A single-row
+  read's miss refreshes the manifests with one single-row read per family
+  (two statements, at most once a minute per process), where ADR 0104 read
+  one.
 - Breakdown and candidate encodings: `cargo run --release -p leep-server
   --example derived_breakdown -- <meta url> <blob url>` (ADR 0105, "Stage
   0", has the table).

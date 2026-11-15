@@ -162,6 +162,8 @@ fn segment_server(stores: &Stores, root: &Path, mode: &str) -> Server {
             "0s",
             "--derived-segments-interval",
             "500ms",
+            "--derived-segments-retire-families",
+            "all",
         ],
     )
 }
@@ -265,7 +267,38 @@ fn build_then_retire(stores: Stores, root: &Path) {
         verify_full(&old, "verify --full of the rolled-back copy");
     }
 
-    // Retire: the feature first, then the rows go; everything still reads.
+    // Retire without naming the second family (a fleet already in retire
+    // upgrading): changeset-v1 passes its door, changeset-v2 does not
+    // (ADR 0105).
+    let server = Server::start_with(
+        free_port(),
+        &stores,
+        root,
+        &[
+            "--derived-segments",
+            "retire",
+            "--debug-derived-segments-small",
+            "--debug-derived-segments-first",
+            "0s",
+            "--derived-segments-interval",
+            "500ms",
+        ],
+    );
+    wait_for("retire deletes the changeset-v1 rows", &server, || {
+        let r = rows(&stores);
+        r.0 == 0 && r.1 == 0
+    });
+    // A few more passes: still none of the second family's rows go.
+    std::thread::sleep(Duration::from_secs(2));
+    drop(server);
+    assert_eq!(rows(&stores), (0, 0, 120, 120));
+    let f = features(&stores);
+    assert!(f.iter().any(|g| g == "derived-segments"), "{f:?}");
+    assert!(!f.iter().any(|g| g == "derived-segments-2"), "{f:?}");
+    assert_eq!(values(&stores, &made), want);
+
+    // Retire naming every family: the feature first, then the rows go;
+    // everything still reads.
     let server = segment_server(&stores, root, "retire");
     wait_for("retire deletes the rows", &server, || {
         rows(&stores) == (0, 0, 0, 0)

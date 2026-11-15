@@ -886,6 +886,8 @@ fn storage_stays_within_its_budgets() {
         "0s",
         "--derived-segments-interval",
         "1s",
+        "--derived-segments-retire-families",
+        "all",
     ]);
     let server = Server::start_with(free_port(), &stores, work, &flags);
     let deadline = Instant::now() + Duration::from_secs(60);

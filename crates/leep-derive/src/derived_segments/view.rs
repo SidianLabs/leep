@@ -7,10 +7,12 @@
 //! Order of a read: the database, exactly the statement issued before;
 //! then, for misses, the in-memory key indexes of the family's live
 //! segments, newest first. Before a miss is declared, manifests older than
-//! [`REFRESH`] are read again, every family's in one statement: one a
-//! minute per process at most, and only when a row is missing (in mode
-//! `build` only rows not derived yet); a `get_derived_kinds` of these kinds
-//! carries it as one more read of the same call. Statement counts per operation do not change (ADR 0081). Rows are
+//! [`REFRESH`] are read again, every family's together: in one batched read
+//! for a batched read's miss, one single-row read per family for a
+//! single-row read's miss, at most once a minute per process, and only when
+//! a row is missing (in mode `build` only rows not derived yet); a
+//! `get_derived_kinds` of these kinds carries them as one more read of the
+//! same call. Statement counts per operation do not change (ADR 0081). Rows are
 //! deleted at least [`RETIRE_AFTER`](super::RETIRE_AFTER) after their
 //! segment was published, so a miss judged against a manifest at most
 //! [`REFRESH`] old is a true miss. DB rows win over segments, so `repair
@@ -163,7 +165,9 @@ impl Segments {
     }
 
     /// Use `raws` (every family's manifest row, in [`FAMILIES`] order, as
-    /// just read).
+    /// just read). Every family is applied, whatever another's error (a
+    /// transient read of one family's index blob must not freeze the other
+    /// family's view); the first error is returned.
     pub async fn apply_all(&self, raws: Vec<Option<Bytes>>) -> Result<()> {
         if raws.len() != self.views.len() {
             return Err(Error::Storage(format!(
@@ -172,10 +176,13 @@ impl Segments {
                 self.views.len()
             )));
         }
+        let mut first = None;
         for (v, raw) in self.views.iter().zip(raws) {
-            v.apply(raw).await?;
+            if let Err(e) = v.apply(raw).await {
+                first.get_or_insert(e);
+            }
         }
-        Ok(())
+        first.map_or(Ok(()), Err)
     }
 
     /// Read every family's manifest from `rows` in one statement and use
@@ -191,12 +198,20 @@ impl Segments {
     /// of a single-row read: such a read never turns into a batched one
     /// (whose failure behaviour differs), at the cost of one more statement
     /// a minute per family.
+    /// Each family is read and applied on its own; the first error is
+    /// returned once all were tried.
     pub async fn refresh_singly(&self, rows: &dyn MetaStore) -> Result<()> {
-        let mut raws = Vec::with_capacity(self.views.len());
-        for k in Self::manifest_keys() {
-            raws.push(rows.get_derived(MANIFEST_KIND, &k).await?);
+        let mut first = None;
+        for (v, k) in self.views.iter().zip(Self::manifest_keys()) {
+            let applied = match rows.get_derived(MANIFEST_KIND, &k).await {
+                Ok(raw) => v.apply(raw).await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = applied {
+                first.get_or_insert(e);
+            }
         }
-        self.apply_all(raws).await
+        first.map_or(Ok(()), Err)
     }
 }
 

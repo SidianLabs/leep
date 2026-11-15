@@ -125,19 +125,30 @@ pub struct CompactOptions {
     /// store then gives the lease up between passes, so `repair` is not
     /// kept waiting for the whole backfill.
     pub max_seal_pages: usize,
-    /// Longest a pass spends on a backfill's generations and pages (it
-    /// finishes the page it is on): with the listing, a pass stays well
-    /// under the two minutes `repair` waits for the lease.
+    /// Longest a pass spends on backfills' generations and pages (it
+    /// finishes the page it is on), counted from the start of the pass over
+    /// every family: with the listings, a pass stays well under the two
+    /// minutes `repair` waits for the lease.
     pub max_seal_time: Duration,
-    /// Most rows one pass deletes, and the longest it spends deleting: a
-    /// pass then gives the lease up, so `repair` (which waits up to two
-    /// minutes for it) is not starved, and the next pass goes on soon.
+    /// Most rows one pass deletes, and the longest it spends deleting, over
+    /// every family: a pass then gives the lease up, so `repair` (which
+    /// waits up to two minutes for it) is not starved, and the next pass
+    /// goes on soon.
     pub max_retire_rows: usize,
     pub max_retire_time: Duration,
-    /// In mode `build`, the rows are listed again only once their estimated
-    /// count grew by `seal_rows` since the last listing, or this long after
-    /// it (so a quiet store's idle seal still happens).
+    /// In mode `build`, a family's rows are listed again only once their
+    /// estimated count grew by `seal_rows` times its columns since the last
+    /// listing, or this long after it (so a quiet store's idle seal still
+    /// happens).
     pub list_every: Duration,
+    /// In mode `retire`, the families (by name) this server may pass the
+    /// one-way door of: record their store feature and delete their rows.
+    /// A family not named deletes rows only once its feature is already
+    /// recorded in the store (another server, or an earlier run, passed
+    /// it), so a fleet in `retire` does not pass a new family's door by
+    /// upgrading (ADR 0105). The default names `changeset-v1` alone, as
+    /// ADR 0104's `retire` did.
+    pub retire_families: Vec<String>,
     /// For crash tests only.
     pub pause: Option<PauseHook>,
 }
@@ -161,13 +172,15 @@ impl Default for CompactOptions {
             max_retire_rows: 65_536,
             max_retire_time: Duration::from_secs(60),
             list_every: Duration::from_secs(600),
+            retire_families: vec![codec::FAMILY_CHANGESET_NAME.to_string()],
             pause: None,
         }
     }
 }
 
 impl CompactOptions {
-    /// Small limits, so small histories seal, merge and retire.
+    /// Small limits, so small histories seal, merge and retire, every
+    /// family.
     pub fn small(mode: Mode) -> Self {
         CompactOptions {
             mode,
@@ -186,8 +199,34 @@ impl CompactOptions {
             max_retire_rows: usize::MAX,
             max_retire_time: Duration::from_secs(3600),
             list_every: Duration::ZERO,
+            retire_families: FAMILIES.iter().map(|f| f.name.to_string()).collect(),
             pause: None,
         }
+    }
+
+    /// Parse `--derived-segments-retire-families`: family names, comma
+    /// separated (`changeset-v1` is always included), or `all`.
+    pub fn parse_retire_families(s: &str) -> Result<Vec<String>> {
+        let mut out = vec![codec::FAMILY_CHANGESET_NAME.to_string()];
+        for name in s.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            if name == "all" {
+                return Ok(FAMILIES.iter().map(|f| f.name.to_string()).collect());
+            }
+            if codec::family_by_name(name).is_none() {
+                return Err(Error::Invalid(format!(
+                    "unknown derived segment family {name:?}; known: {}",
+                    FAMILIES
+                        .iter()
+                        .map(|f| f.name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            if !out.iter().any(|n| n == name) {
+                out.push(name.to_string());
+            }
+        }
+        Ok(out)
     }
 
     /// The tier of a segment of `rows` keys: `floor(log_fanout(rows /
@@ -211,6 +250,19 @@ impl CompactOptions {
 #[derive(Default)]
 pub struct CompactState {
     families: HashMap<u8, FamilyState>,
+    /// Time and rows the current pass spent, shared by its families.
+    budget: PassBudget,
+    /// Which family goes first: rotated each pass, so a family's bounded
+    /// work never always waits behind another's.
+    rotate: usize,
+}
+
+/// What one pass may spend over every family.
+#[derive(Default, Clone, Copy)]
+struct PassBudget {
+    started: Option<std::time::Instant>,
+    retire_started: Option<std::time::Instant>,
+    retired_rows: u64,
 }
 
 #[derive(Default)]
@@ -224,6 +276,9 @@ struct FamilyState {
     last_growth: Option<Instant>,
     last_unsealed: usize,
     feature_recorded: bool,
+    /// Whether this process said once that `retire` holds the family back
+    /// (its feature unrecorded and the family not named).
+    held_back_warned: bool,
     /// Runs whose merge came out over the byte cap: not tried again.
     oversize: HashSet<Vec<Hash>>,
     /// Live segments this process read whole and found sound: later passes
@@ -396,10 +451,16 @@ pub async fn compact_pass(
         Err(Error::Conflict(_)) => return Ok(None),
         Err(e) => return Err(e),
     };
+    state.budget = PassBudget {
+        started: Some(std::time::Instant::now()),
+        ..PassBudget::default()
+    };
+    let first = state.rotate % FAMILIES.len();
+    state.rotate = state.rotate.wrapping_add(1);
     let result = async {
         let mut total = PassReport::default();
         let mut failed = None;
-        for fam in FAMILIES {
+        for fam in FAMILIES[first..].iter().chain(&FAMILIES[..first]) {
             let run = async {
                 let mut p = Pass::load(repo, fam, opts, &lease, features).await?;
                 p.run(state).await?;
@@ -444,6 +505,7 @@ fn point(fam: &Family, at: &'static str) -> &'static str {
         "seal-swapped" => "changeset-v2:seal-swapped",
         "merge-stored" => "changeset-v2:merge-stored",
         "retire-deleted" => "changeset-v2:retire-deleted",
+        "feature-recorded" => "changeset-v2:feature-recorded",
         other => other,
     }
 }
@@ -469,6 +531,8 @@ pub(crate) struct Pass<'a> {
     /// a read of its blob by this pass.
     reused: HashSet<Hash>,
     started: std::time::Instant,
+    /// The pass's shared budget while this family runs.
+    budget: PassBudget,
     /// Live segments whose data this pass could not read: no merge or
     /// retire uses them again in this pass, and the next pass probes them
     /// whole.
@@ -536,6 +600,7 @@ impl<'a> Pass<'a> {
             rows: None,
             reused: HashSet::new(),
             started: std::time::Instant::now(),
+            budget: PassBudget::default(),
             unreadable: HashSet::new(),
             report,
         };
@@ -610,7 +675,19 @@ impl<'a> Pass<'a> {
         if self.report.newer_manifest {
             return Ok(());
         }
-        let state = state.families.entry(self.fam.id).or_default();
+        self.budget = state.budget;
+        self.started = *self
+            .budget
+            .started
+            .get_or_insert_with(std::time::Instant::now);
+        let fam_state = state.families.entry(self.fam.id).or_default();
+        let r = self.run_family(fam_state).await;
+        self.budget.retired_rows += self.report.retired_rows;
+        state.budget = self.budget;
+        r
+    }
+
+    async fn run_family(&mut self, state: &mut FamilyState) -> Result<()> {
         self.check_live(state).await?;
         let now = Instant::now();
         let live: HashSet<Hash> = self.man.live.iter().map(|s| s.index).collect();
@@ -637,12 +714,42 @@ impl<'a> Pass<'a> {
         self.merge(state).await?;
         // Not during a backfill: each pass would list every row again to
         // find the few newly ripe ones.
-        if self.opts.mode == Mode::Retire && state.backfill.is_none() {
+        if self.opts.mode == Mode::Retire
+            && state.backfill.is_none()
+            && self.may_retire(state).await?
+        {
             self.retire(state).await?;
         }
         self.report.live_segments = self.man.live.len() as u64;
         self.report.live_bytes = self.man.live.iter().map(|s| s.data_len as u64).sum::<u64>();
         Ok(())
+    }
+
+    /// Whether `retire` may delete this family's rows: the family is named
+    /// in [`CompactOptions::retire_families`], or its store feature is
+    /// already recorded (so the door is passed). Otherwise it is held back,
+    /// said once per process.
+    async fn may_retire(&mut self, state: &mut FamilyState) -> Result<bool> {
+        if state.feature_recorded || self.opts.retire_families.iter().any(|n| n == self.fam.name) {
+            return Ok(true);
+        }
+        if feature_recorded(self.features, self.fam.feature).await? {
+            state.feature_recorded = true;
+            return Ok(true);
+        }
+        if !state.held_back_warned {
+            state.held_back_warned = true;
+            tracing::warn!(
+                family = self.fam.name,
+                feature = self.fam.feature,
+                "--derived-segments retire deletes no {} row: the store feature {} is not \
+                 recorded and the family is not named in --derived-segments-retire-families; \
+                 name it once every binary runs this release (ADR 0105)",
+                self.fam.name,
+                self.fam.feature
+            );
+        }
+        Ok(false)
     }
 
     /// Whether `s`'s blobs read, probed by this pass itself: `Ok(false)`
@@ -874,7 +981,7 @@ impl<'a> Pass<'a> {
             None => true,
             Some((at, n)) => {
                 (self.opts.mode == Mode::Retire && state.retire_left.is_none())
-                    || estimate >= n + self.opts.seal_rows as u64
+                    || estimate >= n + (self.opts.seal_rows * self.fam.columns.len().max(1)) as u64
                     || at.elapsed() >= self.opts.list_every
             }
         };
@@ -1289,7 +1396,10 @@ impl<'a> Pass<'a> {
             Some(w) => w,
             None => self.retire_work(&ripe, state).await?,
         };
-        let retire_started = std::time::Instant::now();
+        let retire_started = *self
+            .budget
+            .retire_started
+            .get_or_insert_with(std::time::Instant::now);
         let mut progress = false;
         while let Some((seg, mut cands)) = work.pop_front() {
             // Carried work names segments by index: one no longer live,
@@ -1300,9 +1410,29 @@ impl<'a> Pass<'a> {
             if !ripe.contains(&seg) || self.unreadable.contains(&seg) {
                 continue;
             }
+            // A blob GC of a binary that cannot read this family (it ran
+            // before the feature was recorded) may have condemned the
+            // segment as an orphan: its rows are not deleted while either
+            // blob carries a condemnation. They go after the next collect,
+            // or stay with the segment dropped and sealed again.
+            let marks = self
+                .repo
+                .row_meta()
+                .get_derived_many(crate::gc::BLOB_CONDEMNED, &[l.r.index, l.r.data])
+                .await?;
+            if marks.iter().any(Option::is_some) {
+                tracing::warn!(
+                    segment = %seg,
+                    family = self.fam.name,
+                    "a derived segment's blob is condemned by blob GC; its rows are not \
+                     retired"
+                );
+                continue;
+            }
             let mut i = 0;
             while i < cands.len() {
-                if self.report.retired_rows as usize >= self.opts.max_retire_rows
+                if (self.budget.retired_rows + self.report.retired_rows) as usize
+                    >= self.opts.max_retire_rows
                     || retire_started.elapsed() >= self.opts.max_retire_time
                 {
                     cands.drain(..i);
@@ -1433,6 +1563,7 @@ impl<'a> Pass<'a> {
             };
             (f.record)(self.fam.feature).await?;
             state.feature_recorded = true;
+            self.pause("feature-recorded").await;
         }
         gc_lease::check(self.lease)?;
         let n = self
@@ -1474,20 +1605,46 @@ fn encode_capped(
     Ok(())
 }
 
-/// The generations of `ids`, which order a segment: stored rows in
-/// batches, read through the view so that once `generation` itself is
-/// sealed and its rows retired (family `changeset-v2`) they come from the
-/// segments; a missing one derived. `None` for a changeset that is no
-/// longer stored. Any order decodes correctly; this one makes references
-/// small.
+/// Which of `ids` are stored changesets, asked of the changesets
+/// themselves: a segment value outlives its changeset (the changeset sweep,
+/// ADR 0059), and once `generation` is sealed a generation proves nothing.
+async fn stored(repo: &Repo, ids: &[Hash]) -> Result<Vec<bool>> {
+    let cs: Vec<ChangesetId> = ids.iter().map(|h| ChangesetId(*h)).collect();
+    match repo.row_meta().changesets_stored_at(&cs).await {
+        Ok(at) if at.len() == cs.len() => Ok(at.iter().map(Option::is_some).collect()),
+        Ok(_) => Err(Error::Storage("changesets_stored_at answered short".into())),
+        // A store that cannot say when: read the changesets.
+        Err(Error::Invalid(_)) => Ok(repo
+            .row_meta()
+            .get_changesets(&cs)
+            .await?
+            .iter()
+            .map(Option::is_some)
+            .collect()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The generations of the stored changesets among `ids`, which order a
+/// segment; `None` for a changeset that is no longer stored (so a seal
+/// skips it and a merge leaves it out). The generations are read through
+/// the view, so that once `generation` itself is sealed and its rows
+/// retired (family `changeset-v2`) they come from the segments, and a
+/// missing one is derived. Any order decodes correctly; this one makes
+/// references small.
 async fn generations(repo: &Repo, ids: &[Hash], batch: usize) -> Result<Vec<Option<u64>>> {
     let mut out = Vec::with_capacity(ids.len());
     for chunk in ids.chunks(batch.max(1)) {
+        let here = stored(repo, chunk).await?;
         let rows = repo
             .meta()
             .get_derived_many(Generation::NAME, chunk)
             .await?;
-        for (id, row) in chunk.iter().zip(rows) {
+        for ((id, row), here) in chunk.iter().zip(rows).zip(here) {
+            if !here {
+                out.push(None);
+                continue;
+            }
             out.push(match row.and_then(|v| decode_u64(&v).ok()) {
                 Some(g) => Some(g),
                 None => match repo.generation(ChangesetId(*id)).await {

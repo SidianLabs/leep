@@ -531,6 +531,15 @@ struct Args {
     /// under a store-wide lease, one server at a time, in the index lane.
     #[arg(long, env = "LEEP_DERIVED_SEGMENTS", default_value = "build", value_parser = parse_derived_segments)]
     derived_segments: leep_derive::derived_segments::Mode,
+    /// In `--derived-segments retire`, the segment families whose one-way
+    /// door this server may pass (ADR 0105): record the family's store
+    /// feature and delete its rows. Comma-separated names (`changeset-v2`),
+    /// or `all`; `changeset-v1` (ADR 0104's) is always included. A family
+    /// not named deletes rows only once its feature is already recorded in
+    /// the store, so a fleet in `retire` does not pass a new family's door
+    /// by upgrading; name a family once every binary runs this release.
+    #[arg(long, env = "LEEP_DERIVED_SEGMENTS_RETIRE_FAMILIES", default_value = "", value_parser = parse_retire_families)]
+    derived_segments_retire_families: String,
     /// How often a derived segments pass runs (ADR 0104, 0105).
     #[arg(long, env = "LEEP_DERIVED_SEGMENTS_INTERVAL", default_value = "5m", value_parser = parse_interval)]
     derived_segments_interval: std::time::Duration,
@@ -1241,6 +1250,12 @@ fn parse_derived_segments(s: &str) -> Result<leep_derive::derived_segments::Mode
     s.parse().map_err(|e: leep_core::Error| e.to_string())
 }
 
+fn parse_retire_families(s: &str) -> Result<String, String> {
+    leep_derive::derived_segments::CompactOptions::parse_retire_families(s)
+        .map(|_| s.to_string())
+        .map_err(|e| e.to_string())
+}
+
 /// `--events-retention` is at most a day: an event names paths of a
 /// session, which are deleted a day after it ends
 /// (`PATHS_RETENTION_SECS`), so an older event would point a reader at
@@ -1369,6 +1384,10 @@ fn start_derived_segments(args: &Args, repo: &Repo) {
         pass.lone_wait = std::time::Duration::ZERO;
         pass.retire_after = std::time::Duration::ZERO;
     }
+    // Checked by the flag's parser.
+    pass.retire_families =
+        CompactOptions::parse_retire_families(&args.derived_segments_retire_families)
+            .unwrap_or_default();
     if let Some(at) = args.debug_derived_segments_pause_at.clone() {
         pass.pause = Some(PauseHook(Arc::new(move |point| {
             let stop = point == at;
