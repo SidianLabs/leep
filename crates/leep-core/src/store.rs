@@ -878,6 +878,30 @@ pub trait MetaStore: Send + Sync + 'static {
         Ok(value)
     }
 
+    /// Set `(kind, key)` to `new` iff the row there is now exactly
+    /// `expected` (`None` = no row), in one atomic step. Returns whether it
+    /// swapped. A row written by one holder at a time still needs this when
+    /// a holder can outlive its lease: a stale holder's write then loses
+    /// instead of overwriting a newer one (the GC mark manifest, ADR 0103).
+    ///
+    /// The database backends do it in one statement. This default reads
+    /// then writes, so a writer racing through it can be overwritten; a
+    /// wrapper store forwards to the store it wraps instead.
+    async fn cas_derived(
+        &self,
+        kind: &str,
+        key: &Hash,
+        expected: Option<&[u8]>,
+        new: Bytes,
+    ) -> Result<bool> {
+        let now = self.get_derived(kind, key).await?;
+        if now.as_deref() != expected {
+            return Ok(false);
+        }
+        self.put_derived(kind, key, new).await?;
+        Ok(true)
+    }
+
     /// [`put_derived`](Self::put_derived) for many rows in one round trip
     /// (ADR 0031). The result is that of putting the rows one by one in
     /// order, so a key given twice keeps its last value.

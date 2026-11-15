@@ -1182,6 +1182,37 @@ impl MetaStore for SqliteMetaStore {
         Ok(Bytes::from(won))
     }
 
+    /// One statement each way: an update matching the expected bytes, or an
+    /// insert that does nothing over a row. SQLite counts a matched row as
+    /// changed even when the bytes are the same.
+    async fn cas_derived(
+        &self,
+        kind: &str,
+        key: &Hash,
+        expected: Option<&[u8]>,
+        new: Bytes,
+    ) -> Result<bool> {
+        let db = self.db_for("cas_derived");
+        let done = match expected {
+            Some(old) => sqlx::query("UPDATE derived SET value = ? WHERE kind = ? AND key = ? AND value = ?")
+                .bind(new.as_ref())
+                .bind(kind)
+                .bind(key.as_bytes().as_slice())
+                .bind(old)
+                .execute(db)
+                .await
+                .map_err(storage)?,
+            None => sqlx::query("INSERT INTO derived (kind, key, value) VALUES (?, ?, ?) ON CONFLICT (kind, key) DO NOTHING")
+                .bind(kind)
+                .bind(key.as_bytes().as_slice())
+                .bind(new.as_ref())
+                .execute(db)
+                .await
+                .map_err(storage)?,
+        };
+        Ok(done.rows_affected() == 1)
+    }
+
     /// One transaction: the rows of every listed kind, then the changesets,
     /// one `IN (...)` statement per [`BATCH_PARAMS`] ids each.
     async fn delete_changesets(&self, ids: &[ChangesetId], kinds: &[&str]) -> Result<u64> {

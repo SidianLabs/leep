@@ -1792,6 +1792,38 @@ impl MetaStore for PostgresMetaStore {
         Ok(Bytes::from(won))
     }
 
+    /// One statement each way: an update matching the expected bytes (a
+    /// racing update waits for the row lock and re-checks), or an insert that
+    /// does nothing over a row. Postgres counts a matched row even when the
+    /// bytes are the same.
+    async fn cas_derived(
+        &self,
+        kind: &str,
+        key: &Hash,
+        expected: Option<&[u8]>,
+        new: Bytes,
+    ) -> Result<bool> {
+        let db = self.db_for("cas_derived");
+        let done = match expected {
+            Some(old) => sqlx::query("UPDATE derived SET value = $1 WHERE kind = $2 AND key = $3 AND value = $4")
+                .bind(new.as_ref())
+                .bind(kind)
+                .bind(key.as_bytes().as_slice())
+                .bind(old)
+                .execute(db)
+                .await
+                .map_err(storage)?,
+            None => sqlx::query("INSERT INTO derived (kind, key, value) VALUES ($1, $2, $3) ON CONFLICT (kind, key) DO NOTHING")
+                .bind(kind)
+                .bind(key.as_bytes().as_slice())
+                .bind(new.as_ref())
+                .execute(db)
+                .await
+                .map_err(storage)?,
+        };
+        Ok(done.rows_affected() == 1)
+    }
+
     /// One transaction of two statements, whatever the number of ids.
     async fn delete_changesets(&self, ids: &[ChangesetId], kinds: &[&str]) -> Result<u64> {
         if ids.is_empty() {

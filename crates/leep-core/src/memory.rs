@@ -694,6 +694,22 @@ impl MetaStore for MemoryMetaStore {
             .clone())
     }
 
+    async fn cas_derived(
+        &self,
+        kind: &str,
+        key: &Hash,
+        expected: Option<&[u8]>,
+        new: Bytes,
+    ) -> Result<bool> {
+        let mut all = self.derived.lock().unwrap();
+        let k = (kind.to_string(), *key);
+        if all.get(&k).map(|v| v.as_ref()) != expected {
+            return Ok(false);
+        }
+        all.insert(k, new);
+        Ok(true)
+    }
+
     async fn put_derived_many(&self, rows: &[DerivedRow]) -> Result<()> {
         let mut all = self.derived.lock().unwrap();
         for r in rows {
@@ -1250,6 +1266,52 @@ async fn check_one_lease_scope(store: &dyn MetaStore, key: &LeaseKey, meta: &str
     assert_eq!((x.epoch, y.epoch), (1, 1));
 }
 
+/// `cas_derived` swaps only from the exact expected row (`None` = none),
+/// and of concurrent swaps from one value exactly one wins.
+pub async fn check_cas_derived_contract(store: &dyn MetaStore) {
+    let key = Hash::of_blob(b"cas-derived");
+    let kind = "cas";
+    let cas = |e: Option<&'static [u8]>, n: &'static [u8]| {
+        store.cas_derived(kind, &key, e, Bytes::from_static(n))
+    };
+    assert!(!cas(Some(b"a"), b"b").await.unwrap(), "no row is not `a`");
+    assert!(store.get_derived(kind, &key).await.unwrap().is_none());
+    assert!(cas(None, b"a").await.unwrap());
+    assert!(!cas(None, b"x").await.unwrap(), "a row is there");
+    assert!(!cas(Some(b"b"), b"x").await.unwrap());
+    assert!(!cas(Some(b"a\0"), b"x").await.unwrap(), "exact bytes only");
+    assert_eq!(
+        store.get_derived(kind, &key).await.unwrap().unwrap(),
+        &b"a"[..]
+    );
+    // Swapping to the same bytes succeeds and changes nothing.
+    assert!(cas(Some(b"a"), b"a").await.unwrap());
+    assert!(cas(Some(b"a"), b"b").await.unwrap());
+    assert_eq!(
+        store.get_derived(kind, &key).await.unwrap().unwrap(),
+        &b"b"[..]
+    );
+    // Other keys and kinds are untouched.
+    assert!(store.get_derived("other", &key).await.unwrap().is_none());
+
+    let key = Hash::of_blob(b"cas-derived-raced");
+    store
+        .put_derived(kind, &key, Bytes::from_static(b"start"))
+        .await
+        .unwrap();
+    let racers =
+        (0..16u8).map(|i| store.cas_derived(kind, &key, Some(b"start"), Bytes::from(vec![i])));
+    let won: Vec<bool> = futures_util::future::join_all(racers)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(won.iter().filter(|w| **w).count(), 1, "{won:?}");
+    let stored = store.get_derived(kind, &key).await.unwrap().unwrap();
+    let winner = won.iter().position(|w| *w).unwrap() as u8;
+    assert_eq!(stored, Bytes::from(vec![winner]));
+}
+
 /// Conformance checks every `MetaStore` implementation should pass. Backend
 /// crates call this from their own tests.
 /// `put_derived_if_absent` keeps the first row and gives every caller,
@@ -1354,6 +1416,7 @@ pub async fn check_meta_store_contract(store: &dyn MetaStore) {
     assert!(store.get_derived("other", &key).await.unwrap().is_none());
 
     check_put_derived_if_absent(store).await;
+    check_cas_derived_contract(store).await;
     check_list_derived(store).await;
     check_delete_derived_steps(store).await;
     check_batched_reads(store).await;

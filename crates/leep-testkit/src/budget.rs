@@ -904,6 +904,27 @@ impl MetaStore for Budget {
         Ok(won)
     }
 
+    async fn cas_derived(
+        &self,
+        kind: &str,
+        key: &Hash,
+        expected: Option<&[u8]>,
+        new: Bytes,
+    ) -> Result<bool> {
+        let len = n(new.len());
+        let won = self
+            .meta(
+                "meta.cas_derived",
+                1,
+                len,
+                self.meta.cas_derived(kind, key, expected, new),
+                none,
+            )
+            .await?;
+        self.kind(kind, 1, len);
+        Ok(won)
+    }
+
     async fn put_derived_many(&self, rows: &[DerivedRow]) -> Result<()> {
         self.meta(
             "meta.put_derived_many",

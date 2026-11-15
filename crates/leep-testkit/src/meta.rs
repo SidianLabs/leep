@@ -352,4 +352,20 @@ impl MetaStore for FaultyMetaStore {
             )
             .await
     }
+
+    async fn cas_derived(
+        &self,
+        kind: &str,
+        key: &Hash,
+        expected: Option<&[u8]>,
+        new: Bytes,
+    ) -> Result<bool> {
+        self.plan
+            .run(
+                Op::PutDerived,
+                self.inner.cas_derived(kind, key, expected, new),
+                |_, v| v,
+            )
+            .await
+    }
 }
