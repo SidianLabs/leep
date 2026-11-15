@@ -17,8 +17,12 @@
 //!   `objects/` after `git gc` for the same history;
 //! - `leep_blob_store_size_ratio`.
 //!
-//! The budgets are about 1.5 times the values measured when they were set
-//! (docs/PERFORMANCE.md, "Storage size guard"). If a change trips one on
+//! After the lands it runs one `gc` with the server stopped and checks that
+//! the marks are segments in the blob store, about 32 bytes a mark, and that
+//! no `gc-mark-v1` row is written (ADR 0103).
+//!
+//! The budgets keep 25% or more over the worst value measured when they were
+//! set (docs/PERFORMANCE.md, "Storage size guard"). If a change trips one on
 //! purpose, measure again and move the line in the same change, saying
 //! why. Runs on Postgres when `LEEP_TEST_POSTGRES_URL` is set (as in CI),
 //! on SQLite otherwise; run `cargo build --workspace` first.
@@ -55,6 +59,12 @@ struct Budgets {
     /// rows of the landed files would take (ADR 0102).
     search_blob_per_land: u64,
     search_blob_share: f64,
+    /// Bytes of GC mark segments per mark after one `gc` (ADR 0103): 32
+    /// and a 33-byte header per segment; a `gc-mark-v1` row was about 167
+    /// on Postgres.
+    mark_bytes: f64,
+    /// Database bytes that `gc` added, per mark.
+    gc_db_per_mark: f64,
 }
 
 // Measured when set (ADR 0101, two runs each): blobs 469-474 bytes a land on
@@ -63,24 +73,35 @@ struct Budgets {
 // it the search and history indexes of a history this small; blob store
 // ratio 0.080. With blob rows as patches (ADR 0102, ten runs on each
 // backend): database 7,850-9,966 (SQLite) and 11,605-13,107 (Postgres) a
-// land, all storage 5.4-6.3x and 8.8-9.4x; the budgets keep 40% or more
-// over the worst run.
+// land, all storage 5.4-6.3x and 8.8-9.4x. Measured again with GC marks as
+// segments (ADR 0103, five runs on each backend): blobs 469-474 on both,
+// database 9,284-10,035 (SQLite) and 12,014-13,243 (Postgres), all storage
+// 6.01-6.31x and 8.84-9.24x, blob store ratio 0.080, and one `gc` writing
+// 749 marks as one segment of 32.0 bytes a mark, the database growing 0
+// (SQLite) and 16 KB, 21.9 bytes a mark (Postgres), against about 100 and
+// 167 bytes a `gc-mark-v1` row. The budgets keep at least 25% over the worst
+// run.
 const SQLITE: Budgets = Budgets {
-    blob_per_land: 700,
-    db_per_land: 14_000,
-    ratio_to_git: 9.0,
-    blob_store_ratio: 0.12,
+    blob_per_land: 600,
+    db_per_land: 12_600,
+    ratio_to_git: 7.9,
+    blob_store_ratio: 0.10,
     search_blob_per_land: SEARCH_BLOB_PER_LAND,
     search_blob_share: SEARCH_BLOB_SHARE,
+    mark_bytes: MARK_BYTES,
+    // Pages are 4 KiB: two pages over 749 marks.
+    gc_db_per_mark: 12.0,
 };
 
 const POSTGRES: Budgets = Budgets {
-    blob_per_land: 700,
-    db_per_land: 19_000,
-    ratio_to_git: 14.0,
-    blob_store_ratio: 0.12,
+    blob_per_land: 600,
+    db_per_land: 16_600,
+    ratio_to_git: 11.6,
+    blob_store_ratio: 0.10,
     search_blob_per_land: SEARCH_BLOB_PER_LAND,
     search_blob_share: SEARCH_BLOB_SHARE,
+    mark_bytes: MARK_BYTES,
+    gc_db_per_mark: 28.0,
 };
 
 /// Key and value bytes of the code search blob rows, retired kind included,
@@ -99,6 +120,10 @@ const SEARCH_BLOB_BYTES: &str =
 // bytes, a share of 1.0); the paced lands below count patches directly.
 const SEARCH_BLOB_PER_LAND: u64 = 1_990;
 const SEARCH_BLOB_SHARE: f64 = 0.99;
+/// Segment bytes a mark (ADR 0103): 32.0 measured, a 33-byte header per
+/// segment on top.
+const MARK_BYTES: f64 = 40.0;
+
 /// One-file lands after the measurement, each waiting for the warmer: all
 /// but at most one must store their blob row as a patch.
 const PACED_LANDS: usize = 10;
@@ -414,6 +439,38 @@ fn settle(stores: &Stores, server: &Server, compacted: bool) -> Sizes {
     }
 }
 
+/// `gc-mark-v1` rows, and the mark manifest (ADR 0103).
+fn gc_record(stores: &Stores) -> (i64, Option<leep_derive::gc_segments::Manifest>) {
+    use sqlx::Connection;
+    const ROWS: &str = "SELECT COUNT(*) FROM derived WHERE kind = 'gc-mark-v1'";
+    const MANIFEST: &str = "SELECT value FROM derived WHERE kind = 'gc-mark-segments-v1'";
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (rows, value): (i64, Option<Vec<u8>>) = rt.block_on(async {
+        if stores.meta.starts_with("sqlite:") {
+            let mut c = sqlx::SqliteConnection::connect(&stores.meta).await.unwrap();
+            let rows = sqlx::query_scalar(ROWS).fetch_one(&mut c).await.unwrap();
+            let v = sqlx::query_scalar(MANIFEST)
+                .fetch_optional(&mut c)
+                .await
+                .unwrap();
+            (rows, v)
+        } else {
+            let mut c = sqlx::PgConnection::connect(&stores.meta).await.unwrap();
+            let rows = sqlx::query_scalar(ROWS).fetch_one(&mut c).await.unwrap();
+            let v = sqlx::query_scalar(MANIFEST)
+                .fetch_optional(&mut c)
+                .await
+                .unwrap();
+            (rows, v)
+        }
+    });
+    let manifest = value.map(|v| leep_derive::gc_segments::Manifest::decode(&v).unwrap());
+    (rows, manifest)
+}
+
 fn metric(addr: SocketAddr, name: &str) -> Option<f64> {
     let (status, _, body) = http_get(addr, "/metrics", None);
     assert_eq!(status, 200);
@@ -597,6 +654,27 @@ fn storage_stays_within_its_budgets() {
     let paced_patches = sizes(&stores).patches - after.patches;
     drop(server);
 
+    // One GC with the servers stopped: its marks are segments in the blob
+    // store, 32 bytes a mark, and it writes no `gc-mark-v1` row (ADR 0103).
+    let pre_gc = sizes(&stores);
+    assert_ok(
+        &server_cmd(
+            &stores,
+            &["gc", "--grace", "0", "--fence", "0s", "--unsafe-no-fence"],
+        ),
+        "leep-server gc",
+    );
+    let post_gc = sizes(&stores);
+    let (mark_rows, manifest) = gc_record(&stores);
+    let manifest = manifest.expect("a mark manifest after gc");
+    let marks: u64 = manifest.live.iter().map(|s| s.marks).sum();
+    let segment_bytes: u64 = mark_segment_files(&blobs_dir(&stores))
+        .iter()
+        .map(|p| fs::metadata(p).unwrap().len())
+        .sum();
+    let mark_bytes = segment_bytes as f64 / marks.max(1) as f64;
+    let gc_db_per_mark = post_gc.db.saturating_sub(pre_gc.db) as f64 / marks.max(1) as f64;
+
     // Git's size for the same history.
     for (files, msg) in &landed {
         git_commit(&repo, files, msg);
@@ -626,13 +704,18 @@ fn storage_stays_within_its_budgets() {
          ({db_per_land} per land), total {total} = {ratio:.2}x git ({git_bytes}), \
          blob store ratio {size_ratio:?}, dictionary {dictionary:?}, search blob rows \
          {search_per_land} per land ({search_share:.2} of whole rows' {whole_per_land}), {} \
-         patches over {PACED_LANDS} paced lands, {:.1}s",
+         patches over {PACED_LANDS} paced lands, gc: {marks} marks in {} segments of \
+         {segment_bytes} bytes ({mark_bytes:.1} a mark), db {} -> {} ({gc_db_per_mark:.1} a \
+         mark), {mark_rows} gc-mark-v1 rows, {:.1}s",
         before.blobs,
         after.blobs,
         before.db - empty.db,
         after.db - empty.db,
         empty.db,
         paced_patches,
+        manifest.live.len(),
+        pre_gc.db - empty.db,
+        post_gc.db - empty.db,
         started.elapsed().as_secs_f64()
     );
     println!("{report}");
@@ -672,6 +755,18 @@ fn storage_stays_within_its_budgets() {
         search_share <= budgets.search_blob_share,
         "search blob rows over {} of whole rows: {report}",
         budgets.search_blob_share
+    );
+    assert_eq!(mark_rows, 0, "gc wrote gc-mark-v1 rows: {report}");
+    assert!(marks > 0, "gc marked nothing: {report}");
+    assert!(
+        mark_bytes <= budgets.mark_bytes,
+        "gc mark bytes per mark over {}: {report}",
+        budgets.mark_bytes
+    );
+    assert!(
+        gc_db_per_mark <= budgets.gc_db_per_mark,
+        "database bytes gc wrote per mark over {}: {report}",
+        budgets.gc_db_per_mark
     );
     let out = server_cmd(&stores, &["verify", "--full"]);
     assert_ok(&out, "leep-server verify --full");

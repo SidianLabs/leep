@@ -3192,17 +3192,23 @@ every changeset row compressed. It takes about 20 s.
 
 | Checked | SQLite: measured / budget | Postgres: measured / budget |
 |---|---|---|
-| Blob store bytes per land, settled | 469-474 / 700 | 469 / 700 |
-| Database bytes per land, settled | 7,850-9,966 / 14,000 | 11,605-13,107 / 19,000 |
-| All storage (database above an empty one, plus blobs) over Git's `objects/` after `git gc` (149 KB) | 5.4-6.3x / 9x | 8.8-9.4x / 14x |
-| `leep_blob_store_size_ratio` | 0.080 / 0.12 | 0.080 / 0.12 |
-| Code search blob rows and keyframes per land (key and value bytes) | 1,368-1,499 / 1,990 | 1,267-1,579 / 1,990 |
-| ... over what whole rows of the landed files take (2,001 a land) | 0.68-0.75 / 0.99 | 0.63-0.79 / 0.99 |
+| Blob store bytes per land, settled | 469-474 / 600 | 469-474 / 600 |
+| Database bytes per land, settled | 9,284-10,035 / 12,600 | 12,014-13,243 / 16,600 |
+| All storage (database above an empty one, plus blobs) over Git's `objects/` after `git gc` (149 KB) | 6.01-6.31x / 7.9x | 8.84-9.24x / 11.6x |
+| `leep_blob_store_size_ratio` | 0.080 / 0.10 | 0.080 / 0.10 |
+| Code search blob rows and keyframes per land (key and value bytes) | 1,368-1,616 / 1,990 | 1,267-1,579 / 1,990 |
+| ... over what whole rows of the landed files take (2,001 a land) | 0.68-0.81 / 0.99 | 0.63-0.79 / 0.99 |
+| One `gc` after the lands (servers stopped): mark segment bytes per mark (749 marks) | 32.0 / 40 | 32.0 / 40 |
+| ... database bytes it adds per mark (a `gc-mark-v1` row was about 100 and 167) | 0 / 12 | 21.9 / 28 |
 
-Budgets are about 1.5 times the measured values (two runs each when set by
-ADR 0101; the database lines were measured again and tightened, and the
+Budgets were about 1.5 times the measured values (two runs each when set
+by ADR 0101; the database lines were measured again and tightened, and the
 search lines added, by ADR 0102, ten runs on each backend, keeping at least
-40% over the worst database run and 25% over the worst search run). The
+40% over the worst database run and 25% over the worst search run). ADR
+0103 added the `gc` lines and measured everything again (five runs on each
+backend; the ranges above), and tightened the blob, database, ratio and
+blob store ratio budgets to at least 25% over the worst run. It left the
+search budgets alone (one SQLite run reached 1,616, 23% under the budget). The
 search blob budgets still fail if blob rows are written whole again (2,001
 bytes a land, a share of 1.0); the share is high for a
 history this short, where most files are edited about three times and
