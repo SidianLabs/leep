@@ -1693,6 +1693,9 @@ async fn gc_under_faults(seed: u64) {
         }
         t += if rng.below(2) == 0 { FENCE + 1 } else { 5 };
         assert_no_dangling(seed, &w).await;
+        if let Err(e) = gc::check_mark_closure(&w.clean).await {
+            panic!("seed {seed} step {step}: {e}");
+        }
     }
 
     // A fault-free pass finishes whatever the dead ones left, and then only
@@ -1794,16 +1797,27 @@ async fn incremental_mark_under_faults(seed: u64) {
         };
         let (r, opts, clock) = (gc_repo.clone(), gc_opts(), TestClock::at(t));
         let collecting = rng.below(2) == 0;
+        // Now and then a full mark, which replaces the record only at its
+        // end (ADR 0103 section 5).
+        let mode = if rng.below(5) == 0 {
+            gc::Mark::Full
+        } else {
+            gc::Mark::Incremental
+        };
         let gc_run = tokio::spawn(async move {
             // Dying mid-run is the point; the result is not.
             if collecting {
-                let _ =
-                    leep_testkit::cancel_after_polls(gc::collect(&r, &opts, &clock), kill_after)
-                        .await;
+                let _ = leep_testkit::cancel_after_polls(
+                    gc::collect_with(&r, &opts, mode, &clock),
+                    kill_after,
+                )
+                .await;
             } else {
-                let _ =
-                    leep_testkit::cancel_after_polls(gc::condemn(&r, &opts, &clock), kill_after)
-                        .await;
+                let _ = leep_testkit::cancel_after_polls(
+                    gc::condemn_with(&r, &opts, mode, &clock),
+                    kill_after,
+                )
+                .await;
             }
         });
         gc_run.await.unwrap();
@@ -1811,8 +1825,16 @@ async fn incremental_mark_under_faults(seed: u64) {
             tips.push(c.await.unwrap());
         }
         t += FENCE + 1;
+        // What the killed run left: every prefix of the live segments a
+        // reader would trust is closed (ADR 0103).
+        if let Err(e) = gc::check_mark_closure(&w.clean).await {
+            panic!("seed {seed} round {round}: {e}");
+        }
         if let Err(e) = gc::check_incremental_mark(&w.clean).await {
             panic!("seed {seed} round {round}: {e}");
+        }
+        if let Err(e) = gc::check_mark_closure(&w.clean).await {
+            panic!("seed {seed} round {round}, after a clean run: {e}");
         }
         assert_no_dangling(seed, &w).await;
     }
