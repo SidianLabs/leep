@@ -181,6 +181,12 @@ pub struct Args {
     /// minutes) so the automatic delta repack runs within a soak.
     #[arg(long, default_value = "2m")]
     pub auto_repack_max_age: String,
+    /// The server's `--derived-segments` (ADR 0104). Not `off`, the harness
+    /// also gives it small limits and passes every 5 s, so seals, merges and
+    /// (in `retire`) row deletions happen under load; a run of a minute or
+    /// more fails unless a pass sealed and, in `retire`, deleted rows.
+    #[arg(long, default_value = "retire")]
+    pub derived_segments: String,
     /// An earlier report.json to compare against.
     #[arg(long)]
     pub baseline: Option<PathBuf>,

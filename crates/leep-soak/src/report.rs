@@ -206,6 +206,34 @@ pub fn write(i: Inputs) -> Result<bool> {
         }
         None => thresholds.push(json!({ "name": "blob store size ratio, second half (max)", "limit": args.max_blob_store_ratio, "value": null, "pass": true, "note": "no automatic delta repack ran in the second half" })),
     }
+    // Derived segments (ADR 0104): passes ran under the load, sealed, and
+    // in mode retire deleted rows. Counted over every server incarnation.
+    if !tr.scrapes.is_empty() && args.derived_segments != "off" && run_secs >= 60.0 {
+        let sum = |p: &str| -> f64 {
+            tr.scrapes
+                .iter()
+                .map(|m| crate::metrics::sum_prefix(m, p))
+                .sum()
+        };
+        let passes = sum("leep_derived_segment_passes_total{outcome=\"ok\"}");
+        let live = tr.scrapes.last().map_or(0.0, |m| {
+            crate::metrics::sum_prefix(m, "leep_derived_segments_live")
+        });
+        let retired = sum("leep_derived_segment_rows_retired_total");
+        let retire = args.derived_segments == "retire";
+        let pass = passes >= 1.0 && live >= 1.0 && (!retire || retired >= 1.0);
+        thresholds.push(json!({ "name": "derived segment passes (ok, live segments, rows retired)", "limit": "at least one pass sealed (and retired)", "value": [passes, live, retired], "pass": pass }));
+        if !pass {
+            push_violation(
+                sh,
+                "derived_segments_idle",
+                format!(
+                    "derived segment passes did not do their work: {passes} passes, {live} live \
+                     segments, {retired} rows retired"
+                ),
+            );
+        }
+    }
     let acks = sh.ledger.len();
     let lands = acks as f64;
     if args.duration.as_secs() >= 10 && acks == 0 {
