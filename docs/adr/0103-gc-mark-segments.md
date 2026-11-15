@@ -195,8 +195,9 @@ record (section 5).
 ### 10. Cost
 A run loads every live segment it trusts into memory at the start of its
 mark: 32 bytes a mark (corpus B about 0.6 MB; the 82,500-commit git/git of
-ADR 0033 about 9 MB; a Linux-sized store with about 10 million objects
-about 320 MB, about what a full mark's walked set already takes). Lookups
+ADR 0033, 326,731 objects and its changesets, about 13 MB; a Linux-sized
+store with about 10 million objects about 320 MB, less than a full mark's
+walked set already takes). Lookups
 are binary searches in memory, so an incremental run makes no row reads
 for marks once the rows are retired. A follow-up can read segments by
 range if the memory matters.
@@ -229,7 +230,16 @@ plan's item A1 (derived data as segments in the blob store) is accepted,
 the kinds that move would be rewritten twice. It gets its own ADR.
 
 ## Consequences
-- New stores never hold `gc-mark-v1` rows.
+- New stores never hold `gc-mark-v1` rows. Measured (docs/PERFORMANCE.md,
+  "Marks as segments"): after one GC, corpus B takes 23.54 MB on Postgres
+  instead of 25.96 MB (3.58x Git instead of 3.95x) and 20.78 MB on SQLite
+  instead of 22.25 MB; its marks take 0.59 MB of segments instead of
+  3.07 MB (Postgres) and 2.04 MB (SQLite) of rows. A GC after 400 lands
+  adds 256 bytes a land instead of 1,311 (Postgres) and 881 (SQLite). GC
+  passes got faster: on B, an incremental run 0.25 to 0.20 s (Postgres)
+  and 0.32 to 0.20 s (SQLite), a first run 0.84 to 0.70 s and 1.32 to
+  0.79 s. Lands are untouched (perf-ratio: server CPU per land 2.9 to
+  4.2 ms before, 2.7 to 3.3 ms after).
 - Every GC run with new marks writes a segment and a manifest row. A
   segment is a loose object until the background repack packs it.
 - `gc` prints `mark segments` and the retired segments it condemned or
