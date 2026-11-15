@@ -1086,6 +1086,16 @@ impl leep_core::MetaStore for CountingReads {
     async fn put_derived_many(&self, rows: &[leep_core::DerivedRow]) -> leep_core::Result<()> {
         self.inner.put_derived_many(rows).await
     }
+
+    async fn cas_derived(
+        &self,
+        kind: &str,
+        key: &Hash,
+        expected: Option<&[u8]>,
+        new: Bytes,
+    ) -> leep_core::Result<bool> {
+        self.inner.cas_derived(kind, key, expected, new).await
+    }
 }
 
 /// The most batched row reads that many concurrent searches had in flight
@@ -1351,6 +1361,16 @@ impl leep_core::MetaStore for Probe {
             *w.entry((r.kind.clone(), r.key)).or_default() += 1;
         }
         result
+    }
+
+    async fn cas_derived(
+        &self,
+        kind: &str,
+        key: &Hash,
+        expected: Option<&[u8]>,
+        new: Bytes,
+    ) -> leep_core::Result<bool> {
+        self.inner.cas_derived(kind, key, expected, new).await
     }
 }
 

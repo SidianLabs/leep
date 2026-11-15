@@ -61,6 +61,9 @@ pub(crate) const CHECKPOINT_MARKS: usize = if cfg!(test) { 7 } else { 1 << 18 };
 pub(crate) const MAX_SEGMENT_MARKS: u64 = if cfg!(test) { 20 } else { 1 << 22 };
 
 /// Overrides of [`CHECKPOINT_MARKS`] and [`MAX_SEGMENT_MARKS`] (0: none).
+/// Process-global, so only built with the `test-hooks` feature, which only
+/// test crates enable: a release binary cannot have its limits changed.
+#[cfg(feature = "test-hooks")]
 static LIMITS: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -69,6 +72,7 @@ static LIMITS: [std::sync::atomic::AtomicU64; 2] = [
 /// For integration tests only: make every run in this process checkpoint
 /// every `checkpoint` marks and cap merges at `max_segment` marks, so that
 /// checkpoints and merges run against real backends with small histories.
+#[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub fn set_limits_for_tests(checkpoint: usize, max_segment: u64) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -76,20 +80,24 @@ pub fn set_limits_for_tests(checkpoint: usize, max_segment: u64) {
     LIMITS[1].store(max_segment, Relaxed);
 }
 
+/// The override at `i`, if a test set one.
+fn limit_override(i: usize) -> Option<u64> {
+    #[cfg(feature = "test-hooks")]
+    if let n @ 1.. = LIMITS[i].load(std::sync::atomic::Ordering::Relaxed) {
+        return Some(n);
+    }
+    let _ = i;
+    None
+}
+
 /// Marks a run holds before it publishes them.
 pub(crate) fn checkpoint_marks() -> usize {
-    match LIMITS[0].load(std::sync::atomic::Ordering::Relaxed) {
-        0 => CHECKPOINT_MARKS,
-        n => n as usize,
-    }
+    limit_override(0).map_or(CHECKPOINT_MARKS, |n| n as usize)
 }
 
 /// Marks a merge may produce at most.
 fn max_segment_marks() -> u64 {
-    match LIMITS[1].load(std::sync::atomic::Ordering::Relaxed) {
-        0 => MAX_SEGMENT_MARKS,
-        n => n,
-    }
+    limit_override(1).unwrap_or(MAX_SEGMENT_MARKS)
 }
 
 /// Retired segments the manifest remembers, for reporting. Beyond this the
@@ -279,6 +287,21 @@ pub fn is_segment(hash: &Hash, data: &[u8]) -> bool {
     data.starts_with(&segment_prefix()) && Hash::of_blob(data) == *hash
 }
 
+/// Whether a failed segment read is definite corruption, which ends the
+/// trusted prefix and retires the segments from there on for good. Narrower
+/// than `verify`'s damage test: only `Encoding` or a storage error that
+/// starts with "corrupt" (a packed copy failing its checksum). A `NotFound`
+/// or a message saying "missing" can be a repack caught mid-swap; retiring
+/// on it would throw away the manifest's tail for a transient error, so the
+/// run aborts and the next one reads again (ADR 0103 section 8).
+pub(crate) fn segment_reads_corrupt(e: &Error) -> bool {
+    match e {
+        Error::Encoding(_) => true,
+        Error::Storage(m) => m.starts_with("corrupt"),
+        _ => false,
+    }
+}
+
 /// What reading the manifest row found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ManifestRead {
@@ -430,10 +453,10 @@ impl MarkRecord {
             .map(|m| m.live.clone())
             .unwrap_or_default();
         for (i, s) in live.iter().enumerate() {
-            // A segment that is gone, that the store reports damaged, or
-            // that does not decode ends the trusted prefix. Any other error
-            // (transient: a lost connection) aborts the run, like every
-            // other read, rather than throwing the record away.
+            // A segment that is not stored, that the store reports corrupt,
+            // or that does not decode ends the trusted prefix. Any other
+            // error aborts the run, like every other read, rather than
+            // throwing the record away: see `segment_reads_corrupt`.
             let hashes = match repo.blobs().get(&s.hash).await {
                 Ok(Some(data)) => match decode_segment(&s.hash, &data) {
                     Ok(h) => Some(h),
@@ -450,7 +473,7 @@ impl MarkRecord {
                     );
                     None
                 }
-                Err(e) if crate::integrity::problems::damage_of(&e).is_some() => {
+                Err(e) if segment_reads_corrupt(&e) => {
                     tracing::warn!(segment = %s.hash, "gc mark segment reads damaged: {e}");
                     None
                 }
@@ -474,6 +497,33 @@ impl MarkRecord {
             }
         }
         Ok(rec)
+    }
+
+    /// Fail with `Conflict` unless the manifest row still holds the bytes
+    /// this run last read or wrote. A run trusts the `gc-mark-v1` rows from
+    /// what it loaded; if its host stalled past its lease while
+    /// `gc --retire-mark-rows` imported and deleted them, a row read would
+    /// answer "no row" for a referenced object. Called after every row read
+    /// that condemn or collect act on, and before their blob loops: the
+    /// import swaps the manifest before any row is deleted, so a row read
+    /// followed by an unchanged manifest saw every row (ADR 0103 section 8).
+    /// Dry runs hold no lease and delete nothing, and are not checked.
+    pub(crate) async fn recheck(&self, repo: &Repo) -> Result<()> {
+        if !self.write {
+            return Ok(());
+        }
+        let now = repo
+            .meta()
+            .get_derived(GC_MARK_SEGMENTS, &MANIFEST_KEY)
+            .await?;
+        if now != self.raw {
+            return Err(Error::Conflict(format!(
+                "the {GC_MARK_SEGMENTS} row changed under this run (another garbage \
+                 collection wrote it after this one lost its lease); this run stopped, \
+                 run it again"
+            )));
+        }
+        Ok(())
     }
 
     /// Whether this run consults what earlier runs recorded.
@@ -896,6 +946,30 @@ mod tests {
         let empty = Manifest::default().encode();
         assert_eq!(empty.len(), 2 + 4 + 4 + 32);
         assert_eq!(Manifest::decode(&empty).unwrap(), Manifest::default());
+    }
+
+    #[test]
+    fn only_definite_corruption_ends_the_trusted_prefix() {
+        let corrupt = [
+            Error::Encoding("bad zstd frame".into()),
+            Error::Storage("corrupt packed object x in pack y: checksum".into()),
+        ];
+        for e in &corrupt {
+            assert!(segment_reads_corrupt(e), "{e}");
+        }
+        let transient = [
+            Error::Storage("pack holding x is listed but its .pack is missing".into()),
+            Error::Storage("connection reset; object missing from response".into()),
+            Error::NotFound("blob x".into()),
+            Error::Storage("timed out".into()),
+            Error::Other("corrupt".into()),
+        ];
+        for e in &transient {
+            assert!(!segment_reads_corrupt(e), "{e}");
+        }
+        // `verify` still files the "missing" ones as damage.
+        assert!(crate::integrity::problems::damage_of(&transient[0]).is_some());
+        assert!(crate::integrity::problems::damage_of(&transient[2]).is_some());
     }
 
     #[test]

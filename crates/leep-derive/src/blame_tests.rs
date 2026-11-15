@@ -165,6 +165,16 @@ impl MetaStore for Slow {
     async fn delete_derived_kind(&self, kind: &str) -> leep_core::Result<u64> {
         self.inner.delete_derived_kind(kind).await
     }
+
+    async fn cas_derived(
+        &self,
+        kind: &str,
+        key: &Hash,
+        expected: Option<&[u8]>,
+        new: Bytes,
+    ) -> leep_core::Result<bool> {
+        self.inner.cas_derived(kind, key, expected, new).await
+    }
 }
 
 fn slow_repo() -> (Repo, Arc<Slow>) {

@@ -1267,7 +1267,7 @@ async fn check_one_lease_scope(store: &dyn MetaStore, key: &LeaseKey, meta: &str
 }
 
 /// `cas_derived` swaps only from the exact expected row (`None` = none),
-/// and of concurrent swaps from one value exactly one wins.
+/// and of concurrent swaps from one value, or from no row, exactly one wins.
 pub async fn check_cas_derived_contract(store: &dyn MetaStore) {
     let key = Hash::of_blob(b"cas-derived");
     let kind = "cas";
@@ -1301,6 +1301,19 @@ pub async fn check_cas_derived_contract(store: &dyn MetaStore) {
         .unwrap();
     let racers =
         (0..16u8).map(|i| store.cas_derived(kind, &key, Some(b"start"), Bytes::from(vec![i])));
+    let won: Vec<bool> = futures_util::future::join_all(racers)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(won.iter().filter(|w| **w).count(), 1, "{won:?}");
+    let stored = store.get_derived(kind, &key).await.unwrap().unwrap();
+    let winner = won.iter().position(|w| *w).unwrap() as u8;
+    assert_eq!(stored, Bytes::from(vec![winner]));
+
+    // Racing first writers: from no row, too, exactly one wins.
+    let key = Hash::of_blob(b"cas-derived-raced-absent");
+    let racers = (0..16u8).map(|i| store.cas_derived(kind, &key, None, Bytes::from(vec![i])));
     let won: Vec<bool> = futures_util::future::join_all(racers)
         .await
         .into_iter()
@@ -2908,6 +2921,15 @@ mod tests {
         }
         async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
             self.0.put_derived(kind, key, value).await
+        }
+        async fn cas_derived(
+            &self,
+            kind: &str,
+            key: &Hash,
+            expected: Option<&[u8]>,
+            new: Bytes,
+        ) -> Result<bool> {
+            self.0.cas_derived(kind, key, expected, new).await
         }
     }
 

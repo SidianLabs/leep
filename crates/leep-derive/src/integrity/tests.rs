@@ -1758,6 +1758,16 @@ impl MetaStore for Estimated {
             exact: false,
         })
     }
+
+    async fn cas_derived(
+        &self,
+        kind: &str,
+        key: &Hash,
+        expected: Option<&[u8]>,
+        new: Bytes,
+    ) -> leep_core::Result<bool> {
+        self.inner.cas_derived(kind, key, expected, new).await
+    }
 }
 
 /// The plan estimates, but counts where a decision depends on it: an

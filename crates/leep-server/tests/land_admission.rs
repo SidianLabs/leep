@@ -133,6 +133,15 @@ impl MetaStore for GatedMeta {
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
         self.inner.put_derived(kind, key, value).await
     }
+    async fn cas_derived(
+        &self,
+        kind: &str,
+        key: &Hash,
+        expected: Option<&[u8]>,
+        new: Bytes,
+    ) -> Result<bool> {
+        self.inner.cas_derived(kind, key, expected, new).await
+    }
     async fn put_derived_many(&self, rows: &[leep_core::DerivedRow]) -> Result<()> {
         self.inner.put_derived_many(rows).await
     }

@@ -823,6 +823,16 @@ impl MetaStore for Tamper {
     ) -> Result<bool> {
         self.inner.release_lease(key, holder, epoch).await
     }
+
+    async fn cas_derived(
+        &self,
+        kind: &str,
+        key: &leep_core::Hash,
+        expected: Option<&[u8]>,
+        new: Bytes,
+    ) -> Result<bool> {
+        self.inner.cas_derived(kind, key, expected, new).await
+    }
 }
 
 /// A branching history with a merge, deletes and nested directories, built

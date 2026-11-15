@@ -170,6 +170,16 @@ impl MetaStore for Pausable {
         self.gate().await;
         self.inner.release_lease(key, holder, epoch).await
     }
+
+    async fn cas_derived(
+        &self,
+        kind: &str,
+        key: &Hash,
+        expected: Option<&[u8]>,
+        new: Bytes,
+    ) -> Result<bool> {
+        self.inner.cas_derived(kind, key, expected, new).await
+    }
 }
 
 /// One simulated server process.

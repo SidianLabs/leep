@@ -1578,6 +1578,16 @@ impl leep_core::MetaStore for SlowRefs {
     ) -> leep_core::Result<()> {
         self.0.put_derived(kind, key, value).await
     }
+
+    async fn cas_derived(
+        &self,
+        kind: &str,
+        key: &leep_core::Hash,
+        expected: Option<&[u8]>,
+        new: Bytes,
+    ) -> leep_core::Result<bool> {
+        self.0.cas_derived(kind, key, expected, new).await
+    }
 }
 
 /// `n` changesets from one base, each adding its own file.
@@ -5008,6 +5018,16 @@ mod warm {
             self.note("put_derived_many");
             self.inner.put_derived_many(rows).await
         }
+
+        async fn cas_derived(
+            &self,
+            kind: &str,
+            key: &Hash,
+            expected: Option<&[u8]>,
+            new: Bytes,
+        ) -> leep_core::Result<bool> {
+            self.inner.cas_derived(kind, key, expected, new).await
+        }
     }
 
     /// The warmer's loops make every metadata call in the index lane,
@@ -5219,6 +5239,16 @@ mod create_rows {
         }
         async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
             self.0.put_derived(kind, key, value).await
+        }
+
+        async fn cas_derived(
+            &self,
+            kind: &str,
+            key: &Hash,
+            expected: Option<&[u8]>,
+            new: Bytes,
+        ) -> Result<bool> {
+            self.0.cas_derived(kind, key, expected, new).await
         }
     }
 
@@ -5452,6 +5482,16 @@ mod create_rows {
         }
         async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
             self.inner.put_derived(kind, key, value).await
+        }
+
+        async fn cas_derived(
+            &self,
+            kind: &str,
+            key: &Hash,
+            expected: Option<&[u8]>,
+            new: Bytes,
+        ) -> Result<bool> {
+            self.inner.cas_derived(kind, key, expected, new).await
         }
     }
 

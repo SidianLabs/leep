@@ -351,6 +351,16 @@ impl MetaStore for Racing {
         }
         self.inner.delete_derived_keys(kinds, keys).await
     }
+
+    async fn cas_derived(
+        &self,
+        kind: &str,
+        key: &Hash,
+        expected: Option<&[u8]>,
+        new: Bytes,
+    ) -> Result<bool> {
+        self.inner.cas_derived(kind, key, expected, new).await
+    }
 }
 
 /// A land of old content racing a pass, before it deletes or during the

@@ -131,6 +131,16 @@ impl MetaStore for Counted {
         self.tick();
         self.0.put_derived(kind, key, value).await
     }
+    async fn cas_derived(
+        &self,
+        kind: &str,
+        key: &Hash,
+        expected: Option<&[u8]>,
+        new: Bytes,
+    ) -> Result<bool> {
+        self.tick();
+        self.0.cas_derived(kind, key, expected, new).await
+    }
     async fn put_derived_many(&self, rows: &[DerivedRow]) -> Result<()> {
         self.tick();
         self.0.put_derived_many(rows).await

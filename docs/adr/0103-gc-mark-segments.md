@@ -192,14 +192,28 @@ against the store. Until then the rows cost what they did.
   durable and named. A merge killed half way likewise leaves orphans.
 - **Merges racing readers.** See section 4: only dry runs and `verify` can
   read an older manifest; a collected segment shortens their prefix.
-- **A segment that cannot be read.** Not stored, bytes that fail the
-  checks, or a read the store answers as damaged (a packed copy failing its
-  checksum: `Encoding`, `NotFound`, or a storage error saying "corrupt" or
-  "missing", the same test `verify` uses): the prefix before it is trusted,
-  the run logs a warning and republishes without it and the segments after
-  it. Any other read *error* (a lost connection) aborts the run like every
-  other read error, so a transient failure does not throw away the record.
-  `verify` reports a damaged segment as `bad_gc_segment`.
+- **A segment that cannot be read.** Not stored (the store answers "no
+  such blob"), bytes that fail the checks (address, prefix, version,
+  length, order), or a read the store answers as definitely corrupt (a
+  packed copy failing its checksum: `Encoding`, or a storage error starting
+  "corrupt"): the prefix before it is trusted, the run logs a warning and
+  republishes without it and the segments after it, which retires them for
+  good. Any other read *error* aborts the run like every other read error,
+  so a transient failure does not throw away the record: a lost connection,
+  but also `NotFound` and a storage error saying "missing" (a pack listed
+  whose file is gone), which a repack caught mid-swap can give. This is
+  narrower than the test `verify` uses to file damage, which counts those
+  too. `verify` reports a damaged segment as `bad_gc_segment`.
+- **Rows deleted under a stale run.** A run that loaded with the rows
+  counting answers "marked?" from them for as long as it runs. If it
+  outlived its lease while `--retire-mark-rows` imported and deleted them,
+  a row read would say "no row" for an object under a row-covered
+  changeset, and collect would delete it. So condemn and collect read the
+  manifest again before their blob loops, and after every row read they act
+  on, and stop with `Conflict` unless it holds exactly the bytes the run
+  last read or wrote. The import swaps the manifest before any row is
+  deleted, so a row read followed by an unchanged manifest saw every row.
+  Dry runs, which hold no lease and delete nothing, are not checked.
 - **A stale lease holder.** A run can outlive its lease: it checks the
   lease before each manifest write, but may stall between the check and the
   write past the 60 s TTL while another holder takes the lease. Such a write
@@ -237,6 +251,20 @@ objects about 320 MB read from the blob store in about three capped
 segments plus a few small ones, less memory than a full mark's walked set
 already takes). Lookups are binary searches in memory, so an incremental
 run makes no row reads for marks once the rows are retired.
+
+A lookup binary-searches every trusted segment in turn until one holds the
+hash, so a miss (the common answer for a walked object) probes all of
+them: about N/cap capped segments plus about log2(cap) smaller ones, each
+probe about log2(segment size) comparisons. That is about 25 probes at
+10 million marks, and about 250 at a billion (238 capped segments plus the
+small ones, some 5,500 comparisons, a few microseconds of cache misses).
+condemn asks once per stored blob and each run once per object it reaches,
+so at a billion marks lookups alone would take hours a pass. Far below
+that it is noise next to the reads. If stores get that large, the lookup
+should become one probe: the blob listing and each page of tree entries
+come in hash order, so a cursor per segment (a merge join), or one merged
+in-memory index, answers in amortized constant time without changing
+anything stored.
 
 On top of that, a run holds the marks it has not published yet (at most
 262,144, 8 MiB) and, while it merges, the merged copy: one merge reads
