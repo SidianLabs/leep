@@ -42,14 +42,15 @@ const BUDGETS: &[Limit] = &[
     Limit::fixed("create", "meta calls", 13),
     Limit::fixed("create", "meta in flight", 1),
     Limit::fixed("create", "blob calls", 6),
-    // The same create on a store whose skiplist and history rows were
-    // sealed into derived segments and deleted (ADR 0104): the same
-    // metadata calls (the segment manifest rides on the first batched read
-    // of a process), plus the segment's index and data blobs, read once
-    // per process.
+    // The same create on a store whose skiplist and history rows (ADR
+    // 0104) and generation, last merge, root tree and log filter rows (ADR
+    // 0105) were sealed into derived segments and deleted: the same
+    // metadata calls (both families' manifests ride on the first batched
+    // read of a process), plus each family's segment index and data blob,
+    // read once per process.
     Limit::fixed("create sealed", "meta calls", 13),
     Limit::fixed("create sealed", "meta in flight", 1),
-    Limit::fixed("create sealed", "blob calls", 8),
+    Limit::fixed("create sealed", "blob calls", 10),
     // Eight creates at once, each as its own actor: still one call at a
     // time each, so the shared pool sees one ask per create.
     Limit::fixed("create x8", "meta in flight per create", 1),
@@ -173,8 +174,8 @@ async fn create_sealed_budget() {
         ..CompactOptions::default()
     };
     let hook = Features {
-        record: Arc::new(|| Box::pin(async { Ok(()) })),
-        recorded: Arc::new(|| Box::pin(async { Ok(true) })),
+        record: Arc::new(|_| Box::pin(async { Ok(()) })),
+        recorded: Arc::new(|_| Box::pin(async { Ok(true) })),
     };
     let mut state = CompactState::default();
     for _ in 0..3 {

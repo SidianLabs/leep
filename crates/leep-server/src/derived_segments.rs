@@ -1,4 +1,4 @@
-//! Derived segments in the server (ADR 0104): a compactor pass every
+//! Derived segments in the server (ADR 0104, 0105): a compactor pass every
 //! `--derived-segments-interval`, under a store-wide lease so one server at
 //! a time runs it, in the index lane (ADR 0073), so it draws on the index
 //! connections and never on the land path's.
@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use leep_core::lane::{scope, Lane};
 use leep_derive::derived_segments::{
-    compact_pass, CompactOptions, CompactState, Features, Mode, PassReport,
+    compact_pass, CompactOptions, CompactState, Features, Mode, PassReport, FAMILIES,
 };
 use leep_derive::Repo;
 
@@ -46,12 +46,28 @@ fn describe() {
     for outcome in ["ok", "busy", "error"] {
         metrics::counter!("leep_derived_segment_passes_total", "outcome" => outcome).increment(0);
     }
-    for kind in ["skiplist", "history-tree-v4"] {
-        metrics::counter!("leep_derived_segment_mismatch_total", "kind" => kind).increment(0);
-        metrics::counter!("leep_derived_segment_rows_retired_total", "kind" => kind).increment(0);
-    }
-    for what in ["manifest", "index", "segment", "missing"] {
-        metrics::counter!("leep_derived_segment_errors_total", "what" => what).increment(0);
+    for fam in FAMILIES {
+        let family = fam.name;
+        for c in fam.columns {
+            let kind = c.kind;
+            metrics::counter!(
+                "leep_derived_segment_mismatch_total",
+                "kind" => kind, "family" => family
+            )
+            .increment(0);
+            metrics::counter!(
+                "leep_derived_segment_rows_retired_total",
+                "kind" => kind, "family" => family
+            )
+            .increment(0);
+        }
+        for what in ["manifest", "index", "segment", "missing"] {
+            metrics::counter!(
+                "leep_derived_segment_errors_total",
+                "what" => what, "family" => family
+            )
+            .increment(0);
+        }
     }
 }
 
@@ -72,22 +88,28 @@ fn record(r: &Option<PassReport>, took: Duration) {
     };
     metrics::counter!("leep_derived_segment_passes_total", "outcome" => "ok").increment(1);
     metrics::histogram!("leep_derived_segment_pass_seconds").record(took.as_secs_f64());
-    metrics::gauge!("leep_derived_segments_live").set(r.live_segments as f64);
-    metrics::gauge!("leep_derived_segment_bytes").set(r.live_bytes as f64);
-    metrics::gauge!("leep_derived_segment_unsealed_rows").set(r.unsealed_rows as f64);
-    if r.sealed_segments > 0 || r.merges > 0 || r.retired_rows > 0 || r.dropped > 0 {
-        tracing::info!(
-            sealed_segments = r.sealed_segments,
-            sealed_changesets = r.sealed_keys,
-            merges = r.merges,
-            retired_rows = r.retired_rows,
-            mismatched = r.mismatched,
-            dropped = r.dropped,
-            live_segments = r.live_segments,
-            live_bytes = r.live_bytes,
-            seconds = took.as_secs_f64(),
-            "derived segments pass (ADR 0104)"
-        );
+    for (family, f) in &r.families {
+        let family = *family;
+        metrics::gauge!("leep_derived_segments_live", "family" => family)
+            .set(f.live_segments as f64);
+        metrics::gauge!("leep_derived_segment_bytes", "family" => family).set(f.live_bytes as f64);
+        metrics::gauge!("leep_derived_segment_unsealed_rows", "family" => family)
+            .set(f.unsealed_rows as f64);
+        if f.sealed_segments > 0 || f.merges > 0 || f.retired_rows > 0 || f.dropped > 0 {
+            tracing::info!(
+                family,
+                sealed_segments = f.sealed_segments,
+                sealed_changesets = f.sealed_keys,
+                merges = f.merges,
+                retired_rows = f.retired_rows,
+                mismatched = f.mismatched,
+                dropped = f.dropped,
+                live_segments = f.live_segments,
+                live_bytes = f.live_bytes,
+                seconds = took.as_secs_f64(),
+                "derived segments pass (ADR 0104, 0105)"
+            );
+        }
     }
 }
 

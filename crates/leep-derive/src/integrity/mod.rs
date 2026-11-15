@@ -7,7 +7,7 @@
 pub mod kinds;
 pub(crate) mod problems;
 pub mod repair;
-mod rows;
+pub(crate) mod rows;
 mod shadow;
 pub mod upgrade;
 pub mod verify;

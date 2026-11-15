@@ -206,8 +206,9 @@ pub fn write(i: Inputs) -> Result<bool> {
         }
         None => thresholds.push(json!({ "name": "blob store size ratio, second half (max)", "limit": args.max_blob_store_ratio, "value": null, "pass": true, "note": "no automatic delta repack ran in the second half" })),
     }
-    // Derived segments (ADR 0104): passes ran under the load, sealed, and
-    // in mode retire deleted rows. Counted over every server incarnation.
+    // Derived segments (ADR 0104, 0105): passes ran under the load, sealed,
+    // and in mode retire deleted rows, in every family. Counted over every
+    // server incarnation.
     if !tr.scrapes.is_empty() && args.derived_segments != "off" && run_secs >= 60.0 {
         let sum = |p: &str| -> f64 {
             tr.scrapes
@@ -221,15 +222,39 @@ pub fn write(i: Inputs) -> Result<bool> {
         });
         let retired = sum("leep_derived_segment_rows_retired_total");
         let retire = args.derived_segments == "retire";
-        let pass = passes >= 1.0 && live >= 1.0 && (!retire || retired >= 1.0);
-        thresholds.push(json!({ "name": "derived segment passes (ok, live segments, rows retired)", "limit": "at least one pass sealed (and retired)", "value": [passes, live, retired], "pass": pass }));
+        // Per family: the last scrape's live segments, rows retired over
+        // every incarnation.
+        let of_family = |m: &BTreeMap<String, f64>, p: &str, family: &str| -> f64 {
+            let label = format!("family=\"{family}\"");
+            m.iter()
+                .filter(|(k, _)| k.starts_with(p) && k.contains(&label))
+                .map(|(_, v)| *v)
+                .sum()
+        };
+        let mut families = Vec::new();
+        let mut families_pass = true;
+        for family in ["changeset-v1", "changeset-v2"] {
+            let live = tr
+                .scrapes
+                .last()
+                .map_or(0.0, |m| of_family(m, "leep_derived_segments_live", family));
+            let retired: f64 = tr
+                .scrapes
+                .iter()
+                .map(|m| of_family(m, "leep_derived_segment_rows_retired_total", family))
+                .sum();
+            families_pass &= live >= 1.0 && (!retire || retired >= 1.0);
+            families.push(json!({ "family": family, "live": live, "retired": retired }));
+        }
+        let pass = passes >= 1.0 && live >= 1.0 && (!retire || retired >= 1.0) && families_pass;
+        thresholds.push(json!({ "name": "derived segment passes (ok, live segments, rows retired)", "limit": "at least one pass sealed (and retired), in every family", "value": [passes, live, retired, families], "pass": pass }));
         if !pass {
             push_violation(
                 sh,
                 "derived_segments_idle",
                 format!(
                     "derived segment passes did not do their work: {passes} passes, {live} live \
-                     segments, {retired} rows retired"
+                     segments, {retired} rows retired; by family {families:?}"
                 ),
             );
         }

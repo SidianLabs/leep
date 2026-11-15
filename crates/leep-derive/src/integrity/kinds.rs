@@ -402,16 +402,17 @@ static KINDS: &[KindInfo] = &[
     KindInfo {
         name: crate::derived_segments::MANIFEST_KIND,
         class: KindClass::Bookkeeping,
-        summary: "the manifest of derived segments in the blob store, which hold skiplist and \
-                  history-tree-v4 values (ADR 0104)",
+        summary: "the manifests of derived segments in the blob store, one per family, which \
+                  hold skiplist, history-tree-v4, generation, last_merge-v1, root_tree and \
+                  log-filter-v1 values (ADR 0104, 0105)",
         rederive: Rederive::No(
             "the next derived-segments pass seals the rows again; segment values are \
-             checked and rederived as skiplist and history-tree-v4",
+             checked and rederived as the kinds they hold",
         ),
         drop: DropPolicy::Refused(
             "after --derived-segments retire it names the only copy of deleted rows; drop \
-             skiplist or history-tree-v4 instead, which also stops the segments answering for \
-             them",
+             the kinds the segments hold instead, which also stops the segments answering \
+             for them",
         ),
     },
     KindInfo {

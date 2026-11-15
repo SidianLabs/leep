@@ -73,8 +73,10 @@ fn plant(stores: &Stores, n: usize) -> Vec<ChangesetId> {
     })
 }
 
-/// Both values of every changeset as a new process reads them; history
-/// parts by content.
+/// The values of every changeset a segment family holds and every
+/// changeset has (`skiplist`, `history-tree-v4`; `generation`, `root_tree`
+/// of `changeset-v2`) as a new process reads them; history parts by
+/// content.
 fn values(stores: &Stores, ids: &[ChangesetId]) -> Vec<Option<Vec<u8>>> {
     let repo = open_repo(stores);
     let keys: Vec<Hash> = ids.iter().map(|i| i.0).collect();
@@ -99,13 +101,23 @@ fn values(stores: &Stores, ids: &[ChangesetId]) -> Vec<Option<Vec<u8>>> {
                     .into_owned()
             }));
         }
+        for kind in ["generation", "root_tree"] {
+            out.extend(
+                repo.meta()
+                    .get_derived_many(kind, &keys)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|v| v.map(|b| b.to_vec())),
+            );
+        }
         out
     })
 }
 
-/// Rows of the two kinds as a binary that predates segments reads them:
-/// the database alone.
-fn rows(stores: &Stores) -> (u64, u64) {
+/// Rows of `skiplist`, `history-tree-v4`, `generation` and `root_tree` as
+/// a binary that predates segments reads them: the database alone.
+fn rows(stores: &Stores) -> (u64, u64, u64, u64) {
     let meta = rt()
         .block_on(leep_meta::open_meta_store(&stores.meta))
         .unwrap();
@@ -113,20 +125,25 @@ fn rows(stores: &Stores) -> (u64, u64) {
         (
             meta.count_derived("skiplist").await.unwrap(),
             meta.count_derived("history-tree-v4").await.unwrap(),
+            meta.count_derived("generation").await.unwrap(),
+            meta.count_derived("root_tree").await.unwrap(),
         )
     })
 }
 
-/// Changesets of `ids` a live segment holds both values of.
+/// Changesets of `ids` live segments of both families hold.
 fn sealed(stores: &Stores, ids: &[ChangesetId]) -> usize {
     let repo = open_repo(stores);
     rt().block_on(async {
-        let (raw, _) = ds::read_manifest(&repo).await.unwrap();
-        repo.segments().apply(raw).await.unwrap();
+        repo.segments().refresh(&**repo.row_meta()).await.unwrap();
+        let v1 = repo.segments().family(ds::FAMILY_CHANGESET).clone();
+        let v2 = repo.segments().family(ds::FAMILY_CHANGESET_V2).clone();
         ids.iter()
             .filter(|id| {
-                repo.segments().holds(&id.0, COL_SKIPLIST)
-                    && repo.segments().holds(&id.0, COL_HISTORY_TREE)
+                v1.holds(&id.0, COL_SKIPLIST)
+                    && v1.holds(&id.0, COL_HISTORY_TREE)
+                    && v2.holds(&id.0, ds::COL_GENERATION)
+                    && v2.holds(&id.0, ds::COL_ROOT_TREE)
             })
             .count()
     })
@@ -145,6 +162,8 @@ fn segment_server(stores: &Stores, root: &Path, mode: &str) -> Server {
             "0s",
             "--derived-segments-interval",
             "500ms",
+            "--derived-segments-retire-families",
+            "all",
         ],
     )
 }
@@ -192,7 +211,7 @@ fn build_then_retire(stores: Stores, root: &Path) {
     let want = values(&stores, &made);
     assert!(want.iter().all(Option::is_some));
     let before = rows(&stores);
-    assert_eq!(before, (120, 120));
+    assert_eq!(before, (120, 120, 120, 120));
 
     // Build: segments appear, every row stays.
     let server = segment_server(&stores, root, "build");
@@ -202,7 +221,9 @@ fn build_then_retire(stores: Stores, root: &Path) {
     drop(server);
     assert_eq!(rows(&stores), before, "build mode deletes no row");
     assert!(
-        !features(&stores).iter().any(|f| f == "derived-segments"),
+        !features(&stores)
+            .iter()
+            .any(|f| f.starts_with("derived-segments")),
         "build mode records no feature"
     );
     assert_eq!(values(&stores, &made), want);
@@ -230,11 +251,15 @@ fn build_then_retire(stores: Stores, root: &Path) {
             .block_on(leep_meta::open_meta_store(&old.meta))
             .unwrap();
         rt().block_on(async {
-            assert!(
-                meta.delete_derived_keys(&[ds::MANIFEST_KIND], &[ds::manifest_key()])
+            let keys = [
+                ds::manifest_key(ds::FAMILY_CHANGESET),
+                ds::manifest_key(ds::FAMILY_CHANGESET_V2),
+            ];
+            assert_eq!(
+                meta.delete_derived_keys(&[ds::MANIFEST_KIND], &keys)
                     .await
-                    .unwrap()
-                    == 1
+                    .unwrap(),
+                2
             );
         });
         drop(meta);
@@ -242,17 +267,50 @@ fn build_then_retire(stores: Stores, root: &Path) {
         verify_full(&old, "verify --full of the rolled-back copy");
     }
 
-    // Retire: the feature first, then the rows go; everything still reads.
+    // Retire without naming the second family (a fleet already in retire
+    // upgrading): changeset-v1 passes its door, changeset-v2 does not
+    // (ADR 0105).
+    let server = Server::start_with(
+        free_port(),
+        &stores,
+        root,
+        &[
+            "--derived-segments",
+            "retire",
+            "--debug-derived-segments-small",
+            "--debug-derived-segments-first",
+            "0s",
+            "--derived-segments-interval",
+            "500ms",
+        ],
+    );
+    wait_for("retire deletes the changeset-v1 rows", &server, || {
+        let r = rows(&stores);
+        r.0 == 0 && r.1 == 0
+    });
+    // A few more passes: still none of the second family's rows go.
+    std::thread::sleep(Duration::from_secs(2));
+    drop(server);
+    assert_eq!(rows(&stores), (0, 0, 120, 120));
+    let f = features(&stores);
+    assert!(f.iter().any(|g| g == "derived-segments"), "{f:?}");
+    assert!(!f.iter().any(|g| g == "derived-segments-2"), "{f:?}");
+    assert_eq!(values(&stores, &made), want);
+
+    // Retire naming every family: the feature first, then the rows go;
+    // everything still reads.
     let server = segment_server(&stores, root, "retire");
     wait_for("retire deletes the rows", &server, || {
-        rows(&stores) == (0, 0)
+        rows(&stores) == (0, 0, 0, 0)
     });
     drop(server);
-    assert!(
-        features(&stores).iter().any(|f| f == "derived-segments"),
-        "{:?}",
-        features(&stores)
-    );
+    for f in ["derived-segments", "derived-segments-2"] {
+        assert!(
+            features(&stores).iter().any(|g| g == f),
+            "{f}: {:?}",
+            features(&stores)
+        );
+    }
     assert_eq!(values(&stores, &made), want);
     verify_full(&stores, "verify --full after retire");
     // A server with passes off still reads them, and GC keeps them.
@@ -301,7 +359,7 @@ fn restore_drill_with_a_manifest_ahead_of_the_blob_copy() {
     let want = values(&stores, &made);
     let server = segment_server(&stores, root, "retire");
     wait_for("retire deletes the rows", &server, || {
-        rows(&stores) == (0, 0)
+        rows(&stores) == (0, 0, 0, 0)
     });
     drop(server);
     let out_dir = root.join("backup");
@@ -315,7 +373,9 @@ fn restore_drill_with_a_manifest_ahead_of_the_blob_copy() {
 
     // Lose the newest live segment from the blob copy.
     let repo = open_repo(&stores);
-    let (_, read) = rt().block_on(ds::read_manifest(&repo)).unwrap();
+    let (_, read) = rt()
+        .block_on(ds::read_manifest(&repo, ds::FAMILY_CHANGESET))
+        .unwrap();
     let ManifestRead::Read(m) = read else {
         panic!("no manifest")
     };
@@ -372,7 +432,9 @@ fn restore_drill_with_a_manifest_ahead_of_the_blob_copy() {
     let server = segment_server(&dest, root, "build");
     wait_for("the lost segment is dropped", &server, || {
         let repo = open_repo(&dest);
-        let (_, read) = rt().block_on(ds::read_manifest(&repo)).unwrap();
+        let (_, read) = rt()
+            .block_on(ds::read_manifest(&repo, ds::FAMILY_CHANGESET))
+            .unwrap();
         matches!(read, ManifestRead::Read(m) if !m.live.iter().any(|s| s.index == lost.index))
     });
     drop(server);

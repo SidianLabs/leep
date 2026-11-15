@@ -144,7 +144,7 @@ pub async fn rederive(
     crate::gc_lease::release(lease, result).await
 }
 
-/// Whether derived segments may hold values of `kind` (ADR 0104).
+/// Whether derived segments may hold values of `kind` (ADR 0104, 0105).
 fn segmented(kind: &str) -> bool {
     crate::derived_segments::codec::kind_column(kind).is_some()
 }
@@ -712,7 +712,7 @@ pub async fn drop_kinds(
         // Derived segments stop answering for the dropped kinds first, and
         // the lease, held to the end, keeps any pass from sealing the rows
         // being dropped (ADR 0104).
-        let cols: Vec<u8> = order
+        let cols: Vec<(u8, u8)> = order
             .iter()
             .filter_map(|k| crate::derived_segments::codec::kind_column(k))
             .collect();
@@ -720,7 +720,17 @@ pub async fn drop_kinds(
             None
         } else {
             let lease = crate::derived_segments::acquire_for(repo, "repair-drop").await?;
-            let n = crate::derived_segments::drop_columns(repo, &lease, &cols).await?;
+            let mut n = 0;
+            for fam in crate::derived_segments::FAMILIES {
+                let mine: Vec<u8> = cols
+                    .iter()
+                    .filter(|(f, _)| *f == fam.id)
+                    .map(|(_, c)| *c)
+                    .collect();
+                if !mine.is_empty() {
+                    n += crate::derived_segments::drop_columns(repo, &lease, fam.id, &mine).await?;
+                }
+            }
             if n > 0 {
                 progress.info(&format!(
                     "repair: {n} derived segment(s) no longer answer for {}",

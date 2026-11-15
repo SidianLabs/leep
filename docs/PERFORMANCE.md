@@ -3202,6 +3202,8 @@ every changeset row compressed. It takes about 20 s.
 | ... database bytes it adds per mark (a `gc-mark-v1` row was about 100 and 167) | 0 / 12 | 21.9 / 28 |
 | Then a server in `--derived-segments retire` (waits cut): derived segment bytes per changeset (index and data blobs; about 120 changesets) | 57.0-59.2 / 75 | 57.0 / 75 |
 | ... over the key and value bytes of the `skiplist` and `history-tree-v4` rows they replace (64.5 KB) | 0.106-0.111 / 0.14 | 0.106 / 0.14 |
+| ... family `changeset-v2` (ADR 0105): segment bytes per changeset | 73.5 / 92 | 73.5 / 92 |
+| ... over the key and value bytes of the `generation`, `last_merge-v1`, `root_tree` and `log-filter-v1` rows they replace (27.9 KB) | 0.316 / 0.40 | 0.316 / 0.40 |
 
 Budgets were about 1.5 times the measured values (two runs each when set
 by ADR 0101; the database lines were measured again and tightened, and the
@@ -3213,7 +3215,10 @@ blob store ratio budgets to at least 25% over the worst run. ADR 0104 added
 the derived segment lines (three runs on each backend; the other lines read
 as before, one SQLite run at 10,444 database bytes a land and 6.48x, inside
 their budgets, since a default server in mode `build` seals nothing in a
-store this small and quiet for less than 10 minutes). It left the
+store this small and quiet for less than 10 minutes). ADR 0105 added
+the `changeset-v2` lines (three runs on each backend, the same bytes every
+run; the `changeset-v1` lines measured as before) and moved no other
+budget. ADR 0104 left the
 search budgets alone (one SQLite run reached 1,616, 23% under the budget). The
 search blob budgets still fail if blob rows are written whole again (2,001
 bytes a land, a share of 1.0); the share is high for a
@@ -4480,6 +4485,40 @@ checkpoint. All storage is database plus blob store.
   process: B's whole history is one 193 KB blob, read in about a
   millisecond from the filesystem; a hit then decompresses one 64 KiB block
   (about 0.1 ms) and is cached.
+
+### Derived segments, family changeset-v2 (ADR 0105)
+
+Measured like "Derived segments (ADR 0104)" above, on a reconstruction of
+corpus B (Leep's history at 89fb9ad plus 2,000 one-file edits made by a
+script, 2,231 changesets, Git 6.35 MB after `git repack -adf`), release
+builds of f3588f2 ("before", ADR 0104 in `retire`) and this change
+("after", both families in `retire`), local Postgres 16 and SQLite,
+filesystem blob store; `VACUUM FULL` / `VACUUM` after the last `gc`.
+
+| Backend | Before (x Git) | After (x Git) | Change |
+|---|---|---|---|
+| Postgres | 15.85 MB (2.50x) | 14.33 MB (2.26x) | -1.53 MB |
+| SQLite | 15.87 MB (2.50x) | 14.69 MB (2.31x) | -1.17 MB (1,173,213 bytes) |
+
+- Against ADR 0104's Git figure for B (6.58 MB), 2.41x becomes 2.18x on
+  Postgres. The ≤2x target (judged in `retire` after `VACUUM FULL`) needs
+  the code search rows too (ADR 0105, Stage B).
+- The four kinds' rows (2,231 each; `log-filter-v1` 149 bytes a row) took
+  about 1.65 MB on Postgres (the `derived_breakdown` example's estimate,
+  with row overhead);
+  after, one segment of 158,596 bytes (77,007 of index, 81,589 of data, 71
+  bytes a changeset), of which the root trees (73.6 KB under zstd) and the
+  key index are nearly all. Generations and last merges compress to about
+  one byte a row in generation order.
+- Statements: the same per operation (both manifests ride on the first
+  batched read; `budget_tests` "create sealed" 13 metadata calls), plus two
+  blob reads per process for the second family's segment. A single-row
+  read's miss refreshes the manifests with one single-row read per family
+  (two statements, at most once a minute per process), where ADR 0104 read
+  one.
+- Breakdown and candidate encodings: `cargo run --release -p leep-server
+  --example derived_breakdown -- <meta url> <blob url>` (ADR 0105, "Stage
+  0", has the table).
 
 ## Changeset compression
 

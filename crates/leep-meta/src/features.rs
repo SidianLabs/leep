@@ -25,8 +25,21 @@ pub const GC_MARK_SEGMENTS: &str = "gc-mark-segments";
 /// derive whole histories again, and its `gc` would delete live segments.
 pub const DERIVED_SEGMENTS: &str = "derived-segments";
 
+/// Rows of a derived segment family added by ADR 0105 (`changeset-v2`:
+/// `generation`, `last_merge-v1`, `root_tree`, `log-filter-v1`) are being
+/// or have been deleted once a segment holds their values. An ADR 0104
+/// binary knows only `derived-segments`: without these rows it would
+/// derive them again from the root, and its `gc` would delete the new
+/// family's live segments as orphans, so it must refuse the store.
+pub const DERIVED_SEGMENTS_2: &str = "derived-segments-2";
+
 /// Every feature this binary can read.
-pub const KNOWN: &[&str] = &[CHANGESET_ZSTD_DICT, GC_MARK_SEGMENTS, DERIVED_SEGMENTS];
+pub const KNOWN: &[&str] = &[
+    CHANGESET_ZSTD_DICT,
+    GC_MARK_SEGMENTS,
+    DERIVED_SEGMENTS,
+    DERIVED_SEGMENTS_2,
+];
 
 /// Record `name` in the store at `url` (idempotent). `mem://` stores are
 /// never shared with another binary, so there is nothing to record.
@@ -73,10 +86,16 @@ pub async fn has_store_feature(url: &str, mode: crate::SchemaMode, name: &str) -
 
 /// Refuse a store that names a feature this binary does not know.
 pub(crate) fn check(names: &[String]) -> Result<()> {
+    check_against(KNOWN, names)
+}
+
+/// [`check`] for a binary that knows `known`: a test stands in for an older
+/// binary with the list it shipped.
+fn check_against(known: &[&str], names: &[String]) -> Result<()> {
     let unknown: Vec<&str> = names
         .iter()
         .map(String::as_str)
-        .filter(|n| !KNOWN.contains(n))
+        .filter(|n| !known.contains(n))
         .collect();
     if unknown.is_empty() {
         return Ok(());
@@ -99,6 +118,7 @@ mod tests {
         check(&[CHANGESET_ZSTD_DICT.to_string()]).unwrap();
         check(&[GC_MARK_SEGMENTS.to_string()]).unwrap();
         check(&[DERIVED_SEGMENTS.to_string()]).unwrap();
+        check(&[DERIVED_SEGMENTS.to_string(), DERIVED_SEGMENTS_2.to_string()]).unwrap();
         let err = check(&[
             CHANGESET_ZSTD_DICT.to_string(),
             "tree-zstd".to_string(),
@@ -106,6 +126,46 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("(tree-zstd, x)"), "{err}");
+    }
+
+    /// Mixed fleets (ADR 0105): the feature list an ADR 0104 binary shipped
+    /// refuses a store once `derived-segments-2` is recorded, naming it, and
+    /// still opens one with only ADR 0104's feature (mode `build` of the new
+    /// family records nothing, so rolling back from it stays free).
+    #[test]
+    fn an_adr_0104_binary_refuses_a_store_with_the_second_family_retired() {
+        const ADR_0104_KNOWN: &[&str] = &[CHANGESET_ZSTD_DICT, GC_MARK_SEGMENTS, DERIVED_SEGMENTS];
+        check_against(ADR_0104_KNOWN, &[DERIVED_SEGMENTS.to_string()]).unwrap();
+        let err = check_against(
+            ADR_0104_KNOWN,
+            &[DERIVED_SEGMENTS.to_string(), DERIVED_SEGMENTS_2.to_string()],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("(derived-segments-2)"), "{err}");
+        // Even recorded alone (only the new family retired).
+        assert!(check_against(ADR_0104_KNOWN, &[DERIVED_SEGMENTS_2.to_string()]).is_err());
+    }
+
+    /// The same through a real store: once recorded by URL, a binary with
+    /// ADR 0104's list refuses to open it, and this one opens it.
+    #[tokio::test]
+    async fn a_store_with_derived_segments_2_is_refused_by_the_old_check() {
+        const ADR_0104_KNOWN: &[&str] = &[CHANGESET_ZSTD_DICT, GC_MARK_SEGMENTS, DERIVED_SEGMENTS];
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}/m.db?mode=rwc", dir.path().display());
+        let mode = crate::SchemaMode::Migrate;
+        add_store_feature(&url, mode, DERIVED_SEGMENTS_2)
+            .await
+            .unwrap();
+        let store = crate::SqliteMetaStore::connect_with(&url, mode)
+            .await
+            .unwrap();
+        let names = store.features().await.unwrap();
+        check(&names).unwrap();
+        assert!(check_against(ADR_0104_KNOWN, &names).is_err());
+        assert!(has_store_feature(&url, mode, DERIVED_SEGMENTS_2)
+            .await
+            .unwrap());
     }
 
     /// `gc --retire-mark-rows` records its feature by URL; the store still

@@ -1667,20 +1667,33 @@ impl Verifier<'_> {
         Ok(())
     }
 
-    /// The derived segment manifest decodes, and every live segment it
-    /// names decodes whole (ADR 0104): both blobs at their addresses, every
-    /// value. A segment that is not stored is a note: its keys read as rows
-    /// or derive again. The values themselves are checked with the rows,
-    /// since the per-changeset checks read through the segment view.
+    /// Every family's derived segment manifest decodes, and every live
+    /// segment it names decodes whole (ADR 0104, 0105): both blobs at their
+    /// addresses, every value of a column this binary knows. A segment that
+    /// is not stored is a note: its keys read as rows or derive again. The
+    /// values themselves are checked with the rows, since the per-changeset
+    /// checks read through the segment view.
     async fn check_derived_segments(&mut self) -> Result<()> {
+        use crate::derived_segments::FAMILIES;
+        for fam in FAMILIES {
+            self.check_segment_family(fam).await?;
+        }
+        Ok(())
+    }
+
+    async fn check_segment_family(
+        &mut self,
+        fam: &'static crate::derived_segments::Family,
+    ) -> Result<()> {
         use crate::derived_segments::{self as ds, codec, view, ManifestRead, MANIFEST_KIND};
         let kind = MANIFEST_KIND;
-        let m = match ds::read_manifest(self.repo).await?.1 {
+        let name = fam.name;
+        let m = match ds::read_manifest(self.repo, fam.id).await?.1 {
             ManifestRead::Absent => return Ok(()),
             ManifestRead::Newer => {
                 self.notes.push(format!(
-                    "the {kind} row was written by a newer leep-server; its segments are not \
-                     checked by this one"
+                    "the {kind} row of family {name} was written by a newer leep-server; its \
+                     segments are not checked by this one"
                 ));
                 return Ok(());
             }
@@ -1693,11 +1706,13 @@ impl Verifier<'_> {
                         "derived",
                         "bad_derived_manifest",
                         format!(
-                            "{kind} row does not decode: no derived segment is read, and                              garbage collection refuses to run until it is replaced"
+                            "{kind} row of family {name} does not decode: none of its derived \
+                             segments is read, and garbage collection refuses to run until it \
+                             is replaced"
                         ),
                     )
                     .kind(kind)
-                    .key(&ds::manifest_key()),
+                    .key(&fam.manifest_key()),
                 );
                 return Ok(());
             }
@@ -1707,20 +1722,22 @@ impl Verifier<'_> {
             let problem = match self.repo.blobs().contains(&s.index).await {
                 Ok(false) => {
                     self.notes.push(format!(
-                        "derived segment {} is not stored; its keys read as rows or derive                          again, and the next derived-segments pass drops it",
+                        "derived segment {} of family {name} is not stored; its keys read as \
+                         rows or derive again, and the next derived-segments pass drops it",
                         s.index
                     ));
                     None
                 }
                 Err(e) => Some(format!("cannot be read: {e}")),
-                Ok(true) => match view::load_index(&**self.repo.blobs(), s).await {
+                Ok(true) => match view::load_index(&**self.repo.blobs(), fam.id, s).await {
                     Err(e) => Some(format!("cannot be read: {e}")),
                     Ok(None) => Some("index does not decode".to_string()),
                     Ok(Some(idx)) => match self.repo.blobs().get(&s.data).await {
                         Err(e) => Some(format!("data cannot be read: {e}")),
                         Ok(None) => {
                             self.notes.push(format!(
-                                "the data of derived segment {} is not stored; its keys read                                  as rows or derive again",
+                                "the data of derived segment {} of family {name} is not \
+                                 stored; its keys read as rows or derive again",
                                 s.index
                             ));
                             None
@@ -1728,7 +1745,16 @@ impl Verifier<'_> {
                         Ok(Some(bytes)) => match codec::decode_data(&idx, &s.data, bytes)
                             .and_then(|d| codec::read_all(&idx, &d))
                         {
-                            Ok(_) => None,
+                            Ok(_) => {
+                                if idx.has_unknown_columns() {
+                                    self.notes.push(format!(
+                                        "derived segment {} of family {name} holds columns a \
+                                         newer leep-server wrote; this one checks the others",
+                                        s.index
+                                    ));
+                                }
+                                None
+                            }
                             Err(e) => Some(e.to_string()),
                         },
                     },
@@ -1741,7 +1767,8 @@ impl Verifier<'_> {
                         "derived",
                         "bad_derived_segment",
                         format!(
-                            "derived segment {} {what}; its keys read as rows or derive again,                              and the next derived-segments pass drops it",
+                            "derived segment {} of family {name} {what}; its keys read as rows \
+                             or derive again, and the next derived-segments pass drops it",
                             s.index
                         ),
                     )
