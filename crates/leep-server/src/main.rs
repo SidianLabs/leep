@@ -1338,6 +1338,20 @@ async fn run_gc(
 fn start_derived_segments(args: &Args, repo: &Repo) {
     use leep_derive::derived_segments::{self as ds, CompactOptions, Mode, PauseHook};
     let mode = args.derived_segments;
+    // Load the live segments' indexes now, not on the first miss.
+    let warm = repo.clone();
+    tokio::spawn(async move {
+        match ds::warm(&warm).await {
+            Ok(n) => tracing::info!(
+                segments = n,
+                index_bytes = warm.segments().index_memory(),
+                "derived segment indexes loaded"
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, "loading derived segment indexes failed; reads load them")
+            }
+        }
+    });
     let mut pass = if args.debug_derived_segments_small {
         CompactOptions::small(mode)
     } else {
@@ -1369,8 +1383,9 @@ fn start_derived_segments(args: &Args, repo: &Repo) {
     } else {
         leep_meta::SchemaMode::Migrate
     };
-    let feature: ds::FeatureHook = Arc::new(move || {
-        let url = url.clone();
+    let record_url = url.clone();
+    let record: ds::FeatureHook = Arc::new(move || {
+        let url = record_url.clone();
         Box::pin(async move {
             leep_meta::features::add_store_feature(&url, schema, ds::FEATURE).await?;
             tracing::warn!(
@@ -1381,6 +1396,13 @@ fn start_derived_segments(args: &Args, repo: &Repo) {
             Ok(())
         })
     });
+    let recorded: ds::FeatureProbe = Arc::new(move || {
+        let url = url.clone();
+        Box::pin(
+            async move { leep_meta::features::has_store_feature(&url, schema, ds::FEATURE).await },
+        )
+    });
+    let feature = ds::Features { record, recorded };
     let mut schedule = leep_server::derived_segments::Schedule {
         interval: args.derived_segments_interval,
         pass,

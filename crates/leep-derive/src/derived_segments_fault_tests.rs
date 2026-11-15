@@ -11,7 +11,7 @@ use crate::changeset_sweep::{self, SweepOptions};
 use crate::derived::{derive, DerivedKind, HistoryTree, Skiplist};
 use crate::derived_segments::view::{Found, ManifestRead};
 use crate::derived_segments::{
-    self as ds, codec, compact_pass, CompactOptions, CompactState, FeatureHook, Mode,
+    self as ds, codec, compact_pass, CompactOptions, CompactState, Features, Mode,
 };
 
 const DAY: i64 = 86_400;
@@ -41,8 +41,11 @@ fn compact_opts(rng: &mut Rng, mode: Mode) -> CompactOptions {
     }
 }
 
-fn no_feature() -> FeatureHook {
-    Arc::new(|| Box::pin(async { Ok(()) }))
+fn no_feature() -> Features {
+    Features {
+        record: Arc::new(|| Box::pin(async { Ok(()) })),
+        recorded: Arc::new(|| Box::pin(async { Ok(true) })),
+    }
 }
 
 /// One commit of `path` on `parent` through `repo`, retried through faults.
@@ -84,7 +87,9 @@ async fn check(seed: u64, step: usize, w: &World) {
     let m = match read {
         ManifestRead::Absent => codec::Manifest::new(codec::FAMILY_CHANGESET),
         ManifestRead::Read(m) => m,
-        ManifestRead::Damaged => panic!("seed {seed} step {step}: the manifest does not decode"),
+        ManifestRead::Damaged | ManifestRead::Newer => {
+            panic!("seed {seed} step {step}: the manifest does not decode")
+        }
     };
     for s in &m.live {
         let idx = ds::view::load_index(&*w.blobs, s)

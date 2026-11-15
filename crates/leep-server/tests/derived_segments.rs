@@ -14,7 +14,7 @@ use leep_core::{
 };
 use leep_derive::derived::{derive, HistoryTree};
 use leep_derive::derived_segments::{
-    compact_pass, CompactOptions, CompactState, FeatureHook, Mode, PassReport,
+    compact_pass, CompactOptions, CompactState, Features, Mode, PassReport,
 };
 use leep_derive::Repo;
 use leep_store::FsBlobStore;
@@ -113,7 +113,10 @@ async fn values(r: &Repo, ids: &[ChangesetId]) -> Vec<Option<Vec<u8>>> {
 }
 
 async fn pass(r: &Repo, mode: Mode, state: &mut CompactState) -> PassReport {
-    let hook: FeatureHook = Arc::new(|| Box::pin(async { Ok(()) }));
+    let hook = Features {
+        record: Arc::new(|| Box::pin(async { Ok(()) })),
+        recorded: Arc::new(|| Box::pin(async { Ok(true) })),
+    };
     compact_pass(r, &CompactOptions::small(mode), state, Some(&hook))
         .await
         .unwrap()

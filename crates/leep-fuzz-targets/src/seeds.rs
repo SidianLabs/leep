@@ -367,6 +367,7 @@ fn rows(out: &mut Out) {
         out.add("derived_segment", "skiplists", pair);
         let m = codec::Manifest {
             family: codec::FAMILY_CHANGESET,
+            seq: 3,
             live: vec![enc.seg],
             retired: vec![Hash([4; 32])],
         };

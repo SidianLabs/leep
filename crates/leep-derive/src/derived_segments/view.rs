@@ -7,7 +7,7 @@
 //! then, for misses, the in-memory key indexes of the live segments, newest
 //! first. Before a miss is declared, a manifest older than [`REFRESH`] is
 //! read again: one statement a minute per process at most, and only when a
-//! row is missing (in mode `build` rows are all there, so never); a
+//! row is missing (in mode `build` only rows not derived yet); a
 //! `get_derived_kinds` of the two kinds carries it as one more read of the
 //! same call. Statement counts per operation do not change (ADR 0081). Rows are
 //! deleted at least [`RETIRE_AFTER`](super::RETIRE_AFTER) after their
@@ -27,9 +27,7 @@ use leep_core::{
     RefStep, RefUpdateContext, Result,
 };
 
-use super::codec::{
-    self, Block, Loc, Manifest, SegmentData, SegmentIndex, SegmentRef, FAMILY_CHANGESET,
-};
+use super::codec::{self, Block, Loc, Manifest, SegmentData, SegmentIndex, SegmentRef};
 use super::{manifest_key, MANIFEST_KIND};
 use crate::repo::{CacheScale, SizedCache};
 
@@ -59,15 +57,19 @@ pub enum ManifestRead {
     Read(Manifest),
     /// The row does not decode: no segment can be found through it.
     Damaged,
+    /// A newer binary wrote it (checksum good, version, flags or family
+    /// unknown): this one reads no segment through it, and writes nothing.
+    Newer,
 }
 
 impl ManifestRead {
     pub fn of(raw: Option<&[u8]>) -> ManifestRead {
         match raw {
             None => ManifestRead::Absent,
-            Some(v) => match Manifest::decode(v) {
-                Ok(m) if m.family == FAMILY_CHANGESET => ManifestRead::Read(m),
-                _ => ManifestRead::Damaged,
+            Some(v) => match Manifest::parse(v) {
+                Ok(m) => ManifestRead::Read(m),
+                Err(codec::ManifestFault::Newer(_)) => ManifestRead::Newer,
+                Err(codec::ManifestFault::Damaged(_)) => ManifestRead::Damaged,
             },
         }
     }
@@ -80,6 +82,8 @@ struct State {
     /// When it was read; `None`: never.
     loaded: Option<tokio::time::Instant>,
     damaged: bool,
+    /// The `seq` of the manifest in use: an older one read late is ignored.
+    seq: Option<u64>,
     /// Live segments whose index could be read, newest first.
     segs: Vec<Arc<Live>>,
     /// Live segments named by `raw` whose index or data could not be read,
@@ -173,17 +177,43 @@ impl SegmentView {
             }
         }
         let read = ManifestRead::of(raw.as_deref());
-        let (live, damaged) = match &read {
-            ManifestRead::Absent => (Vec::new(), false),
-            ManifestRead::Read(m) => (m.live.clone(), false),
-            ManifestRead::Damaged => {
+        let live = match &read {
+            ManifestRead::Absent => Vec::new(),
+            ManifestRead::Read(m) => {
+                // Monotonic: a manifest older than the one in use (a read
+                // that raced a newer write) is not applied.
+                let mut s = self.state.write().unwrap();
+                if s.seq.is_some_and(|cur| m.seq < cur) {
+                    s.loaded = Some(tokio::time::Instant::now());
+                    return Ok(());
+                }
+                drop(s);
+                m.live.clone()
+            }
+            ManifestRead::Damaged | ManifestRead::Newer => {
+                let newer = read == ManifestRead::Newer;
                 metrics::counter!("leep_derived_segment_errors_total", "what" => "manifest")
                     .increment(1);
-                tracing::error!(
-                    "the {MANIFEST_KIND} row does not decode: derived segments are not read \
-                     (rows still are); see LeepDerivedSegmentPassesFailing in RUNBOOKS.md"
-                );
-                (Vec::new(), true)
+                if newer {
+                    tracing::warn!(
+                        "the {MANIFEST_KIND} row was written by a newer leep-server: this one \
+                         reads no derived segment through it (rows still are)"
+                    );
+                } else {
+                    tracing::error!(
+                        "the {MANIFEST_KIND} row does not decode: derived segments are not \
+                         read (rows still are); see LeepDerivedSegmentPassesFailing in \
+                         RUNBOOKS.md"
+                    );
+                }
+                // The segments in use were read whole and checked; they
+                // still give right values, so keep them rather than read
+                // everything as missing.
+                let mut s = self.state.write().unwrap();
+                s.raw = raw;
+                s.loaded = Some(tokio::time::Instant::now());
+                s.damaged = true;
+                return Ok(());
             }
         };
         let (have, mut broken) = {
@@ -193,6 +223,13 @@ impl SegmentView {
             (have, s.broken.clone())
         };
         broken.retain(|h, t| live.iter().any(|s| s.index == *h) && t.elapsed() < self.refresh);
+        // Indexes not in memory yet, fetched a few at a time.
+        let wanted: Vec<SegmentRef> = live
+            .iter()
+            .filter(|r| !have.contains_key(&r.index) && !broken.contains_key(&r.index))
+            .copied()
+            .collect();
+        let loaded = load_indexes(&*self.blobs, &wanted).await?;
         let mut segs = Vec::with_capacity(live.len());
         for r in live.iter().rev() {
             if let Some(l) = have.get(&r.index) {
@@ -207,26 +244,35 @@ impl SegmentView {
                 }
                 continue;
             }
-            if broken.contains_key(&r.index) {
-                continue;
-            }
-            match load_index(&*self.blobs, r).await? {
-                Some(idx) => segs.push(Arc::new(Live {
+            match loaded.get(&r.index) {
+                Some(Some(idx)) => segs.push(Arc::new(Live {
                     r: *r,
-                    idx: Arc::new(idx),
+                    idx: idx.clone(),
                 })),
-                None => {
+                Some(None) => {
                     broken.insert(r.index, tokio::time::Instant::now());
                 }
+                None => {}
             }
         }
+        let memory: usize = segs.iter().map(|l| l.idx.memory()).sum();
+        metrics::gauge!("leep_derived_segment_index_bytes").set(memory as f64);
         let mut s = self.state.write().unwrap();
+        s.seq = match &read {
+            ManifestRead::Read(m) => Some(m.seq),
+            _ => s.seq,
+        };
         s.raw = raw;
         s.loaded = Some(tokio::time::Instant::now());
-        s.damaged = damaged;
+        s.damaged = false;
         s.segs = segs;
         s.broken = broken;
         Ok(())
+    }
+
+    /// Bytes the live segments' indexes hold in memory.
+    pub fn index_memory(&self) -> usize {
+        self.segments().iter().map(|l| l.idx.memory()).sum()
     }
 
     /// Stop using a live segment whose data cannot be read, until the
@@ -389,6 +435,22 @@ fn block_key(data: &Hash, col: usize, block: usize) -> Hash {
         *b ^= p;
     }
     k
+}
+
+/// Index blobs read at once by a manifest change.
+const INDEX_FETCHES: usize = 8;
+
+/// [`load_index`] of each of `wanted`, [`INDEX_FETCHES`] at a time.
+pub(crate) async fn load_indexes(
+    blobs: &dyn BlobStore,
+    wanted: &[SegmentRef],
+) -> Result<BTreeMap<Hash, Option<Arc<SegmentIndex>>>> {
+    use futures_util::stream::{self, StreamExt, TryStreamExt};
+    stream::iter(wanted.iter().copied())
+        .map(|r| async move { Ok::<_, Error>((r.index, load_index(blobs, &r).await?.map(Arc::new))) })
+        .buffer_unordered(INDEX_FETCHES)
+        .try_collect()
+        .await
 }
 
 /// Read and decode `r`'s index blob. `None` when it is not stored, is
@@ -682,6 +744,10 @@ impl MetaStore for SegmentedMeta {
 
     async fn delete_derived_keys(&self, kinds: &[&str], keys: &[Hash]) -> Result<u64> {
         self.inner.delete_derived_keys(kinds, keys).await
+    }
+
+    async fn delete_derived_values(&self, kind: &str, rows: &[(Hash, Bytes)]) -> Result<u64> {
+        self.inner.delete_derived_values(kind, rows).await
     }
 
     async fn ref_log(

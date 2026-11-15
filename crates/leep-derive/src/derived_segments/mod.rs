@@ -26,7 +26,8 @@ use leep_core::{Error, Hash, LeaseKey, Result};
 
 pub use codec::{Manifest, SegmentRef, COL_HISTORY_TREE, COL_SKIPLIST};
 pub use compactor::{
-    compact_pass, CompactOptions, CompactState, FeatureHook, Mode, PassReport, PauseHook,
+    compact_pass, CompactOptions, CompactState, FeatureHook, FeatureProbe, Features, Mode,
+    PassReport, PauseHook,
 };
 pub use view::{ManifestRead, SegmentView};
 
@@ -76,6 +77,15 @@ pub async fn read_manifest(repo: &Repo) -> Result<(Option<Bytes>, ManifestRead)>
     Ok((raw, read))
 }
 
+/// Read the manifest and load every live segment's index into `repo`'s
+/// view: a server does this in the background at start, so its first miss
+/// does not wait for every index blob.
+pub async fn warm(repo: &Repo) -> Result<usize> {
+    let (raw, _) = read_manifest(repo).await?;
+    repo.segments().apply(raw).await?;
+    Ok(repo.segments().segments().len())
+}
+
 /// Write `next` iff the row still holds `expected` (`None`: no row), under
 /// a lease checked first. A holder that lost its lease and wakes after
 /// another wrote the row fails here with `Conflict` and stops.
@@ -83,9 +93,10 @@ pub(crate) async fn swap_manifest(
     repo: &Repo,
     lease: &Option<GcLease>,
     expected: Option<&[u8]>,
-    next: &Manifest,
+    next: &mut Manifest,
 ) -> Result<Bytes> {
     gc_lease::check(lease)?;
+    next.seq = next_seq(next.seq);
     let bytes = next.encode();
     if !repo
         .row_meta()
@@ -100,6 +111,16 @@ pub(crate) async fn swap_manifest(
     // Readers of this process see it at once.
     repo.segments().apply(Some(bytes.clone())).await?;
     Ok(bytes)
+}
+
+/// The `seq` of a manifest written over one with `prev`: one more, or the
+/// clock in microseconds if that is more, so a manifest written over a
+/// damaged row (whose `seq` is unknown) still sorts after what readers hold.
+fn next_seq(prev: u64) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as u64);
+    prev.saturating_add(1).max(now)
 }
 
 /// What blob GC must know: the blobs of live segments (never condemned)
@@ -127,6 +148,10 @@ pub(crate) async fn gc_view(repo: &Repo) -> Result<GcView> {
         ManifestRead::Damaged => Err(Error::Other(format!(
             "the {MANIFEST_KIND} row does not decode, so garbage collection cannot tell live \
              derived segments from orphans; see LeepDerivedSegmentPassesFailing in RUNBOOKS.md"
+        ))),
+        ManifestRead::Newer => Err(Error::Other(format!(
+            "the {MANIFEST_KIND} row was written by a newer leep-server, so this garbage \
+             collection cannot tell live derived segments from orphans; run the newer gc"
         ))),
     }
 }
@@ -160,6 +185,11 @@ pub(crate) async fn drop_columns(repo: &Repo, lease: &Option<GcLease>, cols: &[u
         ManifestRead::Absent => return Ok(0),
         ManifestRead::Read(m) => m,
         ManifestRead::Damaged => Manifest::new(codec::FAMILY_CHANGESET),
+        ManifestRead::Newer => {
+            return Err(Error::Invalid(format!(
+                "the {MANIFEST_KIND} row was written by a newer leep-server; run its repair"
+            )))
+        }
     };
     let mask = cols.iter().fold(0u64, |m, c| m | 1 << c);
     let mut changed = 0;
@@ -176,7 +206,7 @@ pub(crate) async fn drop_columns(repo: &Repo, lease: &Option<GcLease>, cols: &[u
     m.live.retain(|s| s.columns != 0);
     m.retire(gone);
     if changed > 0 || matches!(ManifestRead::of(raw.as_deref()), ManifestRead::Damaged) {
-        swap_manifest(repo, lease, raw.as_deref(), &m).await?;
+        swap_manifest(repo, lease, raw.as_deref(), &mut m).await?;
     }
     Ok(changed)
 }

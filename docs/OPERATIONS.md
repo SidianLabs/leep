@@ -3526,6 +3526,11 @@ target/release/leep-soak --duration 30m --rate-limit 5 --rate-burst 10 --max-con
 target/release/leep-soak --duration 10m --seed 0x2a --out replay   # the plan of an earlier failure
 ```
 
+The soak's server runs derived segments (ADR 0104) in `--derived-segments
+retire` with small limits and a pass every 5 s (`--derived-segments build`
+or `off` to change it); a run of a minute or more fails unless passes
+sealed segments and, in `retire`, deleted rows.
+
 It creates a throwaway Postgres database in the admin URL (`--postgres-url`,
 `LEEP_SOAK_POSTGRES_URL`, else `LEEP_TEST_POSTGRES_URL`; `--sqlite` or no URL
 means SQLite), puts blobs in a directory, starts `leep-server` with
@@ -3798,8 +3803,21 @@ segment, is missing or wrong; the row then wins. `repair drop --kind
 skiplist` (or `history-tree-v4`) first stops every segment answering for
 that kind (its column is cleared in the manifest), then deletes the rows,
 so everything derives again. Both hold the derived-segments lease, waiting
-up to two minutes for a running pass; `repair drop` refuses
-`derived-segments-v1` itself.
+up to two minutes for a running pass (a pass seals at most four segments of
+16,384 changesets, then gives the lease up); `repair drop` refuses
+`derived-segments-v1` itself. **Other running servers keep answering from
+the segments for up to a minute** (they read the manifest again at their
+next miss after 60 s): restart them, or wait a minute, before checking
+that a dropped kind derives again, as for the search kinds above. A pass
+deletes a row only if it still holds the bytes it compared, so a row
+`repair rederive` wrote is never deleted as equal to the old value.
+
+A pass in mode `build` lists the keys of both kinds only when their
+estimated count grew by 1,024 since its last listing, or 10 minutes
+passed. It never replaces a manifest written by a newer `leep-server`, and
+replaces a damaged one only if the store has no `derived-segments` feature
+recorded. On a store with the feature it drops a segment it cannot read
+only when two passes in a row agree.
 
 **Backups and restores.** Segments are blobs, so `backup` copies them. A
 metadata snapshot can name a segment the blob copy lacks (sealed between

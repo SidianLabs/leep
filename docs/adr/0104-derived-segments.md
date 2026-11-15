@@ -97,18 +97,36 @@ it has no rows.
 ### 3. The manifest
 One derived row per family, kind `derived-segments-v1`, key
 `Hash::of_object("derived-segment-family", "changeset-v1")`: version,
-flags, family, the live segments in publish order (index and data
-addresses, keys, a column mask, data bytes), up to 2,048 blobs of retired
-segments, and a trailing BLAKE3. A key in several live segments answers
-from the newest whose mask has the column. The row is replaced whole, and
-only by `MetaStore::cas_derived` against the bytes its writer last read or
-wrote (ADR 0103); a writer that loses the swap stops. `repair drop` refuses
-the kind.
+flags, family, a sequence number, the live segments in publish order (index
+and data addresses, keys, a column mask, data bytes), up to 2,048 blobs of
+retired segments, and a trailing BLAKE3. A key in several live segments
+answers from the newest whose mask has the column. The row is replaced
+whole, and only by `MetaStore::cas_derived` against the bytes its writer
+last read or wrote (ADR 0103); a writer that loses the swap stops. `repair
+drop` refuses the kind.
+
+- **Sequence.** Every write sets it to the previous value plus one, or the
+  writer's clock in microseconds if that is more (a manifest written over
+  a damaged row, whose number is unknown, still sorts after what readers
+  hold). A reader never applies a manifest older than the one it uses, so
+  a read that raced a newer write cannot take it back to segments a merge
+  has retired.
+- **Damage and newer formats.** A row whose checksum fails is damaged. A
+  row whose checksum holds but whose version, flags or family this binary
+  does not know was written by a newer binary: it is never treated as
+  damage and never replaced. A pass then does nothing, `gc` and `repair
+  drop` refuse, `verify` notes it, and readers keep the segments they had
+  (or read rows only).
 
 ### 4. The compactor
 A pass runs every `--derived-segments-interval` (5 minutes) in the index
 lane (ADR 0073) under the store-wide lease `maintenance/derived-segments`,
-one server at a time. It lists the keys of both kinds (bounded pages), and:
+one server at a time. It loads the live segments' indexes itself, never
+through the shared read view (whose state a reader's transient error or a
+late read may have moved), lists the keys of both kinds (bounded pages;
+in mode `build` only once their estimated count grew by 1,024 since the
+last listing or 10 minutes passed, so a quiet store is not listed every
+pass), and:
 
 1. **Seals** the keys whose rows no live segment holds, once at least 1,024
    changesets are unsealed, or at least 64 and their number has not grown
@@ -120,7 +138,10 @@ one server at a time. It lists the keys of both kinds (bounded pages), and:
    at most 16,384 and encoded (halved until the data fits 4 MiB); both blobs
    are made durable (`put_rescuing_many_loose`), and only then is the
    manifest swapped to name them. A backfill is the same step, restartable
-   anywhere, since "already sealed" is read from the manifest.
+   anywhere, since "already sealed" is read from the manifest; a pass seals
+   at most four pages and gives the lease up, so a long backfill does not
+   keep `repair` waiting. Keys whose changeset is no longer stored are
+   remembered and skipped until the next periodic listing.
 2. **Merges** runs of four adjacent live segments of one tier (`floor(log4(keys
    / 1,024))`), the longest prefix of the run that fits the caps (two or
    more), so a row is rewritten about three times at most. Adjacent, so a key
@@ -131,18 +152,29 @@ one server at a time. It lists the keys of both kinds (bounded pages), and:
    segment this process has seen live for at least 10 minutes (counted from
    its own publish), it reads the manifest again under the lease (it must be
    the one the pass holds), reads the row and the segment's value, and
-   deletes the row only if they are equal, in steps of 1,000 keys with a
-   lease check before each and a rest after (ADR 0052). An unequal row stays
-   (rows win) and is counted in `leep_derived_segment_mismatch_total`. The
-   store feature `derived-segments` is recorded before the first delete of
-   each process.
+   deletes the row only if they are equal and only if the row still holds
+   the bytes it compared (`MetaStore::delete_derived_values`, one statement
+   in the SQL backends), in steps of 1,000 keys with a lease check before
+   each and a rest after (ADR 0052). An unequal row stays (rows win), is
+   counted in `leep_derived_segment_mismatch_total` once, and is not read
+   again while the same segment holds the key. The store feature
+   `derived-segments` is recorded before the first delete of each process.
+   Candidates are taken one holding segment at a time, so one data blob is
+   in memory at once.
 
-It also drops from the manifest a live segment whose index is not stored or
-does not decode, or whose data blob is not stored (its keys read as rows or
-derive again, and seal again), and forgets retired blobs no longer stored.
-A transient read error aborts the pass. A manifest that does not decode is
-replaced in mode `build`, where every row is still stored, and refused in
-mode `retire`, where it may name the only copy of deleted rows.
+It probes every live segment itself: the index blob, and the data blob read
+whole and decoded the first time this process sees the segment (only its
+presence afterwards). A segment whose blobs are definitely lost or damaged
+(not stored, address or structure wrong, a read the store reports corrupt)
+is dropped from the manifest (its keys read as rows or derive again, and
+seal again); on a store with the feature `derived-segments` recorded, only
+when two passes in a row agree, so a blob a repack was moving is not lost
+for good. Any other read error fails the pass and drops nothing. Retired
+blobs no longer stored are forgotten. A manifest that does not decode is
+replaced only by a pass in mode `build` on a store without the feature
+recorded (asked of the store, not this process's flag: another server may
+have retired rows); otherwise the pass refuses, since the manifest may name
+the only copy of deleted rows.
 
 Lands are untouched: `skiplist` is still written in
 `put_changeset_with_derived` and `history-tree-v4` by the warmer.
@@ -169,14 +201,21 @@ reader read the manifest again and look once more, then read as missing.
 **Statements.** Per operation unchanged (ADR 0081): a sealed key costs the
 same round trip, which now misses, and a memory lookup. The manifest is
 read only for a miss, at most once a minute per process (in mode `build`
-every row is there, so never), and a `get_derived_kinds` of the two kinds
+only for rows not derived yet: a new changeset before the warmer, a root's
+`history-tree-v4`), and a `get_derived_kinds` of the two kinds
 carries it as one more read of the same call. `budget_tests` measures a
 create on a sealed and retired store at the same 13 metadata calls, plus
 two blob reads (the index and data blob, once per process).
 
 `count_derived` and `estimate_derived` of the two kinds count rows and
 sealed keys together, so `upgrade-index` does not see a retired store as
-incomplete; `derived_present` consults the indexes. Listings stay rows.
+incomplete (`count_derived` pages through every row key once segments
+exist, to count each key once; it is an operator tool's call); `derived_present`
+consults the indexes. Listings stay rows.
+
+**Start.** A server loads the live segments' indexes in the background at
+start, a few blobs at a time, so its first miss does not wait for all of
+them; `leep_derived_segment_index_bytes` reports what they hold.
 
 ### 6. Blob GC, the changeset sweep, verify, repair, backups
 - **Blob GC** reads the manifest in condemn and again in collect (after the
@@ -197,10 +236,16 @@ incomplete; `derived_present` consults the indexes. Listings stay rows.
   every live segment's mask by swap first (a segment left with none is
   retired), then deletes the rows, holding the derived-segments lease
   throughout so no pass seals what it drops. With a manifest that does not
-  decode, it replaces it with an empty one.
+  decode, it replaces it with an empty one. Other servers keep answering
+  from the old manifest until they read it again, up to a minute (they do
+  so at their next miss after 60 s): the values are the same pure
+  functions, but to make every server derive again at once, restart them
+  or wait a minute (OPERATIONS.md, "Derived segments").
 - **`repair rederive`** of the two kinds writes rows where the value read
-  (row or segment) is missing or wrong; rows win. It holds the lease, so no
-  pass deletes a row it just wrote as equal to the value it replaced.
+  (row or segment) is missing or wrong; rows win. It holds the lease, and a
+  pass deletes a row only if it still holds the bytes the pass compared, so
+  even a pass that outlived its lease cannot delete a row `repair` just
+  rewrote.
 - **Backups** copy segments as blobs. A snapshot naming a segment the blob
   copy lacks reads those values as missing: they derive again on demand,
   `verify` notes the segment, `repair rederive --missing` fills the rows,
@@ -235,8 +280,17 @@ the operating system only on `VACUUM FULL derived` (or `pg_repack`) and
 - A stale lease holder (a pass that stalled past the 60 s lease while
   another took it): its manifest swap fails on the compare-and-swap and it
   stops. Its deletes are preceded by a lease check and a fresh read of the
-  manifest; the remaining window can only delete a row whose segment was
-  just dropped, which reads as missing and derives again.
+  manifest, and delete only rows still holding the bytes compared; the
+  remaining window can only delete a row whose segment was just dropped,
+  which reads as missing and derives again.
+- Clocks. The 10 minutes before a row is deleted and the lease's renewal
+  are measured on the host's monotonic clock. A host suspended past them (a
+  paused VM, a laptop asleep) may resume believing a segment old enough, or
+  its lease held, when other servers saw neither: the lease check and the
+  value-conditional delete bound what it can do to deleting rows equal to
+  a segment named by the manifest it read, and a reader whose manifest is
+  older than that segment reads the manifest again before it declares a
+  miss, as with ADR 0012's VM freeze.
 - A segment lost or damaged (address, prefix, version, structure): its keys
   read as rows or derive again, and the next pass drops it and seals again.
   A transient read error never does: it fails the read or the pass.
@@ -254,9 +308,9 @@ the operating system only on `VACUUM FULL derived` (or `pg_repack`) and
 - Write amplification: a row is sealed once and merged about three times.
 - Retired segments wait for the operator's `gc`: up to about twice the
   live segment bytes in the meantime.
-- In mode `build` a pass lists every key of both kinds each time (2.4
-  million keys on a Linux-sized store); in mode `retire` only the unsealed
-  ones remain to list.
+- In mode `build` a pass lists every key of both kinds whenever they grew
+  by 1,024 or 10 minutes passed (2.4 million keys on a Linux-sized store);
+  in mode `retire` only the unsealed ones remain to list, every pass.
 
 ## Consequences
 - `leep-server --derived-segments build` (the default) seals in the
@@ -269,6 +323,11 @@ the operating system only on `VACUUM FULL derived` (or `pg_repack`) and
   one segment of 0.27 MB, as the design's model said; about 1,264 bytes of
   rows a changeset become about 120. Before a vacuum Postgres keeps the
   freed pages for later rows.
+- Changed after review, before release: the manifest gained its sequence
+  number; a damaged manifest is replaced only where the store has no
+  `derived-segments` feature, and a newer one never; passes load and probe
+  segments themselves, and on a store with the feature drop one only when
+  two passes agree; row deletes are value-conditional.
 - Deviations from the design while implementing: the manifest is read
   again only for a miss (and rides along in a `get_derived_kinds` call),
   not with every read (a single read turned into a batched one changed

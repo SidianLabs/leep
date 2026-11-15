@@ -1677,6 +1677,13 @@ impl Verifier<'_> {
         let kind = MANIFEST_KIND;
         let m = match ds::read_manifest(self.repo).await?.1 {
             ManifestRead::Absent => return Ok(()),
+            ManifestRead::Newer => {
+                self.notes.push(format!(
+                    "the {kind} row was written by a newer leep-server; its segments are not \
+                     checked by this one"
+                ));
+                return Ok(());
+            }
             ManifestRead::Read(m) => m,
             ManifestRead::Damaged => {
                 self.kstats(kind).checked += 1;

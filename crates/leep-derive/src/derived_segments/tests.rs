@@ -372,12 +372,13 @@ fn golden_bytes() {
     }
     let m = Manifest {
         family: codec::FAMILY_CHANGESET,
+        seq: 7,
         live: vec![enc.seg],
         retired: vec![h(9)],
     };
     let v = m.encode();
-    assert_eq!(&v[..7], &[1, 0, 1, 0, 0, 0, 1]);
-    assert_eq!(v.len(), 3 + 4 + 80 + 4 + 32 + 32);
+    assert_eq!(&v[..15], &[1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 1]);
+    assert_eq!(v.len(), 3 + 8 + 4 + 80 + 4 + 32 + 32);
     assert_eq!(Manifest::decode(&v).unwrap(), m);
     assert_eq!(
         manifest_key(),
@@ -395,7 +396,7 @@ fn golden_bytes() {
 
 const GOLDEN_INDEX: &str = "1879b9d8ae9d69329ad1a98661dcf422e8d8f81e9b1d3c656e39c4df84b74dff";
 const GOLDEN_DATA: &str = "7a9e9903bd91483e6abb114a609642e806682c61158744b0334159a443605703";
-const GOLDEN_MANIFEST: &str = "2ad96a59f45dcc2df989eed73be6a16d3d17e970b0bb81ead63a99e7c1bc90cc";
+const GOLDEN_MANIFEST: &str = "3c79193c20e1e1d114bcd4661f87c6b4c7fa53eb446382a4a518467f6f1ce858";
 
 /// Every flipped bit of either blob or of the manifest is refused.
 #[test]
@@ -419,6 +420,7 @@ fn every_damaged_bit_is_refused() {
     }
     let m = Manifest {
         family: codec::FAMILY_CHANGESET,
+        seq: 7,
         live: vec![enc.seg],
         retired: vec![h(4)],
     }
@@ -474,21 +476,28 @@ fn manifest_retired_list_is_bounded_and_never_names_a_live_blob() {
 
 /// Records each call, so a test can check the feature was recorded before
 /// the first row was deleted.
-pub(crate) fn feature_hook(log: Arc<Mutex<Vec<&'static str>>>) -> FeatureHook {
-    Arc::new(move || {
-        let log = log.clone();
-        Box::pin(async move {
-            log.lock().unwrap().push("feature");
-            Ok(())
-        })
-    })
+pub(crate) fn feature_hook(log: Arc<Mutex<Vec<&'static str>>>) -> Features {
+    let seen = log.clone();
+    Features {
+        record: Arc::new(move || {
+            let log = log.clone();
+            Box::pin(async move {
+                log.lock().unwrap().push("feature");
+                Ok(())
+            })
+        }),
+        recorded: Arc::new(move || {
+            let seen = seen.clone();
+            Box::pin(async move { Ok(!seen.lock().unwrap().is_empty()) })
+        }),
+    }
 }
 
 pub(crate) async fn pass(
     r: &Repo,
     opts: &CompactOptions,
     state: &mut CompactState,
-    f: Option<&FeatureHook>,
+    f: Option<&Features>,
 ) -> PassReport {
     compact_pass(r, opts, state, f)
         .await
@@ -501,7 +510,7 @@ pub(crate) async fn settle(
     r: &Repo,
     opts: &CompactOptions,
     state: &mut CompactState,
-    f: Option<&FeatureHook>,
+    f: Option<&Features>,
 ) -> PassReport {
     let mut total = PassReport::default();
     for _ in 0..20 {
@@ -688,13 +697,13 @@ async fn a_stale_pass_loses_the_swap() {
     build(&r, None).await;
     let opts = CompactOptions::small(Mode::Build);
     let none = None;
-    let mut stale = Pass::load(&r, &opts, &none).await.unwrap();
-    let mut first = Pass::load(&r, &opts, &none).await.unwrap();
-    first.run(&mut CompactState::default(), None).await.unwrap();
+    let mut stale = Pass::load(&r, &opts, &none, None).await.unwrap();
+    let mut first = Pass::load(&r, &opts, &none, None).await.unwrap();
+    first.run(&mut CompactState::default()).await.unwrap();
     let (after, _) = read_manifest(&r).await.unwrap();
     assert!(after.is_some());
     let err = stale
-        .run(&mut CompactState::default(), None)
+        .run(&mut CompactState::default())
         .await
         .expect_err("stale");
     assert!(matches!(err, Error::Conflict(_)), "{err}");
@@ -1275,4 +1284,283 @@ async fn an_unreadable_segment_is_tried_again_after_a_refresh() {
         .await
         .unwrap()
         .is_some());
+}
+
+// --- review fixes: store state over process flags, monotonic manifests ---
+
+/// A blob store that fails reads of chosen blobs with a transient error.
+struct Flaky {
+    inner: Arc<dyn leep_core::BlobStore>,
+    failing: Mutex<std::collections::HashSet<Hash>>,
+}
+
+#[async_trait]
+impl leep_core::BlobStore for Flaky {
+    async fn put_with_hash(&self, hash: Hash, data: Bytes) -> leep_core::Result<()> {
+        self.inner.put_with_hash(hash, data).await
+    }
+    async fn get(&self, hash: &Hash) -> leep_core::Result<Option<Bytes>> {
+        if self.failing.lock().unwrap().contains(hash) {
+            return Err(Error::Storage("connection reset".into()));
+        }
+        self.inner.get(hash).await
+    }
+    async fn list_page(
+        &self,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> leep_core::Result<Vec<leep_core::BlobMeta>> {
+        self.inner.list_page(after, limit).await
+    }
+    async fn delete(&self, hash: &Hash) -> leep_core::Result<()> {
+        self.inner.delete(hash).await
+    }
+}
+
+fn recorded_features() -> Features {
+    Features {
+        record: Arc::new(|| Box::pin(async { Ok(()) })),
+        recorded: Arc::new(|| Box::pin(async { Ok(true) })),
+    }
+}
+
+/// A damaged manifest is replaced in mode build only while the store has
+/// no `derived-segments` feature: another server may have retired rows.
+#[tokio::test]
+async fn a_damaged_manifest_is_kept_once_the_feature_is_recorded() {
+    let r = repo();
+    build(&r, None).await;
+    let mut st = CompactState::default();
+    settle(&r, &CompactOptions::small(Mode::Build), &mut st, None).await;
+    let junk = Bytes::from_static(b"junk");
+    r.row_meta()
+        .put_derived(MANIFEST_KIND, &manifest_key(), junk.clone())
+        .await
+        .unwrap();
+    let f = recorded_features();
+    let err = compact_pass(&r, &CompactOptions::small(Mode::Build), &mut st, Some(&f))
+        .await
+        .expect_err("refused");
+    assert!(err.to_string().contains("not replaced"), "{err}");
+    assert_eq!(read_manifest(&r).await.unwrap().0, Some(junk));
+    // Without the feature, build replaces it.
+    let p = pass(&r, &CompactOptions::small(Mode::Build), &mut st, None).await;
+    assert!(p.damaged_manifest);
+}
+
+/// A manifest with a good checksum but an unknown version is a newer
+/// binary's: never damage, never replaced. Passes do nothing, GC and
+/// `repair drop` refuse, readers read rows only.
+#[tokio::test]
+async fn a_newer_manifest_is_left_alone() {
+    let r = repo();
+    let ids = build(&r, None).await;
+    let mut body = vec![2u8, 0, 1];
+    body.extend_from_slice(&[0; 12]);
+    let sum = Hash::of_blob(&body);
+    body.extend_from_slice(&sum.0);
+    let newer = Bytes::from(body);
+    assert!(matches!(
+        codec::Manifest::parse(&newer),
+        Err(codec::ManifestFault::Newer(_))
+    ));
+    r.row_meta()
+        .put_derived(MANIFEST_KIND, &manifest_key(), newer.clone())
+        .await
+        .unwrap();
+    for mode in [Mode::Build, Mode::Retire] {
+        let p = pass(
+            &r,
+            &CompactOptions::small(mode),
+            &mut CompactState::default(),
+            None,
+        )
+        .await;
+        assert!(p.newer_manifest && p.sealed_segments == 0 && p.retired_rows == 0);
+    }
+    assert_eq!(read_manifest(&r).await.unwrap().0, Some(newer.clone()));
+    assert!(
+        crate::integrity::drop_kinds(&r, &[Skiplist::NAME], false, &crate::integrity::Quiet)
+            .await
+            .is_err()
+    );
+    assert_eq!(read_manifest(&r).await.unwrap().0, Some(newer));
+    assert!(values(&r, &ids).await.iter().all(Option::is_some));
+}
+
+/// A pass probes segments itself: a transient read error fails the pass
+/// and drops nothing, whatever a reader marked broken; on a store with the
+/// feature recorded, a lost segment is dropped only when two passes agree.
+#[tokio::test]
+async fn transient_errors_drop_nothing_and_losses_need_two_passes() {
+    let blobs: Arc<dyn leep_core::BlobStore> = Arc::new(MemoryBlobStore::new());
+    let flaky = Arc::new(Flaky {
+        inner: blobs.clone(),
+        failing: Mutex::default(),
+    });
+    let r = Repo::new(flaky.clone(), Arc::new(MemoryMetaStore::new()));
+    let ids = build(&r, None).await;
+    let f = recorded_features();
+    let mut st = CompactState::default();
+    settle(&r, &CompactOptions::small(Mode::Retire), &mut st, Some(&f)).await;
+    let (before, ManifestRead::Read(m)) = read_manifest(&r).await.unwrap() else {
+        panic!()
+    };
+    let seg = m.live[0];
+    // A reader in another handle finds the data unreadable and marks it.
+    flaky.failing.lock().unwrap().insert(seg.data);
+    let reader = fresh(&r);
+    reader
+        .meta()
+        .get_derived(Skiplist::NAME, &ids[1].0)
+        .await
+        .ok();
+    // A new process's pass fails on the transient error, dropping nothing.
+    let mut fresh_state = CompactState::default();
+    assert!(compact_pass(
+        &r,
+        &CompactOptions::small(Mode::Retire),
+        &mut fresh_state,
+        Some(&f)
+    )
+    .await
+    .is_err());
+    assert_eq!(read_manifest(&r).await.unwrap().0, before);
+    flaky.failing.lock().unwrap().clear();
+    // Lost for real: the first pass suspects it, the second drops it.
+    let data = blobs.get(&seg.data).await.unwrap().unwrap();
+    blobs.delete(&seg.data).await.unwrap();
+    let p = pass(
+        &r,
+        &CompactOptions::small(Mode::Retire),
+        &mut fresh_state,
+        Some(&f),
+    )
+    .await;
+    assert_eq!(p.dropped, 0);
+    // It came back meanwhile (a repack was moving it): nothing dropped.
+    blobs.put_with_hash(seg.data, data).await.unwrap();
+    let p = pass(
+        &r,
+        &CompactOptions::small(Mode::Retire),
+        &mut fresh_state,
+        Some(&f),
+    )
+    .await;
+    assert_eq!(p.dropped, 0);
+    blobs.delete(&seg.data).await.unwrap();
+    let p = pass(
+        &r,
+        &CompactOptions::small(Mode::Retire),
+        &mut fresh_state,
+        Some(&f),
+    )
+    .await;
+    assert_eq!(p.dropped, 0);
+    let p = pass(
+        &r,
+        &CompactOptions::small(Mode::Retire),
+        &mut fresh_state,
+        Some(&f),
+    )
+    .await;
+    assert_eq!(p.dropped, 1, "{p:?}");
+}
+
+/// A manifest read late never replaces a newer one a view already uses.
+#[tokio::test]
+async fn a_stale_manifest_is_not_applied_over_a_newer_one() {
+    let r = repo();
+    build(&r, None).await;
+    let mut st = CompactState::default();
+    pass(&r, &CompactOptions::small(Mode::Build), &mut st, None).await;
+    let (old, _) = read_manifest(&r).await.unwrap();
+    let state = Arc::new(tokio::sync::Mutex::new(st));
+    let mut each = passes_while_building(
+        &r,
+        CompactOptions::small(Mode::Build),
+        state.clone(),
+        Arc::default(),
+    );
+    each().await;
+    let mut next = commit(&r, &[], &[("z", Some("z"))], "z").await;
+    for i in 0..4 {
+        next = commit(&r, &[next], &[("z", Some(&format!("z{i}")))], "z").await;
+    }
+    derive::<HistoryTree>(&r, next).await.unwrap();
+    each().await;
+    let (new, ManifestRead::Read(nm)) = read_manifest(&r).await.unwrap() else {
+        panic!()
+    };
+    assert_ne!(old, new);
+    let v = fresh(&r);
+    v.segments().apply(new.clone()).await.unwrap();
+    v.segments().apply(old).await.unwrap();
+    assert_eq!(v.segments().raw(), new);
+    assert_eq!(v.segments().segments().len(), nm.live.len());
+}
+
+/// Two handles: one holds a manifest read before a segment was sealed,
+/// while another seals, waits out `RETIRE_AFTER` and deletes the rows. The
+/// stale handle's manifest is then older than `REFRESH`, so it reads the
+/// manifest again before declaring a miss, and every value is right; one
+/// whose segment was merged away and collected reads again and finds the
+/// merged one.
+#[tokio::test(start_paused = true)]
+async fn a_stale_handle_still_reads_right_values() {
+    let r = repo();
+    let ids = build(&r, None).await;
+    let want = values(&r, &ids).await;
+    let stale = fresh(&r);
+    // The stale handle reads its (empty) manifest now.
+    stale
+        .segments()
+        .apply(read_manifest(&r).await.unwrap().0)
+        .await
+        .unwrap();
+    let opts = CompactOptions {
+        retire_after: RETIRE_AFTER,
+        ..CompactOptions::small(Mode::Retire)
+    };
+    let hook = feature_hook(Arc::default());
+    let mut st = CompactState::default();
+    pass(&r, &opts, &mut st, Some(&hook)).await;
+    tokio::time::advance(RETIRE_AFTER).await;
+    let p = pass(&r, &opts, &mut st, Some(&hook)).await;
+    assert!(p.retired_rows > 0, "{p:?}");
+    let keys: Vec<Hash> = ids.iter().map(|i| i.0).collect();
+    let got = stale
+        .meta()
+        .get_derived_many(Skiplist::NAME, &keys)
+        .await
+        .unwrap();
+    assert_eq!(got, want[..ids.len()]);
+    assert_eq!(stale.derived_count(), 0);
+}
+
+/// In mode build the rows are listed again only once they grew by
+/// `seal_rows` or `list_every` passed.
+#[tokio::test(start_paused = true)]
+async fn build_mode_lists_rows_only_when_they_grew() {
+    let r = repo();
+    let ids = build(&r, None).await;
+    let opts = CompactOptions {
+        seal_rows: 4,
+        list_every: Duration::from_secs(600),
+        ..CompactOptions::small(Mode::Build)
+    };
+    let mut st = CompactState::default();
+    assert!(pass(&r, &opts, &mut st, None).await.listed);
+    assert!(!pass(&r, &opts, &mut st, None).await.listed);
+    let mut tip = *ids.last().unwrap();
+    for i in 0..3 {
+        tip = commit(&r, &[tip], &[("g", Some(&format!("{i}")))], "g").await;
+    }
+    derive::<HistoryTree>(&r, tip).await.unwrap();
+    // Six more rows: at least `seal_rows`.
+    let p = pass(&r, &opts, &mut st, None).await;
+    assert!(p.listed && p.sealed_keys == 3, "{p:?}");
+    assert!(!pass(&r, &opts, &mut st, None).await.listed);
+    tokio::time::advance(Duration::from_secs(600)).await;
+    assert!(pass(&r, &opts, &mut st, None).await.listed);
 }

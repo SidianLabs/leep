@@ -158,7 +158,7 @@ async fn create_budget() {
 
 #[tokio::test]
 async fn create_sealed_budget() {
-    use crate::derived_segments::{compact_pass, CompactOptions, CompactState, FeatureHook, Mode};
+    use crate::derived_segments::{compact_pass, CompactOptions, CompactState, Features, Mode};
     let (r, blobs, meta) = plain();
     build(&r, &[]).await;
     let head = long_history(&r, 300, 0).await;
@@ -172,7 +172,10 @@ async fn create_sealed_budget() {
         rest_factor: 0,
         ..CompactOptions::default()
     };
-    let hook: FeatureHook = Arc::new(|| Box::pin(async { Ok(()) }));
+    let hook = Features {
+        record: Arc::new(|| Box::pin(async { Ok(()) })),
+        recorded: Arc::new(|| Box::pin(async { Ok(true) })),
+    };
     let mut state = CompactState::default();
     for _ in 0..3 {
         compact_pass(&r, &opts, &mut state, Some(&hook))

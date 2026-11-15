@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use leep_core::lane::{scope, Lane};
 use leep_derive::derived_segments::{
-    compact_pass, CompactOptions, CompactState, FeatureHook, Mode, PassReport,
+    compact_pass, CompactOptions, CompactState, Features, Mode, PassReport,
 };
 use leep_derive::Repo;
 
@@ -20,8 +20,9 @@ pub struct Schedule {
     pub first: Duration,
     pub jitter: Duration,
     pub pass: CompactOptions,
-    /// Records the store feature before mode `retire` deletes a row.
-    pub feature: Option<FeatureHook>,
+    /// Records the store feature before mode `retire` deletes a row, and
+    /// tells whether it is recorded.
+    pub feature: Option<Features>,
 }
 
 impl Default for Schedule {

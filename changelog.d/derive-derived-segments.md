@@ -25,6 +25,11 @@
   `skiplist` or `history-tree-v4` also stops segments answering for the
   kind, and refuses `derived-segments-v1`; `repair drop` and `rederive`
   of those kinds wait for the derived-segments lease.
+- **Added.** `MetaStore::delete_derived_values`, a value-conditional delete
+  (one statement in Postgres and SQLite), used by `retire`.
+- **Changed.** `leep-soak` runs its server with derived segments in
+  `retire` and fails a run of a minute or more whose passes sealed or
+  retired nothing (`--derived-segments` to change the mode).
 - **Changed.** The default `--derive-cache-bytes` is 468 MiB (was 420): it
   now includes 48 MiB for segment blocks and data blobs.
 - **Added.** Metrics `leep_derived_segment_*` and the alert

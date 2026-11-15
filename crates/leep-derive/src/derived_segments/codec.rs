@@ -183,6 +183,11 @@ impl SegmentRef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
     pub family: u8,
+    /// Grows with every write (the previous value plus one, or the writer's
+    /// clock in microseconds if that is more), so a reader never goes back to
+    /// an older manifest it reads late, and one written over a damaged row
+    /// still sorts after what readers held.
+    pub seq: u64,
     /// Live segments, oldest first. A key in several answers from the
     /// newest that has the column.
     pub live: Vec<SegmentRef>,
@@ -192,24 +197,36 @@ pub struct Manifest {
     pub retired: Vec<Hash>,
 }
 
+/// Why a manifest row is not a [`Manifest`] this binary can use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ManifestFault {
+    /// The checksum or the structure is wrong: damage.
+    Damaged(String),
+    /// The checksum holds but the version, flags or family are unknown: a
+    /// newer binary wrote it. Never treated as damage, never replaced.
+    Newer(String),
+}
+
 impl Manifest {
     pub fn new(family: u8) -> Self {
         Manifest {
             family,
+            seq: 0,
             live: Vec::new(),
             retired: Vec::new(),
         }
     }
 
-    /// `version, flags, family, u32 live count, (index, data, u32 rows,
-    /// u64 columns, u32 data bytes)*, u32 retired count, hash*, BLAKE3 of
-    /// everything before`. Integers big-endian.
+    /// `version, flags, family, u64 seq, u32 live count, (index, data, u32
+    /// rows, u64 columns, u32 data bytes)*, u32 retired count, hash*, BLAKE3
+    /// of everything before`. Integers big-endian.
     pub fn encode(&self) -> Bytes {
         let mut out =
-            Vec::with_capacity(3 + 4 + self.live.len() * 80 + 4 + self.retired.len() * 32 + 32);
+            Vec::with_capacity(3 + 8 + 4 + self.live.len() * 80 + 4 + self.retired.len() * 32 + 32);
         out.push(MANIFEST_VERSION);
         out.push(0);
         out.push(self.family);
+        out.extend_from_slice(&self.seq.to_be_bytes());
         out.extend_from_slice(&(self.live.len() as u32).to_be_bytes());
         for s in &self.live {
             out.extend_from_slice(&s.index.0);
@@ -228,27 +245,41 @@ impl Manifest {
     }
 
     pub fn decode(v: &[u8]) -> Result<Manifest> {
-        let bad = |what: &str| Error::Encoding(format!("derived segment manifest: {what}"));
-        if v.len() < 3 + 4 + 4 + 32 {
+        Self::parse(v).map_err(|f| match f {
+            ManifestFault::Damaged(m) | ManifestFault::Newer(m) => {
+                Error::Encoding(format!("derived segment manifest: {m}"))
+            }
+        })
+    }
+
+    /// [`Manifest::decode`], telling damage from a newer format.
+    pub fn parse(v: &[u8]) -> std::result::Result<Manifest, ManifestFault> {
+        let bad = |what: &str| ManifestFault::Damaged(what.to_string());
+        if v.len() < 32 + 3 {
             return Err(bad("short"));
         }
         let (body, sum) = v.split_at(v.len() - 32);
         if Hash::of_blob(body).0 != sum {
             return Err(bad("checksum"));
         }
+        let newer = |what: &str| ManifestFault::Newer(what.to_string());
         if body[0] != MANIFEST_VERSION {
-            return Err(bad("unknown version"));
+            return Err(newer("unknown version"));
         }
         if body[1] != 0 {
-            return Err(bad("unknown flags"));
+            return Err(newer("unknown flags"));
         }
         let family = body[2];
+        if family != FAMILY_CHANGESET {
+            return Err(newer("unknown family"));
+        }
         let mut at = 3;
-        let mut take = |n: usize| -> Result<&[u8]> {
+        let mut take = |n: usize| -> std::result::Result<&[u8], ManifestFault> {
             let s = body.get(at..at + n).ok_or_else(|| bad("truncated"))?;
             at += n;
             Ok(s)
         };
+        let seq = u64::from_be_bytes(take(8)?.try_into().unwrap());
         let n = u32::from_be_bytes(take(4)?.try_into().unwrap()) as usize;
         let mut live = Vec::with_capacity(n.min(4096));
         for _ in 0..n {
@@ -275,6 +306,7 @@ impl Manifest {
         }
         Ok(Manifest {
             family,
+            seq,
             live,
             retired,
         })

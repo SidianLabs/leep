@@ -14,8 +14,10 @@ use futures_util::future::BoxFuture;
 use leep_core::{ChangesetId, Error, Hash, Result};
 use tokio::time::Instant;
 
-use super::codec::{self, Manifest, SealRow, SegmentRef, COL_HISTORY_TREE, COL_SKIPLIST};
-use super::view::{Found, Live, ManifestRead};
+use super::codec::{
+    self, Block, Loc, Manifest, SealRow, SegmentData, SegmentRef, COL_HISTORY_TREE, COL_SKIPLIST,
+};
+use super::view::{load_indexes, Live, ManifestRead};
 use super::{lease_key, read_manifest, swap_manifest, MANIFEST_KIND};
 use crate::derived::history_pack::same_part;
 use crate::derived::{decode_u64, DerivedKind, Generation};
@@ -64,6 +66,19 @@ impl std::fmt::Display for Mode {
 /// row delete of every process; idempotent.
 pub type FeatureHook = Arc<dyn Fn() -> BoxFuture<'static, Result<()>> + Send + Sync>;
 
+/// Whether the store has the feature [`super::FEATURE`] recorded: rows may
+/// have been deleted, whatever this process's mode.
+pub type FeatureProbe = Arc<dyn Fn() -> BoxFuture<'static, Result<bool>> + Send + Sync>;
+
+/// The store feature, as a pass needs it. Without one (memory stores,
+/// tests) a store is taken to have no feature recorded, and mode `retire`
+/// refuses to delete.
+#[derive(Clone)]
+pub struct Features {
+    pub record: FeatureHook,
+    pub recorded: FeatureProbe,
+}
+
 /// Called at named points of a pass ("seal-stored", "merge-stored",
 /// "retire-deleted"); a crash test's server stops there to be killed.
 #[derive(Clone)]
@@ -100,6 +115,14 @@ pub struct CompactOptions {
     /// Rest after each delete step, as a multiple of how long it took
     /// (ADR 0052's bounded steps).
     pub rest_factor: u32,
+    /// Most pages of `max_rows` one pass seals: a first seal of a large
+    /// store then gives the lease up between passes, so `repair` is not
+    /// kept waiting for the whole backfill.
+    pub max_seal_pages: usize,
+    /// In mode `build`, the rows are listed again only once their estimated
+    /// count grew by `seal_rows` since the last listing, or this long after
+    /// it (so a quiet store's idle seal still happens).
+    pub list_every: Duration,
     /// For crash tests only.
     pub pause: Option<PauseHook>,
 }
@@ -118,6 +141,8 @@ impl Default for CompactOptions {
             retire_after: super::RETIRE_AFTER,
             batch: 1000,
             rest_factor: 1,
+            max_seal_pages: 4,
+            list_every: Duration::from_secs(600),
             pause: None,
         }
     }
@@ -138,6 +163,8 @@ impl CompactOptions {
             retire_after: Duration::ZERO,
             batch: 7,
             rest_factor: 0,
+            max_seal_pages: 64,
+            list_every: Duration::ZERO,
             pause: None,
         }
     }
@@ -162,14 +189,30 @@ impl CompactOptions {
 pub struct CompactState {
     /// Keys with one of the two rows, since first seen so.
     lone_since: HashMap<Hash, Instant>,
-    /// Live segments, since first seen live by this process.
+    /// Live segments, since first seen live (or published) by this process.
     live_since: HashMap<Hash, Instant>,
-    /// When the unsealed count last grew.
+    /// When the number of keys with rows last grew.
     last_growth: Option<Instant>,
     last_unsealed: usize,
     feature_recorded: bool,
     /// Runs whose merge came out over the byte cap: not tried again.
     oversize: HashSet<Vec<Hash>>,
+    /// Live segments this process read whole and found sound: later passes
+    /// only check their blobs are still stored.
+    verified: HashSet<Hash>,
+    /// Live segments the last pass found unreadable but kept: on a store
+    /// with the feature recorded, a segment is dropped only when two passes
+    /// in a row agree.
+    suspect: HashSet<Hash>,
+    /// Rows found unequal to their holding segment's value, with that
+    /// segment: not read and reported again while it holds them.
+    mismatched: HashMap<(Hash, u8), Hash>,
+    /// Keys with rows whose changeset is not stored (the changeset sweep
+    /// was killed between rows and changeset): skipped until the next
+    /// listing after `list_every`.
+    unstored: HashSet<Hash>,
+    /// The last listing: when, the estimated row count then, and the keys.
+    listed: Option<(Instant, u64)>,
 }
 
 /// What one pass did.
@@ -188,7 +231,7 @@ pub struct PassReport {
     pub dropped: u64,
     /// Rows deleted (mode `retire`).
     pub retired_rows: u64,
-    /// Rows unequal to their segment's value, kept.
+    /// Rows found unequal to their segment's value, kept.
     pub mismatched: u64,
     /// Row values that do not decode, never sealed.
     pub bad_values: u64,
@@ -196,7 +239,14 @@ pub struct PassReport {
     pub live_bytes: u64,
     /// Whether the manifest named in the row could not be decoded.
     pub damaged_manifest: bool,
+    /// Whether a newer binary wrote the manifest: the pass did nothing.
+    pub newer_manifest: bool,
+    /// Whether the rows were listed (in mode `build` only when they grew).
+    pub listed: bool,
 }
+
+/// A row to retire: its key and column, its holding segment and where.
+type Candidate = (Hash, u8, Arc<Live>, Loc);
 
 const KINDS: [(u8, &str); 2] = [
     (COL_SKIPLIST, crate::derived::Skiplist::NAME),
@@ -216,13 +266,13 @@ fn bit(col: u8) -> u8 {
 }
 
 /// One pass under [`lease_key`]'s lease; `None` when another server holds
-/// it. `feature` records [`super::FEATURE`]; mode `retire` refuses to
-/// delete without it.
+/// it. `features` records and reads [`super::FEATURE`]; mode `retire`
+/// refuses to delete without it.
 pub async fn compact_pass(
     repo: &Repo,
     opts: &CompactOptions,
     state: &mut CompactState,
-    feature: Option<&FeatureHook>,
+    features: Option<&Features>,
 ) -> Result<Option<PassReport>> {
     if opts.mode == Mode::Off {
         return Ok(Some(PassReport::default()));
@@ -233,23 +283,35 @@ pub async fn compact_pass(
         Err(e) => return Err(e),
     };
     let result = async {
-        let mut p = Pass::load(repo, opts, &lease).await?;
-        p.run(state, feature).await?;
+        let mut p = Pass::load(repo, opts, &lease, features).await?;
+        p.run(state).await?;
         Ok(p.report)
     }
     .await;
     gc_lease::release(lease, result).await.map(Some)
 }
 
+async fn feature_recorded(features: Option<&Features>) -> Result<bool> {
+    match features {
+        Some(f) => (f.recorded)().await,
+        None => Ok(false),
+    }
+}
+
 pub(crate) struct Pass<'a> {
     repo: &'a Repo,
     opts: &'a CompactOptions,
     lease: &'a Option<GcLease>,
+    features: Option<&'a Features>,
     /// The manifest row as this pass last read or wrote it.
     raw: Option<Bytes>,
     man: Manifest,
-    /// Loaded live segments, by index hash.
+    /// Live segments whose index this pass loaded itself, by index hash.
     segs: HashMap<Hash, Arc<Live>>,
+    /// Data blobs and blocks this pass read (one segment at a time where it
+    /// reads many).
+    data: HashMap<Hash, Arc<SegmentData>>,
+    blocks: HashMap<(Hash, usize, usize), Arc<Block>>,
     /// Keys with rows, and which of the two kinds they have rows of.
     rows: Option<HashMap<Hash, u8>>,
     report: PassReport,
@@ -260,79 +322,172 @@ impl<'a> Pass<'a> {
         repo: &'a Repo,
         opts: &'a CompactOptions,
         lease: &'a Option<GcLease>,
+        features: Option<&'a Features>,
     ) -> Result<Pass<'a>> {
         let (raw, read) = read_manifest(repo).await?;
         let mut report = PassReport::default();
         let man = match read {
             ManifestRead::Absent => Manifest::new(codec::FAMILY_CHANGESET),
             ManifestRead::Read(m) => m,
+            ManifestRead::Newer => {
+                // Never damage: a newer binary's format. Touch nothing.
+                tracing::warn!(
+                    "the {MANIFEST_KIND} row was written by a newer leep-server; this one \
+                     runs no derived segment pass"
+                );
+                report.newer_manifest = true;
+                Manifest::new(codec::FAMILY_CHANGESET)
+            }
             ManifestRead::Damaged => {
                 report.damaged_manifest = true;
-                if opts.mode == Mode::Retire {
+                // Replaced only where every row is certainly still stored:
+                // this process is in mode build and the store has never
+                // recorded the feature (another server may have retired).
+                if opts.mode == Mode::Retire || feature_recorded(features).await? {
                     return Err(Error::Other(format!(
-                        "the {MANIFEST_KIND} row does not decode; in mode retire it may name the \
-                         only copy of deleted rows, so it is not replaced automatically (see \
-                         LeepDerivedSegmentPassesFailing in RUNBOOKS.md)"
+                        "the {MANIFEST_KIND} row does not decode, and rows may have been \
+                         retired (the store feature {} is recorded, or this server runs \
+                         retire), so it may name the only copy of deleted rows; it is not \
+                         replaced automatically (see LeepDerivedSegmentPassesFailing in \
+                         RUNBOOKS.md)",
+                        super::FEATURE
                     )));
                 }
-                // In build mode every row is still stored: start over.
                 tracing::warn!("the {MANIFEST_KIND} row does not decode; replacing it");
                 Manifest::new(codec::FAMILY_CHANGESET)
             }
         };
-        let view = repo.segments();
-        view.apply(raw.clone()).await?;
-        let segs = view
-            .segments()
-            .into_iter()
-            .map(|l| (l.r.index, l))
-            .collect();
-        Ok(Pass {
+        let mut p = Pass {
             repo,
             opts,
             lease,
+            features,
             raw,
             man,
-            segs,
+            segs: HashMap::new(),
+            data: HashMap::new(),
+            blocks: HashMap::new(),
             rows: None,
             report,
-        })
+        };
+        if !p.report.newer_manifest {
+            p.load_segments().await?;
+        }
+        Ok(p)
     }
 
-    pub(crate) async fn run(
-        &mut self,
-        state: &mut CompactState,
-        feature: Option<&FeatureHook>,
-    ) -> Result<()> {
-        self.check_live().await?;
+    /// Load the live segments' indexes itself, not through the shared read
+    /// view (whose state a reader's transient error or a late read may
+    /// have moved). A transient read error fails the pass.
+    async fn load_segments(&mut self) -> Result<()> {
+        let missing: Vec<SegmentRef> = self
+            .man
+            .live
+            .iter()
+            .filter(|s| !self.segs.contains_key(&s.index))
+            .copied()
+            .collect();
+        for (h, idx) in load_indexes(&**self.repo.blobs(), &missing).await? {
+            if let (Some(idx), Some(r)) = (idx, self.man.live.iter().find(|s| s.index == h)) {
+                self.segs.insert(h, Arc::new(Live { r: *r, idx }));
+            }
+        }
+        // Column masks come from the manifest.
+        for s in &self.man.live {
+            if let Some(l) = self.segs.get_mut(&s.index) {
+                if l.r != *s {
+                    *l = Arc::new(Live {
+                        r: *s,
+                        idx: l.idx.clone(),
+                    });
+                }
+            }
+        }
+        let live: HashSet<Hash> = self.man.live.iter().map(|s| s.index).collect();
+        self.segs.retain(|h, _| live.contains(h));
+        Ok(())
+    }
+
+    pub(crate) async fn run(&mut self, state: &mut CompactState) -> Result<()> {
+        if self.report.newer_manifest {
+            return Ok(());
+        }
+        self.check_live(state).await?;
         let now = Instant::now();
         let live: HashSet<Hash> = self.man.live.iter().map(|s| s.index).collect();
         state.live_since.retain(|h, _| live.contains(h));
-        for h in live {
-            state.live_since.entry(h).or_insert(now);
+        for h in &live {
+            state.live_since.entry(*h).or_insert(now);
         }
+        state.verified.retain(|h| live.contains(h));
+        state.mismatched.retain(|_, h| live.contains(h));
         self.seal(state).await?;
         self.merge(state).await?;
         if self.opts.mode == Mode::Retire {
-            self.retire(state, feature).await?;
+            self.retire(state).await?;
         }
         self.report.live_segments = self.man.live.len() as u64;
         self.report.live_bytes = self.man.live.iter().map(|s| s.data_len as u64).sum::<u64>();
         Ok(())
     }
 
+    /// Whether `s`'s blobs read, probed by this pass itself: `Ok(false)`
+    /// only for definite loss or damage (not stored, address or structure
+    /// wrong, a read the store reports corrupt); any other error fails the
+    /// pass. A segment read whole once in this process is later only checked
+    /// for presence.
+    async fn probe(&mut self, s: &SegmentRef, state: &mut CompactState) -> Result<bool> {
+        let Some(live) = self.segs.get(&s.index).cloned() else {
+            // `load_indexes` gives `None` only for definite loss or damage.
+            return Ok(false);
+        };
+        if state.verified.contains(&s.index) {
+            return self.repo.blobs().contains(&s.data).await;
+        }
+        let bytes = match self.repo.blobs().get(&s.data).await {
+            Ok(Some(b)) => b,
+            Ok(None) => return Ok(false),
+            Err(e) if crate::gc_segments::segment_reads_corrupt(&e) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let sound = codec::decode_data(&live.idx, &s.data, bytes)
+            .and_then(|d| codec::read_all(&live.idx, &d).map(|_| d));
+        match sound {
+            Ok(_) => {
+                state.verified.insert(s.index);
+                Ok(true)
+            }
+            Err(_) => Ok(false),
+        }
+    }
+
     /// Drop live segments that cannot be read (their keys then read as rows
     /// or derive again, and seal again), forget retired blobs no longer
-    /// stored, and replace a manifest that did not decode.
-    async fn check_live(&mut self) -> Result<()> {
-        let mut gone = Vec::new();
-        for s in &self.man.live {
-            let readable =
-                self.segs.contains_key(&s.index) && self.repo.blobs().contains(&s.data).await?;
-            if !readable {
-                gone.push(*s);
+    /// stored, and replace a manifest that did not decode. On a store with
+    /// the feature recorded a segment is dropped only when this pass and the
+    /// last both found it unreadable.
+    async fn check_live(&mut self, state: &mut CompactState) -> Result<()> {
+        let mut bad = Vec::new();
+        for s in self.man.live.clone() {
+            if !self.probe(&s, state).await? {
+                bad.push(s);
             }
         }
+        let careful = !bad.is_empty() && feature_recorded(self.features).await?;
+        let mut gone = Vec::new();
+        let mut suspect = HashSet::new();
+        for s in bad {
+            if careful && !state.suspect.contains(&s.index) {
+                tracing::warn!(
+                    segment = %s.index,
+                    "a derived segment cannot be read; dropping it if the next pass agrees"
+                );
+                suspect.insert(s.index);
+            } else {
+                gone.push(s);
+            }
+        }
+        state.suspect = suspect;
         let mut retired = Vec::with_capacity(self.man.retired.len());
         for h in &self.man.retired {
             if self.repo.blobs().contains(h).await? {
@@ -359,20 +514,14 @@ impl<'a> Pass<'a> {
     }
 
     async fn write(&mut self) -> Result<()> {
-        let bytes = swap_manifest(self.repo, self.lease, self.raw.as_deref(), &self.man).await?;
+        let bytes =
+            swap_manifest(self.repo, self.lease, self.raw.as_deref(), &mut self.man).await?;
         self.raw = Some(bytes);
-        self.segs = self
-            .repo
-            .segments()
-            .segments()
-            .into_iter()
-            .map(|l| (l.r.index, l))
-            .collect();
-        Ok(())
+        self.load_segments().await
     }
 
     /// The newest live segment holding `key`'s value of `col`.
-    fn holder(&self, key: &Hash, col: u8) -> Option<(Arc<Live>, codec::Loc)> {
+    fn holder(&self, key: &Hash, col: u8) -> Option<(Arc<Live>, Loc)> {
         self.man.live.iter().rev().find_map(|s| {
             if !s.has(col) {
                 return None;
@@ -382,35 +531,117 @@ impl<'a> Pass<'a> {
         })
     }
 
-    /// Every key with a row of either kind.
-    async fn list_rows(&mut self) -> Result<&HashMap<Hash, u8>> {
-        if self.rows.is_none() {
-            let mut rows: HashMap<Hash, u8> = HashMap::new();
-            for (col, kind) in KINDS {
-                let mut after = None;
-                loop {
-                    let page = self
-                        .repo
-                        .row_meta()
-                        .list_derived_keys(kind, after, 10_000)
-                        .await?;
-                    let Some(last) = page.last().copied() else {
-                        break;
-                    };
-                    after = Some(last);
-                    for k in page {
+    /// The data blob of `live`, read once per pass. `None`: not readable.
+    async fn data_of(&mut self, live: &Live) -> Result<Option<Arc<SegmentData>>> {
+        if let Some(d) = self.data.get(&live.r.data) {
+            return Ok(Some(d.clone()));
+        }
+        let bytes = match self.repo.blobs().get(&live.r.data).await {
+            Ok(Some(b)) => b,
+            Ok(None) => return Ok(None),
+            Err(e) if crate::gc_segments::segment_reads_corrupt(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        match codec::decode_data(&live.idx, &live.r.data, bytes) {
+            Ok(d) => {
+                let d = Arc::new(d);
+                self.data.insert(live.r.data, d.clone());
+                Ok(Some(d))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Forget the data and blocks read so far (between segments).
+    fn forget_data(&mut self) {
+        self.data.clear();
+        self.blocks.clear();
+    }
+
+    /// The value at `loc` of `live`; `None` if it cannot be read.
+    async fn value_at(&mut self, live: &Live, loc: Loc, col: u8) -> Result<Option<Bytes>> {
+        let Some(data) = self.data_of(live).await? else {
+            return Ok(None);
+        };
+        let key = (live.r.data, loc.col, loc.block);
+        let block = match self.blocks.get(&key) {
+            Some(b) => b.clone(),
+            None => match codec::read_block(&live.idx, &data, loc.col, loc.block) {
+                Ok(b) => {
+                    let b = Arc::new(b);
+                    self.blocks.insert(key, b.clone());
+                    b
+                }
+                Err(_) => return Ok(None),
+            },
+        };
+        Ok(block
+            .row(loc.rank)
+            .and_then(|row| codec::row_value(&live.idx, &data, col, loc.ord, row).ok()))
+    }
+
+    /// The keys with rows of either kind: listed again in mode `retire`
+    /// always (only unsealed rows remain), in mode `build` once their
+    /// estimated count grew by `seal_rows` or `list_every` passed.
+    async fn list_rows(&mut self, state: &mut CompactState) -> Result<()> {
+        if self.rows.is_some() {
+            return Ok(());
+        }
+        let mut estimate = 0;
+        for (_, kind) in KINDS {
+            estimate += self.repo.row_meta().estimate_derived(kind).await?.rows;
+        }
+        let due = match state.listed {
+            None => true,
+            Some((at, n)) => {
+                self.opts.mode == Mode::Retire
+                    || estimate >= n + self.opts.seal_rows as u64
+                    || at.elapsed() >= self.opts.list_every
+            }
+        };
+        if !due {
+            self.rows = Some(HashMap::new());
+            return Ok(());
+        }
+        if state
+            .listed
+            .is_none_or(|(at, _)| at.elapsed() >= self.opts.list_every)
+        {
+            state.unstored.clear();
+        }
+        state.listed = Some((Instant::now(), estimate));
+        self.report.listed = true;
+        let mut rows: HashMap<Hash, u8> = HashMap::new();
+        for (col, kind) in KINDS {
+            let mut after = None;
+            loop {
+                let page = self
+                    .repo
+                    .row_meta()
+                    .list_derived_keys(kind, after, 10_000)
+                    .await?;
+                let Some(last) = page.last().copied() else {
+                    break;
+                };
+                after = Some(last);
+                for k in page {
+                    if !state.unstored.contains(&k) {
                         *rows.entry(k).or_default() |= bit(col);
                     }
                 }
             }
-            self.rows = Some(rows);
         }
-        Ok(self.rows.as_ref().expect("listed above"))
+        self.rows = Some(rows);
+        Ok(())
     }
 
     async fn seal(&mut self, state: &mut CompactState) -> Result<()> {
+        self.list_rows(state).await?;
+        if !self.report.listed {
+            return Ok(());
+        }
         let now = Instant::now();
-        let rows = self.list_rows().await?.clone();
+        let rows = self.rows.take().unwrap_or_default();
         let mut unsealed_rows = 0u64;
         let mut lone_now: HashSet<Hash> = HashSet::new();
         let mut cands: Vec<(Hash, u8)> = Vec::new();
@@ -447,13 +678,14 @@ impl<'a> Pass<'a> {
                 cands.push((*k, open));
             }
         }
+        let keyed = rows.len();
+        self.rows = Some(rows);
         state.lone_since.retain(|k, _| lone_now.contains(k));
         self.report.unsealed_rows = unsealed_rows;
-        let unsealed = rows.len();
-        if unsealed > state.last_unsealed || state.last_growth.is_none() {
+        if keyed > state.last_unsealed || state.last_growth.is_none() {
             state.last_growth = Some(now);
         }
-        state.last_unsealed = unsealed;
+        state.last_unsealed = keyed;
         let idle = state
             .last_growth
             .is_some_and(|t| now.duration_since(t) >= self.opts.idle);
@@ -463,13 +695,20 @@ impl<'a> Pass<'a> {
         }
         let ids: Vec<Hash> = cands.iter().map(|(k, _)| *k).collect();
         let gens = generations(self.repo, &ids, self.opts.batch).await?;
-        let mut order: Vec<(u64, Hash, u8)> = cands
-            .iter()
-            .zip(gens)
-            .filter_map(|((k, m), g)| g.map(|g| (g, *k, *m)))
-            .collect();
+        let mut order: Vec<(u64, Hash, u8)> = Vec::with_capacity(n);
+        for ((k, m), g) in cands.iter().zip(gens) {
+            match g {
+                Some(g) => order.push((g, *k, *m)),
+                None => {
+                    state.unstored.insert(*k);
+                }
+            }
+        }
         order.sort_unstable();
-        for page in order.chunks(self.opts.max_rows.max(1)) {
+        for page in order
+            .chunks(self.opts.max_rows.max(1))
+            .take(self.opts.max_seal_pages.max(1))
+        {
             let mut seal: Vec<SealRow> = Vec::with_capacity(page.len());
             let mut values: HashMap<Hash, Vec<(u8, Bytes)>> = HashMap::new();
             for (col, kind) in KINDS {
@@ -514,6 +753,7 @@ impl<'a> Pass<'a> {
                 self.man.live.push(enc.seg);
                 self.write().await?;
                 state.live_since.insert(enc.seg.index, Instant::now());
+                state.verified.insert(enc.seg.index);
                 self.report.sealed_segments += 1;
                 self.report.sealed_keys += enc.seg.rows as u64;
             }
@@ -579,34 +819,34 @@ impl<'a> Pass<'a> {
             let mut values: HashMap<(Hash, u8), Bytes> = HashMap::new();
             for s in &run {
                 let l = self.segs[&s.index].clone();
-                let Some(data) = self.repo.segments().data(&l).await? else {
-                    // Not stored or damaged: drop it, and look again.
-                    self.man.live.retain(|x| x.index != s.index);
-                    self.man.retire([*s]);
-                    self.report.dropped += 1;
-                    self.write().await?;
+                let Some(data) = self.data_of(&l).await? else {
+                    // Unreadable now: leave the run for a later pass; the
+                    // next check of live segments decides about it.
+                    self.forget_data();
+                    state.verified.remove(&s.index);
                     continue 'runs;
                 };
-                for (k, col, v) in codec::read_all(&l.idx, &data)? {
+                for (key, col, v) in codec::read_all(&l.idx, &data)? {
                     if s.has(col) {
-                        values.insert((k, col), v);
+                        values.insert((key, col), v);
                     }
                 }
             }
+            self.forget_data();
             let mut keys: Vec<Hash> = values.keys().map(|(k, _)| *k).collect();
             keys.sort_unstable();
             keys.dedup();
             let gens = generations(self.repo, &keys, self.opts.batch).await?;
             let mut rows = Vec::with_capacity(keys.len());
-            for (k, g) in keys.iter().zip(gens) {
+            for (key, g) in keys.iter().zip(gens) {
                 let Some(g) = g else { continue };
                 let mut v: Vec<(u8, Bytes)> = KINDS
                     .iter()
-                    .filter_map(|(c, _)| values.remove(&(*k, *c)).map(|b| (*c, b)))
+                    .filter_map(|(c, _)| values.remove(&(*key, *c)).map(|b| (*c, b)))
                     .collect();
                 v.sort_by_key(|(c, _)| *c);
                 rows.push(SealRow {
-                    key: *k,
+                    key: *key,
                     generation: g,
                     values: v,
                 });
@@ -630,6 +870,7 @@ impl<'a> Pass<'a> {
             self.man.retire(run.iter().copied());
             self.write().await?;
             state.live_since.insert(enc.seg.index, Instant::now());
+            state.verified.insert(enc.seg.index);
             self.report.merges += 1;
             self.report.merged_away += k as u64;
         }
@@ -639,13 +880,10 @@ impl<'a> Pass<'a> {
     /// [`CompactOptions::retire_after`], holds the same value for. The
     /// feature is recorded first; the manifest is read again under the
     /// lease and must be the one this pass holds; each step checks the
-    /// lease, compares every row with its segment value and deletes only
-    /// equal ones.
-    async fn retire(
-        &mut self,
-        state: &mut CompactState,
-        feature: Option<&FeatureHook>,
-    ) -> Result<()> {
+    /// lease, compares every row with its segment value, and deletes a row
+    /// only if it still holds the bytes compared (one statement), so a row
+    /// `repair` rewrote meanwhile stays.
+    async fn retire(&mut self, state: &mut CompactState) -> Result<()> {
         let now = Instant::now();
         let ripe: HashSet<Hash> = state
             .live_since
@@ -662,72 +900,96 @@ impl<'a> Pass<'a> {
                 "the {MANIFEST_KIND} row changed under this pass; stopping before deleting rows"
             )));
         }
-        let rows = self.list_rows().await?.clone();
-        for (col, kind) in KINDS {
-            let mut keys: Vec<(Hash, Arc<Live>, codec::Loc)> = rows
-                .iter()
-                .filter(|(_, m)| *m & bit(col) != 0)
-                .filter_map(|(k, _)| self.holder(k, col).map(|(l, loc)| (*k, l, loc)))
-                .filter(|(_, l, _)| ripe.contains(&l.r.index))
-                .collect();
-            keys.sort_unstable_by_key(|(k, _, _)| *k);
-            for chunk in keys.chunks(self.opts.batch.max(1)) {
-                let started = std::time::Instant::now();
-                let ks: Vec<Hash> = chunk.iter().map(|(k, _, _)| *k).collect();
-                let got = self.repo.row_meta().get_derived_many(kind, &ks).await?;
-                let mut del = Vec::with_capacity(ks.len());
-                for ((k, l, loc), row) in chunk.iter().zip(got) {
-                    let Some(row) = row else { continue };
-                    let seg = match self.repo.segments().read_at(l, *loc, col).await? {
-                        Found::Yes(v) => v,
-                        _ => continue,
-                    };
-                    let equal = if col == COL_HISTORY_TREE {
-                        same_part(&row, &seg)
-                    } else {
-                        row == seg
-                    };
-                    if equal {
-                        del.push(*k);
-                    } else {
-                        self.report.mismatched += 1;
-                        metrics::counter!("leep_derived_segment_mismatch_total", "kind" => kind)
-                            .increment(1);
-                        tracing::warn!(
-                            key = %k,
-                            kind,
-                            "a {kind} row differs from its derived segment's value; the row                              stays and wins (run `leep-server verify --derived {kind}`)"
-                        );
-                    }
-                }
-                if del.is_empty() {
+        self.list_rows(state).await?;
+        let rows = self.rows.take().unwrap_or_default();
+        // Candidates by holding segment, so one data blob is in memory at a
+        // time.
+        let mut by_seg: HashMap<Hash, Vec<Candidate>> = HashMap::new();
+        for (k, m) in &rows {
+            for (col, _) in KINDS {
+                if m & bit(col) == 0 {
                     continue;
                 }
-                if !state.feature_recorded {
-                    let Some(f) = feature else {
-                        return Err(Error::Invalid(
-                            "--derived-segments retire needs the store feature recorded first,                              and this handle cannot record it"
-                                .into(),
-                        ));
-                    };
-                    f().await?;
-                    state.feature_recorded = true;
+                let Some((l, loc)) = self.holder(k, col) else {
+                    continue;
+                };
+                if !ripe.contains(&l.r.index)
+                    || state.mismatched.get(&(*k, col)) == Some(&l.r.index)
+                {
+                    continue;
                 }
-                gc_lease::check(self.lease)?;
-                let n = self
-                    .repo
-                    .row_meta()
-                    .delete_derived_keys(&[kind], &del)
-                    .await?;
-                self.report.retired_rows += n;
-                self.pause("retire-deleted").await;
-                metrics::counter!("leep_derived_segment_rows_retired_total", "kind" => kind)
-                    .increment(n);
-                let rest = started.elapsed() * self.opts.rest_factor;
-                if !rest.is_zero() {
-                    tokio::time::sleep(rest).await;
+                by_seg.entry(l.r.index).or_default().push((*k, col, l, loc));
+            }
+        }
+        self.rows = Some(rows);
+        let mut segs: Vec<Hash> = by_seg.keys().copied().collect();
+        segs.sort_unstable();
+        for seg in segs {
+            let mut cands = by_seg.remove(&seg).unwrap_or_default();
+            cands.sort_unstable_by_key(|(k, c, _, _)| (*c, *k));
+            for (col, kind) in KINDS {
+                let mine: Vec<&Candidate> = cands.iter().filter(|(_, c, _, _)| *c == col).collect();
+                for chunk in mine.chunks(self.opts.batch.max(1)) {
+                    let started = std::time::Instant::now();
+                    let ks: Vec<Hash> = chunk.iter().map(|(k, _, _, _)| *k).collect();
+                    let got = self.repo.row_meta().get_derived_many(kind, &ks).await?;
+                    let mut del = Vec::with_capacity(ks.len());
+                    for ((k, _, l, loc), row) in chunk.iter().zip(got) {
+                        let Some(row) = row else { continue };
+                        let Some(value) = self.value_at(l, *loc, col).await? else {
+                            continue;
+                        };
+                        let equal = if col == COL_HISTORY_TREE {
+                            same_part(&row, &value)
+                        } else {
+                            row == value
+                        };
+                        if equal {
+                            del.push((*k, row));
+                        } else {
+                            self.report.mismatched += 1;
+                            state.mismatched.insert((*k, col), l.r.index);
+                            metrics::counter!("leep_derived_segment_mismatch_total", "kind" => kind)
+                                .increment(1);
+                            tracing::warn!(
+                                key = %k,
+                                kind,
+                                "a {kind} row differs from its derived segment's value; the \
+                                 row stays and wins (run `leep-server verify --derived {kind}`)"
+                            );
+                        }
+                    }
+                    if del.is_empty() {
+                        continue;
+                    }
+                    if !state.feature_recorded {
+                        let Some(f) = self.features else {
+                            return Err(Error::Invalid(
+                                "--derived-segments retire needs the store feature recorded \
+                                 first, and this handle cannot record it"
+                                    .into(),
+                            ));
+                        };
+                        (f.record)().await?;
+                        state.feature_recorded = true;
+                    }
+                    gc_lease::check(self.lease)?;
+                    let n = self
+                        .repo
+                        .row_meta()
+                        .delete_derived_values(kind, &del)
+                        .await?;
+                    self.report.retired_rows += n;
+                    self.pause("retire-deleted").await;
+                    metrics::counter!("leep_derived_segment_rows_retired_total", "kind" => kind)
+                        .increment(n);
+                    let rest = started.elapsed() * self.opts.rest_factor;
+                    if !rest.is_zero() {
+                        tokio::time::sleep(rest).await;
+                    }
                 }
             }
+            self.forget_data();
         }
         Ok(())
     }
