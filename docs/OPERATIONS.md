@@ -3760,7 +3760,8 @@ never the land path's). It lists the keys of both kinds, and:
    or 64 that have not grown for 10 minutes; a changeset whose
    `history-tree-v4` row is not derived yet waits 10 minutes for it. A
    segment holds at most 16,384 changesets and 4 MiB; a store's existing
-   history is sealed in pages of that size, restartable anywhere;
+   history is sealed in pages of that size, restartable anywhere (a
+   backfill, below);
 2. merges runs of four segments of one size tier (1k, 4k, 16k changesets);
    the segments merged away are collected by the next `gc` like orphans
    (`retired derived segment blobs condemned` / `deleted` in its report);
@@ -3768,6 +3769,28 @@ never the land path's). It lists the keys of both kinds, and:
    minutes, after comparing each with the segment's value (an unequal row
    stays and wins, `leep_derived_segment_mismatch_total`), 1,000 a
    statement, resting as long as each step took.
+
+**Backfill cost.** The first pass on a store with history lists every key
+of both kinds once and reads every changeset's generation (in batches of
+1,000, for at most a minute a pass); the passes after it seal four pages
+(65,536 changesets) each without listing again, 5 s apart, and so do
+retirements (65,536 rows or a minute a pass, none while a seal backfill is
+under way). Each pass gives the lease up, so `repair`, which waits up to
+two minutes for it, is not starved. Measured on Postgres 16 with synthetic
+chains (`crates/leep-server/tests/derived_segments_backfill.rs`; one kind,
+so a real store lists about twice the keys):
+
+| Changesets | Seal passes | First pass | Each after | All passes | Retire passes, all |
+|---|---|---|---|---|---|
+| 500,000 | 8 | 6.2 s | 0.4 to 0.6 s | 10.1 s | 8, 45 s |
+| 2,000,000 | 31 | 19.8 s | about 0.8 s | 44.7 s | 31, 106 s |
+
+Before the listing was carried, every seal pass listed again and took 4.4
+to 5.1 s at 500,000 changesets (37.4 s in all), growing with the store.
+Only the first pass grows with the store (about 10 s a million changesets
+of one kind here); retiring is bound by its deletes and the equal rest
+after each (at most 5.7 s a pass).
+`leep_derived_segment_unsealed_rows` falls as it goes.
 
 The log line "derived segments pass (ADR 0104)" (level info) gives what a
 pass did; the metrics are `leep_derived_segment_*` ([Metrics](#metrics)).

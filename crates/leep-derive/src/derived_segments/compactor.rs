@@ -5,7 +5,7 @@
 //! every manifest write is a compare-and-swap from the bytes the pass last
 //! read or wrote, and blobs are durable before the manifest names them.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -119,6 +119,10 @@ pub struct CompactOptions {
     /// store then gives the lease up between passes, so `repair` is not
     /// kept waiting for the whole backfill.
     pub max_seal_pages: usize,
+    /// Longest a pass spends on a backfill's generations and pages (it
+    /// finishes the page it is on): with the listing, a pass stays well
+    /// under the two minutes `repair` waits for the lease.
+    pub max_seal_time: Duration,
     /// Most rows one pass deletes, and the longest it spends deleting: a
     /// pass then gives the lease up, so `repair` (which waits up to two
     /// minutes for it) is not starved, and the next pass goes on soon.
@@ -147,6 +151,7 @@ impl Default for CompactOptions {
             batch: 1000,
             rest_factor: 1,
             max_seal_pages: 4,
+            max_seal_time: Duration::from_secs(60),
             max_retire_rows: 65_536,
             max_retire_time: Duration::from_secs(60),
             list_every: Duration::from_secs(600),
@@ -171,6 +176,7 @@ impl CompactOptions {
             batch: 7,
             rest_factor: 0,
             max_seal_pages: 64,
+            max_seal_time: Duration::from_secs(3600),
             max_retire_rows: usize::MAX,
             max_retire_time: Duration::from_secs(3600),
             list_every: Duration::ZERO,
@@ -220,10 +226,67 @@ pub struct CompactState {
     /// was killed between rows and changeset): skipped until the next
     /// listing after `list_every`.
     unstored: HashSet<Hash>,
+    /// Rows whose value does not decode, by key and column: not sealed,
+    /// and skipped like `unstored` (cleared with it), so they do not make
+    /// every listing a backfill again.
+    bad: HashSet<(Hash, u8)>,
     /// When `unstored` was last cleared.
     unstored_cleared: Option<Instant>,
     /// The last listing: when, and the estimated row count then.
     listed: Option<(Instant, u64)>,
+    /// A seal backfill under way: the candidates of a listing, consumed
+    /// page by page by the following passes without listing again.
+    backfill: Option<Backfill>,
+    /// Rows a retirement that hit its bound has still to compare, by
+    /// holding segment: the following passes go on without listing again.
+    retire_left: Option<RetireWork>,
+    /// The live segments (with their column masks) the carried work above
+    /// accounts for: those live at its listing, and those this process
+    /// published since. A live segment outside it (another server's pass,
+    /// a `repair drop`), or a dropped one, makes a pass forget the work
+    /// and list again.
+    known: HashMap<Hash, u64>,
+}
+
+/// Rows to compare and retire: by holding segment, each list by column and
+/// key.
+type RetireWork = VecDeque<(Hash, Vec<(Hash, u8)>)>;
+
+/// Seal candidates carried across passes.
+struct Backfill {
+    /// Candidates whose generation is not read yet.
+    pending: Vec<(Hash, u8)>,
+    /// Candidates with their generations; sorted by `(generation, id)` once
+    /// `pending` is empty, then sealed from `next` on.
+    order: Vec<(u64, Hash, u8)>,
+    sorted: bool,
+    next: usize,
+}
+
+impl Backfill {
+    fn rows_left(&self) -> u64 {
+        let pending = self.pending.iter().map(|(_, m)| m.count_ones() as u64);
+        let order = self.order[self.next.min(self.order.len())..]
+            .iter()
+            .map(|(_, _, m)| m.count_ones() as u64);
+        pending.sum::<u64>() + order.sum::<u64>()
+    }
+}
+
+/// A key with rows, as a pass sees it.
+#[derive(Clone, Copy)]
+struct RowKey {
+    /// Bit `c`: it has a row of column `c`.
+    have: u8,
+    /// Per column (by [`slot`]), the position in the manifest's live list
+    /// of its newest holding segment, or [`NONE`].
+    holder: [u32; 2],
+}
+
+const NONE: u32 = u32::MAX;
+
+fn slot(col: u8) -> usize {
+    usize::from(col != COL_SKIPLIST)
 }
 
 /// What one pass did.
@@ -254,13 +317,11 @@ pub struct PassReport {
     pub newer_manifest: bool,
     /// Whether the rows were listed (in mode `build` only when they grew).
     pub listed: bool,
-    /// Whether the pass stopped with work left (seal candidates beyond its
-    /// pages, rows beyond its retire bound): the next pass should run soon.
+    /// Whether the pass made progress and stopped with work left (a
+    /// backfill's candidates beyond its pages or time, rows beyond its
+    /// retire bound): the next pass should run soon.
     pub more: bool,
 }
-
-/// A row to retire: its key and column, its holding segment and where.
-type Candidate = (Hash, u8, Arc<Live>, Loc);
 
 const KINDS: [(u8, &str); 2] = [
     (COL_SKIPLIST, crate::derived::Skiplist::NAME),
@@ -327,7 +388,11 @@ pub(crate) struct Pass<'a> {
     data: HashMap<Hash, Arc<SegmentData>>,
     blocks: HashMap<(Hash, usize, usize), Arc<Block>>,
     /// Keys with rows, and which of the two kinds they have rows of.
-    rows: Option<HashMap<Hash, u8>>,
+    rows: Option<HashMap<Hash, RowKey>>,
+    /// Live segments whose decoded index came from the read view, not from
+    /// a read of its blob by this pass.
+    reused: HashSet<Hash>,
+    started: std::time::Instant,
     /// Live segments whose data this pass could not read: no merge or
     /// retire uses them again in this pass, and the next pass probes them
     /// whole.
@@ -386,6 +451,8 @@ impl<'a> Pass<'a> {
             data: HashMap::new(),
             blocks: HashMap::new(),
             rows: None,
+            reused: HashSet::new(),
+            started: std::time::Instant::now(),
             unreadable: HashSet::new(),
             report,
         };
@@ -415,6 +482,7 @@ impl<'a> Pass<'a> {
             }
             if let Some(idx) = held.get(&s.index) {
                 if idx.data == s.data && idx.len() == s.rows as usize {
+                    self.reused.insert(s.index);
                     self.segs.insert(
                         s.index,
                         Arc::new(Live {
@@ -450,6 +518,7 @@ impl<'a> Pass<'a> {
         }
         let live: HashSet<Hash> = self.man.live.iter().map(|s| s.index).collect();
         self.segs.retain(|h, _| live.contains(h));
+        self.reused.retain(|h| live.contains(h));
         Ok(())
     }
 
@@ -466,9 +535,24 @@ impl<'a> Pass<'a> {
         }
         state.verified.retain(|h| live.contains(h));
         state.mismatched.retain(|_, h| live.contains(h));
+        let accounted = self
+            .man
+            .live
+            .iter()
+            .all(|s| state.known.get(&s.index) == Some(&s.columns));
+        if self.report.dropped > 0 || !accounted {
+            if state.backfill.is_some() || state.retire_left.is_some() {
+                // List again now, not after `list_every`.
+                state.listed = None;
+            }
+            state.backfill = None;
+            state.retire_left = None;
+        }
         self.seal(state).await?;
         self.merge(state).await?;
-        if self.opts.mode == Mode::Retire {
+        // Not during a backfill: each pass would list every row again to
+        // find the few newly ripe ones.
+        if self.opts.mode == Mode::Retire && state.backfill.is_none() {
             self.retire(state).await?;
         }
         self.report.live_segments = self.man.live.len() as u64;
@@ -480,12 +564,15 @@ impl<'a> Pass<'a> {
     /// only for definite loss or damage (not stored, address or structure
     /// wrong, a read the store reports corrupt); any other error fails the
     /// pass. A segment read whole once in this process is later only checked
-    /// for presence.
+    /// for presence, as is an index taken from the read view.
     async fn probe(&mut self, s: &SegmentRef, state: &mut CompactState) -> Result<bool> {
         let Some(live) = self.segs.get(&s.index).cloned() else {
             // `load_indexes` gives `None` only for definite loss or damage.
             return Ok(false);
         };
+        if self.reused.contains(&s.index) && !self.repo.blobs().contains(&s.index).await? {
+            return Ok(false);
+        }
         if state.verified.contains(&s.index) {
             return self.repo.blobs().contains(&s.data).await;
         }
@@ -566,15 +653,59 @@ impl<'a> Pass<'a> {
         self.load_segments().await
     }
 
-    /// The newest live segment holding `key`'s value of `col`.
-    fn holder(&self, key: &Hash, col: u8) -> Option<(Arc<Live>, Loc)> {
-        self.man.live.iter().rev().find_map(|s| {
-            if !s.has(col) {
-                return None;
+    /// The newest live segment holding `key`'s value of `col`, as its
+    /// position in the live list.
+    fn holder(&self, key: &Hash, col: u8) -> u32 {
+        self.man
+            .live
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, s)| {
+                let l = self.segs.get(&s.index)?;
+                (s.has(col) && l.idx.has(key, col)).then_some(i as u32)
+            })
+            .unwrap_or(NONE)
+    }
+
+    /// Set every key's newest holder of each column it has a row of. Few
+    /// rows look each key up in every segment; many walk every segment's
+    /// keys once, newest first, so a backfill is linear in the keys, not
+    /// keys times segments.
+    fn place_holders(&self, rows: &mut HashMap<Hash, RowKey>) {
+        let sealed: usize = self.man.live.iter().map(|s| s.rows as usize).sum();
+        if rows.len().saturating_mul(self.man.live.len()) <= sealed {
+            for (k, r) in rows.iter_mut() {
+                for (col, _) in KINDS {
+                    r.holder[slot(col)] = if r.have & bit(col) != 0 {
+                        self.holder(k, col)
+                    } else {
+                        NONE
+                    };
+                }
             }
-            let l = self.segs.get(&s.index)?;
-            l.idx.locate(key, col).map(|loc| (l.clone(), loc))
-        })
+            return;
+        }
+        for r in rows.values_mut() {
+            r.holder = [NONE; 2];
+        }
+        for (i, s) in self.man.live.iter().enumerate().rev() {
+            let Some(l) = self.segs.get(&s.index) else {
+                continue;
+            };
+            for (col, _) in KINDS {
+                if !s.has(col) {
+                    continue;
+                }
+                for k in l.idx.keys_with(col) {
+                    if let Some(r) = rows.get_mut(k) {
+                        if r.have & bit(col) != 0 && r.holder[slot(col)] == NONE {
+                            r.holder[slot(col)] = i as u32;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// A live segment whose data this pass could not read: skipped for the
@@ -638,8 +769,9 @@ impl<'a> Pass<'a> {
     }
 
     /// The keys with rows of either kind: listed again in mode `retire`
-    /// always (only unsealed rows remain), in mode `build` once their
-    /// estimated count grew by `seal_rows` or `list_every` passed.
+    /// unless a retirement is carried over (only unsealed rows remain), in
+    /// mode `build` once their estimated count grew by `seal_rows` or
+    /// `list_every` passed.
     async fn list_rows(&mut self, state: &mut CompactState) -> Result<()> {
         if self.rows.is_some() {
             return Ok(());
@@ -651,7 +783,7 @@ impl<'a> Pass<'a> {
         let due = match state.listed {
             None => true,
             Some((at, n)) => {
-                self.opts.mode == Mode::Retire
+                (self.opts.mode == Mode::Retire && state.retire_left.is_none())
                     || estimate >= n + self.opts.seal_rows as u64
                     || at.elapsed() >= self.opts.list_every
             }
@@ -665,11 +797,12 @@ impl<'a> Pass<'a> {
             .is_none_or(|at| at.elapsed() >= self.opts.list_every)
         {
             state.unstored.clear();
+            state.bad.clear();
             state.unstored_cleared = Some(Instant::now());
         }
         state.listed = Some((Instant::now(), estimate));
         self.report.listed = true;
-        let mut rows: HashMap<Hash, u8> = HashMap::new();
+        let mut rows: HashMap<Hash, RowKey> = HashMap::new();
         for (col, kind) in KINDS {
             let mut after = None;
             loop {
@@ -683,30 +816,37 @@ impl<'a> Pass<'a> {
                 };
                 after = Some(last);
                 for k in page {
-                    if !state.unstored.contains(&k) {
-                        *rows.entry(k).or_default() |= bit(col);
+                    if !state.unstored.contains(&k) && !state.bad.contains(&(k, col)) {
+                        rows.entry(k)
+                            .or_insert(RowKey {
+                                have: 0,
+                                holder: [NONE; 2],
+                            })
+                            .have |= bit(col);
                     }
                 }
             }
         }
+        // Work still carried accounts for every live segment (`run` checked),
+        // so it stays valid; from here on so does what this listing finds.
+        state.known = self.man.live.iter().map(|s| (s.index, s.columns)).collect();
         self.rows = Some(rows);
         Ok(())
     }
 
-    async fn seal(&mut self, state: &mut CompactState) -> Result<()> {
-        self.list_rows(state).await?;
-        if !self.report.listed {
-            return Ok(());
-        }
+    /// The keys to seal from a fresh listing, once there are enough of
+    /// them: rows no live segment holds, a lone one once it waited.
+    fn seal_candidates(&mut self, state: &mut CompactState) -> Vec<(Hash, u8)> {
         let now = Instant::now();
-        let rows = self.rows.take().unwrap_or_default();
+        let mut rows = self.rows.take().unwrap_or_default();
+        self.place_holders(&mut rows);
         let mut unsealed_rows = 0u64;
         let mut lone_now: HashSet<Hash> = HashSet::new();
         let mut cands: Vec<(Hash, u8)> = Vec::new();
-        for (k, have) in &rows {
+        for (k, r) in &rows {
             let mut open = 0u8;
             for (col, _) in KINDS {
-                if have & bit(col) != 0 && self.holder(k, col).is_none() {
+                if r.have & bit(col) != 0 && r.holder[slot(col)] == NONE {
                     open |= bit(col);
                 }
             }
@@ -724,7 +864,12 @@ impl<'a> Pass<'a> {
             } else {
                 COL_HISTORY_TREE
             };
-            if self.holder(k, other(col)).is_some() {
+            let other_held = if r.have & bit(other(col)) != 0 {
+                r.holder[slot(other(col))] != NONE
+            } else {
+                self.holder(k, other(col)) != NONE
+            };
+            if other_held {
                 cands.push((*k, open));
                 continue;
             }
@@ -749,78 +894,141 @@ impl<'a> Pass<'a> {
             .is_some_and(|t| now.duration_since(t) >= self.opts.idle);
         let n = cands.len();
         if n == 0 || (n < self.opts.seal_rows && !(n >= self.opts.idle_rows && idle)) {
-            return Ok(());
+            return Vec::new();
         }
-        let ids: Vec<Hash> = cands.iter().map(|(k, _)| *k).collect();
-        let gens = generations(self.repo, &ids, self.opts.batch).await?;
-        let mut order: Vec<(u64, Hash, u8)> = Vec::with_capacity(n);
-        for ((k, m), g) in cands.iter().zip(gens) {
-            match g {
-                Some(g) => order.push((g, *k, *m)),
-                None => {
-                    state.unstored.insert(*k);
-                }
+        cands
+    }
+
+    /// Seal what a listing found unsealed. A listing's candidates become a
+    /// backfill the following passes go on with, without listing again:
+    /// first their generations (in batches, within `max_seal_time`), then,
+    /// sorted by `(generation, id)`, at most `max_seal_pages` pages a pass.
+    async fn seal(&mut self, state: &mut CompactState) -> Result<()> {
+        if state.backfill.is_none() {
+            self.list_rows(state).await?;
+            if !self.report.listed {
+                return Ok(());
             }
+            let pending = self.seal_candidates(state);
+            if pending.is_empty() {
+                return Ok(());
+            }
+            state.backfill = Some(Backfill {
+                pending,
+                order: Vec::new(),
+                sorted: false,
+                next: 0,
+            });
         }
-        order.sort_unstable();
-        if order.len() > self.opts.max_rows.max(1) * self.opts.max_seal_pages.max(1) {
-            // Candidates beyond this pass's pages: list again next pass and
-            // run it soon (a backfill).
-            self.report.more = true;
-            state.listed = None;
-        }
-        for page in order
-            .chunks(self.opts.max_rows.max(1))
-            .take(self.opts.max_seal_pages.max(1))
-        {
-            let mut seal: Vec<SealRow> = Vec::with_capacity(page.len());
-            let mut values: HashMap<Hash, Vec<(u8, Bytes)>> = HashMap::new();
-            for (col, kind) in KINDS {
-                let keys: Vec<Hash> = page
-                    .iter()
-                    .filter(|(_, _, m)| m & bit(col) != 0)
-                    .map(|(_, k, _)| *k)
-                    .collect();
-                for chunk in keys.chunks(self.opts.batch.max(1)) {
-                    let got = self.repo.row_meta().get_derived_many(kind, chunk).await?;
-                    for (k, v) in chunk.iter().zip(got) {
-                        if let Some(v) = v {
-                            values.entry(*k).or_default().push((col, v));
-                        }
+        let Some(mut bf) = state.backfill.take() else {
+            return Ok(());
+        };
+        let deadline = self.started + self.opts.max_seal_time;
+        let mut progress = false;
+        let chunk = self.opts.batch.max(1) * 16;
+        while !bf.pending.is_empty() {
+            if progress && std::time::Instant::now() >= deadline {
+                break;
+            }
+            let part = bf.pending.split_off(bf.pending.len().saturating_sub(chunk));
+            let ids: Vec<Hash> = part.iter().map(|(k, _)| *k).collect();
+            let gens = generations(self.repo, &ids, self.opts.batch).await?;
+            for ((k, m), g) in part.into_iter().zip(gens) {
+                match g {
+                    Some(g) => bf.order.push((g, k, m)),
+                    None => {
+                        state.unstored.insert(k);
                     }
                 }
             }
-            for (g, k, _) in page {
-                if let Some(v) = values.remove(k) {
-                    seal.push(SealRow {
-                        key: *k,
-                        generation: *g,
-                        values: v,
-                    });
+            progress = true;
+        }
+        if bf.pending.is_empty() && !bf.sorted {
+            bf.order.sort_unstable();
+            bf.sorted = true;
+        }
+        let page_rows = self.opts.max_rows.max(1);
+        let mut pages = 0;
+        while bf.sorted && bf.next < bf.order.len() && pages < self.opts.max_seal_pages.max(1) {
+            if progress && std::time::Instant::now() >= deadline {
+                break;
+            }
+            let end = (bf.next + page_rows).min(bf.order.len());
+            let page = bf.order[bf.next..end].to_vec();
+            self.seal_page(&page, state).await?;
+            bf.next = end;
+            pages += 1;
+            progress = true;
+        }
+        if !self.report.listed {
+            self.report.unsealed_rows = bf.rows_left();
+        }
+        if !bf.sorted || bf.next < bf.order.len() {
+            // Every pass that runs this does some of it (a batch of
+            // generations or a page), so a backfill always ends.
+            self.report.more |= progress;
+            state.backfill = Some(bf);
+        }
+        Ok(())
+    }
+
+    /// Read the rows of one page and seal them, in segments that fit
+    /// `max_bytes`. A row gone meanwhile is left out; one whose value does
+    /// not decode is remembered and not listed again for a while.
+    async fn seal_page(
+        &mut self,
+        page: &[(u64, Hash, u8)],
+        state: &mut CompactState,
+    ) -> Result<()> {
+        let mut seal: Vec<SealRow> = Vec::with_capacity(page.len());
+        let mut values: HashMap<Hash, Vec<(u8, Bytes)>> = HashMap::new();
+        for (col, kind) in KINDS {
+            let keys: Vec<Hash> = page
+                .iter()
+                .filter(|(_, _, m)| m & bit(col) != 0)
+                .map(|(_, k, _)| *k)
+                .collect();
+            for chunk in keys.chunks(self.opts.batch.max(1)) {
+                let got = self.repo.row_meta().get_derived_many(kind, chunk).await?;
+                for (k, v) in chunk.iter().zip(got) {
+                    if let Some(v) = v {
+                        values.entry(*k).or_default().push((col, v));
+                    }
                 }
             }
-            if seal.is_empty() {
+        }
+        for (g, k, _) in page {
+            if let Some(v) = values.remove(k) {
+                seal.push(SealRow {
+                    key: *k,
+                    generation: *g,
+                    values: v,
+                });
+            }
+        }
+        if seal.is_empty() {
+            return Ok(());
+        }
+        let mut out = Vec::new();
+        encode_capped(self.opts.max_bytes, &seal, &mut out)?;
+        for (enc, bad) in out {
+            for b in &bad {
+                tracing::warn!(key = %b.key, column = b.col, "derived row not sealed: {}", b.why);
+                state.bad.insert((b.key, b.col));
+            }
+            self.report.bad_values += bad.len() as u64;
+            if enc.seg.rows == 0 {
                 continue;
             }
-            let mut out = Vec::new();
-            encode_capped(self.opts.max_bytes, &seal, &mut out)?;
-            for (enc, bad) in out {
-                for b in &bad {
-                    tracing::warn!(key = %b.key, column = b.col, "derived row not sealed: {}", b.why);
-                }
-                self.report.bad_values += bad.len() as u64;
-                if enc.seg.rows == 0 {
-                    continue;
-                }
-                self.store(&enc).await?;
-                self.pause("seal-stored").await;
-                self.man.live.push(enc.seg);
-                self.write().await?;
-                state.live_since.insert(enc.seg.index, Instant::now());
-                state.verified.insert(enc.seg.index);
-                self.report.sealed_segments += 1;
-                self.report.sealed_keys += enc.seg.rows as u64;
-            }
+            self.store(&enc).await?;
+            self.pause("seal-stored").await;
+            self.man.live.push(enc.seg);
+            self.write().await?;
+            state.known.insert(enc.seg.index, enc.seg.columns);
+            state.live_since.insert(enc.seg.index, Instant::now());
+            state.verified.insert(enc.seg.index);
+            self.report.sealed_segments += 1;
+            self.report.sealed_keys += enc.seg.rows as u64;
         }
         Ok(())
     }
@@ -940,6 +1148,9 @@ impl<'a> Pass<'a> {
             self.man.live = next;
             self.man.retire(run.iter().copied());
             self.write().await?;
+            if enc.seg.rows > 0 {
+                state.known.insert(enc.seg.index, enc.seg.columns);
+            }
             state.live_since.insert(enc.seg.index, Instant::now());
             state.verified.insert(enc.seg.index);
             self.report.merges += 1;
@@ -973,110 +1184,172 @@ impl<'a> Pass<'a> {
                 "the {MANIFEST_KIND} row changed under this pass; stopping before deleting rows"
             )));
         }
-        self.list_rows(state).await?;
-        let rows = self.rows.take().unwrap_or_default();
-        // Candidates by holding segment, so one data blob is in memory at a
-        // time.
-        let mut by_seg: HashMap<Hash, Vec<Candidate>> = HashMap::new();
-        for (k, m) in &rows {
-            for (col, _) in KINDS {
-                if m & bit(col) == 0 {
-                    continue;
-                }
-                let Some((l, loc)) = self.holder(k, col) else {
-                    continue;
-                };
-                if !ripe.contains(&l.r.index)
-                    || self.unreadable.contains(&l.r.index)
-                    || state.mismatched.get(&(*k, col)) == Some(&l.r.index)
-                {
-                    continue;
-                }
-                by_seg.entry(l.r.index).or_default().push((*k, col, l, loc));
-            }
-        }
-        self.rows = Some(rows);
-        let mut segs: Vec<Hash> = by_seg.keys().copied().collect();
-        segs.sort_unstable();
+        let mut work = match state.retire_left.take() {
+            Some(w) => w,
+            None => self.retire_work(&ripe, state).await?,
+        };
         let retire_started = std::time::Instant::now();
-        for seg in segs {
-            let mut cands = by_seg.remove(&seg).unwrap_or_default();
-            cands.sort_unstable_by_key(|(k, c, _, _)| (*c, *k));
-            for (col, kind) in KINDS {
-                let mine: Vec<&Candidate> = cands.iter().filter(|(_, c, _, _)| *c == col).collect();
-                for chunk in mine.chunks(self.opts.batch.max(1)) {
-                    if self.report.retired_rows as usize >= self.opts.max_retire_rows
-                        || retire_started.elapsed() >= self.opts.max_retire_time
-                    {
-                        self.report.more = true;
-                        return Ok(());
-                    }
-                    if self.unreadable.contains(&seg) {
-                        break;
-                    }
-                    let started = std::time::Instant::now();
-                    let ks: Vec<Hash> = chunk.iter().map(|(k, _, _, _)| *k).collect();
-                    let got = self.repo.row_meta().get_derived_many(kind, &ks).await?;
-                    let mut del = Vec::with_capacity(ks.len());
-                    for ((k, _, l, loc), row) in chunk.iter().zip(got) {
-                        let Some(row) = row else { continue };
-                        let Some(value) = self.value_at(l, *loc, col).await? else {
-                            self.mark_unreadable(l.r.index, state);
-                            continue;
-                        };
-                        let equal = if col == COL_HISTORY_TREE {
-                            same_part(&row, &value)
-                        } else {
-                            row == value
-                        };
-                        if equal {
-                            del.push((*k, row));
-                        } else {
-                            self.report.mismatched += 1;
-                            state.mismatched.insert((*k, col), l.r.index);
-                            metrics::counter!("leep_derived_segment_mismatch_total", "kind" => kind)
-                                .increment(1);
-                            tracing::warn!(
-                                key = %k,
-                                kind,
-                                "a {kind} row differs from its derived segment's value; the \
-                                 row stays and wins (run `leep-server verify --derived {kind}`)"
-                            );
-                        }
-                    }
-                    if del.is_empty() {
-                        continue;
-                    }
-                    if !state.feature_recorded {
-                        let Some(f) = self.features else {
-                            return Err(Error::Invalid(
-                                "--derived-segments retire needs the store feature recorded \
-                                 first, and this handle cannot record it"
-                                    .into(),
-                            ));
-                        };
-                        (f.record)().await?;
-                        state.feature_recorded = true;
-                    }
-                    gc_lease::check(self.lease)?;
-                    let n = self
-                        .repo
-                        .row_meta()
-                        .delete_derived_values(kind, &del)
-                        .await?;
-                    self.report.retired_rows += n;
-                    self.pause("retire-deleted").await;
-                    metrics::counter!("leep_derived_segment_rows_retired_total", "kind" => kind)
-                        .increment(n);
-                    let rest = started.elapsed() * self.opts.rest_factor;
-                    if !rest.is_zero() {
-                        tokio::time::sleep(rest).await;
-                    }
+        let mut progress = false;
+        while let Some((seg, mut cands)) = work.pop_front() {
+            // Carried work names segments by index: one no longer live,
+            // ripe or readable is left for the next listing.
+            let Some(l) = self.segs.get(&seg).cloned() else {
+                continue;
+            };
+            if !ripe.contains(&seg) || self.unreadable.contains(&seg) {
+                continue;
+            }
+            let mut i = 0;
+            while i < cands.len() {
+                if self.report.retired_rows as usize >= self.opts.max_retire_rows
+                    || retire_started.elapsed() >= self.opts.max_retire_time
+                {
+                    cands.drain(..i);
+                    work.push_front((seg, cands));
+                    state.retire_left = Some(work);
+                    self.report.more |= progress;
+                    return Ok(());
                 }
+                if self.unreadable.contains(&seg) {
+                    break;
+                }
+                let col = cands[i].1;
+                let mut j = i;
+                while j < cands.len() && j - i < self.opts.batch.max(1) && cands[j].1 == col {
+                    j += 1;
+                }
+                let chunk: Vec<(Hash, Loc)> = cands[i..j]
+                    .iter()
+                    .filter(|(k, _)| l.r.has(col) && state.mismatched.get(&(*k, col)) != Some(&seg))
+                    .filter_map(|(k, _)| l.idx.locate(k, col).map(|loc| (*k, loc)))
+                    .collect();
+                i = j;
+                let kind = if col == COL_SKIPLIST {
+                    KINDS[0].1
+                } else {
+                    KINDS[1].1
+                };
+                let n = self.retire_chunk(&l, col, kind, &chunk, state).await?;
+                progress |= n > 0;
             }
             self.forget_data();
         }
         Ok(())
+    }
+
+    /// The rows to retire, from a listing: each row whose newest holding
+    /// segment is ripe, by that segment (in index order, so one data blob
+    /// is in memory at a time), sorted by column and key.
+    async fn retire_work(
+        &mut self,
+        ripe: &HashSet<Hash>,
+        state: &mut CompactState,
+    ) -> Result<RetireWork> {
+        self.list_rows(state).await?;
+        let mut rows = self.rows.take().unwrap_or_default();
+        self.place_holders(&mut rows);
+        let mut by_seg: HashMap<Hash, Vec<(Hash, u8)>> = HashMap::new();
+        for (k, r) in &rows {
+            for (col, _) in KINDS {
+                let at = r.holder[slot(col)];
+                if r.have & bit(col) == 0 || at == NONE {
+                    continue;
+                }
+                let seg = self.man.live[at as usize].index;
+                if !ripe.contains(&seg)
+                    || self.unreadable.contains(&seg)
+                    || state.mismatched.get(&(*k, col)) == Some(&seg)
+                {
+                    continue;
+                }
+                by_seg.entry(seg).or_default().push((*k, col));
+            }
+        }
+        self.rows = Some(rows);
+        let mut work: Vec<(Hash, Vec<(Hash, u8)>)> = by_seg.into_iter().collect();
+        work.sort_unstable_by_key(|(seg, _)| *seg);
+        for (_, cands) in &mut work {
+            cands.sort_unstable_by_key(|(k, c)| (*c, *k));
+        }
+        Ok(work.into())
+    }
+
+    /// One step of a retirement: compare the rows of `chunk` with the
+    /// values `live` holds and delete the equal ones still holding the
+    /// bytes compared. A value that cannot be read marks the segment
+    /// unreadable and ends the step (the rows compared before it are still
+    /// deleted). Returns the rows deleted or found unequal.
+    async fn retire_chunk(
+        &mut self,
+        live: &Arc<Live>,
+        col: u8,
+        kind: &'static str,
+        chunk: &[(Hash, Loc)],
+        state: &mut CompactState,
+    ) -> Result<u64> {
+        if chunk.is_empty() {
+            return Ok(0);
+        }
+        let started = std::time::Instant::now();
+        let ks: Vec<Hash> = chunk.iter().map(|(k, _)| *k).collect();
+        let got = self.repo.row_meta().get_derived_many(kind, &ks).await?;
+        let mut del = Vec::with_capacity(ks.len());
+        let mut unequal = 0;
+        for ((k, loc), row) in chunk.iter().zip(got) {
+            let Some(row) = row else { continue };
+            let Some(value) = self.value_at(live, *loc, col).await? else {
+                self.mark_unreadable(live.r.index, state);
+                break;
+            };
+            let equal = if col == COL_HISTORY_TREE {
+                same_part(&row, &value)
+            } else {
+                row == value
+            };
+            if equal {
+                del.push((*k, row));
+            } else {
+                unequal += 1;
+                self.report.mismatched += 1;
+                state.mismatched.insert((*k, col), live.r.index);
+                metrics::counter!("leep_derived_segment_mismatch_total", "kind" => kind)
+                    .increment(1);
+                tracing::warn!(
+                    key = %k,
+                    kind,
+                    "a {kind} row differs from its derived segment's value; the \
+                     row stays and wins (run `leep-server verify --derived {kind}`)"
+                );
+            }
+        }
+        if del.is_empty() {
+            return Ok(unequal);
+        }
+        if !state.feature_recorded {
+            let Some(f) = self.features else {
+                return Err(Error::Invalid(
+                    "--derived-segments retire needs the store feature recorded \
+                     first, and this handle cannot record it"
+                        .into(),
+                ));
+            };
+            (f.record)().await?;
+            state.feature_recorded = true;
+        }
+        gc_lease::check(self.lease)?;
+        let n = self
+            .repo
+            .row_meta()
+            .delete_derived_values(kind, &del)
+            .await?;
+        self.report.retired_rows += n;
+        self.pause("retire-deleted").await;
+        metrics::counter!("leep_derived_segment_rows_retired_total", "kind" => kind).increment(n);
+        let rest = started.elapsed() * self.opts.rest_factor;
+        if !rest.is_zero() {
+            tokio::time::sleep(rest).await;
+        }
+        Ok(n + unequal)
     }
 }
 

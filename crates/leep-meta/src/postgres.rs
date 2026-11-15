@@ -1853,36 +1853,38 @@ impl MetaStore for PostgresMetaStore {
         Ok(n)
     }
 
+    /// One statement. The rows are locked first in `(kind, key)` order, as
+    /// batched writes take them (`put_derived_many`), so the two wait for
+    /// each other instead of deadlocking.
     async fn delete_derived_keys(&self, kinds: &[&str], keys: &[Hash]) -> Result<u64> {
         if keys.is_empty() || kinds.is_empty() {
             return Ok(0);
         }
         let keys: Vec<&[u8]> = unique(keys.iter().map(|k| k.as_bytes().as_slice()));
-        let n = sqlx::query("DELETE FROM derived WHERE kind = ANY($1) AND key = ANY($2)")
-            .bind(kinds)
-            .bind(&keys)
-            .execute(self.db_for("delete_derived_keys"))
-            .await
-            .map_err(storage)?
-            .rows_affected();
+        let n = sqlx::query(
+            "DELETE FROM derived WHERE ctid IN (\
+               SELECT ctid FROM derived WHERE kind = ANY($1) AND key = ANY($2) \
+               ORDER BY kind, key FOR UPDATE)",
+        )
+        .bind(kinds)
+        .bind(&keys)
+        .execute(self.db_for("delete_derived_keys"))
+        .await
+        .map_err(storage)?
+        .rows_affected();
         Ok(n)
     }
 
     /// One statement: a row is deleted only if its value is still the one
-    /// given. The rows are locked first in key order, as batched writes
-    /// take them (`put_derived_many`), so the two wait for each other
-    /// instead of deadlocking.
+    /// given. The rows are locked first in key order (the `ORDER BY` under
+    /// `FOR UPDATE`), as batched writes take them (`put_derived_many`), so
+    /// the two wait for each other instead of deadlocking.
     async fn delete_derived_values(&self, kind: &str, rows: &[(Hash, Bytes)]) -> Result<u64> {
         if rows.is_empty() {
             return Ok(0);
         }
-        let mut sorted: Vec<&(Hash, Bytes)> = rows.iter().collect();
-        sorted.sort_by_key(|(k, _)| *k);
-        let keys: Vec<&[u8]> = sorted
-            .iter()
-            .map(|(k, _)| k.as_bytes().as_slice())
-            .collect();
-        let values: Vec<&[u8]> = sorted.iter().map(|(_, v)| v.as_ref()).collect();
+        let keys: Vec<&[u8]> = rows.iter().map(|(k, _)| k.as_bytes().as_slice()).collect();
+        let values: Vec<&[u8]> = rows.iter().map(|(_, v)| v.as_ref()).collect();
         let n = sqlx::query(
             "DELETE FROM derived WHERE ctid IN (\
                SELECT d.ctid FROM derived d \
