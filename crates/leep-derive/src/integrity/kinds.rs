@@ -15,6 +15,7 @@ use crate::derived::{
     HISTORY_NODE_KIND, LOG_FILTER_NAME_KIND,
 };
 use crate::gc::{BLOB_CLAIM, BLOB_CONDEMNED, BLOB_DOOM, BLOB_RESCUE, GC_MARK};
+use crate::gc_segments::GC_MARK_SEGMENTS;
 use crate::git_map::{GIT_BLOB_KIND, GIT_COMMIT_KIND, GIT_OID_KIND, GIT_STYLE_KIND, GIT_TREE_KIND};
 use crate::search::{
     BLOB_KEYFRAME_KIND as BLOB_KEYFRAMES, BLOB_KIND as BLOB_TRIGRAMS,
@@ -396,6 +397,16 @@ static KINDS: &[KindInfo] = &[
             "incremental garbage collection stops walking at a marked tree node (ADR 0033); \
              dropping part of the kind can leave a row whose subtree lost its rows, and the \
              next collect would delete blobs a changeset references",
+        ),
+    },
+    KindInfo {
+        name: GC_MARK_SEGMENTS,
+        class: KindClass::Bookkeeping,
+        summary: "the manifest of garbage collection mark segments in the blob store",
+        rederive: Rederive::No("`leep-server gc --full` walks all of history and replaces it"),
+        drop: DropPolicy::Refused(
+            "it says whether the gc-mark-v1 rows still count (ADR 0103); without it a gc \
+             would trust rows that may be half deleted",
         ),
     },
 ];

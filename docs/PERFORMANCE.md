@@ -3192,17 +3192,23 @@ every changeset row compressed. It takes about 20 s.
 
 | Checked | SQLite: measured / budget | Postgres: measured / budget |
 |---|---|---|
-| Blob store bytes per land, settled | 469-474 / 700 | 469 / 700 |
-| Database bytes per land, settled | 7,850-9,966 / 14,000 | 11,605-13,107 / 19,000 |
-| All storage (database above an empty one, plus blobs) over Git's `objects/` after `git gc` (149 KB) | 5.4-6.3x / 9x | 8.8-9.4x / 14x |
-| `leep_blob_store_size_ratio` | 0.080 / 0.12 | 0.080 / 0.12 |
-| Code search blob rows and keyframes per land (key and value bytes) | 1,368-1,499 / 1,990 | 1,267-1,579 / 1,990 |
-| ... over what whole rows of the landed files take (2,001 a land) | 0.68-0.75 / 0.99 | 0.63-0.79 / 0.99 |
+| Blob store bytes per land, settled | 469-474 / 600 | 469-474 / 600 |
+| Database bytes per land, settled | 9,284-10,035 / 12,600 | 12,014-13,243 / 16,600 |
+| All storage (database above an empty one, plus blobs) over Git's `objects/` after `git gc` (149 KB) | 6.01-6.31x / 7.9x | 8.84-9.24x / 11.6x |
+| `leep_blob_store_size_ratio` | 0.080 / 0.10 | 0.080 / 0.10 |
+| Code search blob rows and keyframes per land (key and value bytes) | 1,368-1,616 / 1,990 | 1,267-1,579 / 1,990 |
+| ... over what whole rows of the landed files take (2,001 a land) | 0.68-0.81 / 0.99 | 0.63-0.79 / 0.99 |
+| One `gc` after the lands (servers stopped): mark segment bytes per mark (749 marks) | 32.0 / 40 | 32.0 / 40 |
+| ... database bytes it adds per mark (a `gc-mark-v1` row was about 100 and 167) | 0 / 12 | 21.9 / 28 |
 
-Budgets are about 1.5 times the measured values (two runs each when set by
-ADR 0101; the database lines were measured again and tightened, and the
+Budgets were about 1.5 times the measured values (two runs each when set
+by ADR 0101; the database lines were measured again and tightened, and the
 search lines added, by ADR 0102, ten runs on each backend, keeping at least
-40% over the worst database run and 25% over the worst search run). The
+40% over the worst database run and 25% over the worst search run). ADR
+0103 added the `gc` lines and measured everything again (five runs on each
+backend; the ranges above), and tightened the blob, database, ratio and
+blob store ratio budgets to at least 25% over the worst run. It left the
+search budgets alone (one SQLite run reached 1,616, 23% under the budget). The
 search blob budgets still fail if blob rows are written whole again (2,001
 bytes a land, a share of 1.0); the share is high for a
 history this short, where most files are edited about three times and
@@ -4353,6 +4359,54 @@ about 4 minutes per GC before. The first run after the change still walks
 everything, faster than before because changesets and root trees are read in
 batches of 1,000 (ADR 0030), and writes one `gc-mark-v1` row per referenced
 object and changeset (91,290 rows, about 1 s).
+
+### Marks as segments (ADR 0103)
+
+Measured on corpora A (Leep's history, Git 4.84 MB) and B (A plus 2,000
+single-file edits, Git 6.58 MB): import, a server with default flags (its
+background work run within seconds) until nothing changes, stop, then
+`leep-server gc --grace 0 --fence 0s --unsafe-no-fence`; local Postgres 16
+and SQLite, filesystem blob store, 4 vCPUs, release builds of a59002b
+("before") and this change ("after"). Database bytes are above an empty
+database on Postgres (`pg_database_size`) and pages in use on SQLite
+(`dbstat`, the WAL included).
+
+| Corpus, backend | Before: all storage after GC (x Git) | GC bookkeeping before | After (x Git) | GC bookkeeping after |
+|---|---|---|---|---|
+| A, Postgres | 15.28 MB (3.16x) | 6,896 rows, +1.15 MB database | 14.41 MB (2.98x) | 0.22 MB of segments, +0.08 MB database |
+| A, SQLite | 13.04 MB (2.69x) | +0.76 MB | 12.50 MB (2.58x) | 0.22 MB, +0 |
+| B, Postgres | 25.96 MB (3.95x) | 18,472 rows, +3.07 MB database | 23.54 MB (3.58x) | 0.59 MB of segments, +0.08 MB database |
+| B, SQLite | 22.25 MB (3.38x) | +2.04 MB | 20.78 MB (3.16x) | 0.59 MB, +0 |
+
+A `gc-mark-v1` row took 166 bytes on Postgres and 110 on SQLite; a mark in
+a segment takes 32 (plus 33 bytes a segment; one segment here, since a
+single run marks everything). The 0.08 MB on Postgres is the manifest row's
+pages.
+
+Per land, over 400 CLI lands of corpus C on top of A (as in "Blob trigram
+patches and retention"), then one `gc`: the lands themselves write no mark,
+so the database grows the same (11,448 and 11,428 bytes a land on Postgres,
+10,772 and 10,711 on SQLite). The `gc` after them walked the 400 changesets
+and marked 2,800 new objects: before, 10,096 rows, +524 KB on Postgres
+(1,311 bytes a land) and +352 KB on SQLite (881 a land); after, one new
+segment of 102 KB (256 bytes a land) and no database growth.
+
+GC pass time, condemn and collect (seconds; three runs of each, two of
+`--full`): "first" is a run with the record removed, so it walks
+everything and writes it; "incremental" a run with nothing new.
+
+| Corpus, backend | first, before / after | incremental, before / after | `--full`, before / after |
+|---|---|---|---|
+| A, Postgres | 0.27 / 0.24 | 0.12 / 0.10 | 0.30 / 0.26 |
+| A, SQLite | 0.42 / 0.23 | 0.13 / 0.09 | 0.65 / 0.26 |
+| B, Postgres | 0.84 / 0.70 | 0.25 / 0.20 | 1.30 / 1.13 |
+| B, SQLite | 1.32 / 0.79 | 0.32 / 0.20 | 2.44 / 1.30 |
+
+After the 400 lands above, the incremental `gc` took 0.83 s before and
+0.62 s after on Postgres, 0.67 and 0.46 s on SQLite (one run each). Writing
+one segment costs one blob write and one row instead of a row per mark,
+and a run reads the segments once into memory (32 bytes a mark) instead of
+a batched row read per page of changesets, blobs and tree entries.
 
 ## Changeset compression
 

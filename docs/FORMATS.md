@@ -44,7 +44,9 @@ skill.
 | derived `blob-condemned-v1` | — | `MetaStore.derived`, key = blob hash, value = condemnation time, unix seconds as 8-byte big-endian `i64`, from the GC host's clock |
 | derived `blob-rescue-v1` | — | `MetaStore.derived`, key = blob hash, value = the condemnation time the writer observed, 8-byte big-endian `i64` |
 | derived `blob-doom-v1` | — | `MetaStore.derived`, key = blob hash, value = condemnation time (8-byte big-endian `i64`) then one state byte: 0 deleting, 1 abandoned, 2 deleted |
-| derived `gc-mark-v1` | — | `MetaStore.derived`, key = changeset id, tree node hash or blob hash, value = the single byte `0x01` (a present row counts whatever it reads, ADR 0033). Written by GC marks in post-order, so a row exists only after the rows of everything below it (ADR 0033) |
+| derived `gc-mark-v1` | — | `MetaStore.derived`, key = changeset id, tree node hash or blob hash, value = the single byte `0x01` (a present row counts whatever it reads, ADR 0033). Written by GC marks in post-order before ADR 0103, so a row exists only after the rows of everything below it; never written since. Read as marks only while the mark manifest says the rows are not retired; deleted by `gc --retire-mark-rows` after the store feature `gc-mark-segments` is recorded (ADR 0103) |
+| derived `gc-mark-segments-v1` | — | `MetaStore.derived`, one row, key = 32 zero bytes: the manifest of GC mark segments (ADR 0103). Bytes: version `0x01`; flags (bit 0 `rows_retired`: the segments are closed without the `gc-mark-v1` rows, which no longer count; other bits zero); `u32` live count, then per live segment its address (32 bytes) and mark count (`u64`), oldest first; `u32` retired count, then the retired segments' addresses (at most 1,024, oldest first); then the BLAKE3 of everything before (32 bytes). Integers big-endian. Replaced whole by each write, a compare-and-swap from the bytes the writer read; a row that does not decode means "trust no record" |
+| blob store blob, GC mark segment | — | bytes = `leep:gc-mark-segment-v1` and a NUL (the object preimage prefix, so uploads cannot write it, ADR 0041), version `0x01`, an 8-byte nonce (any value; it makes every write a new object), then marked hashes (changeset ids, tree node hashes, blob hashes), 32 bytes each, strictly ascending; address = `Hash::of_blob(bytes)` (equal to `Hash::of_object("gc-mark-segment-v1", <bytes after the prefix>)`). To the blob store an ordinary blob: packed, delta-compressed, backed up. Immutable. Every prefix of the manifest's live list is closed: each mark's tree nodes and blobs below it, and a changeset mark's contents and root tree, are marked in that prefix (or, while not retired, by `gc-mark-v1` rows) (ADR 0103) |
 | derived `cs-condemned-v1` | — | `MetaStore.derived`, key = changeset id, value = condemnation time, unix seconds as 8-byte big-endian `i64`, from the sweep host's clock (ADR 0059) |
 | derived `cs-rescue-v1` | — | `MetaStore.derived`, key = changeset id, value = the condemnation time the writer observed, 8-byte big-endian `i64` |
 | derived `cs-doom-v1` | — | `MetaStore.derived`, key = changeset id, value = condemnation time (8-byte big-endian `i64`) then one state byte: 0 deleting, 1 abandoned, 2 deleted |
@@ -759,6 +761,7 @@ one. Names so far:
 | Name | Meaning | Recorded by |
 |---|---|---|
 | `changeset-zstd-dict` | `changesets.data` may be a zstd frame made with a `changeset_dicts` dictionary (ADR 0053) | `compact-changesets`, before it stores or uses a dictionary; a server's automatic compaction (ADR 0101), before the first dictionary it stores and before it rewrites rows; migration 0004 for a store that already has one |
+| `gc-mark-segments` | GC marks live only in segments; the `gc-mark-v1` rows are being or have been deleted, so a `gc` that would trust them must not run (ADR 0103) | `gc --retire-mark-rows`, after it imports the rows into a segment and before it deletes any |
 
 Binaries from before migration 0004 do not read the table.
 
@@ -1745,9 +1748,37 @@ deleted by the sweep read as not found; a client may store one again.
 
 Values of `gc-mark-v1` and `cs-reach-v1`: a present row counts whatever it
 reads (ADR 0033, amended), so a damaged value keeps rather than frees.
+Since ADR 0103 GC marks are written as segments (blobs starting with
+`leep:gc-mark-segment-v1\0`) named by the `gc-mark-segments-v1` manifest, not as `gc-mark-v1` rows.
 
 The lease table gains the scope `gc` (name `store`, repository 0) for one
 GC at a time. No schema, `/v1`, `Changeset`, `TreeNode` or hash change.
+
+## GC mark segments (new derived kind, blob-store object and store feature, ADR 0103)
+GC marks move from `gc-mark-v1` rows to immutable segments, blobs in the
+blob store whose bytes start with `leep:gc-mark-segment-v1\0`, named by the
+one `gc-mark-segments-v1` row
+(bytes in the table above). No schema, `/v1`, `Changeset`, `TreeNode` or
+hash change. Rules a reader and a writer follow:
+
+- A segment is written and made durable before any manifest names it, and
+  each holds a post-order prefix of one run's marks; so every prefix of the
+  live list (plus the `gc-mark-v1` rows while `rows_retired` is clear) is
+  closed. A reader trusts the longest prefix it can read in full: a segment
+  that is missing, or whose bytes fail the address, version, length or
+  ascending check, ends it.
+- Lookups are exact. Nothing approximate (Bloom filters) may stand in for a
+  segment: a false mark on a tree node condemns its subtree.
+- Only adjacent live segments merge, newest first. A full mark, or a run
+  that read a manifest that does not decode, replaces the list with its own
+  segments (named only at its end) and sets `rows_retired`.
+- Every write of the manifest row is a compare-and-swap against the bytes
+  its writer last read or wrote (no row is a valid expected state); a
+  writer that loses it stops.
+- Segments no longer live stay stored until blob GC collects them like
+  orphans; live ones are never condemned.
+- Store feature `gc-mark-segments` (ADR 0055) is recorded by
+  `gc --retire-mark-rows` before it deletes any `gc-mark-v1` row.
 
 ## Backup directory (new, ADR 0026; no change to stored objects)
 Written and read by `leep-server backup`, `restore` and `backup-verify`.

@@ -2152,13 +2152,21 @@ unreferenced blobs and only GC reclaims them.
      another `gc` holds the `gc` lease; a killed run's lease lapses in 60 s;
    - `gc --full frees the trees of deleted changesets ...`: `--full` needs
      `--backups DIR` or `--backup-fence`;
-   - `bad duration "..."; use e.g. 0, 90s, 30m, 24h, 7d`.
+   - `bad duration "..."; use e.g. 0, 90s, 30m, 24h, 7d`;
+   - `the metadata store uses format features this server cannot read
+     (gc-mark-segments)`: someone ran `gc --retire-mark-rows` (ADR 0103) and the
+     cron job runs an older `leep-server`. Upgrade the binary the job uses.
 3. Is it simply slow or killed? Condemn and collect walk only changesets stored since
    the last run (`changesets walked` in the report; ADR 0033), but still list every
    changeset and blob, so they take longer as the store grows, and the first run
    after an upgrade, or one with `--full`, walks all of history. A job killed by a
    timeout or an overlapping run never reports success. Killing GC is safe, and a
-   killed run is finished by running it again; what it marked before dying is kept.
+   killed run is finished by running it again; what it marked before dying is kept
+   (published every 262,144 marks as a segment, ADR 0103). A run that walks all of
+   history every time although nothing failed: `leep-server verify --derived` reports
+   `bad_gc_segment` or `bad_gc_row` on `gc-mark-segments-v1`, or notes a segment
+   that is not stored (an older `gc` collected it, or a restore); the next run
+   republishes, and `gc --full` replaces the record.
 4. Nothing deleted for a day after a restore: restored blobs have the restore time
    as their modification time, so `--grace` (default 24h) starts again.
 

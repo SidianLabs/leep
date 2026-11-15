@@ -116,7 +116,7 @@ Rules:
 | `Changeset` | `Hash::of_object("changeset-v1", postcard)` | `MetaStore::put_changeset` |
 | Ref | name → `ChangesetId` | `MetaStore`, CAS only |
 | Ref log entry | `seq` → (ref, old, new, time, actor, operation, message) | `MetaStore`, appended by `cas_ref_logged` (or `cas_ref_logged_chain`, one entry per step) in the CAS's own transaction |
-| Derived value | `(kind, key)` → bytes | `MetaStore::put_derived` |
+| Derived value | `(kind, key)` → bytes | `MetaStore::put_derived`; `cas_derived` for a row a holder may overwrite after losing its lease (the GC mark manifest, ADR 0103) |
 
 `Changeset { parents, author, timestamp, message, changes, extra }`:
 - `changes: BTreeMap<RepoPath, FileChange>` is relative to `parents[0]`. A
@@ -236,7 +236,8 @@ way.
 | `cs-condemned-v1` / `cs-rescue-v1` / `cs-doom-v1` / `gc-fence-active-v1` | per changeset id (the flag: one row), the encodings of their `blob-*-v1` counterparts; the fence of changeset GC (ADR 0059): rescues by every writer that names a condemned changeset; condemnation, doom and the flag by the sweep (ADR 0059 phase 2) | changeset garbage collection, and the rescue checks of creates, lands, ref moves, rebases, merges, attestations and mirror maps |
 | `cs-tombstone-v1` | per deleted changeset id: deletion time and root tree hash, written before the delete; dropped after `--tombstone-retention` (ADR 0059 section 11) | `gc --full --backup-fence`, and the sweep's tombstone pass |
 | `cs-reach-v1` | per changeset id, one byte: "a ref or ref log entry reaches it, and every parent has a row"; written parents first, plus a progress row at the zero key (ADR 0059 section 4) | the changeset sweep's incremental reachability mark |
-| `gc-mark-v1` | per changeset id, tree node hash or blob hash, one byte: "referenced by a stored changeset, and everything below has a row"; written by GC marks in post-order (ADR 0033) | incremental GC marks, which skip covered changesets and stop at marked tree nodes |
+| `gc-mark-v1` | per changeset id, tree node hash or blob hash, one byte: "referenced by a stored changeset, and everything below has a row"; written by GC marks in post-order before ADR 0103, never since; deleted by `gc --retire-mark-rows` | incremental GC marks, until the manifest says the rows are retired |
+| `gc-mark-segments-v1` | one row: the ordered list of live GC mark segments (blobs of sorted 32-byte hashes behind the object prefix `leep:gc-mark-segment-v1\0`), whether the `gc-mark-v1` rows still count, and retired segments; every prefix of the list is closed (ADR 0103) | incremental GC marks, which skip covered changesets and stop at marked tree nodes |
 | `blob-trigrams-v2` | per blob hash: sorted trigram set of a UTF-8 text blob up to 1 MiB (delta varints), or a "not indexed" marker, stored whole (the retired `blob-trigrams-v1` encoding, which is read where a blob has no v2 row) or as a patch (codes added and removed) on the set in `blob-trigrams-keyframe-v2` of the keyframe its predecessor (the file at the same path in the directory's predecessor) is on, while `patch² <= 128 × whole`; a probe costs at most two rows. Rows of blobs no ref head has held for `--search-retention` (14 days) are deleted and derived again on demand (ADR 0014, ADR 0102) | code search |
 | `blob-trigrams-keyframe-v2` | per blob hash: that blob's whole set, the base of patches; written before any patch on it, in its one encoding, so it never changes, and never retired (ADR 0102) | as above |
 | `git-blob-v1` / `git-tree-v1` | per blob hash / tree node hash: the 20-byte sha1 git gives the blob, or the git tree of the node (a subtree with no files left out); pure functions of content (ADR 0090) | git ids of a store's objects, the coming git wire protocol |
@@ -1451,9 +1452,16 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
   uploads with a two-flag handshake in meta. Grace and fence together make GC
   safe beside running servers, with no residual race. See ADR 0008 and
   ADR 0012. The mark is incremental (ADR 0033): each run records what it
-  walked in `gc-mark-v1` rows, written so a row always vouches for
-  everything below it, and the next run walks only changesets with no row
-  and stops at marked tree nodes. Ref moves never force a full walk, and a
+  walked, written so a mark always vouches for everything below it, and the
+  next run walks only changesets with no mark and stops at marked tree
+  nodes. The record is a few immutable segments of sorted 32-byte hashes in
+  the blob store, each a post-order prefix of one run's marks published only
+  once durable, merged geometrically up to a cap and named in order by one
+  `gc-mark-segments-v1` row, which only a compare-and-swap rewrites (so a
+  run that outlived its lease cannot overwrite a newer record); a reader trusts the longest prefix of them it
+  can read, so a lost segment only means more walking, and lookups are
+  exact (ADR 0103). Stores GC'd before that keep `gc-mark-v1` rows, which
+  count until `gc --retire-mark-rows` imports and deletes them. Ref moves never force a full walk, and a
   marked object stays marked even after the changeset sweep deletes the
   changesets that used it, which only keeps it; `gc --full` walks
   everything anyway, and keeps the trees of changesets deleted within its
