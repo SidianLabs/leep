@@ -701,6 +701,28 @@ pub trait MetaStore: Send + Sync + 'static {
 
     /// Ref log entries, newest first: those of `name` or of every ref, with
     /// `seq` below `before_seq` when given, at most `limit`.
+    /// Delete each `(key, value)` row of `kind` whose value is still
+    /// exactly `value`; a row rewritten meanwhile stays. Returns the rows
+    /// deleted. One statement in the SQL backends, so a compare and a delete
+    /// cannot be split by another writer (derived segments retire rows with
+    /// it, ADR 0104). The default reads and then deletes, which is not
+    /// atomic; every store and every wrapper that forwards deletes
+    /// implements or forwards it.
+    async fn delete_derived_values(&self, kind: &str, rows: &[(Hash, Bytes)]) -> Result<u64> {
+        let keys: Vec<Hash> = rows.iter().map(|(k, _)| *k).collect();
+        let now = self.get_derived_many(kind, &keys).await?;
+        let equal: Vec<Hash> = rows
+            .iter()
+            .zip(now)
+            .filter(|((_, want), got)| got.as_ref() == Some(want))
+            .map(|((k, _), _)| *k)
+            .collect();
+        if equal.is_empty() {
+            return Ok(0);
+        }
+        self.delete_derived_keys(&[kind], &equal).await
+    }
+
     async fn ref_log(
         &self,
         name: Option<&str>,
@@ -977,7 +999,9 @@ pub trait MetaStore: Send + Sync + 'static {
     /// elsewhere (leep-derive's derived segments, ADR 0104): the store it
     /// sits on. A new `Repo` over a view puts a view of its own on that
     /// store instead of stacking a second one, so a new handle starts cold.
-    /// `None` for every store and for every other wrapper.
+    /// `None` for every store and for every other wrapper, which must not
+    /// forward it: a wrapper above a view is a different store, and
+    /// unwrapping through it would drop the wrapper.
     fn view_base(&self) -> Option<std::sync::Arc<dyn MetaStore>> {
         None
     }

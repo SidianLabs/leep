@@ -1868,6 +1868,28 @@ impl MetaStore for PostgresMetaStore {
         Ok(n)
     }
 
+    /// One statement: a row is deleted only if its value is still the one
+    /// given.
+    async fn delete_derived_values(&self, kind: &str, rows: &[(Hash, Bytes)]) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let keys: Vec<&[u8]> = rows.iter().map(|(k, _)| k.as_bytes().as_slice()).collect();
+        let values: Vec<&[u8]> = rows.iter().map(|(_, v)| v.as_ref()).collect();
+        let n = sqlx::query(
+            "DELETE FROM derived d USING UNNEST($2::bytea[], $3::bytea[]) AS r(key, value) \
+             WHERE d.kind = $1 AND d.key = r.key AND d.value = r.value",
+        )
+        .bind(kind)
+        .bind(&keys)
+        .bind(&values)
+        .execute(self.db_for("delete_derived_values"))
+        .await
+        .map_err(storage)?
+        .rows_affected();
+        Ok(n)
+    }
+
     /// One `INSERT ... SELECT FROM UNNEST` statement, so the batch is atomic.
     /// Rows go in `(kind, key)` order: every batched write then locks rows in
     /// one global order, so two batches sharing keys (claims for the same

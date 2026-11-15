@@ -715,6 +715,17 @@ impl MetaStore for Budget {
         .await
     }
 
+    async fn delete_derived_values(&self, kind: &str, rows: &[(Hash, Bytes)]) -> Result<u64> {
+        self.meta(
+            "meta.delete_derived_values",
+            n(rows.len()),
+            0,
+            self.meta.delete_derived_values(kind, rows),
+            none,
+        )
+        .await
+    }
+
     async fn ref_log(
         &self,
         name: Option<&str>,

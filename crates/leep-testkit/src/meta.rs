@@ -333,6 +333,16 @@ impl MetaStore for FaultyMetaStore {
             .await
     }
 
+    async fn delete_derived_values(&self, kind: &str, rows: &[(Hash, Bytes)]) -> Result<u64> {
+        self.plan
+            .run(
+                Op::DeleteChangesets,
+                self.inner.delete_derived_values(kind, rows),
+                |_, v| v,
+            )
+            .await
+    }
+
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()> {
         self.plan
             .run(

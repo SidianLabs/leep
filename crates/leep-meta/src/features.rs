@@ -51,6 +51,26 @@ pub async fn add_store_feature(url: &str, mode: crate::SchemaMode, name: &str) -
     }
 }
 
+/// Whether the store at `url` has `name` recorded. `mem://` stores never
+/// do.
+pub async fn has_store_feature(url: &str, mode: crate::SchemaMode, name: &str) -> Result<bool> {
+    if url.starts_with("sqlite:") {
+        let store = crate::SqliteMetaStore::connect_with(url, mode).await?;
+        let r = store.features().await;
+        store.pool.close().await;
+        Ok(r?.iter().any(|f| f == name))
+    } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        let store = crate::PostgresMetaStore::connect_with(url, mode).await?;
+        let r = store.features().await;
+        store.pool.close().await;
+        Ok(r?.iter().any(|f| f == name))
+    } else if url.starts_with("mem://") {
+        Ok(false)
+    } else {
+        Err(Error::Invalid(format!("unsupported meta store url: {url}")))
+    }
+}
+
 /// Refuse a store that names a feature this binary does not know.
 pub(crate) fn check(names: &[String]) -> Result<()> {
     let unknown: Vec<&str> = names
@@ -106,6 +126,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.features().await.unwrap(), [GC_MARK_SEGMENTS]);
+        assert!(has_store_feature(&url, mode, GC_MARK_SEGMENTS)
+            .await
+            .unwrap());
+        assert!(!has_store_feature(&url, mode, DERIVED_SEGMENTS)
+            .await
+            .unwrap());
         add_store_feature("mem://", mode, GC_MARK_SEGMENTS)
             .await
             .unwrap();
