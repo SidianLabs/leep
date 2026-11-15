@@ -160,6 +160,14 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_search_retention_rows_total` | counter | `kind` = `blob-trigrams-v2`, `blob-trigrams-v1`; `outcome` = `deleted`, `restored`, `backfilled` | Blob rows it deleted; deleted rows it derived again because a ref moved to a head holding the blob during the pass (a revert to old content); and missing rows of current heads' blobs its backfill derived. |
 | `leep_search_retention_seconds` | histogram | none | Time of each pass that ran (walk, listing, deletes and rests). |
 | `leep_search_retention_live_blobs` | gauge | none | Blob entries the last pass found below every head current now or within `--search-retention` (a blob under several trees counts once per tree). |
+| `leep_derived_segment_passes_total` | counter | `outcome` = `ok`, `busy`, `error` | Passes of the derived segment compactor (ADR 0104). `busy`: another server held its lease. An error is logged and retried at the next interval. |
+| `leep_derived_segment_pass_seconds` | histogram | none | Time of each pass that ran. |
+| `leep_derived_segments_live` / `leep_derived_segment_bytes` | gauge | none | Live derived segments after the last pass, and the bytes of their data blobs. |
+| `leep_derived_segment_unsealed_rows` | gauge | none | `skiplist` and `history-tree-v4` rows no live segment held when the last pass looked; seals start at 1,024 changesets (or 64 after 10 quiet minutes). |
+| `leep_derived_segment_reads_total` | counter | `outcome` = `hit` | Values a read found in a segment because the row was missing. |
+| `leep_derived_segment_errors_total` | counter | `what` = `manifest`, `index`, `segment`, `missing` | A manifest row that does not decode; a segment index not stored or damaged; segment data that does not decode; a data blob not stored. Each reads as missing rows, which derive again. Anything but rare: run `leep-server verify --derived`. |
+| `leep_derived_segment_mismatch_total` | counter | `kind` | Rows a `retire` pass kept because they differ from their segment's value (rows win). Should stay 0: run `verify --full --derived <kind>`. |
+| `leep_derived_segment_rows_retired_total` | counter | `kind` | Rows a `retire` pass deleted because a live segment holds the same value. |
 | `leep_changeset_dictionary` | gauge | none | The id of the newest changeset dictionary (0: none yet). |
 | `leep_land_cancelled_total` | counter | none | Lands whose caller went away (timeout, disconnect) while queued, dropped before their batch replayed them. |
 | `leep_land_batch_deadline_total` | counter | none | Lands answered 409 because their batch was still retrying 60 s after its first attempt (`MAX_BATCH_LIFETIME`, ADR 0059) and gave up instead of moving the ref. Clients resend; keyed lands are then answered from their record. Anything but rare means a store so slow, or a ref so contended, that lands do not finish. |
@@ -1974,6 +1982,13 @@ deletes the `gc-mark-v1` rows, because a `gc` from before ADR 0103 would
 trust what is left of them half way; run it only after every binary is
 upgraded.
 
+A server in `--derived-segments retire` records `derived-segments` (ADR
+0104) before the first `skiplist` or `history-tree-v4` row it deletes,
+because a binary from before ADR 0104 would derive whole histories again
+without them and its `gc` would delete the segments holding them; set
+`retire` only after every binary is upgraded (see
+[Derived segments](#derived-segments)).
+
 The check only protects against binaries that have it. **Servers from
 before this release do not read the table**, and those from before ADR 0053
 cannot read compressed rows. So for this release the rule above still
@@ -1994,7 +2009,7 @@ apply to the server and to its tools (`verify`, `repair`, `upgrade-index`,
 | `--meta-land-pool-size` / `LEEP_META_LAND_POOL_SIZE` | an eighth of `--meta-pool-size`, at least 4 | Further Postgres connections reserved for land leaders (ADR 0067), opened on first use. `0` reserves none. SQLite ignores it. |
 | `--meta-index-pool-size` / `LEEP_META_INDEX_POOL_SIZE` | a sixteenth of `--meta-pool-size`, at least 4 | Further Postgres connections reserved for the index warmer (ADR 0073), opened on first use (only by a server that warms). `0` reserves none. SQLite ignores it. |
 | `--meta-pool-min` / `LEEP_META_POOL_MIN` | 4 | The server's warm floor (ADR 0084): connections opened at startup and kept open, this many of `--meta-pool-size` and of the land reserve and one each of the index and lease pools (10 at the default). `0` opens every connection on first use. Server only: commands (`gc`, `repack`, `migrate`, `backup`, ...) always open lazily. SQLite ignores it. |
-| `--derive-cache-bytes` / `LEEP_DERIVE_CACHE_BYTES` | 440401920 (420 MiB) | The in-memory caches of derived indexes: path-history nodes, parts and roots (148 MiB), tree nodes (32 MiB), nodes of unstored trees derived on read (16 MiB, ADR 0069), search's directory filters (64 MiB), skiplists read by blame and filtered logs (32 MiB), and the filtered-log caches (128 MiB). The ancestry and skiplist caches are bounded by entries, about 100 MB together by default, and scale by the same factor. |
+| `--derive-cache-bytes` / `LEEP_DERIVE_CACHE_BYTES` | 490733568 (468 MiB) | The in-memory caches of derived indexes: path-history nodes, parts and roots (148 MiB), tree nodes (32 MiB), nodes of unstored trees derived on read (16 MiB, ADR 0069), search's directory filters (64 MiB), skiplists read by blame and filtered logs (32 MiB), the filtered-log caches (128 MiB), and derived segments' decompressed blocks (16 MiB) and data blobs (32 MiB, ADR 0104). The ancestry and skiplist caches are bounded by entries, about 100 MB together by default, and scale by the same factor. |
 
 `--cache-bytes` (256 MiB) is separate: it caches blobs.
 
@@ -2091,7 +2106,7 @@ allocators (musl, macOS, Windows) are unaffected.
   with `canceling statement due to statement timeout` in the ERROR log; if a
   legitimate one does, raise the flag rather than turning it off.
 - **Derive caches.** Every cache gets its default share of the budget
-  times `budget / 420 MiB`. More helps derivation of very wide histories
+  times `budget / 468 MiB`. More helps derivation of very wide histories
   and filtered logs over long ranges: `history-tree-v4` derivation re-reads
   hot directory nodes, and `log-filter-v1` merge walks reuse fingerprints.
   Search keeps the `tree-trigrams-v2` rows it reads from the store, and the
@@ -3028,6 +3043,8 @@ history, trees and blobs first, derived rows after.
 | `bad_attestation`, `invalid_signature` | A signature or review row does not decode, does not belong to any changeset, or a signature does not verify | These are not derived from history and are never rewritten by `repair`. Restore the row from a backup, or delete it with SQL if it is junk, and have the author sign again |
 | `bad_rebased_origin`, `bad_gc_row` | Bookkeeping rows that are malformed or name changesets that do not exist (a rebased-origin row may name a swept original, but must agree with its copy's `leep.rebased_from`) | Restore from a backup. A bad GC row can be deleted with SQL while no `gc` runs; `repair` refuses to touch them |
 | `bad_gc_segment` | A GC mark segment the manifest names does not decode, or holds a different number of marks (ADR 0103). One that is not stored is only a note (normal after restoring a backup taken while `gc` ran) | Nothing is lost: the next `gc` trusts only the segments before it, walks the rest and stops naming it. Run `gc` (or `gc --full`) |
+| `bad_derived_manifest` | The `derived-segments-v1` row does not decode (ADR 0104). No derived segment is read (rows still are), and `gc` refuses to run, since it cannot tell live segments from orphans | In mode `build` every row is still stored: the next derived segments pass replaces the row. After `retire`, a pass refuses to; run `repair drop --kind skiplist --kind history-tree-v4` (it replaces the manifest with an empty one and drops the rows), then `repair rederive --kind history-tree-v4 --missing` or let reads derive them |
+| `bad_derived_segment` | A live derived segment's index or data does not decode (ADR 0104). One that is not stored is only a note (normal after restoring a backup whose blob copy finished before the segment was sealed) | Nothing wrong is read: its keys read as rows or derive again, and the next pass drops it from the manifest and seals the rows again. After `retire`, `repair rederive --kind skiplist --kind history-tree-v4 --missing` writes the rows at once |
 | `reflog_divergence` | A ref's newest ref log entry does not say where the ref is now | Someone changed the `refs` table or the log directly, or a restore mixed two points in time. Decide which is right: if the ref is right, the log is merely incomplete and nothing breaks; if the log is right, `leep undo`-style recovery is `POST /v1/refs/{name}` to the logged value. `repair` never edits either |
 | `reflog_chain_break` | An entry's `new` does not equal the next entry's `old`: an entry was removed or edited | The log is the record of what happened; restore it from a backup if you need it complete. Refs are unaffected |
 
@@ -3109,7 +3126,7 @@ Kinds that cannot be rederived (and so are refused by `drop` with an
 explanation and exit status 2): `signature-v1`, `review-v1` and `review-source-v1` (clients wrote
 them), `rebased-origin-v1` (written by rebase; `land`'s retry detection depends
 on it), `blob-claim-v1`, `blob-condemned-v1`, `blob-rescue-v1`, `blob-doom-v1`, `gc-mark-v1`,
-`gc-mark-segments-v1` (the GC fence and marks, ADR 0012, 0033, 0103), `history-node-v4` (or `-v3`, `-v2`, `-v1`) and
+`gc-mark-segments-v1` (the GC fence and marks, ADR 0012, 0033, 0103), `derived-segments-v1` (ADR 0104; drop `skiplist` or `history-tree-v4` instead), `history-node-v4` (or `-v3`, `-v2`, `-v1`) and
 `tree-trigrams-keyframe-v2` on their own, and the ref log. The full table
 with reasons is in ADR 0025. `blame-v2` can be dropped but not rederived: its rows
 are keyed by a hash of (changeset, path) and cannot be listed.
@@ -3509,6 +3526,11 @@ target/release/leep-soak --duration 30m --rate-limit 5 --rate-burst 10 --max-con
 target/release/leep-soak --duration 10m --seed 0x2a --out replay   # the plan of an earlier failure
 ```
 
+The soak's server runs derived segments (ADR 0104) in `--derived-segments
+retire` with small limits and a pass every 5 s (`--derived-segments build`
+or `off` to change it); a run of a minute or more fails unless passes
+sealed segments and, in `retire`, deleted rows.
+
 It creates a throwaway Postgres database in the admin URL (`--postgres-url`,
 `LEEP_SOAK_POSTGRES_URL`, else `LEEP_TEST_POSTGRES_URL`; `--sqlite` or no URL
 means SQLite), puts blobs in a directory, starts `leep-server` with
@@ -3713,3 +3735,110 @@ returned to the filesystem by `VACUUM FULL derived` (an exclusive lock) or
 keep up with an hourly pass. On SQLite freed pages go on the free list and
 are reused; `VACUUM` returns them.
 
+### Derived segments
+
+`skiplist` and `history-tree-v4` hold one row per changeset that is a pure
+function of history, about 1.3 KB a changeset with row overhead. Since ADR
+0104 a background pass seals them into immutable **derived segments** in
+the blob store (an index blob and a data blob each; changeset ids inside
+are positions, so a segment takes about a tenth of the rows) named by one
+`derived-segments-v1` row. Values do not change: every read asks the
+database first (a row wins), then the segments. The blobs start with object
+prefixes uploads cannot write, are packed and backed up like any blob, and
+blob GC never condemns a live one.
+
+| Flag / env | Default | What it does |
+|---|---|---|
+| `--derived-segments off\|build\|retire` / `LEEP_DERIVED_SEGMENTS` | `build` | `build`: seal and merge in the background, keep every row. `retire`: also delete rows a live segment holds the same value for (the one-way door below). `off`: no passes; segments already written are still read. |
+| `--derived-segments-interval D` / `LEEP_DERIVED_SEGMENTS_INTERVAL` | `5m` | How often a pass runs (the first 2 to 3 minutes after start). |
+
+A pass holds the store-wide lease `maintenance` / `derived-segments`, so one
+server at a time runs it, in the index lane (it uses the index connections,
+never the land path's). It lists the keys of both kinds, and:
+
+1. seals the rows no live segment holds once 1,024 changesets are unsealed,
+   or 64 that have not grown for 10 minutes; a changeset whose
+   `history-tree-v4` row is not derived yet waits 10 minutes for it. A
+   segment holds at most 16,384 changesets and 4 MiB; a store's existing
+   history is sealed in pages of that size, restartable anywhere;
+2. merges runs of four segments of one size tier (1k, 4k, 16k changesets);
+   the segments merged away are collected by the next `gc` like orphans
+   (`retired derived segment blobs condemned` / `deleted` in its report);
+3. in mode `retire`, deletes rows whose segment has been live for 10
+   minutes, after comparing each with the segment's value (an unequal row
+   stays and wins, `leep_derived_segment_mismatch_total`), 1,000 a
+   statement, resting as long as each step took.
+
+The log line "derived segments pass (ADR 0104)" (level info) gives what a
+pass did; the metrics are `leep_derived_segment_*` ([Metrics](#metrics)).
+Each server keeps the live segments' indexes in memory (about 40 bytes a
+changeset) and reads a segment's data blob once (at most 4 MiB, kept under
+`--derive-cache-bytes`).
+
+**Rollout.** `build` (the default) is free to roll back: every row stays,
+so a binary from before ADR 0104 reads everything and ignores the manifest
+(an older `gc` may collect live segments as orphans; the next pass notices
+and seals again). The storage only comes back with `retire`:
+
+> **One-way door.** With `--derived-segments retire` the server records the
+> store feature `derived-segments` before it deletes the first row. From
+> then on every binary older than ADR 0104 refuses the store (see
+> [Format features](#format-features)): without the rows it would derive
+> whole histories again from the root (hours on a large store), and its
+> `gc` would delete live segments. Going back means restoring a backup
+> taken before the feature was recorded. Set `retire` only once every
+> server, importer and cron job runs this release or later, on one server
+> or all (passes take turns).
+
+Postgres and SQLite reuse the space of deleted rows for later rows, but
+return it to the operating system only on `VACUUM FULL derived` (or
+`pg_repack`) and `VACUUM` (docs/PERFORMANCE.md, "Derived segments").
+
+**Repair and verify.** `verify` reads segment values like rows (so
+`--full` checks them against their recomputation) and checks the manifest
+(`bad_derived_manifest`) and every live segment (`bad_derived_segment`); a
+segment that is not stored is a note. `repair rederive --kind skiplist`
+(or `history-tree-v4`) writes a row wherever the value read, row or
+segment, is missing or wrong; the row then wins. `repair drop --kind
+skiplist` (or `history-tree-v4`) first stops every segment answering for
+that kind (its column is cleared in the manifest), then deletes the rows,
+so everything derives again. Both hold the derived-segments lease, waiting
+up to two minutes for a running pass (a pass seals at most four pages of
+16,384 changesets and deletes at most 65,536 rows or for at most a minute,
+then gives the lease up, and the next pass follows 5 s later while work is
+left); `repair drop` refuses
+`derived-segments-v1` itself. **Other running servers keep answering from
+the segments for up to a minute** (they read the manifest again at their
+next miss after 60 s): restart them, or wait a minute, before checking
+that a dropped kind derives again, as for the search kinds above. Within
+that minute such a server may also derive and store new rows from a stale
+segment value; when a drop is meant to purge wrong values, stop or restart
+the other servers before the drop, or drop again after a minute.
+
+**Restart servers after a damaged manifest is replaced, or after a
+metadata restore.** A manifest written over a damaged row takes the
+writer's clock as its sequence number; if an earlier writer's clock was
+ahead, running servers keep the manifest they hold (they never apply a
+lower sequence) until the clocks catch up. A restored database can hold a
+manifest older than the one servers hold, for the same reason. A restart
+reads the manifest afresh. A pass
+deletes a row only if it still holds the bytes it compared, so a row
+`repair rederive` wrote is never deleted as equal to the old value.
+
+A pass in mode `build` lists the keys of both kinds only when their
+estimated count grew by 1,024 since its last listing, or 10 minutes
+passed. It never replaces a manifest written by a newer `leep-server`, and
+replaces a damaged one only if the store has no `derived-segments` feature
+recorded. On a store with the feature it drops a segment it cannot read
+only when two passes in a row agree (also on stores that cannot record
+features, once this process has retired rows). A pass that cannot read a
+segment's data while merging or retiring leaves it alone for the rest of
+the pass, and the next pass reads it whole.
+
+**Backups and restores.** Segments are blobs, so `backup` copies them. A
+metadata snapshot can name a segment the blob copy lacks (sealed between
+the two halves): after the restore, those values read as missing rows,
+`verify` notes the segment, and they derive again on demand; `repair
+rederive --kind skiplist --kind history-tree-v4 --missing` writes them all
+at once, and the next pass drops the segment from the manifest. Segments
+the snapshot does not name are orphans the next `gc` collects.

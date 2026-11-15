@@ -275,6 +275,18 @@ groups:
     annotations:
       summary: "Servers report different versions for over 2 hours: a rollout is unfinished (equal versions do not prove equal builds)."
       runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepmixedversions
+  - alert: LeepDerivedSegmentPassesFailing
+    # ADR 0104. A pass that fails seals nothing; a mismatch is a row kept
+    # because it differs from its segment's value (counted again each pass).
+    expr: |
+      sum(increase(leep_derived_segment_passes_total{outcome="error"}[1h])) > 3
+      or
+      sum(increase(leep_derived_segment_mismatch_total[1h])) > 0
+    for: 30m
+    labels: {severity: ticket}
+    annotations:
+      summary: "Derived segment passes keep failing, or keep finding skiplist or history-tree-v4 rows that differ from their segments' values."
+      runbook_url: https://git.example.com/leep/blob/main/docs/RUNBOOKS.md#leepderivedsegmentpassesfailing
 - name: leep-mirror
   # Metrics from `leep-git mirror run --listen`, scraped under a job named
   # "leep-mirror"; adjust. See "Git mirror" above.

@@ -332,6 +332,48 @@ fn rows(out: &mut Out) {
     );
     out.add("gc_rows", "mark-segment", with_prefix(5, &segment));
 
+    {
+        use leep_derive::derived_segments::codec;
+        let entry = |b: u8, g: u64| {
+            let mut v = id(b).0.as_bytes().to_vec();
+            v.extend_from_slice(&g.to_be_bytes());
+            v
+        };
+        let rows = vec![
+            codec::SealRow {
+                key: id(1).0,
+                generation: 1,
+                values: vec![(codec::COL_SKIPLIST, bytes::Bytes::new())],
+            },
+            codec::SealRow {
+                key: id(2).0,
+                generation: 2,
+                values: vec![(codec::COL_SKIPLIST, entry(1, 1).into())],
+            },
+            codec::SealRow {
+                key: id(3).0,
+                generation: 3,
+                values: vec![(
+                    codec::COL_SKIPLIST,
+                    [entry(2, 2), entry(7, 1)].concat().into(),
+                )],
+            },
+        ];
+        let (enc, _) = codec::encode(codec::FAMILY_CHANGESET, &rows, 7).unwrap();
+        let mut pair = vec![1u8];
+        pair.extend_from_slice(&(enc.index.1.len() as u16).to_be_bytes());
+        pair.extend_from_slice(&enc.index.1);
+        pair.extend_from_slice(&enc.data.1);
+        out.add("derived_segment", "skiplists", pair);
+        let m = codec::Manifest {
+            family: codec::FAMILY_CHANGESET,
+            seq: 3,
+            live: vec![enc.seg],
+            retired: vec![Hash([4; 32])],
+        };
+        out.add("derived_segment", "manifest", with_prefix(0, &m.encode()));
+    }
+
     let mut skip = Vec::new();
     for (n, generation) in [(1u8, 7u64), (2, 6), (3, 4)] {
         skip.extend_from_slice(id(n).0.as_bytes());

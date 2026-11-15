@@ -400,6 +400,21 @@ static KINDS: &[KindInfo] = &[
         ),
     },
     KindInfo {
+        name: crate::derived_segments::MANIFEST_KIND,
+        class: KindClass::Bookkeeping,
+        summary: "the manifest of derived segments in the blob store, which hold skiplist and \
+                  history-tree-v4 values (ADR 0104)",
+        rederive: Rederive::No(
+            "the next derived-segments pass seals the rows again; segment values are \
+             checked and rederived as skiplist and history-tree-v4",
+        ),
+        drop: DropPolicy::Refused(
+            "after --derived-segments retire it names the only copy of deleted rows; drop \
+             skiplist or history-tree-v4 instead, which also stops the segments answering for \
+             them",
+        ),
+    },
+    KindInfo {
         name: GC_MARK_SEGMENTS,
         class: KindClass::Bookkeeping,
         summary: "the manifest of garbage collection mark segments in the blob store",

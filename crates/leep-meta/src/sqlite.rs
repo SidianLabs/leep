@@ -1252,6 +1252,32 @@ impl MetaStore for SqliteMetaStore {
         Ok(n)
     }
 
+    /// One transaction; each row deleted only if its value is still the
+    /// one given.
+    async fn delete_derived_values(&self, kind: &str, rows: &[(Hash, Bytes)]) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self
+            .db_for("delete_derived_values")
+            .begin()
+            .await
+            .map_err(storage)?;
+        let mut n = 0;
+        for (key, value) in rows {
+            n += sqlx::query("DELETE FROM derived WHERE kind = ? AND key = ? AND value = ?")
+                .bind(kind)
+                .bind(key.as_bytes().as_slice())
+                .bind(value.as_ref())
+                .execute(&mut *tx)
+                .await
+                .map_err(storage)?
+                .rows_affected();
+        }
+        tx.commit().await.map_err(storage)?;
+        Ok(n)
+    }
+
     async fn delete_derived_keys(&self, kinds: &[&str], keys: &[Hash]) -> Result<u64> {
         if keys.is_empty() || kinds.is_empty() {
             return Ok(0);

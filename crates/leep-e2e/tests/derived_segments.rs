@@ -1,0 +1,380 @@
+//! Derived segments (ADR 0104) with the real binaries: a store moves from
+//! rows to segments in mode `build` (every row stays, so a binary that
+//! predates segments reads everything and rolling back is free), then
+//! `retire` deletes the rows after recording the store feature; and a
+//! restore drill with a metadata snapshot naming a segment the blob copy
+//! lacks. Run `cargo build --workspace` first.
+
+mod common;
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use common::*;
+use leep_core::{Changeset, ChangesetId, FileChange, FileKind, Hash, RepoPath};
+use leep_derive::derived_segments::{self as ds, ManifestRead, COL_HISTORY_TREE, COL_SKIPLIST};
+use leep_derive::Repo;
+
+fn rt() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    })
+}
+
+fn open_repo(stores: &Stores) -> Repo {
+    let blobs = leep_store::open_blob_store(&stores.blobs).expect("blob store");
+    let meta = rt()
+        .block_on(leep_meta::open_meta_store(&stores.meta))
+        .expect("meta store");
+    Repo::new(blobs, meta)
+}
+
+/// `n` changesets on `main`, with history-tree-v4 derived for all.
+fn plant(stores: &Stores, n: usize) -> Vec<ChangesetId> {
+    let repo = open_repo(stores);
+    rt().block_on(async {
+        let mut tip: Option<ChangesetId> = None;
+        let mut made = Vec::new();
+        for i in 0..n {
+            let body = format!("fn f{i}() {{}}\n");
+            let content = repo.put_blob(body.clone().into()).await.unwrap();
+            let id = repo
+                .create_changeset(Changeset {
+                    parents: tip.into_iter().collect(),
+                    author: "t".into(),
+                    timestamp: 1,
+                    message: format!("c{i}"),
+                    changes: BTreeMap::from([(
+                        RepoPath::new(format!("m{}/f{}.rs", i % 5, i % 13)).unwrap(),
+                        FileChange::Modify {
+                            content,
+                            kind: FileKind::Regular,
+                            size: body.len() as u64,
+                        },
+                    )]),
+                    extra: BTreeMap::new(),
+                })
+                .await
+                .unwrap();
+            made.push(id);
+            tip = Some(id);
+        }
+        repo.meta().cas_ref("main", None, tip).await.unwrap();
+        leep_derive::derived::derive::<leep_derive::derived::HistoryTree>(&repo, tip.unwrap())
+            .await
+            .unwrap();
+        made
+    })
+}
+
+/// Both values of every changeset as a new process reads them; history
+/// parts by content.
+fn values(stores: &Stores, ids: &[ChangesetId]) -> Vec<Option<Vec<u8>>> {
+    let repo = open_repo(stores);
+    let keys: Vec<Hash> = ids.iter().map(|i| i.0).collect();
+    rt().block_on(async {
+        let mut out: Vec<Option<Vec<u8>>> = repo
+            .meta()
+            .get_derived_many("skiplist", &keys)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|v| v.map(|b| b.to_vec()))
+            .collect();
+        for v in repo
+            .meta()
+            .get_derived_many("history-tree-v4", &keys)
+            .await
+            .unwrap()
+        {
+            out.push(v.map(|b| {
+                leep_derive::derived::history_pack::canonical(&b)
+                    .unwrap()
+                    .into_owned()
+            }));
+        }
+        out
+    })
+}
+
+/// Rows of the two kinds as a binary that predates segments reads them:
+/// the database alone.
+fn rows(stores: &Stores) -> (u64, u64) {
+    let meta = rt()
+        .block_on(leep_meta::open_meta_store(&stores.meta))
+        .unwrap();
+    rt().block_on(async {
+        (
+            meta.count_derived("skiplist").await.unwrap(),
+            meta.count_derived("history-tree-v4").await.unwrap(),
+        )
+    })
+}
+
+/// Changesets of `ids` a live segment holds both values of.
+fn sealed(stores: &Stores, ids: &[ChangesetId]) -> usize {
+    let repo = open_repo(stores);
+    rt().block_on(async {
+        let (raw, _) = ds::read_manifest(&repo).await.unwrap();
+        repo.segments().apply(raw).await.unwrap();
+        ids.iter()
+            .filter(|id| {
+                repo.segments().holds(&id.0, COL_SKIPLIST)
+                    && repo.segments().holds(&id.0, COL_HISTORY_TREE)
+            })
+            .count()
+    })
+}
+
+fn segment_server(stores: &Stores, root: &Path, mode: &str) -> Server {
+    Server::start_with(
+        free_port(),
+        stores,
+        root,
+        &[
+            "--derived-segments",
+            mode,
+            "--debug-derived-segments-small",
+            "--debug-derived-segments-first",
+            "0s",
+            "--derived-segments-interval",
+            "500ms",
+        ],
+    )
+}
+
+fn wait_for(what: &str, server: &Server, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !done() {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: timed out\n{}",
+            server.log_text()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn features(stores: &Stores) -> Vec<String> {
+    use sqlx::Connection;
+    rt().block_on(async {
+        if stores.meta.starts_with("sqlite:") {
+            let mut c = sqlx::SqliteConnection::connect(&stores.meta).await.unwrap();
+            sqlx::query_scalar("SELECT name FROM store_features")
+                .fetch_all(&mut c)
+                .await
+                .unwrap()
+        } else {
+            let mut c = sqlx::PgConnection::connect(&stores.meta).await.unwrap();
+            sqlx::query_scalar("SELECT name FROM store_features")
+                .fetch_all(&mut c)
+                .await
+                .unwrap()
+        }
+    })
+}
+
+fn verify_full(stores: &Stores, what: &str) -> String {
+    let out = server_cmd(stores, &["verify", "--full"]);
+    assert_ok(&out, what);
+    stdout(&out)
+}
+
+/// `build`, beside binaries that read rows only, then `retire`.
+fn build_then_retire(stores: Stores, root: &Path) {
+    let made = plant(&stores, 120);
+    let want = values(&stores, &made);
+    assert!(want.iter().all(Option::is_some));
+    let before = rows(&stores);
+    assert_eq!(before, (120, 120));
+
+    // Build: segments appear, every row stays.
+    let server = segment_server(&stores, root, "build");
+    wait_for("build seals every changeset", &server, || {
+        sealed(&stores, &made) == made.len()
+    });
+    drop(server);
+    assert_eq!(rows(&stores), before, "build mode deletes no row");
+    assert!(
+        !features(&stores).iter().any(|f| f == "derived-segments"),
+        "build mode records no feature"
+    );
+    assert_eq!(values(&stores, &made), want);
+    verify_full(&stores, "verify --full in build mode");
+
+    // Rolling every binary back is free: an older binary ignores the
+    // manifest and reads the rows. Without the manifest, the store still
+    // verifies in full and every value reads from rows.
+    if stores.meta.starts_with("sqlite:") {
+        let copy = root.join("rollback");
+        std::fs::create_dir_all(&copy).unwrap();
+        let src = stores
+            .meta
+            .trim_start_matches("sqlite://")
+            .split('?')
+            .next()
+            .unwrap()
+            .to_string();
+        std::fs::copy(&src, copy.join("meta.db")).unwrap();
+        let old = Stores {
+            meta: format!("sqlite://{}?mode=rwc", copy.join("meta.db").display()),
+            blobs: stores.blobs.clone(),
+        };
+        let meta = rt()
+            .block_on(leep_meta::open_meta_store(&old.meta))
+            .unwrap();
+        rt().block_on(async {
+            assert!(
+                meta.delete_derived_keys(&[ds::MANIFEST_KIND], &[ds::manifest_key()])
+                    .await
+                    .unwrap()
+                    == 1
+            );
+        });
+        drop(meta);
+        assert_eq!(values(&old, &made), want, "an older binary's reads");
+        verify_full(&old, "verify --full of the rolled-back copy");
+    }
+
+    // Retire: the feature first, then the rows go; everything still reads.
+    let server = segment_server(&stores, root, "retire");
+    wait_for("retire deletes the rows", &server, || {
+        rows(&stores) == (0, 0)
+    });
+    drop(server);
+    assert!(
+        features(&stores).iter().any(|f| f == "derived-segments"),
+        "{:?}",
+        features(&stores)
+    );
+    assert_eq!(values(&stores, &made), want);
+    verify_full(&stores, "verify --full after retire");
+    // A server with passes off still reads them, and GC keeps them.
+    let gc = server_cmd(
+        &stores,
+        &["gc", "--grace", "0", "--fence", "0s", "--unsafe-no-fence"],
+    );
+    assert_ok(&gc, "gc");
+    let out = stdout(&gc);
+    assert!(out.contains("derived segments: "), "{out}");
+    assert_eq!(values(&stores, &made), want, "after gc");
+    verify_full(&stores, "verify --full after gc");
+}
+
+#[test]
+fn build_keeps_rows_for_older_binaries_then_retire_deletes_them_sqlite() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    build_then_retire(Stores::sqlite(&root.join("data")), root);
+}
+
+#[test]
+fn build_keeps_rows_for_older_binaries_then_retire_deletes_them_postgres() {
+    let Some(db) = PgDb::create("leep_e2e") else {
+        return;
+    };
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    build_then_retire(Stores::with_meta(&root.join("data"), db.url.clone()), root);
+    drop(db);
+}
+
+/// A backup whose metadata snapshot names a segment its blob copy lacks
+/// (the copy finished before the segment was sealed): the restore reads
+/// those values as missing, `verify` notes it, `repair rederive --missing`
+/// fills the rows, and the next pass stops naming the segment.
+#[test]
+fn restore_drill_with_a_manifest_ahead_of_the_blob_copy() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let stores = Stores::sqlite(&root.join("data"));
+    let made = plant(&stores, 120);
+    let want = values(&stores, &made);
+    let server = segment_server(&stores, root, "retire");
+    wait_for("retire deletes the rows", &server, || {
+        rows(&stores) == (0, 0)
+    });
+    drop(server);
+    let out_dir = root.join("backup");
+    let out = server_cmd(
+        &stores,
+        &["backup", "--out", out_dir.to_str().unwrap(), "--json"],
+    );
+    assert_ok(&out, "backup");
+    let manifest: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let name = manifest["manifest"]["name"].as_str().unwrap().to_string();
+
+    // Lose the newest live segment from the blob copy.
+    let repo = open_repo(&stores);
+    let (_, read) = rt().block_on(ds::read_manifest(&repo)).unwrap();
+    let ManifestRead::Read(m) = read else {
+        panic!("no manifest")
+    };
+    let lost = *m.live.last().unwrap();
+    for h in [lost.index, lost.data] {
+        let hex = h.to_hex();
+        let f = out_dir.join("blobs").join(&hex[..2]).join(&hex[2..]);
+        assert!(
+            f.is_file(),
+            "segment blob {hex} is not a file in the backup"
+        );
+        std::fs::remove_file(f).unwrap();
+    }
+    drop(repo);
+
+    let dest = Stores::sqlite(&root.join("restored"));
+    let out = server_cmd(
+        &dest,
+        &[
+            "restore",
+            "--from",
+            out_dir.to_str().unwrap(),
+            "--snapshot",
+            &name,
+            "--json",
+        ],
+    );
+    assert_ok(&out, "restore");
+    // Rows of the lost segment's keys read as missing: noted, not damage.
+    let got = values(&dest, &made);
+    let missing = got.iter().filter(|v| v.is_none()).count();
+    assert!(
+        missing > 0 && missing <= 2 * lost.rows as usize,
+        "{missing}"
+    );
+    let v = verify_full(&dest, "verify --full of the restore");
+    assert!(v.contains("is not stored"), "{v}");
+    let out = server_cmd(
+        &dest,
+        &[
+            "repair",
+            "rederive",
+            "--kind",
+            "skiplist",
+            "--kind",
+            "history-tree-v4",
+            "--missing",
+        ],
+    );
+    assert_ok(&out, "repair rederive --missing");
+    assert_eq!(values(&dest, &made), want);
+    verify_full(&dest, "verify --full after repair");
+    // The next pass drops the segment the blob copy lacks.
+    let server = segment_server(&dest, root, "build");
+    wait_for("the lost segment is dropped", &server, || {
+        let repo = open_repo(&dest);
+        let (_, read) = rt().block_on(ds::read_manifest(&repo)).unwrap();
+        matches!(read, ManifestRead::Read(m) if !m.live.iter().any(|s| s.index == lost.index))
+    });
+    drop(server);
+    assert_eq!(values(&dest, &made), want);
+}

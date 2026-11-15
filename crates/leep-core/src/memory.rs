@@ -476,6 +476,19 @@ impl MetaStore for MemoryMetaStore {
         Ok(n)
     }
 
+    async fn delete_derived_values(&self, kind: &str, rows: &[(Hash, Bytes)]) -> Result<u64> {
+        let mut derived = self.derived.lock().unwrap();
+        let mut n = 0;
+        for (key, value) in rows {
+            let k = (kind.to_string(), *key);
+            if derived.get(&k) == Some(value) {
+                derived.remove(&k);
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     async fn changesets_stored_at(&self, ids: &[ChangesetId]) -> Result<Vec<Option<u64>>> {
         let _changesets = self.changesets.lock().unwrap();
         let at = self.stored_at.lock().unwrap();
@@ -1269,6 +1282,35 @@ async fn check_one_lease_scope(store: &dyn MetaStore, key: &LeaseKey, meta: &str
 /// `cas_derived` swaps only from the exact expected row (`None` = none),
 /// and of concurrent swaps from one value, or from no row, exactly one wins.
 pub async fn check_cas_derived_contract(store: &dyn MetaStore) {
+    // A value-conditional delete removes only rows still holding the value.
+    let (ka, kb) = (Hash([0xD1; 32]), Hash([0xD2; 32]));
+    store
+        .put_derived("cdv", &ka, Bytes::from_static(b"a"))
+        .await
+        .unwrap();
+    store
+        .put_derived("cdv", &kb, Bytes::from_static(b"b"))
+        .await
+        .unwrap();
+    let n = store
+        .delete_derived_values(
+            "cdv",
+            &[
+                (ka, Bytes::from_static(b"a")),
+                (kb, Bytes::from_static(b"stale")),
+                (Hash([0xD3; 32]), Bytes::from_static(b"c")),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(store.get_derived("cdv", &ka).await.unwrap(), None);
+    assert_eq!(
+        store.get_derived("cdv", &kb).await.unwrap(),
+        Some(Bytes::from_static(b"b"))
+    );
+    assert_eq!(store.delete_derived_values("cdv", &[]).await.unwrap(), 0);
+
     let key = Hash::of_blob(b"cas-derived");
     let kind = "cas";
     let cas = |e: Option<&'static [u8]>, n: &'static [u8]| {

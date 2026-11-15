@@ -3200,6 +3200,8 @@ every changeset row compressed. It takes about 20 s.
 | ... over what whole rows of the landed files take (2,001 a land) | 0.68-0.81 / 0.99 | 0.63-0.79 / 0.99 |
 | One `gc` after the lands (servers stopped): mark segment bytes per mark (749 marks) | 32.0 / 40 | 32.0 / 40 |
 | ... database bytes it adds per mark (a `gc-mark-v1` row was about 100 and 167) | 0 / 12 | 21.9 / 28 |
+| Then a server in `--derived-segments retire` (waits cut): derived segment bytes per changeset (index and data blobs; about 120 changesets) | 57.0-59.2 / 75 | 57.0 / 75 |
+| ... over the key and value bytes of the `skiplist` and `history-tree-v4` rows they replace (64.5 KB) | 0.106-0.111 / 0.14 | 0.106 / 0.14 |
 
 Budgets were about 1.5 times the measured values (two runs each when set
 by ADR 0101; the database lines were measured again and tightened, and the
@@ -3207,7 +3209,11 @@ search lines added, by ADR 0102, ten runs on each backend, keeping at least
 40% over the worst database run and 25% over the worst search run). ADR
 0103 added the `gc` lines and measured everything again (five runs on each
 backend; the ranges above), and tightened the blob, database, ratio and
-blob store ratio budgets to at least 25% over the worst run. It left the
+blob store ratio budgets to at least 25% over the worst run. ADR 0104 added
+the derived segment lines (three runs on each backend; the other lines read
+as before, one SQLite run at 10,444 database bytes a land and 6.48x, inside
+their budgets, since a default server in mode `build` seals nothing in a
+store this small and quiet for less than 10 minutes). It left the
 search budgets alone (one SQLite run reached 1,616, 23% under the budget). The
 search blob budgets still fail if blob rows are written whole again (2,001
 bytes a land, a share of 1.0); the share is high for a
@@ -4417,6 +4423,63 @@ condemn makes one lookup per stored blob, so a billion-object store would
 spend hours a pass on lookups alone. ADR 0103 ("Cost") names the fix if
 stores get there: a merge join against the hash-ordered listings, or one
 merged index, needing no format change.
+
+### Derived segments (ADR 0104)
+
+Measured like "Marks as segments" above: corpora A (Leep's history, 231
+changesets, Git 4.84 MB) and B (A plus 2,000 single-file edits, 2,231
+changesets, Git 6.58 MB) imported, a server with default flags (its
+background work run within seconds) until nothing changes for 30 s, stop,
+`gc --grace 0 --fence 0s --unsafe-no-fence`, measure, then `VACUUM FULL`
+(Postgres) or `VACUUM` (SQLite) and measure again. Release builds of
+3538b12 ("before") and this change in `--derived-segments retire` with its
+waits cut ("after"; a production server waits 10 minutes before sealing a
+quiet store this small and before deleting rows). Local Postgres 16 and
+SQLite, filesystem blob store. Database bytes are above an empty database:
+`pg_database_size` on Postgres, pages in use on SQLite after a WAL
+checkpoint. All storage is database plus blob store.
+
+| Corpus, backend | Before: after `gc` / after vacuum (x Git) | After: after `gc` / after vacuum (x Git) | Change after vacuum |
+|---|---|---|---|
+| A, Postgres | 14.12 / 11.40 MB (2.36x) | 14.11 / 11.06 MB (2.28x) | -0.34 MB |
+| A, SQLite | 12.32 / 12.06 MB (2.49x) | 12.06 / 11.72 MB (2.42x) | -0.34 MB |
+| B, Postgres | 23.07 / 19.09 MB (2.90x) | 23.35 / 15.87 MB (2.41x) | **-3.22 MB** |
+| B, SQLite | 20.61 / 19.15 MB (2.91x) | 18.45 / 15.86 MB (2.41x) | **-3.29 MB** |
+
+- The two kinds took 2.82 MB of key and value bytes on B (2,231 rows each:
+  `skiplist` 977,832, `history-tree-v4` 1,839,483) and 0.31 MB on A. After,
+  one segment each: B 193,092 bytes of data blob plus its index, the blob
+  store growing 0.27 MB packed (the design's model said 0.27 MB); A 48,535
+  bytes of data, +0.06 MB. The manifest row is 155 bytes.
+- **Per changeset, settled:** 1,264 bytes of rows (plus about 130 of
+  Postgres row and index overhead) become about 120 bytes of segment on B,
+  and 1,346 become about 250 on A, whose history is short and merge-heavy.
+  The storage size guard's 120 changesets take 57 bytes a changeset against
+  538 of rows.
+- **Before the vacuum** Postgres keeps the deleted rows' pages (23.35 MB on
+  B; the 0.28 MB more than before is the segment), and later rows reuse
+  them; SQLite counts them free at once (18.45 MB, -2.15). The rows of a
+  store that seals as it grows never pile up, and an upgraded store gets
+  the space back with `VACUUM FULL derived` (or `pg_repack`) once `retire`
+  has run.
+- In mode `build` (the default) nothing is deleted: the store grows by the
+  segments, 0.06 MB on A and 0.27 MB on B, until an operator sets
+  `retire`.
+- Lands are untouched (`skiplist` is still written with the changeset and
+  `history-tree-v4` by the warmer); see the perf-ratio run below. `budget_tests` measures a create on a sealed and
+  retired store at the same 13 metadata calls as on rows, plus 2 blob
+  reads (the index and data blob, once per process).
+- `scripts/perf-ratio.sh` against 3538b12 (two A B A B runs on this
+  shared 4-core box): statements per land 1.01x to 1.07x (swarm, its land
+  pool and land-bench), DB bytes per land 1.00x, lands/s 0.92x to 1.21x.
+  The first run failed one wall-time check on a single outlier (swarm
+  create p99 63.5 ms in one B run against 9 to 11 elsewhere), the second
+  passed all 23 checks (create p99 15.5 and 21.4 ms against 224.5 and
+  786.1); a fresh server in mode `build` seals nothing during the bench.
+- A cold read of a sealed key reads its segment's data blob once per
+  process: B's whole history is one 193 KB blob, read in about a
+  millisecond from the filesystem; a hit then decompresses one 64 KiB block
+  (about 0.1 ms) and is cached.
 
 ## Changeset compression
 

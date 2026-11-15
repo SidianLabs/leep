@@ -86,6 +86,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "derived_segment"
+path = "fuzz_targets/derived_segment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "api_json"
 path = "fuzz_targets/api_json.rs"
 test = false

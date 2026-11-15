@@ -299,7 +299,21 @@ async fn run(args: Args) -> Result<bool> {
             (args.cache_mib * 1024 * 1024).to_string(),
             "--auto-repack-max-age".to_string(),
             args.auto_repack_max_age.clone(),
+            "--derived-segments".to_string(),
+            args.derived_segments.clone(),
         ]);
+        if args.derived_segments != "off" {
+            extra.extend(
+                [
+                    "--debug-derived-segments-small",
+                    "--debug-derived-segments-first",
+                    "5s",
+                    "--derived-segments-interval",
+                    "5s",
+                ]
+                .map(String::from),
+            );
+        }
         if let Some(r) = args.rate_limit {
             extra.extend(["--rate-limit".to_string(), r.to_string()]);
         }

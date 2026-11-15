@@ -42,6 +42,14 @@ const BUDGETS: &[Limit] = &[
     Limit::fixed("create", "meta calls", 13),
     Limit::fixed("create", "meta in flight", 1),
     Limit::fixed("create", "blob calls", 6),
+    // The same create on a store whose skiplist and history rows were
+    // sealed into derived segments and deleted (ADR 0104): the same
+    // metadata calls (the segment manifest rides on the first batched read
+    // of a process), plus the segment's index and data blobs, read once
+    // per process.
+    Limit::fixed("create sealed", "meta calls", 13),
+    Limit::fixed("create sealed", "meta in flight", 1),
+    Limit::fixed("create sealed", "blob calls", 8),
     // Eight creates at once, each as its own actor: still one call at a
     // time each, so the shared pool sees one ask per create.
     Limit::fixed("create x8", "meta in flight per create", 1),
@@ -139,6 +147,53 @@ async fn create_budget() {
     let u = b.stop();
     budget_check(
         "create",
+        &[
+            ("meta calls", 0, u.meta_calls()),
+            ("meta in flight", 0, u.meta_in_flight as u64),
+            ("blob calls", 0, u.blob_calls()),
+        ],
+        &u,
+    );
+}
+
+#[tokio::test]
+async fn create_sealed_budget() {
+    use crate::derived_segments::{compact_pass, CompactOptions, CompactState, Features, Mode};
+    let (r, blobs, meta) = plain();
+    build(&r, &[]).await;
+    let head = long_history(&r, 300, 0).await;
+    let opts = CompactOptions {
+        mode: Mode::Retire,
+        seal_rows: 1,
+        idle_rows: 1,
+        idle: std::time::Duration::ZERO,
+        lone_wait: std::time::Duration::ZERO,
+        retire_after: std::time::Duration::ZERO,
+        rest_factor: 0,
+        ..CompactOptions::default()
+    };
+    let hook = Features {
+        record: Arc::new(|| Box::pin(async { Ok(()) })),
+        recorded: Arc::new(|| Box::pin(async { Ok(true) })),
+    };
+    let mut state = CompactState::default();
+    for _ in 0..3 {
+        compact_pass(&r, &opts, &mut state, Some(&hook))
+            .await
+            .unwrap();
+    }
+    assert_eq!(meta.count_derived("skiplist").await.unwrap(), 0);
+    let body = Bytes::from_static(b"1\n");
+    let content = r.put_blob(body.clone()).await.unwrap();
+    let (fresh, b) = counted(blobs, meta);
+    b.start();
+    fresh
+        .create_changeset(changeset(head, one_file("x/1", content, body.len())))
+        .await
+        .unwrap();
+    let u = b.stop();
+    budget_check(
+        "create sealed",
         &[
             ("meta calls", 0, u.meta_calls()),
             ("meta in flight", 0, u.meta_in_flight as u64),

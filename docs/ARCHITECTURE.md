@@ -116,7 +116,7 @@ Rules:
 | `Changeset` | `Hash::of_object("changeset-v1", postcard)` | `MetaStore::put_changeset` |
 | Ref | name → `ChangesetId` | `MetaStore`, CAS only |
 | Ref log entry | `seq` → (ref, old, new, time, actor, operation, message) | `MetaStore`, appended by `cas_ref_logged` (or `cas_ref_logged_chain`, one entry per step) in the CAS's own transaction |
-| Derived value | `(kind, key)` → bytes | `MetaStore::put_derived`; `cas_derived` for a row a holder may overwrite after losing its lease (the GC mark manifest, ADR 0103) |
+| Derived value | `(kind, key)` → bytes | `MetaStore::put_derived`; `cas_derived` for a row a holder may overwrite after losing its lease (the GC mark manifest, ADR 0103; the derived segment manifest, ADR 0104). `skiplist` and `history-tree-v4` values may instead be held by derived segments in the blob store (ADR 0104) |
 
 `Changeset { parents, author, timestamp, message, changes, extra }`:
 - `changes: BTreeMap<RepoPath, FileChange>` is relative to `parents[0]`. A
@@ -222,7 +222,7 @@ way.
 |---|---|---|
 | `root_tree` | 32-byte tree hash. Applies `changes` to `parents[0]`'s tree, rewriting only the directories on changed paths and pruning empty ones | everything |
 | `generation` | `1 + max(parents)`; roots = 1 | log ordering, ancestry |
-| `skiplist` | power-of-two first-parent ancestors | `is_ancestor`, `merge_base` |
+| `skiplist` | power-of-two first-parent ancestors; a row, or a value in a derived segment (ADR 0104) | `is_ancestor`, `merge_base` |
 | `signature-v1` / `rebased-origin-v1` | attestations and server rebase links, keyed per (changeset, key) and per copy; not pure functions of the changeset, so written by `put_signature` and `rebase` rather than derived | signed-changeset listing and the land policy |
 | `review-v1` | review verdicts, keyed per (changeset, reviewer name) (`Hash::of_object("review", id‖name)`); attestations written by `put_review`, last write wins, listed with one lookup per reviewer (write tokens without `"review": false`) | review listing and the review land policy |
 | `review-source-v1` | which token posted a review for a named principal and the `source` it gave (`ReviewSource { via, source, timestamp }`), keyed as `review-v1` is; written by `put_review_source` beside the review (ADR 0063) | `source` and `via` in review listing, the audit trail |
@@ -230,13 +230,14 @@ way.
 | `check-v1` | the newest result of one CI check on a changeset (`Check { check, outcome, by, url, summary, timestamp }`), keyed per (changeset, check name) (`Hash::of_object("check", id‖name)`); attestations written by `put_check`, last write wins, never carried across rebases, listed with one lookup per known check name (the checks policy's and every token's allow-list) (ADR 0091) | check listing, promotion of `green/<ref>`, red state and catch-up |
 | `last_merge-v1` | generation of the nearest merge on the first-parent chain (0 if none) | lets `merge_base` answer from skiplists when no merge sits above the first-parent common ancestor |
 | `blob-claim-v1` / `blob-condemned-v1` / `blob-rescue-v1` / `blob-doom-v1` | per blob hash, 8-byte big-endian unix seconds (doom adds a state byte); GC bookkeeping, not derived from changesets: claims by uploads and dedup checks, condemnation by `gc condemn`, rescue by uploads of a condemned blob, doom by `gc collect` (ADR 0012) | blob garbage collection and the server's missing-blob checks |
-| `history-tree-v4` | the changeset's history pack (ADR 0045): the nodes of a tree parallel to `root_tree` recording for each path (including deleted ones) the newest changesets that changed it, as written by this changeset's derivation, and the address of its root. A pack is cut into parts of about 16 KB; this value is part 0 and `history-node-v4` rows hold the rest. Nodes are addressed by (writer, part, index) and name changesets through a table per part, so the hundreds of nodes a merge rewrites name its few dozen ids once; nodes of more than 64 entries are stored as content-defined chunks so an edit rewrites one chunk (ADR 0027), and a changed node, chunk or chunk list is stored as a patch on an earlier whole version that names the entries it replaces by position (ADR 0037). Built from the first parent's tree plus the spines of changed paths, and at merges the paths where the second parent's history differs from the merge base's (another parent's from the first's, for octopus or unrelated merges) (ADR 0013) | path log, `last-change` |
+| `history-tree-v4` | the changeset's history pack (ADR 0045): the nodes of a tree parallel to `root_tree` recording for each path (including deleted ones) the newest changesets that changed it, as written by this changeset's derivation, and the address of its root. A pack is cut into parts of about 16 KB; this value is part 0 and `history-node-v4` rows hold the rest. Nodes are addressed by (writer, part, index) and name changesets through a table per part, so the hundreds of nodes a merge rewrites name its few dozen ids once; nodes of more than 64 entries are stored as content-defined chunks so an edit rewrites one chunk (ADR 0027), and a changed node, chunk or chunk list is stored as a patch on an earlier whole version that names the entries it replaces by position (ADR 0037). Built from the first parent's tree plus the spines of changed paths, and at merges the paths where the second parent's history differs from the merge base's (another parent's from the first's, for octopus or unrelated merges) (ADR 0013). A row, or a value in a derived segment (ADR 0104) | path log, `last-change` |
 | `log-filter-v1` | per changeset at first-parent depth `d`: for each level `j ≤ tz(d)`, the 64-bit fingerprints of the authors, `extra` keys and `agent.model`/`agent.session` values of everything reachable from it but not from its first-parent ancestor `2^j` up (side branches included); lower-cased author names by fingerprint in `log-filter-name-v1` (ADR 0047) | `log` with `author`/`extra` filters and no path |
 | `blame-v2` | per (changeset, path), keyed `Hash::of_object("blame", id‖path)`: the postcard `(path, lines)` of a complete blame, following renames and merged branches (ADR 0065; the retired `blame` followed first parents only) | blame |
 | `cs-condemned-v1` / `cs-rescue-v1` / `cs-doom-v1` / `gc-fence-active-v1` | per changeset id (the flag: one row), the encodings of their `blob-*-v1` counterparts; the fence of changeset GC (ADR 0059): rescues by every writer that names a condemned changeset; condemnation, doom and the flag by the sweep (ADR 0059 phase 2) | changeset garbage collection, and the rescue checks of creates, lands, ref moves, rebases, merges, attestations and mirror maps |
 | `cs-tombstone-v1` | per deleted changeset id: deletion time and root tree hash, written before the delete; dropped after `--tombstone-retention` (ADR 0059 section 11) | `gc --full --backup-fence`, and the sweep's tombstone pass |
 | `cs-reach-v1` | per changeset id, one byte: "a ref or ref log entry reaches it, and every parent has a row"; written parents first, plus a progress row at the zero key (ADR 0059 section 4) | the changeset sweep's incremental reachability mark |
 | `gc-mark-v1` | per changeset id, tree node hash or blob hash, one byte: "referenced by a stored changeset, and everything below has a row"; written by GC marks in post-order before ADR 0103, never since; deleted by `gc --retire-mark-rows` | incremental GC marks, until the manifest says the rows are retired |
+| `derived-segments-v1` | one row per family (`changeset-v1` so far): the live derived segments in publish order, each an index blob and a data blob in the blob store with a column mask, and retired segments' blobs; replaced only by `cas_derived` under the `derived-segments` lease (ADR 0104) | the segment view every `Repo` reads `skiplist` and `history-tree-v4` through; the compactor; blob GC, which never condemns a live segment |
 | `gc-mark-segments-v1` | one row: the ordered list of live GC mark segments (blobs of sorted 32-byte hashes behind the object prefix `leep:gc-mark-segment-v1\0`), whether the `gc-mark-v1` rows still count, and retired segments; every prefix of the list is closed (ADR 0103) | incremental GC marks, which skip covered changesets and stop at marked tree nodes |
 | `blob-trigrams-v2` | per blob hash: sorted trigram set of a UTF-8 text blob up to 1 MiB (delta varints), or a "not indexed" marker, stored whole (the retired `blob-trigrams-v1` encoding, which is read where a blob has no v2 row) or as a patch (codes added and removed) on the set in `blob-trigrams-keyframe-v2` of the keyframe its predecessor (the file at the same path in the directory's predecessor) is on, while `patch² <= 128 × whole`; a probe costs at most two rows. Rows of blobs no ref head has held for `--search-retention` (14 days) are deleted and derived again on demand (ADR 0014, ADR 0102) | code search |
 | `blob-trigrams-keyframe-v2` | per blob hash: that blob's whole set, the base of patches; written before any patch on it, in its one encoding, so it never changes, and never retired (ADR 0102) | as above |
@@ -246,6 +247,31 @@ way.
 | `git-style-v1` | one row: the store's commit style (`plain`/`trailer`, optionally `+provenance`), written once by the first derivation or mirror start (ADR 0090) | every git commit id of a changeset made in Leep |
 | `tree-trigrams-v2` | per tree node hash: fixed-size bloom filter (2^19 bits) over every trigram below the directory, the OR of its children's filters, stored whole (dense or sparse), as a one-byte "saturated" marker past 2^17 bits set (admits every query; a saturated child makes its parent saturated), or as a patch (positions added and removed) on the whole filter in `tree-trigrams-keyframe-v2` of the keyframe its predecessor (the same path in the first parent's tree) is on, while `patch² <= 512 × whole`; reads cost at most two rows (ADR 0014, ADR 0094) | code search directory pruning |
 | `tree-trigrams-keyframe-v2` | per tree node hash: that directory's whole filter, the base of patches; a function of content written before any patch on it, so it never changes, which the patches rely on since a `tree-trigrams-v2` row may be rewritten by a derivation from another predecessor (ADR 0094) | as above |
+
+**Derived segments** ([ADR 0104](adr/0104-derived-segments.md)). The
+values of `skiplist` and `history-tree-v4`, one per changeset and pure
+functions of history, can leave the database for immutable segments in the
+blob store: an index blob (sorted keys, each key's ordinal in
+`(generation, id)` order, per column a presence bitmap and a block
+directory) and a data blob (a table of external ids and zstd blocks of
+rows), where a changeset id the value names is a backward distance to an
+earlier key of the segment or an index into the external table. Values are
+unchanged: a segment gives back what the row read would. One
+`derived-segments-v1` row names the live segments; only `cas_derived`
+replaces it. `Repo::new` wraps the metadata store in a view
+(`derived_segments::view`) so every read site reads through it: the
+database first, exactly as before (a row wins), then for a miss the
+in-memory indexes of the live segments, newest first, reading a manifest
+older than 60 s again before a miss is declared (with the miss, or in the
+same `get_derived_kinds` call, so statements per operation do not change).
+A background compactor in the server (`--derived-segments off|build|retire`,
+default `build`) seals rows no live segment holds once 1,024 changesets are
+unsealed (or 64 after 10 quiet minutes), merges segments by tiers of four
+up to 16,384 keys and 4 MiB, and in mode `retire` deletes a row equal to
+its segment's value once the segment has been live for 10 minutes, after
+recording the store feature `derived-segments`, the one-way door. Every
+failure reads as a missing row, which derives again. `Repo::row_meta` is
+the store without the view: the compactor's and blob GC's.
 
 **Unstored trees** ([ADR 0069](adr/0069-lazy-create-trees.md)). The
 `root_tree` row is always stored with its changeset, but the nodes of the
@@ -1467,7 +1493,10 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
   everything anyway, and keeps the trees of changesets deleted within its
   required `--backup-fence`. Blob GC and the changeset sweep hold the
   store-wide `gc` lease (ADR 0056 scope `gc`), so no two run at once, and
-  refuse a fence the servers' timeouts do not cover.
+  refuse a fence the servers' timeouts do not cover. Derived segments (ADR
+  0104) are read from their manifest in condemn and again in collect: a
+  live segment's blobs are never condemned, retired ones are collected like
+  orphans and reported apart, and a manifest that does not decode stops GC.
   [ADR 0059](adr/0059-unreachable-changeset-gc.md) deletes changesets no
   root reaches (refs, every ref log entry, landed-copy scan windows,
   attestations, mirror maps, a grace period) by the same condemn, fence and

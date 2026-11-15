@@ -128,11 +128,34 @@ pub async fn rederive(
     opts: &RederiveOptions,
     progress: &dyn Progress,
 ) -> Result<RederiveReport> {
-    let started = Instant::now();
     for k in &opts.kinds {
         kinds::check_rederivable(k)?;
     }
     let all = kinds::with_dependencies(&opts.kinds);
+    // A row written here wins over a segment value (ADR 0104); with the
+    // derived-segments lease held no pass deletes it meanwhile as equal to
+    // the value it was read as.
+    let lease = if !opts.dry_run && all.iter().any(|k| segmented(k)) {
+        crate::derived_segments::acquire_for(repo, "repair-rederive").await?
+    } else {
+        None
+    };
+    let result = rederive_leased(repo, opts, progress, all).await;
+    crate::gc_lease::release(lease, result).await
+}
+
+/// Whether derived segments may hold values of `kind` (ADR 0104).
+fn segmented(kind: &str) -> bool {
+    crate::derived_segments::codec::kind_column(kind).is_some()
+}
+
+async fn rederive_leased(
+    repo: &Repo,
+    opts: &RederiveOptions,
+    progress: &dyn Progress,
+    all: Vec<&'static str>,
+) -> Result<RederiveReport> {
+    let started = Instant::now();
     let (compute, shadow_meta, shadow_blobs) = if opts.dry_run {
         let meta = ShadowMeta::new(repo.meta().clone());
         let blobs = ShadowBlobs::new(repo.blobs().clone());
@@ -686,6 +709,32 @@ pub async fn drop_kinds(
             *n = meta.count_derived(kind).await?;
         }
     } else {
+        // Derived segments stop answering for the dropped kinds first, and
+        // the lease, held to the end, keeps any pass from sealing the rows
+        // being dropped (ADR 0104).
+        let cols: Vec<u8> = order
+            .iter()
+            .filter_map(|k| crate::derived_segments::codec::kind_column(k))
+            .collect();
+        let lease = if cols.is_empty() {
+            None
+        } else {
+            let lease = crate::derived_segments::acquire_for(repo, "repair-drop").await?;
+            let n = crate::derived_segments::drop_columns(repo, &lease, &cols).await?;
+            if n > 0 {
+                progress.info(&format!(
+                    "repair: {n} derived segment(s) no longer answer for {}",
+                    order
+                        .iter()
+                        .filter(|k| segmented(k))
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ));
+            }
+            lease
+        };
+        let _lease = LeaseGuard(lease);
         progress.info(&format!("repair: dropping {}", order.join(" ")));
         let mut ticks = Ticker::new(Duration::from_secs(10));
         let mut cursor: Option<Vec<u8>> = None;
@@ -722,6 +771,20 @@ pub async fn drop_kinds(
 
 fn is_zero(n: &u64) -> bool {
     *n == 0
+}
+
+/// Releases a lease when the drop ends, however it ends (a dropped lease
+/// lapses after its TTL; a released one at once).
+struct LeaseGuard(Option<crate::gc_lease::GcLease>);
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        if let Some(l) = self.0.take() {
+            tokio::spawn(async move {
+                let _ = l.release().await;
+            });
+        }
+    }
 }
 
 /// Copy every `blob-trigrams-v1` row whose blob has no `blob-trigrams-v2`

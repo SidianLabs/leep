@@ -23,8 +23,9 @@ The targets run three ways:
 | `changeset`, `tree_node`, `signature`, `review` | postcard decoders of persisted objects: decode never panics, a decoded value re-encodes and decodes to itself, content hashes are stable |
 | `history_node` | parts of path-history packs (ADR 0045): decode never panics, nodes resolve against a keyframe or fail, and a decoded keyframe stored again (whole, or as an edit of itself) reads back the same |
 | `blob_trigrams_row`, `tree_trigrams_row`, `trigram_codec` | code search rows (`blob-trigrams-v2` with its patch rows, `tree-trigrams-v2` with its saturated and patch rows): the decoders, the lazy `Probe`, and encoders against decoders |
-| `gc_rows` | `blob-claim`, `-condemned`, `-rescue` and `-doom` rows |
+| `gc_rows` | `blob-claim`, `-condemned`, `-rescue` and `-doom` rows, the GC mark manifest and segments |
 | `skiplist_row` | the skiplist derived row |
+| `derived_segment` | the derived segment manifest, and an index and data blob pair parsed past their address checks; what decodes re-encodes to the same values (ADR 0104) |
 | `api_json` | every `/v1` request body, and the response types clients parse, as JSON |
 | `server_router` | the real axum router over a seeded in-memory repo, driven with arbitrary methods, paths, queries and bodies: anything below 500 is fine, 5xx is a bug |
 | `owners`, `review_policy`, `signing_keys`, `auth_tokens` | `OWNERS` files and the server's three config files |

@@ -59,7 +59,11 @@ skill.
 | derived `tree-trigrams-v2` | — | `MetaStore.derived`, key = tree node hash (`TreeNode::hash()`), value = see "Code search index" below (ADR 0094) |
 | derived `tree-trigrams-keyframe-v2` | — | `MetaStore.derived`, key = tree node hash, value = the whole filter of that directory, dense or sparse as in `tree-trigrams-v2`; only ever written with that one encoding, before any patch on it (ADR 0094) |
 | retired `tree-trigrams-v1` | — | the same key, value = a whole filter, dense or sparse; written by servers before ADR 0094; never read by current servers; removed with `repair drop --kind tree-trigrams-v1` |
-| derived `history-tree-v4` | — | `MetaStore.derived`, key = changeset id, value = part 0 of the changeset's history pack (ADR 0045): the history nodes its derivation wrote, and its root node's address |
+| derived `history-tree-v4` | — | `MetaStore.derived`, key = changeset id, value = part 0 of the changeset's history pack (ADR 0045): the history nodes its derivation wrote, and its root node's address. The value may instead be held by a live derived segment (column 2 of family `changeset-v1`, ADR 0104), and the row deleted; a row wins over a segment |
+| derived `skiplist` | — | `MetaStore.derived`, key = changeset id, value = first-parent ancestors at distances 1, 2, 4, ...: per entry its id (32 bytes) and generation (8-byte big-endian), generations strictly descending; empty for a root. The value may instead be held by a live derived segment (column 1 of family `changeset-v1`, ADR 0104), and the row deleted; a row wins over a segment |
+| derived `derived-segments-v1` | — | `MetaStore.derived`, one row per family, key = `Hash::of_object("derived-segment-family", <family name>)` (family `changeset-v1` only, so far): the manifest of derived segments (ADR 0104). Bytes: version `0x01`; flags `0x00`; family `0x01` (a row whose checksum holds but whose version, flags or family are unknown was written by a newer binary: never damage, never replaced); `u64` sequence (each write the previous plus one, or the writer's clock in microseconds if more; readers never apply a lower one than they hold); `u32` live count, then per live segment, oldest first: index blob address (32 bytes), data blob address (32), keys (`u32`), column mask (`u64`, bit `c` for column `c`; readers use only those), data blob bytes (`u32`); `u32` retired count, then the addresses of retired segments' blobs (at most 2,048, oldest first); then the BLAKE3 of everything before (32 bytes). Integers big-endian. Replaced whole by each write, a compare-and-swap from the bytes the writer read; a row that does not decode means "no segment is read" |
+| blob store blob, derived segment index | — | bytes = `leep:derived-segment-index-v1` and a NUL (an object preimage prefix, so uploads cannot write it, ADR 0041), version `0x01`, an 8-byte nonce (the same in its data blob; any value), then varints unless stated: family (`1` = `changeset-v1`), key count `n`, the `n` keys (32 bytes each, strictly ascending), each key's ordinal (a permutation of `0..n`), column count, and per column in ascending order: its number, a presence bitmap of `ceil(n/8)` bytes (bit `o % 8` of byte `o / 8`, least significant first, set when ordinal `o` has a value; bits past `n` zero), block count, and per block its first ordinal (strictly ascending, each a present ordinal, the first the first present one), offset and length in the data blob, and uncompressed length (at most 16 MiB); then the data blob's address (32 bytes) and length. Address = `Hash::of_blob(bytes)`. Immutable (ADR 0104) |
+| blob store blob, derived segment data | — | bytes = `leep:derived-segment-data-v1` and a NUL, version `0x01`, the index's nonce (8 bytes), a varint count of external ids and the ids (32 bytes each), then the blocks: each a zstd frame of the rows of one column for the present ordinals from its first up to the next block's first, each row `varint length` then its bytes. Rows by column: 1 (`skiplist`): entry count, the entries' id references, the first generation, then each next generation as the previous minus it (at least 1); 2 (`history-tree-v4`): the part's id table length, its id references, then part 0's bytes after the table, verbatim (the 8-byte checksum is left out and computed again on read, and the value given back uncompressed, encoding `0`). An id reference is a varint `r`: even, the key at ordinal `own - 1 - r/2`; odd, external id `r >> 1`; never the row's own key. Address = `Hash::of_blob(bytes)`. Immutable (ADR 0104) |
 | history pack part | `history-node-v4` | `MetaStore.derived` (kind `history-node-v4`), key = `Hash::of_object("history-node-v4", changeset id ‖ part as u32 LE)`, value = part 1 and up of a pack that did not fit in one |
 | derived `log-filter-v1` | — | `MetaStore.derived`, key = changeset id, value = see "Log filter index" below (ADR 0047) |
 | derived `log-filter-name-v1` | — | `MetaStore.derived`, key = `Hash::of_object("log-filter-name-v1", fingerprint as 8 bytes big-endian)`, value = the author's name, lower-cased (`str::to_lowercase`), UTF-8 |
@@ -762,6 +766,7 @@ one. Names so far:
 |---|---|---|
 | `changeset-zstd-dict` | `changesets.data` may be a zstd frame made with a `changeset_dicts` dictionary (ADR 0053) | `compact-changesets`, before it stores or uses a dictionary; a server's automatic compaction (ADR 0101), before the first dictionary it stores and before it rewrites rows; migration 0004 for a store that already has one |
 | `gc-mark-segments` | GC marks live only in segments; the `gc-mark-v1` rows are being or have been deleted, so a `gc` that would trust them must not run (ADR 0103) | `gc --retire-mark-rows`, after it imports the rows into a segment and before it deletes any |
+| `derived-segments` | `skiplist` and `history-tree-v4` rows are being or have been deleted where a live derived segment holds their values, so a binary that reads only rows (and would derive whole histories again, and whose `gc` would delete live segments) must not run (ADR 0104) | a server in `--derived-segments retire`, before the first row it deletes |
 
 Binaries from before migration 0004 do not read the table.
 
@@ -1779,6 +1784,35 @@ hash change. Rules a reader and a writer follow:
   orphans; live ones are never condemned.
 - Store feature `gc-mark-segments` (ADR 0055) is recorded by
   `gc --retire-mark-rows` before it deletes any `gc-mark-v1` row.
+
+## Derived segments (new derived kind, blob-store objects and store feature, ADR 0104)
+`skiplist` and `history-tree-v4` values may live in immutable segments in
+the blob store, an index blob and a data blob each, named by the one
+`derived-segments-v1` row of family `changeset-v1` (bytes in the table
+above). The kinds, their keys and their values do not change; a segment is
+a lossless container of values read from rows. No schema, `/v1`,
+`Changeset`, `TreeNode` or hash change. Rules a reader and a writer follow:
+
+- A read of either kind asks the database first; a row wins. For a miss, a
+  reader looks in the live segments, newest first, among those whose column
+  mask has the kind's column, and only then declares the row missing, after
+  reading the manifest again if its copy is older than 60 s.
+- Values come back as a row read gives them: `skiplist` byte for byte,
+  `history-tree-v4` as part 0 with its checksum computed from the key and
+  the bytes, uncompressed (the same part by ADR 0045's definition).
+- A segment holds only values read from rows and checked as their kind. Its
+  blobs are durable before any manifest names them. A blob read is checked by
+  address, prefix, version, nonce and structure; one that fails, or is not
+  stored, reads as missing rows (derive again), never as a value.
+- Every write of the manifest row is a compare-and-swap against the bytes
+  its writer last read or wrote, under the `maintenance/derived-segments`
+  lease; a writer that loses it stops.
+- A row is deleted only in `--derived-segments retire`, after the store
+  feature `derived-segments` is recorded, at least 10 minutes after the
+  segment holding its value was published, and only if equal to that value.
+- Segments merged away stay stored until blob GC collects them like orphans;
+  live ones are never condemned. Column numbers, once given, never change;
+  new kinds take new numbers (and hash-keyed ones a new family).
 
 ## Backup directory (new, ADR 0026; no change to stored objects)
 Written and read by `leep-server backup`, `restore` and `backup-verify`.

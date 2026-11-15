@@ -42,3 +42,13 @@ stored in `MetaStore` under `(kind, key)`. See ARCHITECTURE.md §5.
      `Repo::with_derive_jobs(1)` against several jobs;
    - a deep chain (≥ 10k changesets) derives without stack overflow.
 7. Add a row to the table in ARCHITECTURE.md §5 and a line to FORMATS.md.
+8. **Per-changeset kinds may later move to derived segments** (ADR 0104,
+   `crates/leep-derive/src/derived_segments/`): a kind joins family
+   `changeset-v1` as a new column, with the next unused column number
+   (numbers are never reused or renumbered), an encoder and decoder in
+   `codec.rs` that give back the exact value a row read would, and an entry
+   in `kind_column`/`column_kind`. Its rows stay the source: segments hold
+   only values read from rows, and a row always wins. Hash-keyed kinds need
+   a new family. Do not add a column in the same change that adds the kind.
+   Run the derived segment tests and fault sweep
+   (`cargo test -p leep-derive derived_segments`).

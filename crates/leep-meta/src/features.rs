@@ -19,8 +19,14 @@ pub const CHANGESET_ZSTD_DICT: &str = "changeset-zstd-dict";
 /// predates segments would trust what is left of the rows.
 pub const GC_MARK_SEGMENTS: &str = "gc-mark-segments";
 
+/// `skiplist` and `history-tree-v4` rows are being or have been deleted
+/// once a derived segment in the blob store holds their values (ADR 0104,
+/// `--derived-segments retire`). A binary that predates segments would
+/// derive whole histories again, and its `gc` would delete live segments.
+pub const DERIVED_SEGMENTS: &str = "derived-segments";
+
 /// Every feature this binary can read.
-pub const KNOWN: &[&str] = &[CHANGESET_ZSTD_DICT, GC_MARK_SEGMENTS];
+pub const KNOWN: &[&str] = &[CHANGESET_ZSTD_DICT, GC_MARK_SEGMENTS, DERIVED_SEGMENTS];
 
 /// Record `name` in the store at `url` (idempotent). `mem://` stores are
 /// never shared with another binary, so there is nothing to record.
@@ -40,6 +46,26 @@ pub async fn add_store_feature(url: &str, mode: crate::SchemaMode, name: &str) -
         r
     } else if url.starts_with("mem://") {
         Ok(())
+    } else {
+        Err(Error::Invalid(format!("unsupported meta store url: {url}")))
+    }
+}
+
+/// Whether the store at `url` has `name` recorded. `mem://` stores never
+/// do.
+pub async fn has_store_feature(url: &str, mode: crate::SchemaMode, name: &str) -> Result<bool> {
+    if url.starts_with("sqlite:") {
+        let store = crate::SqliteMetaStore::connect_with(url, mode).await?;
+        let r = store.features().await;
+        store.pool.close().await;
+        Ok(r?.iter().any(|f| f == name))
+    } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        let store = crate::PostgresMetaStore::connect_with(url, mode).await?;
+        let r = store.features().await;
+        store.pool.close().await;
+        Ok(r?.iter().any(|f| f == name))
+    } else if url.starts_with("mem://") {
+        Ok(false)
     } else {
         Err(Error::Invalid(format!("unsupported meta store url: {url}")))
     }
@@ -72,6 +98,7 @@ mod tests {
         check(&[]).unwrap();
         check(&[CHANGESET_ZSTD_DICT.to_string()]).unwrap();
         check(&[GC_MARK_SEGMENTS.to_string()]).unwrap();
+        check(&[DERIVED_SEGMENTS.to_string()]).unwrap();
         let err = check(&[
             CHANGESET_ZSTD_DICT.to_string(),
             "tree-zstd".to_string(),
@@ -99,6 +126,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.features().await.unwrap(), [GC_MARK_SEGMENTS]);
+        assert!(has_store_feature(&url, mode, GC_MARK_SEGMENTS)
+            .await
+            .unwrap());
+        assert!(!has_store_feature(&url, mode, DERIVED_SEGMENTS)
+            .await
+            .unwrap());
         add_store_feature("mem://", mode, GC_MARK_SEGMENTS)
             .await
             .unwrap();
