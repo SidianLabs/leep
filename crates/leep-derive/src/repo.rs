@@ -77,7 +77,14 @@ struct CreateInputs {
 #[derive(Clone)]
 pub struct Repo {
     blobs: Arc<dyn BlobStore>,
+    /// The metadata store as read: `rows` through the derived segment view
+    /// (ADR 0104), or a land batch's staged store over it.
     meta: Arc<dyn MetaStore>,
+    /// The metadata store itself, without the segment view: what the
+    /// compactor seals from and deletes in.
+    rows: Arc<dyn MetaStore>,
+    /// The live derived segments this handle reads, shared by clones.
+    pub(crate) segments: Arc<crate::derived_segments::SegmentView>,
     /// Per-ref queues that group concurrent lands into batches (see `land`).
     pub(crate) land_queues: Arc<crate::land::LandQueues>,
     /// How long a ref's queue may grow before lands are refused (ADR 0060,
@@ -617,8 +624,9 @@ impl<V> SizedMaps<V> {
 
 /// Bytes the byte-bounded derive caches of one [`Repo`] hold by default:
 /// path-history nodes, parts, roots and patches, tree nodes, search's
-/// directory filters, skiplists read by queries, and the filtered-log
-/// caches. See [`Repo::with_cache_budget`].
+/// directory filters, skiplists read by queries, the filtered-log caches,
+/// and the blocks and data blobs of derived segments (ADR 0104). See
+/// [`Repo::with_cache_budget`].
 pub const DEFAULT_CACHE_BYTES: usize = HISTORY_CACHE_BYTES
     + HISTORY_RAW_CACHE_BYTES
     + HISTORY_PART_CACHE_BYTES
@@ -628,7 +636,9 @@ pub const DEFAULT_CACHE_BYTES: usize = HISTORY_CACHE_BYTES
     + crate::lazy_tree::LAZY_NODE_CACHE_BYTES
     + SEARCH_TREE_CACHE_BYTES
     + SKIP_READ_CACHE_BYTES
-    + crate::derived::LOG_FILTER_CACHE_BYTES;
+    + crate::derived::LOG_FILTER_CACHE_BYTES
+    + crate::derived_segments::view::BLOCK_CACHE_BYTES
+    + crate::derived_segments::view::DATA_CACHE_BYTES;
 
 /// Every cache's default bound times `total / DEFAULT_CACHE_BYTES`, so the
 /// default budget gives exactly the default bounds.
@@ -666,9 +676,19 @@ pub const MAX_DEFAULT_DERIVE_JOBS: usize = 8;
 impl Repo {
     pub fn new(blobs: Arc<dyn BlobStore>, meta: Arc<dyn MetaStore>) -> Self {
         let coord = meta.coord_store();
+        // A view of its own on the store under any view, so handles never
+        // stack two and a new one starts cold.
+        let rows = meta.view_base().unwrap_or(meta);
+        let segments = Arc::new(crate::derived_segments::SegmentView::new(blobs.clone()));
+        let meta: Arc<dyn MetaStore> = Arc::new(crate::derived_segments::view::SegmentedMeta::new(
+            rows.clone(),
+            segments.clone(),
+        ));
         Repo {
             blobs,
             meta,
+            rows,
+            segments,
             land_queues: Arc::default(),
             land_queue_bound: None,
             land_policy: None,
@@ -970,6 +990,7 @@ impl Repo {
         self.skiplists = Arc::new(SkiplistCache::scaled(s));
         self.skip_reads = Arc::new(SizedCache::scaled(s));
         self.log_filter = Arc::new(crate::derived::LogFilterCaches::scaled(s));
+        self.segments.scale(s);
         self
     }
 
@@ -1028,6 +1049,18 @@ impl Repo {
 
     pub fn meta(&self) -> &Arc<dyn MetaStore> {
         &self.meta
+    }
+
+    /// The metadata store without the derived segment view (ADR 0104):
+    /// rows only. For the compactor, blob GC and checks of the rows
+    /// themselves; everything else reads [`Repo::meta`].
+    pub fn row_meta(&self) -> &Arc<dyn MetaStore> {
+        &self.rows
+    }
+
+    /// The derived segments this handle reads.
+    pub fn segments(&self) -> &Arc<crate::derived_segments::SegmentView> {
+        &self.segments
     }
 
     /// Validate and store a changeset, deriving its tree and generation.
@@ -2065,7 +2098,7 @@ mod tests {
         ] {
             assert_eq!(d.of(n), n);
         }
-        assert_eq!(DEFAULT_CACHE_BYTES, 420 << 20);
+        assert_eq!(DEFAULT_CACHE_BYTES, 468 << 20);
         let half = CacheScale {
             total: DEFAULT_CACHE_BYTES / 2,
         };

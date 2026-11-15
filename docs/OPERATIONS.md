@@ -1994,7 +1994,7 @@ apply to the server and to its tools (`verify`, `repair`, `upgrade-index`,
 | `--meta-land-pool-size` / `LEEP_META_LAND_POOL_SIZE` | an eighth of `--meta-pool-size`, at least 4 | Further Postgres connections reserved for land leaders (ADR 0067), opened on first use. `0` reserves none. SQLite ignores it. |
 | `--meta-index-pool-size` / `LEEP_META_INDEX_POOL_SIZE` | a sixteenth of `--meta-pool-size`, at least 4 | Further Postgres connections reserved for the index warmer (ADR 0073), opened on first use (only by a server that warms). `0` reserves none. SQLite ignores it. |
 | `--meta-pool-min` / `LEEP_META_POOL_MIN` | 4 | The server's warm floor (ADR 0084): connections opened at startup and kept open, this many of `--meta-pool-size` and of the land reserve and one each of the index and lease pools (10 at the default). `0` opens every connection on first use. Server only: commands (`gc`, `repack`, `migrate`, `backup`, ...) always open lazily. SQLite ignores it. |
-| `--derive-cache-bytes` / `LEEP_DERIVE_CACHE_BYTES` | 440401920 (420 MiB) | The in-memory caches of derived indexes: path-history nodes, parts and roots (148 MiB), tree nodes (32 MiB), nodes of unstored trees derived on read (16 MiB, ADR 0069), search's directory filters (64 MiB), skiplists read by blame and filtered logs (32 MiB), and the filtered-log caches (128 MiB). The ancestry and skiplist caches are bounded by entries, about 100 MB together by default, and scale by the same factor. |
+| `--derive-cache-bytes` / `LEEP_DERIVE_CACHE_BYTES` | 490733568 (468 MiB) | The in-memory caches of derived indexes: path-history nodes, parts and roots (148 MiB), tree nodes (32 MiB), nodes of unstored trees derived on read (16 MiB, ADR 0069), search's directory filters (64 MiB), skiplists read by blame and filtered logs (32 MiB), the filtered-log caches (128 MiB), and derived segments' decompressed blocks (16 MiB) and data blobs (32 MiB, ADR 0104). The ancestry and skiplist caches are bounded by entries, about 100 MB together by default, and scale by the same factor. |
 
 `--cache-bytes` (256 MiB) is separate: it caches blobs.
 
@@ -2091,7 +2091,7 @@ allocators (musl, macOS, Windows) are unaffected.
   with `canceling statement due to statement timeout` in the ERROR log; if a
   legitimate one does, raise the flag rather than turning it off.
 - **Derive caches.** Every cache gets its default share of the budget
-  times `budget / 420 MiB`. More helps derivation of very wide histories
+  times `budget / 468 MiB`. More helps derivation of very wide histories
   and filtered logs over long ranges: `history-tree-v4` derivation re-reads
   hot directory nodes, and `log-filter-v1` merge walks reuse fingerprints.
   Search keeps the `tree-trigrams-v2` rows it reads from the store, and the

@@ -973,6 +973,15 @@ pub trait MetaStore: Send + Sync + 'static {
         false
     }
 
+    /// For a read-through view that answers some derived reads from
+    /// elsewhere (leep-derive's derived segments, ADR 0104): the store it
+    /// sits on. A new `Repo` over a view puts a view of its own on that
+    /// store instead of stacking a second one, so a new handle starts cold.
+    /// `None` for every store and for every other wrapper.
+    fn view_base(&self) -> Option<std::sync::Arc<dyn MetaStore>> {
+        None
+    }
+
     /// The lease row of `key`, live or not.
     async fn lease(&self, key: &LeaseKey, timing: LeaseTiming) -> Result<Option<Lease>> {
         let _ = (key, timing);

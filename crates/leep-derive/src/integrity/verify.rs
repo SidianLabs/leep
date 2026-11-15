@@ -514,6 +514,12 @@ impl Verifier<'_> {
             self.scan_git_style().await?;
         }
         self.scan_gc_rows().await?;
+        if self.has(crate::derived_segments::MANIFEST_KIND)
+            || self.has(crate::derived::Skiplist::NAME)
+            || self.has(HistoryTree::NAME)
+        {
+            self.check_derived_segments().await?;
+        }
         if self.has(BLAME_KIND) {
             self.phase("blame");
             self.check_blame(&selected).await?;
@@ -1654,6 +1660,86 @@ impl Verifier<'_> {
                     )
                     .kind(kind)
                     .key(&s.hash),
+                );
+            }
+            self.tick();
+        }
+        Ok(())
+    }
+
+    /// The derived segment manifest decodes, and every live segment it
+    /// names decodes whole (ADR 0104): both blobs at their addresses, every
+    /// value. A segment that is not stored is a note: its keys read as rows
+    /// or derive again. The values themselves are checked with the rows,
+    /// since the per-changeset checks read through the segment view.
+    async fn check_derived_segments(&mut self) -> Result<()> {
+        use crate::derived_segments::{self as ds, codec, view, ManifestRead, MANIFEST_KIND};
+        let kind = MANIFEST_KIND;
+        let m = match ds::read_manifest(self.repo).await?.1 {
+            ManifestRead::Absent => return Ok(()),
+            ManifestRead::Read(m) => m,
+            ManifestRead::Damaged => {
+                self.kstats(kind).checked += 1;
+                self.kstats(kind).mismatched += 1;
+                self.log.push(
+                    Problem::new(
+                        "derived",
+                        "bad_derived_manifest",
+                        format!(
+                            "{kind} row does not decode: no derived segment is read, and                              garbage collection refuses to run until it is replaced"
+                        ),
+                    )
+                    .kind(kind)
+                    .key(&ds::manifest_key()),
+                );
+                return Ok(());
+            }
+        };
+        self.kstats(kind).checked += 1;
+        for s in &m.live {
+            let problem = match self.repo.blobs().contains(&s.index).await {
+                Ok(false) => {
+                    self.notes.push(format!(
+                        "derived segment {} is not stored; its keys read as rows or derive                          again, and the next derived-segments pass drops it",
+                        s.index
+                    ));
+                    None
+                }
+                Err(e) => Some(format!("cannot be read: {e}")),
+                Ok(true) => match view::load_index(&**self.repo.blobs(), s).await {
+                    Err(e) => Some(format!("cannot be read: {e}")),
+                    Ok(None) => Some("index does not decode".to_string()),
+                    Ok(Some(idx)) => match self.repo.blobs().get(&s.data).await {
+                        Err(e) => Some(format!("data cannot be read: {e}")),
+                        Ok(None) => {
+                            self.notes.push(format!(
+                                "the data of derived segment {} is not stored; its keys read                                  as rows or derive again",
+                                s.index
+                            ));
+                            None
+                        }
+                        Ok(Some(bytes)) => match codec::decode_data(&idx, &s.data, bytes)
+                            .and_then(|d| codec::read_all(&idx, &d))
+                        {
+                            Ok(_) => None,
+                            Err(e) => Some(e.to_string()),
+                        },
+                    },
+                },
+            };
+            if let Some(what) = problem {
+                self.kstats(kind).mismatched += 1;
+                self.log.push(
+                    Problem::new(
+                        "derived",
+                        "bad_derived_segment",
+                        format!(
+                            "derived segment {} {what}; its keys read as rows or derive again,                              and the next derived-segments pass drops it",
+                            s.index
+                        ),
+                    )
+                    .kind(kind)
+                    .key(&s.index),
                 );
             }
             self.tick();

@@ -598,6 +598,12 @@ pub struct CondemnReport {
     pub mark_segments: u64,
     /// Retired mark segments newly condemned. Not counted in `condemned`.
     pub segments_condemned: u64,
+    /// Live derived segments (ADR 0104); their blobs are never condemned
+    /// and not counted in `blobs_scanned`.
+    pub derived_segments: u64,
+    /// Blobs of retired derived segments newly condemned. Not counted in
+    /// `condemned`.
+    pub derived_segments_condemned: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -625,6 +631,11 @@ pub struct CollectReport {
     pub mark_segments: u64,
     /// Retired mark segments deleted, or that would be in a dry run.
     pub segments_deleted: u64,
+    /// Live derived segments (ADR 0104).
+    pub derived_segments: u64,
+    /// Blobs of retired derived segments deleted, or that would be in a dry
+    /// run. Not counted in `deleted`.
+    pub derived_segments_deleted: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1217,6 +1228,10 @@ async fn condemn_leased(
     let live = marked.record.live();
     let retired = marked.record.retired();
     let mut retired_stored: HashSet<Hash> = HashSet::new();
+    // Derived segments likewise (ADR 0104): live ones are never condemned,
+    // retired ones are collected like orphans and reported apart.
+    let derived = crate::derived_segments::gc_view(repo).await?;
+    report.derived_segments = derived.segments;
     marked.record.recheck(repo).await?;
     let grace = secs(opts.grace);
     let cutoff = started_at.saturating_sub(grace);
@@ -1231,13 +1246,15 @@ async fn condemn_leased(
         let (referenced, earlier) = marked.which(repo, &hashes).await?;
         report.marked_earlier += earlier;
         for (blob, referenced) in page.into_iter().zip(referenced) {
-            if live.contains(&blob.hash) {
+            if live.contains(&blob.hash) || derived.live.contains(&blob.hash) {
                 continue;
             }
-            let segment = retired.contains(&blob.hash);
-            if segment {
+            let derived_segment = derived.retired.contains(&blob.hash);
+            let segment = retired.contains(&blob.hash) || derived_segment;
+            if retired.contains(&blob.hash) {
                 retired_stored.insert(blob.hash);
-            } else {
+            }
+            if !segment {
                 report.blobs_scanned += 1;
             }
             if referenced {
@@ -1272,7 +1289,9 @@ async fn condemn_leased(
                     .put_derived(BLOB_CONDEMNED, &blob.hash, time_value(at))
                     .await?;
             }
-            if segment {
+            if derived_segment {
+                report.derived_segments_condemned += 1;
+            } else if segment {
                 report.segments_condemned += 1;
             } else {
                 report.condemned += 1;
@@ -1336,6 +1355,10 @@ async fn collect_leased(
     let retired = marked.record.retired();
     let mut retired_stored: HashSet<Hash> = HashSet::new();
     let mut seg = CollectReport::default();
+    // Derived segments (ADR 0104), read now, after the fence: a live one
+    // an earlier condemn saw as an orphan is rescued here.
+    let derived = crate::derived_segments::gc_view(repo).await?;
+    let mut dseg = CollectReport::default();
     // What the mark trusted must still be the record before anything is
     // deleted; `which` checks again after each row read.
     marked.record.recheck(repo).await?;
@@ -1355,11 +1378,19 @@ async fn collect_leased(
             .await?;
         let mut candidates = Vec::new();
         for (blob, row) in page.into_iter().zip(rows) {
+            let derived_segment =
+                derived.live.contains(&blob.hash) || derived.retired.contains(&blob.hash);
             let segment = live.contains(&blob.hash) || retired.contains(&blob.hash);
             if retired.contains(&blob.hash) {
                 retired_stored.insert(blob.hash);
             }
-            let report = if segment { &mut seg } else { &mut report };
+            let report = if derived_segment {
+                &mut dseg
+            } else if segment {
+                &mut seg
+            } else {
+                &mut report
+            };
             report.blobs_scanned += 1;
             if row.is_none() {
                 continue;
@@ -1372,15 +1403,24 @@ async fn collect_leased(
                 report.fence_pending += 1;
                 continue;
             }
-            candidates.push((blob, state, c, segment));
+            candidates.push((blob, state, c, segment, derived_segment));
         }
-        let hashes: Vec<Hash> = candidates.iter().map(|(b, _, _, _)| b.hash).collect();
+        let hashes: Vec<Hash> = candidates.iter().map(|(b, _, _, _, _)| b.hash).collect();
         let (referenced, _) = marked.which(repo, &hashes).await?;
-        for ((blob, state, c, segment), is_marked) in candidates.into_iter().zip(referenced) {
+        for ((blob, state, c, segment, derived_segment), is_marked) in
+            candidates.into_iter().zip(referenced)
+        {
             // A live segment is referenced: an older `gc` that does not know
             // segments may have condemned it.
-            let is_marked = is_marked || live.contains(&blob.hash);
-            let report = if segment { &mut seg } else { &mut report };
+            let is_marked =
+                is_marked || live.contains(&blob.hash) || derived.live.contains(&blob.hash);
+            let report = if derived_segment {
+                &mut dseg
+            } else if segment {
+                &mut seg
+            } else {
+                &mut report
+            };
             report.condemned += 1;
             if !state.is_condemned() {
                 if !is_marked {
@@ -1442,6 +1482,8 @@ async fn collect_leased(
     }
     report.segments_deleted = seg.deleted;
     report.mark_segments = marked.record.live_count();
+    report.derived_segments = derived.segments;
+    report.derived_segments_deleted = dseg.deleted;
     if !opts.dry_run {
         marked
             .record

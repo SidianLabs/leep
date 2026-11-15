@@ -1060,6 +1060,18 @@ pub fn canonical(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
     }
 }
 
+/// Part 0 of `cs`'s pack as stored uncompressed, from its bytes after the
+/// checksum ([`canonical`]): the checksum is a function of `cs` and `rest`,
+/// so a container that keeps only `rest` (derived segments, ADR 0104)
+/// gives back the same part by [`same_part`].
+pub fn part0_from_rest(cs: ChangesetId, rest: &[u8]) -> Bytes {
+    let mut out = Vec::with_capacity(CHECKSUM + 1 + rest.len());
+    out.extend_from_slice(&checksum(cs, 0, rest));
+    out.push(0);
+    out.extend_from_slice(rest);
+    Bytes::from(out)
+}
+
 /// Whether two copies of a part hold the same content.
 pub fn same_part(a: &[u8], b: &[u8]) -> bool {
     a == b

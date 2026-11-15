@@ -29,6 +29,10 @@ mod admission;
 #[path = "sweep_fault_tests.rs"]
 mod sweep;
 
+/// Derived segments (ADR 0104), in the same sweep.
+#[path = "derived_segments_fault_tests.rs"]
+mod derived_segments;
+
 /// Whether the repositories of the run with `seed` leave their creates'
 /// tree nodes out (ADR 0069): `LEEP_FAULT_LAZY=on` or `off` for every seed,
 /// otherwise odd seeds on and even seeds off, so one sweep covers both.

@@ -23,6 +23,7 @@ mod comments;
 pub mod context;
 mod cursor;
 pub mod derived;
+pub mod derived_segments;
 pub mod events;
 mod filter_log;
 pub mod gc;
