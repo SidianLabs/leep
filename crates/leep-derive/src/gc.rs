@@ -791,7 +791,7 @@ impl MarkWriter<'_> {
             return Ok(());
         }
         self.pending.push(key);
-        if self.pending.len() >= crate::gc_segments::CHECKPOINT_MARKS {
+        if self.pending.len() >= crate::gc_segments::checkpoint_marks() {
             self.flush().await?;
         }
         Ok(())
@@ -1019,6 +1019,100 @@ pub(crate) async fn check_incremental_mark(r: &Repo) -> std::result::Result<u64,
         }
     }
     Ok(stats.changesets_walked)
+}
+
+/// Test oracle for ADR 0103's invariant: every prefix of the manifest's
+/// live list that a reader would trust (plus the `gc-mark-v1` rows while
+/// they count) is closed. For each prefix, everything directly below a
+/// marked changeset or tree node (its `Modify` contents and root tree, or
+/// its entries) is marked within that prefix or by a row. Checked one
+/// segment at a time: the marks of segment `i` must have their children in
+/// segments `0..=i`. Objects no stored changeset references (a deleted
+/// changeset's mark) have nothing to check.
+#[cfg(test)]
+pub(crate) async fn check_mark_closure(r: &Repo) -> std::result::Result<(), String> {
+    use crate::gc_segments::{decode_segment, read_manifest, Manifest, ManifestRead};
+    let err = |e: Error| e.to_string();
+    let m = match read_manifest(r).await.map_err(err)? {
+        ManifestRead::Absent => Manifest::default(),
+        ManifestRead::Read(m) => m,
+        // Trusted by no reader.
+        ManifestRead::Damaged => return Ok(()),
+    };
+    // What is directly below each referenced changeset and tree node.
+    let mut below: std::collections::HashMap<Hash, Vec<Hash>> = Default::default();
+    let ids = r
+        .meta()
+        .list_changesets(None, usize::MAX)
+        .await
+        .map_err(err)?;
+    let changesets = r.meta().get_changesets(&ids).await.map_err(err)?;
+    let roots = r.root_trees(&ids).await.map_err(err)?;
+    let mut stack = Vec::new();
+    for ((id, cs), root) in ids.iter().zip(changesets).zip(roots) {
+        let Some(cs) = cs else { continue };
+        let mut v: Vec<Hash> = cs
+            .changes
+            .values()
+            .filter_map(|c| match c {
+                FileChange::Modify { content, .. } => Some(*content),
+                _ => None,
+            })
+            .collect();
+        v.push(root);
+        below.insert(id.0, v);
+        stack.push(root);
+    }
+    while let Some(t) = stack.pop() {
+        if below.contains_key(&t) {
+            continue;
+        }
+        let node = r.read_tree(t).await.map_err(err)?;
+        let mut v = Vec::new();
+        for e in node.entries.values() {
+            match e {
+                TreeEntry::File { content, .. } => v.push(*content),
+                TreeEntry::Dir { tree } => {
+                    v.push(*tree);
+                    stack.push(*tree);
+                }
+            }
+        }
+        below.insert(t, v);
+    }
+    let mut marked: HashSet<Hash> = HashSet::new();
+    if !m.rows_retired {
+        let rows = r
+            .meta()
+            .list_derived(GC_MARK, None, usize::MAX)
+            .await
+            .map_err(err)?;
+        marked.extend(rows.into_iter().map(|(k, _)| k));
+    }
+    for (i, s) in m.live.iter().enumerate() {
+        // A reader trusts no further than the first segment it cannot read.
+        let Ok(Some(data)) = r.blobs().get(&s.hash).await else {
+            break;
+        };
+        let Ok(hashes) = decode_segment(&s.hash, &data) else {
+            break;
+        };
+        marked.extend(hashes.iter().copied());
+        for h in &hashes {
+            for child in below.get(h).into_iter().flatten() {
+                if !marked.contains(child) {
+                    return Err(format!(
+                        "the first {} of {} live segments are not closed: {h} is marked \
+                         but {child} below it is not (rows counted: {})",
+                        i + 1,
+                        m.live.len(),
+                        !m.rows_retired
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Mark `root` and everything below it that is not marked yet, emitting
@@ -2561,9 +2655,15 @@ mod tests {
     }
 
     async fn assert_marks_agree(r: &Repo, what: &str) -> MarkStats {
+        check_mark_closure(r)
+            .await
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
         let walked = check_incremental_mark(r)
             .await
             .unwrap_or_else(|e| panic!("{what}: {e}"));
+        check_mark_closure(r)
+            .await
+            .unwrap_or_else(|e| panic!("{what}, after an incremental run: {e}"));
         MarkStats {
             changesets_scanned: 0,
             changesets_walked: walked,
@@ -2648,6 +2748,29 @@ mod tests {
 
     // --- mark segments (ADR 0103) -------------------------------------------
 
+    /// Below the cap, each live segment holds less than half the marks of
+    /// the one before it; at the cap, neighbours stay apart.
+    fn assert_capped_geometric(m: &crate::gc_segments::Manifest, what: &str) {
+        use crate::gc_segments::MAX_SEGMENT_MARKS;
+        for w in m.live.windows(2) {
+            assert!(
+                w[1].marks * 2 < w[0].marks || w[0].marks + w[1].marks > MAX_SEGMENT_MARKS,
+                "{what}: {:?}",
+                m.live
+            );
+        }
+    }
+
+    /// A replacing run's record: no segment over the cap unless alone, and
+    /// no two neighbours that would fit in one.
+    fn assert_compacted(m: &crate::gc_segments::Manifest) {
+        use crate::gc_segments::MAX_SEGMENT_MARKS;
+        assert!(!m.live.is_empty());
+        for w in m.live.windows(2) {
+            assert!(w[0].marks + w[1].marks > MAX_SEGMENT_MARKS, "{:?}", m.live);
+        }
+    }
+
     async fn manifest(r: &Repo) -> crate::gc_segments::Manifest {
         match crate::gc_segments::read_manifest(r).await.unwrap() {
             crate::gc_segments::ManifestRead::Read(m) => m,
@@ -2704,9 +2827,7 @@ mod tests {
             let m = manifest(&r).await;
             assert_eq!(c.mark_segments, m.live.len() as u64);
             assert!(!m.rows_retired);
-            for w in m.live.windows(2) {
-                assert!(w[1].marks * 2 < w[0].marks, "round {i}: {:?}", m.live);
-            }
+            assert_capped_geometric(&m, &format!("round {i}"));
         }
         // No row is written any more.
         assert!(r
@@ -2882,11 +3003,11 @@ mod tests {
         assert_eq!((c.marked_earlier, c.condemned), (0, 0));
         let m = manifest(&r).await;
         assert!(m.rows_retired);
-        assert_eq!(m.live.len(), 1);
+        assert_compacted(&m);
         assert_marks_agree(&r, "replaced manifest").await;
     }
 
-    /// `gc --full` replaces the record with one segment of its own, closed
+    /// `gc --full` replaces the record with segments of its own, closed
     /// without the rows; what it replaced is retired.
     #[tokio::test]
     async fn a_full_mark_replaces_the_record() {
@@ -2908,10 +3029,11 @@ mod tests {
         assert_eq!(f.condemned, 0);
         let m = manifest(&r).await;
         assert!(m.rows_retired);
-        assert_eq!(m.live.len(), 1);
-        assert_eq!(m.live[0].marks as usize, f.marked as usize + ids.len() + 1);
+        assert_compacted(&m);
+        let total: u64 = m.live.iter().map(|s| s.marks).sum();
+        assert_eq!(total as usize, f.marked as usize + ids.len() + 1);
         for s in &old.live {
-            assert!(m.retired.contains(&s.hash) || m.live[0].hash == s.hash);
+            assert!(m.retired.contains(&s.hash), "{s:?} not retired");
         }
         assert_marks_agree(&r, "after full").await;
     }
@@ -2948,6 +3070,397 @@ mod tests {
                 .is_some());
         }
         assert_marks_agree(&r, "rescued segments").await;
+    }
+
+    /// A run that loaded the record and then outlived its lease cannot
+    /// overwrite what `gc --retire-mark-rows` wrote meanwhile: every
+    /// manifest write swaps from the bytes its writer read (ADR 0103
+    /// section 8). Without that, the stale write would drop the imported
+    /// segment and count rows that are deleted, and the next collect would
+    /// delete live objects.
+    #[tokio::test]
+    async fn a_stale_mark_record_cannot_overwrite_an_import() {
+        let (r, blobs) = setup();
+        let ids = build_history(&r).await;
+        age_all(&blobs).await;
+        write_legacy_rows(&r).await;
+        let t = now();
+        commit(&r, &[ids[6]], &[("d/e/n.txt", Some("n\n"))]).await;
+        condemn(&r, &opts(1, false), &TestClock::at(t))
+            .await
+            .unwrap();
+        let before = read_everything(&r).await;
+        assert!(!manifest(&r).await.rows_retired);
+        // Two runs load the record, an incremental one and a full one, and
+        // stall past their leases.
+        let mut stale = MarkRecord::load(&r, true, true).await.unwrap();
+        let mut stale_full = MarkRecord::load(&r, false, true).await.unwrap();
+        assert!(stale.rows);
+        let new_tip = commit(&r, &[ids[6]], &[("late.txt", Some("late\n"))]).await;
+        stale_full
+            .publish(&r, &None, vec![new_tip.0])
+            .await
+            .unwrap();
+
+        crate::gc_segments::import_mark_rows(&r).await.unwrap();
+        let imported = manifest(&r).await;
+        assert!(imported.rows_retired);
+
+        let e = stale.publish(&r, &None, vec![new_tip.0]).await.unwrap_err();
+        assert!(matches!(e, Error::Conflict(_)), "{e}");
+        let e = stale_full.finish(&r, &None).await.unwrap_err();
+        assert!(matches!(e, Error::Conflict(_)), "{e}");
+        assert_eq!(manifest(&r).await, imported);
+
+        crate::gc_segments::delete_mark_rows(&r, &mut |_| {})
+            .await
+            .unwrap();
+        // A stale writer of the forgotten-segment list loses too.
+        let kind = crate::gc_segments::GC_MARK_SEGMENTS;
+        let key = crate::gc_segments::MANIFEST_KEY;
+        let with_retired = crate::gc_segments::Manifest {
+            retired: vec![Hash::of_blob(b"retired")],
+            ..imported.clone()
+        };
+        r.meta()
+            .put_derived(kind, &key, with_retired.encode())
+            .await
+            .unwrap();
+        let mut stale = MarkRecord::load(&r, true, true).await.unwrap();
+        r.meta()
+            .put_derived(kind, &key, imported.encode())
+            .await
+            .unwrap();
+        let e = stale.prune_retired(&r, &None, |_| false).await.unwrap_err();
+        assert!(matches!(e, Error::Conflict(_)), "{e}");
+        assert_eq!(manifest(&r).await, imported);
+        let k = collect(&r, &opts(1, false), &TestClock::at(t + 10 + FENCE))
+            .await
+            .unwrap();
+        assert_eq!(k.deleted, 0, "{k:?}");
+        let c = condemn(&r, &opts(1, false), &TestClock::at(t + 20))
+            .await
+            .unwrap();
+        assert_eq!(c.condemned, 0, "{c:?}");
+        let mut now_everything = read_everything(&r).await;
+        now_everything.retain(|(id, _, _)| *id != new_tip);
+        assert_eq!(now_everything, before);
+        assert_marks_agree(&r, "after the stale writers").await;
+    }
+
+    /// `gc --full` names its checkpoint segments only at its end: killed
+    /// anywhere before, it leaves the old record exactly as it was, and
+    /// its segments are orphans collected like any.
+    #[tokio::test]
+    async fn a_full_mark_killed_between_checkpoints_leaves_the_old_record() {
+        use leep_testkit::{FaultPlan, FaultyBlobStore, FaultyMetaStore};
+        let (r, blobs) = setup();
+        let ids = build_history(&r).await;
+        age_all(&blobs).await;
+        let t = now();
+        condemn(&r, &opts(1, false), &TestClock::at(t))
+            .await
+            .unwrap();
+        commit(&r, &[ids[6]], &[("late.txt", Some("late\n"))]).await;
+        condemn(&r, &opts(1, false), &TestClock::at(t + 1))
+            .await
+            .unwrap();
+        let before = read_everything(&r).await;
+        let key = crate::gc_segments::MANIFEST_KEY;
+        let kind = crate::gc_segments::GC_MARK_SEGMENTS;
+        let old = r.meta().get_derived(kind, &key).await.unwrap().unwrap();
+        let old_m = manifest(&r).await;
+        let known: HashSet<Hash> = old_m
+            .live
+            .iter()
+            .map(|s| s.hash)
+            .chain(old_m.retired.iter().copied())
+            .collect();
+        // Yields between store calls, so the run can be killed between them.
+        let plan = FaultPlan::new(7);
+        plan.jitter(2);
+        let killable = Repo::new(
+            Arc::new(FaultyBlobStore::new(blobs.clone(), plan.clone())),
+            Arc::new(FaultyMetaStore::new(r.meta().clone(), plan.clone())),
+        );
+        let (mut killed, mut orphans) = (0, 0);
+        let (full_opts, clock) = (opts(1, false), TestClock::at(t + 2));
+        for kill in 0..10_000 {
+            let run = condemn_with(&killable, &full_opts, Mark::Full, &clock);
+            if let Some(done) = leep_testkit::cancel_after_polls(run, kill).await {
+                done.unwrap();
+                break;
+            }
+            let now = r.meta().get_derived(kind, &key).await.unwrap().unwrap();
+            if now != old {
+                // Killed after its manifest swap: the full record is whole.
+                let m = manifest(&r).await;
+                assert!(m.rows_retired);
+                assert_compacted(&m);
+                break;
+            }
+            killed += 1;
+            let extra = stored_segments(&blobs)
+                .await
+                .into_iter()
+                .filter(|h| !known.contains(h))
+                .count();
+            orphans = orphans.max(extra);
+            check_mark_closure(&r).await.unwrap();
+        }
+        assert!(killed > 5, "{killed}");
+        assert!(
+            orphans > 0,
+            "no checkpoint segment was written before a kill"
+        );
+        let m = manifest(&r).await;
+        assert!(m.rows_retired);
+        assert_compacted(&m);
+        // The orphaned checkpoints are condemned and deleted like any
+        // orphan; the live record and the history stay.
+        let late = t + 3 * HOUR;
+        condemn(&r, &opts(1, false), &TestClock::at(late))
+            .await
+            .unwrap();
+        collect(&r, &opts(1, false), &TestClock::at(late + FENCE + 1))
+            .await
+            .unwrap();
+        condemn(&r, &opts(1, false), &TestClock::at(late + 2 * HOUR))
+            .await
+            .unwrap();
+        collect(
+            &r,
+            &opts(1, false),
+            &TestClock::at(late + 2 * HOUR + FENCE + 1),
+        )
+        .await
+        .unwrap();
+        let live: HashSet<Hash> = manifest(&r).await.live.iter().map(|s| s.hash).collect();
+        assert_eq!(stored_segments(&blobs).await, live);
+        assert_eq!(read_everything(&r).await, before);
+        assert_marks_agree(&r, "after the killed full runs").await;
+    }
+
+    /// Retiring the rows killed anywhere: in the import, between the import
+    /// and the delete (where the server records the store feature), and in
+    /// the delete. The record stays closed throughout, a later GC cycle
+    /// keeps the whole history, and running the retirement again finishes
+    /// it.
+    #[tokio::test]
+    async fn retiring_the_rows_killed_anywhere_keeps_the_record_closed() {
+        use leep_testkit::{FaultPlan, FaultyBlobStore, FaultyMetaStore};
+        let mut kills = (0, 0);
+        for kill in 0..200 {
+            let (r, blobs) = setup();
+            let ids = build_history(&r).await;
+            age_all(&blobs).await;
+            let rows = write_legacy_rows(&r).await;
+            let t = now();
+            commit(&r, &[ids[6]], &[("d/e/n.txt", Some("n\n"))]).await;
+            condemn(&r, &opts(1, false), &TestClock::at(t))
+                .await
+                .unwrap();
+            let before = read_everything(&r).await;
+            let plan = FaultPlan::new(kill as u64);
+            plan.jitter(2);
+            let killable = Repo::new(
+                Arc::new(FaultyBlobStore::new(blobs.clone(), plan.clone())),
+                Arc::new(FaultyMetaStore::new(r.meta().clone(), plan.clone())),
+            );
+            let what = format!("kill {kill}");
+            let imported = leep_testkit::cancel_after_polls(
+                crate::gc_segments::import_mark_rows(&killable),
+                kill,
+            )
+            .await
+            .map(|r| r.unwrap());
+            check_mark_closure(&r)
+                .await
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            if imported.is_none() {
+                kills.0 += 1;
+                assert!(!manifest(&r).await.rows_retired, "{what}");
+            } else {
+                let deleted = leep_testkit::cancel_after_polls(
+                    crate::gc_segments::delete_mark_rows(&killable, &mut |_| {}),
+                    kill / 3,
+                )
+                .await;
+                if deleted.is_none() {
+                    kills.1 += 1;
+                }
+                check_mark_closure(&r)
+                    .await
+                    .unwrap_or_else(|e| panic!("{what}: {e}"));
+            }
+            // A GC cycle on what was left keeps the whole history.
+            condemn(&r, &opts(1, false), &TestClock::at(t + 10))
+                .await
+                .unwrap();
+            let k = collect(&r, &opts(1, false), &TestClock::at(t + 20 + FENCE))
+                .await
+                .unwrap();
+            assert_eq!(k.deleted, 0, "{what}: {k:?}");
+            assert_eq!(read_everything(&r).await, before, "{what}");
+            assert_marks_agree(&r, &what).await;
+            // Running it again finishes the retirement.
+            let again = crate::gc_segments::import_mark_rows(&r).await.unwrap();
+            assert_eq!(again.already_retired, imported.is_some(), "{what}");
+            if !again.already_retired {
+                assert_eq!(again.imported, rows, "{what}");
+            }
+            crate::gc_segments::delete_mark_rows(&r, &mut |_| {})
+                .await
+                .unwrap();
+            assert!(r
+                .meta()
+                .list_derived(GC_MARK, None, 1)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_marks_agree(&r, &format!("{what}, retired")).await;
+            if imported.is_some() && kill > 60 {
+                break;
+            }
+        }
+        assert!(kills.0 > 3 && kills.1 > 3, "{kills:?}");
+    }
+
+    /// A blob store that reports some blobs as damaged, or fails to read
+    /// them as if the connection dropped.
+    struct FailingReads {
+        inner: Arc<MemoryBlobStore>,
+        bad: std::sync::Mutex<Vec<(Hash, Error)>>,
+    }
+
+    #[async_trait]
+    impl BlobStore for FailingReads {
+        async fn put_with_hash(&self, hash: Hash, data: Bytes) -> Result<()> {
+            self.inner.put_with_hash(hash, data).await
+        }
+        async fn get(&self, hash: &Hash) -> Result<Option<Bytes>> {
+            let bad = self
+                .bad
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(h, _)| h == hash)
+                .map(|(_, e)| match e {
+                    Error::Storage(m) => Error::Storage(m.clone()),
+                    _ => Error::Other("unexpected".into()),
+                });
+            match bad {
+                Some(e) => Err(e),
+                None => self.inner.get(hash).await,
+            }
+        }
+        async fn list_page(&self, after: Option<Hash>, limit: usize) -> Result<Vec<BlobMeta>> {
+            self.inner.list_page(after, limit).await
+        }
+        async fn delete(&self, hash: &Hash) -> Result<()> {
+            self.inner.delete(hash).await
+        }
+    }
+
+    /// A segment the store reports corrupt (a packed copy failing its
+    /// checksum) ends the trusted prefix like one that does not decode,
+    /// instead of failing every run until `gc --full`; a transient read
+    /// error still aborts the run and keeps the record.
+    #[tokio::test]
+    async fn a_segment_the_store_reports_corrupt_ends_the_trusted_prefix() {
+        let blobs = Arc::new(MemoryBlobStore::new());
+        let failing = Arc::new(FailingReads {
+            inner: blobs.clone(),
+            bad: Default::default(),
+        });
+        let r = Repo::new(failing.clone(), Arc::new(MemoryMetaStore::new()));
+        let mut ids = build_history(&r).await;
+        age_all(&blobs).await;
+        let t = now();
+        condemn(&r, &opts(1, false), &TestClock::at(t))
+            .await
+            .unwrap();
+        for i in 0..3 {
+            let path = format!("x{i}/y.txt");
+            ids.push(commit(&r, &[ids[6]], &[(&path, Some("y\n"))]).await);
+            condemn(&r, &opts(1, false), &TestClock::at(t + 1 + i))
+                .await
+                .unwrap();
+        }
+        let before = read_everything(&r).await;
+        let m = manifest(&r).await;
+        assert!(m.live.len() >= 2, "{m:?}");
+        let newest = m.live.last().unwrap().hash;
+
+        failing
+            .bad
+            .lock()
+            .unwrap()
+            .push((newest, Error::Storage("connection reset by peer".into())));
+        let e = condemn(&r, &opts(1, false), &TestClock::at(t + 10))
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("connection reset"), "{e}");
+        assert_eq!(manifest(&r).await, m, "a transient error keeps the record");
+
+        failing.bad.lock().unwrap()[0].1 = Error::Storage(format!(
+            "corrupt packed object {newest} in pack p: checksum mismatch"
+        ));
+        let c = condemn(&r, &opts(1, false), &TestClock::at(t + 20))
+            .await
+            .unwrap();
+        assert!(c.changesets_walked > 0, "{c:?}");
+        assert_eq!(c.condemned, 0, "{c:?}");
+        let after = manifest(&r).await;
+        assert!(!after.live.iter().any(|s| s.hash == newest), "{after:?}");
+        assert!(after.retired.contains(&newest));
+        failing.bad.lock().unwrap().clear();
+        let k = collect(&r, &opts(1, false), &TestClock::at(t + 30 + FENCE))
+            .await
+            .unwrap();
+        assert_eq!(k.deleted, 0, "{k:?}");
+        assert_eq!(read_everything(&r).await, before);
+        assert_marks_agree(&r, "after a corrupt segment").await;
+    }
+
+    /// Merges stop at the cap, so a long-lived store keeps several capped
+    /// segments rather than one that every merge rewrites whole.
+    #[tokio::test]
+    async fn merges_stop_at_the_segment_cap() {
+        use crate::gc_segments::MAX_SEGMENT_MARKS;
+        let (r, blobs) = setup();
+        let mut ids = build_history(&r).await;
+        age_all(&blobs).await;
+        let t = now();
+        for i in 0..30 {
+            let path = format!("cap/{i}/f.txt");
+            let text = format!("cap {i}\n");
+            ids.push(commit(&r, &[*ids.last().unwrap()], &[(&path, Some(&text))]).await);
+            condemn(&r, &opts(1, false), &TestClock::at(t + i))
+                .await
+                .unwrap();
+            let m = manifest(&r).await;
+            assert_capped_geometric(&m, &format!("round {i}"));
+            for s in &m.live {
+                assert!(s.marks <= MAX_SEGMENT_MARKS, "round {i}: {:?}", m.live);
+            }
+        }
+        let m = manifest(&r).await;
+        let total: u64 = m.live.iter().map(|s| s.marks).sum();
+        assert!(total > 3 * MAX_SEGMENT_MARKS, "{total}");
+        assert!(m.live.len() >= 3, "{:?}", m.live);
+        assert_marks_agree(&r, "capped").await;
+        let f = condemn_with(&r, &opts(1, false), Mark::Full, &TestClock::at(t + 100))
+            .await
+            .unwrap();
+        assert_eq!(f.condemned, 0);
+        let m = manifest(&r).await;
+        assert_compacted(&m);
+        assert!(m.live.len() >= 3, "{:?}", m.live);
+        for s in &m.live {
+            assert!(s.marks <= MAX_SEGMENT_MARKS, "{:?}", m.live);
+        }
+        assert_marks_agree(&r, "capped full").await;
     }
 
     #[tokio::test]

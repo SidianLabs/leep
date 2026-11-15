@@ -45,7 +45,7 @@ skill.
 | derived `blob-rescue-v1` | — | `MetaStore.derived`, key = blob hash, value = the condemnation time the writer observed, 8-byte big-endian `i64` |
 | derived `blob-doom-v1` | — | `MetaStore.derived`, key = blob hash, value = condemnation time (8-byte big-endian `i64`) then one state byte: 0 deleting, 1 abandoned, 2 deleted |
 | derived `gc-mark-v1` | — | `MetaStore.derived`, key = changeset id, tree node hash or blob hash, value = the single byte `0x01` (a present row counts whatever it reads, ADR 0033). Written by GC marks in post-order before ADR 0103, so a row exists only after the rows of everything below it; never written since. Read as marks only while the mark manifest says the rows are not retired; deleted by `gc --retire-mark-rows` after the store feature `gc-mark-segments` is recorded (ADR 0103) |
-| derived `gc-mark-segments-v1` | — | `MetaStore.derived`, one row, key = 32 zero bytes: the manifest of GC mark segments (ADR 0103). Bytes: version `0x01`; flags (bit 0 `rows_retired`: the segments are closed without the `gc-mark-v1` rows, which no longer count; other bits zero); `u32` live count, then per live segment its address (32 bytes) and mark count (`u64`), oldest first; `u32` retired count, then the retired segments' addresses (at most 1,024, oldest first); then the BLAKE3 of everything before (32 bytes). Integers big-endian. Replaced whole by each write; a row that does not decode means "trust no record" |
+| derived `gc-mark-segments-v1` | — | `MetaStore.derived`, one row, key = 32 zero bytes: the manifest of GC mark segments (ADR 0103). Bytes: version `0x01`; flags (bit 0 `rows_retired`: the segments are closed without the `gc-mark-v1` rows, which no longer count; other bits zero); `u32` live count, then per live segment its address (32 bytes) and mark count (`u64`), oldest first; `u32` retired count, then the retired segments' addresses (at most 1,024, oldest first); then the BLAKE3 of everything before (32 bytes). Integers big-endian. Replaced whole by each write, a compare-and-swap from the bytes the writer read; a row that does not decode means "trust no record" |
 | blob store blob, GC mark segment | — | bytes = `leep:gc-mark-segment-v1` and a NUL (the object preimage prefix, so uploads cannot write it, ADR 0041), version `0x01`, an 8-byte nonce (any value; it makes every write a new object), then marked hashes (changeset ids, tree node hashes, blob hashes), 32 bytes each, strictly ascending; address = `Hash::of_blob(bytes)` (equal to `Hash::of_object("gc-mark-segment-v1", <bytes after the prefix>)`). To the blob store an ordinary blob: packed, delta-compressed, backed up. Immutable. Every prefix of the manifest's live list is closed: each mark's tree nodes and blobs below it, and a changeset mark's contents and root tree, are marked in that prefix (or, while not retired, by `gc-mark-v1` rows) (ADR 0103) |
 | derived `cs-condemned-v1` | — | `MetaStore.derived`, key = changeset id, value = condemnation time, unix seconds as 8-byte big-endian `i64`, from the sweep host's clock (ADR 0059) |
 | derived `cs-rescue-v1` | — | `MetaStore.derived`, key = changeset id, value = the condemnation time the writer observed, 8-byte big-endian `i64` |
@@ -1771,7 +1771,10 @@ hash change. Rules a reader and a writer follow:
   segment: a false mark on a tree node condemns its subtree.
 - Only adjacent live segments merge, newest first. A full mark, or a run
   that read a manifest that does not decode, replaces the list with its own
-  segment and sets `rows_retired`.
+  segments (named only at its end) and sets `rows_retired`.
+- Every write of the manifest row is a compare-and-swap against the bytes
+  its writer last read or wrote (no row is a valid expected state); a
+  writer that loses it stops.
 - Segments no longer live stay stored until blob GC collects them like
   orphans; live ones are never condemned.
 - Store feature `gc-mark-segments` (ADR 0055) is recorded by

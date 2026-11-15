@@ -55,6 +55,43 @@ const FLAG_ROWS_RETIRED: u8 = 1;
 /// marks, so every test runs checkpoints and merges.
 pub(crate) const CHECKPOINT_MARKS: usize = if cfg!(test) { 7 } else { 1 << 18 };
 
+/// Marks a merge may produce at most (4 Mi marks, 128 MiB): beyond this,
+/// segments stay apart, so no merge reads, sorts and rewrites the whole
+/// record of a large store at once. Tests use a small cap so they reach it.
+pub(crate) const MAX_SEGMENT_MARKS: u64 = if cfg!(test) { 20 } else { 1 << 22 };
+
+/// Overrides of [`CHECKPOINT_MARKS`] and [`MAX_SEGMENT_MARKS`] (0: none).
+static LIMITS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// For integration tests only: make every run in this process checkpoint
+/// every `checkpoint` marks and cap merges at `max_segment` marks, so that
+/// checkpoints and merges run against real backends with small histories.
+#[doc(hidden)]
+pub fn set_limits_for_tests(checkpoint: usize, max_segment: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    LIMITS[0].store(checkpoint as u64, Relaxed);
+    LIMITS[1].store(max_segment, Relaxed);
+}
+
+/// Marks a run holds before it publishes them.
+pub(crate) fn checkpoint_marks() -> usize {
+    match LIMITS[0].load(std::sync::atomic::Ordering::Relaxed) {
+        0 => CHECKPOINT_MARKS,
+        n => n as usize,
+    }
+}
+
+/// Marks a merge may produce at most.
+fn max_segment_marks() -> u64 {
+    match LIMITS[1].load(std::sync::atomic::Ordering::Relaxed) {
+        0 => MAX_SEGMENT_MARKS,
+        n => n,
+    }
+}
+
 /// Retired segments the manifest remembers, for reporting. Beyond this the
 /// oldest are forgotten and collected as plain orphans.
 const MAX_RETIRED: usize = 1024;
@@ -254,19 +291,50 @@ pub enum ManifestRead {
 }
 
 pub async fn read_manifest(repo: &Repo) -> Result<ManifestRead> {
-    Ok(
-        match repo
-            .meta()
-            .get_derived(GC_MARK_SEGMENTS, &MANIFEST_KEY)
-            .await?
-        {
-            None => ManifestRead::Absent,
-            Some(v) => match Manifest::decode(&v) {
-                Ok(m) => ManifestRead::Read(m),
-                Err(_) => ManifestRead::Damaged,
-            },
+    Ok(read_manifest_raw(repo).await?.1)
+}
+
+/// [`read_manifest`], with the row's bytes: a later write swaps from them.
+async fn read_manifest_raw(repo: &Repo) -> Result<(Option<Bytes>, ManifestRead)> {
+    let raw = repo
+        .meta()
+        .get_derived(GC_MARK_SEGMENTS, &MANIFEST_KEY)
+        .await?;
+    let read = match &raw {
+        None => ManifestRead::Absent,
+        Some(v) => match Manifest::decode(v) {
+            Ok(m) => ManifestRead::Read(m),
+            Err(_) => ManifestRead::Damaged,
         },
-    )
+    };
+    Ok((raw, read))
+}
+
+/// Write `next` as the manifest iff the row is still `expected` (the bytes
+/// the writer last read or wrote; `None` = no row). A writer that loses its
+/// lease and wakes up after another holder wrote the row then fails here
+/// instead of putting back a record that, say, still counts rows that were
+/// deleted since (ADR 0103 section 8). Returns the bytes written.
+async fn swap_manifest(
+    repo: &Repo,
+    lease: &Option<crate::gc_lease::GcLease>,
+    expected: Option<&[u8]>,
+    next: &Manifest,
+) -> Result<Bytes> {
+    crate::gc_lease::check(lease)?;
+    let bytes = next.encode();
+    if !repo
+        .meta()
+        .cas_derived(GC_MARK_SEGMENTS, &MANIFEST_KEY, expected, bytes.clone())
+        .await?
+    {
+        return Err(Error::Conflict(format!(
+            "the {GC_MARK_SEGMENTS} row changed under this run (another garbage \
+             collection wrote it after this one lost its lease); this run stopped, \
+             run it again"
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Merge sorted, distinct lists into one.
@@ -312,9 +380,16 @@ pub(crate) struct MarkRecord {
     /// The manifest as stored now (after this run's writes), or `None` when
     /// it did not decode and this run has not replaced it yet.
     stored: Option<Manifest>,
+    /// The manifest row's bytes as this run last read or wrote them (`None`:
+    /// no row). Every write swaps from exactly these.
+    raw: Option<Bytes>,
     /// The segments this run trusts and the ones it published, with their
-    /// hashes, in manifest order. When `replace`, only this run's own.
+    /// hashes, in manifest order. When `replace`, only this run's own, which
+    /// no manifest names until [`finish`](Self::finish).
     chain: Vec<(SegmentRef, Vec<Hash>)>,
+    /// Segments a replacing run wrote and then merged away before its
+    /// manifest: never named, retired by that manifest.
+    unpublished_gone: Vec<Hash>,
     /// Whether the rows of `gc-mark-v1` count as marks.
     pub(crate) rows: bool,
     /// Whether this run ignores the earlier record and its manifest
@@ -329,7 +404,7 @@ impl MarkRecord {
     /// Read the manifest, and unless `trust` is false, every live segment
     /// in order up to the first that cannot be read.
     pub(crate) async fn load(repo: &Repo, trust: bool, write: bool) -> Result<MarkRecord> {
-        let read = read_manifest(repo).await?;
+        let (raw, read) = read_manifest_raw(repo).await?;
         let (stored, damaged) = match read {
             ManifestRead::Absent => (Some(Manifest::default()), false),
             ManifestRead::Read(m) => (Some(m), false),
@@ -339,7 +414,9 @@ impl MarkRecord {
         let mut rec = MarkRecord {
             rows: !replace && stored.as_ref().is_some_and(|m| !m.rows_retired),
             stored,
+            raw,
             chain: Vec::new(),
+            unpublished_gone: Vec::new(),
             replace,
             write,
             stats: SegmentStats::default(),
@@ -353,12 +430,31 @@ impl MarkRecord {
             .map(|m| m.live.clone())
             .unwrap_or_default();
         for (i, s) in live.iter().enumerate() {
-            // A transient error aborts the run, like every other read; a
-            // segment that is gone or does not decode ends the trusted
-            // prefix.
-            let hashes = match repo.blobs().get(&s.hash).await? {
-                Some(data) => decode_segment(&s.hash, &data).ok(),
-                None => None,
+            // A segment that is gone, that the store reports damaged, or
+            // that does not decode ends the trusted prefix. Any other error
+            // (transient: a lost connection) aborts the run, like every
+            // other read, rather than throwing the record away.
+            let hashes = match repo.blobs().get(&s.hash).await {
+                Ok(Some(data)) => match decode_segment(&s.hash, &data) {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        tracing::warn!(segment = %s.hash, "gc mark segment not trusted: {e}");
+                        None
+                    }
+                },
+                Ok(None) => {
+                    tracing::warn!(
+                        segment = %s.hash,
+                        "gc mark segment named by the manifest is not stored; \
+                         walking what it and the segments after it recorded"
+                    );
+                    None
+                }
+                Err(e) if crate::integrity::problems::damage_of(&e).is_some() => {
+                    tracing::warn!(segment = %s.hash, "gc mark segment reads damaged: {e}");
+                    None
+                }
+                Err(e) => return Err(e),
             };
             match hashes {
                 Some(h) => {
@@ -412,7 +508,10 @@ impl MarkRecord {
 
     /// Publish `marks` (a post-order prefix of what this run emitted since
     /// its last publish) as a segment, then merge the newest segments while
-    /// the newest is at least half the size of the one before it.
+    /// the newest is at least half the size of the one before it and the
+    /// merge stays within [`MAX_SEGMENT_MARKS`]. A replacing run only writes
+    /// its segments here: its manifest names them in [`finish`](Self::finish),
+    /// so the record it replaces stands until then.
     pub(crate) async fn publish(
         &mut self,
         repo: &Repo,
@@ -430,7 +529,8 @@ impl MarkRecord {
         let mut gone = Vec::new();
         while self.chain.len() >= 2 {
             let n = self.chain.len();
-            if self.chain[n - 1].0.marks.saturating_mul(2) < self.chain[n - 2].0.marks {
+            let (a, b) = (self.chain[n - 2].0.marks, self.chain[n - 1].0.marks);
+            if b.saturating_mul(2) < a || a.saturating_add(b) > max_segment_marks() {
                 break;
             }
             let (b, bh) = self.chain.pop().unwrap();
@@ -441,12 +541,18 @@ impl MarkRecord {
             gone.extend([a.hash, b.hash]);
             self.chain.push((seg, m));
         }
+        if self.replace {
+            self.unpublished_gone.extend(gone);
+            return Ok(());
+        }
         self.write_manifest(repo, lease, gone).await
     }
 
-    /// At the end of a run. A replacing run publishes its manifest even if
-    /// it marked nothing, so a damaged manifest does not stay, and merges
-    /// its own segments into one.
+    /// At the end of a run. A replacing run publishes its manifest here, and
+    /// only here, even if it marked nothing, so a damaged manifest does not
+    /// stay. It first merges runs of adjacent segments of its own whose
+    /// marks fit in [`MAX_SEGMENT_MARKS`]: adjacent, so every prefix of what
+    /// it names stays closed.
     pub(crate) async fn finish(
         &mut self,
         repo: &Repo,
@@ -463,10 +569,26 @@ impl MarkRecord {
             }
             return Ok(());
         }
-        let mut gone = Vec::new();
-        if self.chain.len() > 1 {
+        let mut gone = std::mem::take(&mut self.unpublished_gone);
+        let mut groups: Vec<Vec<(SegmentRef, Vec<Hash>)>> = Vec::new();
+        for (s, h) in std::mem::take(&mut self.chain) {
+            match groups.last_mut() {
+                Some(g)
+                    if g.iter().map(|(s, _)| s.marks).sum::<u64>() + s.marks
+                        <= max_segment_marks() =>
+                {
+                    g.push((s, h))
+                }
+                _ => groups.push(vec![(s, h)]),
+            }
+        }
+        for mut g in groups {
+            if g.len() == 1 {
+                self.chain.push(g.pop().unwrap());
+                continue;
+            }
             let mut all: Vec<Hash> = Vec::new();
-            for (s, h) in self.chain.drain(..) {
+            for (s, h) in g {
                 gone.push(s.hash);
                 all = merge(&all, &h);
             }
@@ -501,10 +623,18 @@ impl MarkRecord {
             .chain(gone)
             .filter(|h| !kept.contains(h));
         next.retire(dropped.collect::<Vec<_>>());
-        crate::gc_lease::check(lease)?;
-        repo.meta()
-            .put_derived(GC_MARK_SEGMENTS, &MANIFEST_KEY, next.encode())
-            .await?;
+        self.swap(repo, lease, next).await
+    }
+
+    /// Swap the manifest from what this run last read or wrote to `next`.
+    async fn swap(
+        &mut self,
+        repo: &Repo,
+        lease: &Option<crate::gc_lease::GcLease>,
+        next: Manifest,
+    ) -> Result<()> {
+        let bytes = swap_manifest(repo, lease, self.raw.as_deref(), &next).await?;
+        self.raw = Some(bytes);
         self.stored = Some(next);
         Ok(())
     }
@@ -528,12 +658,7 @@ impl MarkRecord {
         if next.retired.len() == stored.retired.len() {
             return Ok(());
         }
-        crate::gc_lease::check(lease)?;
-        repo.meta()
-            .put_derived(GC_MARK_SEGMENTS, &MANIFEST_KEY, next.encode())
-            .await?;
-        self.stored = Some(next);
-        Ok(())
+        self.swap(repo, lease, next).await
     }
 
     #[cfg(test)]
@@ -568,9 +693,22 @@ pub struct RetireRowsReport {
 
 /// Copy every `gc-mark-v1` row into one segment published first in the
 /// manifest, and mark the rows retired: from then on readers ignore them.
-/// Holds the GC lease, so no GC (old or new) writes rows meanwhile. The
-/// rows' key order is the segment's order, so this is one pass.
+/// Holds the GC lease, so no GC of this release writes the manifest
+/// meanwhile, and swaps the manifest from what it read, so one that lost
+/// its lease cannot put back a record that counts the rows. Refused on a
+/// store without leases. Precondition: no `gc` from before ADR 0103 runs
+/// (it writes rows without the lease). The rows' key order is the
+/// segment's order, so this is one pass.
+///
+/// The segment is one, whatever its size: the rows have no post-order, so
+/// only all of them together are closed.
 pub async fn import_mark_rows(repo: &Repo) -> Result<RetireRowsReport> {
+    if !repo.meta().supports_leases() {
+        return Err(Error::Invalid(format!(
+            "retiring the {GC_MARK} rows needs a metadata store with leases, so that no \
+             garbage collection runs meanwhile"
+        )));
+    }
     let lease = crate::gc_lease::GcLease::acquire(repo.meta(), "blob-mark-import").await?;
     let result = import_leased(repo, &lease).await;
     crate::gc_lease::release(lease, result).await
@@ -580,7 +718,8 @@ async fn import_leased(
     repo: &Repo,
     lease: &Option<crate::gc_lease::GcLease>,
 ) -> Result<RetireRowsReport> {
-    let mut stored = match read_manifest(repo).await? {
+    let (raw, read) = read_manifest_raw(repo).await?;
+    let mut stored = match read {
         ManifestRead::Absent => Manifest::default(),
         ManifestRead::Read(m) => m,
         ManifestRead::Damaged => {
@@ -620,10 +759,7 @@ async fn import_leased(
     stored.rows_retired = true;
     let live: HashSet<Hash> = stored.live.iter().map(|s| s.hash).collect();
     stored.retired.retain(|h| !live.contains(h));
-    crate::gc_lease::check(lease)?;
-    repo.meta()
-        .put_derived(GC_MARK_SEGMENTS, &MANIFEST_KEY, stored.encode())
-        .await?;
+    swap_manifest(repo, lease, raw.as_deref(), &stored).await?;
     Ok(RetireRowsReport {
         imported,
         ..RetireRowsReport::default()
@@ -639,16 +775,19 @@ pub async fn delete_mark_rows(
     repo: &Repo,
     step: &mut (dyn FnMut(&leep_core::DeleteStep) + Send),
 ) -> Result<u64> {
-    match read_manifest(repo).await? {
-        ManifestRead::Read(m) if m.rows_retired => {}
-        _ => {
-            return Err(Error::Invalid(format!(
-                "the {GC_MARK} rows are not retired yet; import them first"
-            )))
-        }
-    }
     let lease = crate::gc_lease::GcLease::acquire(repo.meta(), "blob-mark-delete").await?;
     let result = async {
+        // Read under the lease: the manifest cannot change between this
+        // check and the delete except by a holder that lost its lease, and
+        // every manifest write swaps from what its writer read.
+        match read_manifest(repo).await? {
+            ManifestRead::Read(m) if m.rows_retired => {}
+            _ => {
+                return Err(Error::Invalid(format!(
+                    "the {GC_MARK} rows are not retired yet; import them first"
+                )))
+            }
+        }
         let mut cursor: Option<Vec<u8>> = None;
         let mut total = 0;
         loop {

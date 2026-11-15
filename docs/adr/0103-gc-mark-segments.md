@@ -59,8 +59,11 @@ One derived row, kind `gc-mark-segments-v1`, key 32 zero bytes, names the
 live segments in the order they were published, each with its mark count;
 a flag `rows_retired`; and up to 1,024 retired segments, for reporting. It
 ends with the BLAKE3 of the rest, so a damaged read is detected (bytes in
-FORMATS.md). A manifest row is replaced whole by one `put_derived`, which
-is atomic in every backend.
+FORMATS.md). A manifest row is replaced whole, and **only by a
+compare-and-swap** against the exact bytes its writer last read or wrote
+(`MetaStore::cas_derived`, one statement in every backend; "no row" is a
+valid expected state). A writer that loses the swap fails with `Conflict`
+and stops (section 8).
 
 ### 3. Publication: the post-order prefix guarantee, restated
 A run emits marks in post-order exactly as before (ADR 0033): a tree
@@ -74,8 +77,11 @@ marks (8 MiB) and at the end of its mark:
 1. sort the prefix and write it as a segment;
 2. make it durable (`put_rescuing_many_loose`, which flushes, and rescues
    it if an older GC condemned identical bytes);
-3. only then write the manifest naming it, after the segments it already
-   named.
+3. only then swap the manifest to one naming it, after the segments it
+   already named.
+
+A run that replaces the record (section 5) does steps 1 and 2 at each
+checkpoint, but not 3: its segments are named only at its end.
 
 Invariant: **every prefix of the manifest's live list (together with the
 `gc-mark-v1` rows while they are not retired) is closed.** It holds
@@ -86,21 +92,24 @@ an orphan blob GC collects like any other; nothing names it, so it changes
 no answer.
 
 A reader trusts **the longest prefix of the live list it can read in full**,
-in order. A segment that is not stored or does not decode ends what it
-trusts there: the segments after it may rest on it. Missing marks only make
-a run walk more. A transient read error aborts the run, like every other
-error before anything is condemned. A run that could not read a segment
+in order. A segment that is not stored, that the store reports damaged or
+that does not decode ends what it trusts there: the segments after it may
+rest on it. Missing marks only make a run walk more. A transient read
+error aborts the run, like every other error before anything is condemned. A run that could not read a segment
 publishes a manifest without it and the segments after it (they are
 retired), even if it marked nothing new.
 
 ### 4. Merges
 After a publish, while the newest segment holds at least half as many
-marks as the one before it, the two are merged into one (written and made
-durable first) and replace the pair in one manifest write. Only adjacent
-segments merge, so every remaining prefix is a prefix of the old list: the
-invariant holds. Segment sizes form a geometric series, so a store keeps
-at most about log2(marks) segments, and a mark is rewritten about log2
-times over its life.
+marks as the one before it, and the two together hold at most 4,194,304
+marks (128 MiB, the segment cap), the two are merged into one (written and
+made durable first) and replace the pair in one manifest write. Only
+adjacent segments merge, so every remaining prefix is a prefix of the old
+list: the invariant holds. Below the cap segment sizes form a geometric
+series, so a store keeps about log2(marks) segments plus one per 2 to 4
+Mi marks beyond the cap, and a mark is rewritten at most about log2(cap)
+times over its life. The cap keeps any one merge (and so any one run's
+extra memory and writes) bounded however large the store grows.
 
 The segments a merge replaced are **retired**: no longer named as live,
 still stored. Blob GC collects them like orphans, through condemn, fence
@@ -115,11 +124,18 @@ already collected it trusts a shorter prefix and walks more. `condemn` and
 condemned is rescued by the next collect.
 
 ### 5. Full marks and damaged manifests replace the record
-`gc --full` trusts no earlier record. At the end it merges its own
-segments into one and writes a manifest naming only that, with
-`rows_retired` set: its segment is closed on its own. Everything the old
-manifest named is retired. This also sheds stale marks of changesets the
-changeset sweep deleted (below).
+`gc --full` trusts no earlier record. Its checkpoints write segments and
+make them durable but name none of them: until its end the old manifest
+stands, so a full run killed part way leaves the old record whole and
+orphan segments that blob GC collects like any orphan. At the end it
+merges runs of its own adjacent segments up to the cap (normally into one)
+and swaps in a manifest naming only those, with `rows_retired` set: they
+are closed on their own. Everything the old manifest named, and the
+segments it merged away, are retired. This also sheds stale marks of
+changesets the changeset sweep deleted (below).
+
+After a replacement the `gc-mark-v1` rows (if any) no longer count; they
+are dead weight until `gc --retire-mark-rows` deletes them.
 
 A manifest that does not decode tells nothing, not even whether the rows
 were retired and may be half deleted. A run that reads one trusts nothing,
@@ -137,12 +153,18 @@ Retirement is an explicit, one-time operator step,
 
 1. **Import**, under the `gc` lease: page through the rows in key order
    (already sorted), write them as one segment and put it **first** in the
-   live list, then set `rows_retired` in the same manifest write. The rows
-   are closed at any instant (0033), the lease keeps any GC from writing
-   rows while the pass runs, and every segment after the new first one
-   rested only on rows it now holds, so the invariant holds without them.
+   live list, then set `rows_retired` in the same manifest swap (from the
+   bytes the import read). The rows are closed at any instant (0033), the
+   lease keeps any GC of this release from writing the manifest while the
+   pass runs, and every segment after the new first one rested only on rows
+   it now holds, so the invariant holds without them. The import is refused
+   on a store without leases, and needs that no `gc` from before this ADR
+   (which writes rows and does not know the manifest) runs meanwhile. The
+   imported segment is one whatever its size, above the cap if need be:
+   the rows have no post-order, so no part of them is closed on its own.
 2. **Record the store feature `gc-mark-segments`** (ADR 0055).
-3. **Delete** the rows in bounded steps (ADR 0052, under the lease).
+3. **Delete** the rows in bounded steps (ADR 0052), under the lease, after
+   reading the manifest under it and finding `rows_retired` set.
 
 The feature comes before the delete because a delete cut short leaves rows
 whose subtrees lost theirs, and a `gc` binary from before this ADR trusts
@@ -170,18 +192,32 @@ against the store. Until then the rows cost what they did.
   durable and named. A merge killed half way likewise leaves orphans.
 - **Merges racing readers.** See section 4: only dry runs and `verify` can
   read an older manifest; a collected segment shortens their prefix.
-- **A segment that cannot be read.** Not stored, or bytes that fail the
-  checks: the prefix before it is trusted, and the run republishes without
-  it. A read *error* aborts the run like every other read error, so a
-  transient failure does not throw away the record; a packed copy that
-  stays corrupt makes every incremental run fail until `gc --full`, which
-  reads no segment, replaces the record (`verify` reports it as
-  `bad_gc_segment`).
-- **A stale lease holder.** Every manifest write checks the lease first.
-  If a run that lost its lease still writes one, that manifest is still a
-  prefix-closed list (its own segments rest only on what it trusted), so
-  the worst case is that it names segments another run retired and blob GC
-  later collects: the next reader trusts a shorter prefix.
+- **A segment that cannot be read.** Not stored, bytes that fail the
+  checks, or a read the store answers as damaged (a packed copy failing its
+  checksum: `Encoding`, `NotFound`, or a storage error saying "corrupt" or
+  "missing", the same test `verify` uses): the prefix before it is trusted,
+  the run logs a warning and republishes without it and the segments after
+  it. Any other read *error* (a lost connection) aborts the run like every
+  other read error, so a transient failure does not throw away the record.
+  `verify` reports a damaged segment as `bad_gc_segment`.
+- **A stale lease holder.** A run can outlive its lease: it checks the
+  lease before each manifest write, but may stall between the check and the
+  write past the 60 s TTL while another holder takes the lease. Such a write
+  must not land. Example: run A loads `[X1]` with `rows_retired` clear and
+  stalls; `gc --retire-mark-rows` imports the rows into `R`, writes
+  `[R, X1]` with `rows_retired` set and deletes the rows; if A then wrote
+  `[X1, X2]` with `rows_retired` clear, `R` would be dropped, the rows
+  gone, and the next run would trust a record that is not closed and
+  condemn live objects. So **every manifest write is a compare-and-swap**
+  against the bytes its writer last read or wrote (section 2): publish,
+  the end of a run, forgetting retired segments, and the import. A's swap
+  expects the `[X1]` bytes, finds `[R, X1]`, and fails with `Conflict`. A
+  run whose swap fails stops before it condemns or deletes anything (the
+  swaps of its mark come before both; one that fails when it forgets
+  retired segments at the very end changes nothing). Its segments are
+  orphans. The delete of the rows reads the manifest under the lease, and
+  the manifest cannot then go back to counting rows: that would take a
+  swap from bytes written before the import.
 
 ### 9. The changeset sweep
 The sweep (ADR 0059) deletes a changeset's `gc-mark-v1` row with it. A
@@ -193,14 +229,24 @@ full mark removes marks, and it removes them all at once by replacing the
 record (section 5).
 
 ### 10. Cost
-A run loads every live segment it trusts into memory at the start of its
-mark: 32 bytes a mark (corpus B about 0.6 MB; the 82,500-commit git/git of
-ADR 0033, 326,731 objects and its changesets, about 13 MB; a Linux-sized
-store with about 10 million objects about 320 MB, less than a full mark's
-walked set already takes). Lookups
-are binary searches in memory, so an incremental run makes no row reads
-for marks once the rows are retired. A follow-up can read segments by
-range if the memory matters.
+A run reads every live segment it trusts, in full, at the start of its
+mark, and keeps them in memory: 32 bytes a mark read and held (corpus B
+about 0.6 MB; the 82,500-commit git/git of ADR 0033, 326,731 objects and
+its changesets, about 13 MB; a Linux-sized store with about 10 million
+objects about 320 MB read from the blob store in about three capped
+segments plus a few small ones, less memory than a full mark's walked set
+already takes). Lookups are binary searches in memory, so an incremental
+run makes no row reads for marks once the rows are retired.
+
+On top of that, a run holds the marks it has not published yet (at most
+262,144, 8 MiB) and, while it merges, the merged copy: one merge reads
+nothing new (both inputs are in memory) and writes at most the cap,
+128 MiB. Amortized over its life a mark is rewritten by merges about
+log2 times, at most about log2(cap) = 22 times; one run's merges each
+write at most the cap, and there are at most about as many as there are
+segments below the cap. A full run's end writes its record once more, in
+capped segments. A follow-up can read
+segments by range if the memory matters.
 
 ## Q6, deferred
 The plan's item Q6 (store `derived.kind` as a `smallint` through a kind

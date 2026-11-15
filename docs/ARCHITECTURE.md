@@ -116,7 +116,7 @@ Rules:
 | `Changeset` | `Hash::of_object("changeset-v1", postcard)` | `MetaStore::put_changeset` |
 | Ref | name → `ChangesetId` | `MetaStore`, CAS only |
 | Ref log entry | `seq` → (ref, old, new, time, actor, operation, message) | `MetaStore`, appended by `cas_ref_logged` (or `cas_ref_logged_chain`, one entry per step) in the CAS's own transaction |
-| Derived value | `(kind, key)` → bytes | `MetaStore::put_derived` |
+| Derived value | `(kind, key)` → bytes | `MetaStore::put_derived`; `cas_derived` for a row a holder may overwrite after losing its lease (the GC mark manifest, ADR 0103) |
 
 `Changeset { parents, author, timestamp, message, changes, extra }`:
 - `changes: BTreeMap<RepoPath, FileChange>` is relative to `parents[0]`. A
@@ -1456,8 +1456,9 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
   next run walks only changesets with no mark and stops at marked tree
   nodes. The record is a few immutable segments of sorted 32-byte hashes in
   the blob store, each a post-order prefix of one run's marks published only
-  once durable, merged geometrically and named in order by one
-  `gc-mark-segments-v1` row; a reader trusts the longest prefix of them it
+  once durable, merged geometrically up to a cap and named in order by one
+  `gc-mark-segments-v1` row, which only a compare-and-swap rewrites (so a
+  run that outlived its lease cannot overwrite a newer record); a reader trusts the longest prefix of them it
   can read, so a lost segment only means more walking, and lookups are
   exact (ADR 0103). Stores GC'd before that keep `gc-mark-v1` rows, which
   count until `gc --retire-mark-rows` imports and deletes them. Ref moves never force a full walk, and a

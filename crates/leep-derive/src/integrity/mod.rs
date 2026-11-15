@@ -5,7 +5,7 @@
 //! through the HTTP API.
 
 pub mod kinds;
-mod problems;
+pub(crate) mod problems;
 pub mod repair;
 mod rows;
 mod shadow;

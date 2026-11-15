@@ -2357,11 +2357,14 @@ bytes start with `leep:gc-mark-segment-v1`, which uploads cannot write;
 merged geometrically, packed and backed up like any blob) named by one
 `gc-mark-segments-v1` row, instead of one `gc-mark-v1` row per object: 32
 bytes a mark instead of about 167 on Postgres. A run loads the segments into
-memory (32 bytes a mark). The report's `mark segments` counts them; merged
+memory (32 bytes a mark), and no segment is merged past 4 Mi marks
+(128 MiB), so a large store keeps a few capped segments. The report's
+`mark segments` counts them; merged
 ones are collected like orphans a grace and a fence later (`retired mark
 segments condemned`/`deleted`, not counted with the blobs). A lost or
-damaged segment only makes the next run walk more, and `verify` notes or
-reports it.
+damaged segment (one the store reports corrupt included; the run logs a
+warning) only makes the next run walk more, and `verify` notes or reports
+it. A transient read error stops the run instead, keeping the record.
 
 **Retiring the `gc-mark-v1` rows of an upgraded store.** A store GC'd before
 ADR 0103 keeps its rows, and new binaries still trust them (and never write
@@ -2380,7 +2383,26 @@ so a rollback means restoring a backup from before it. Before it, rolling
 back is free: an older `gc` ignores the segments (and collects them as
 orphans; the next new run walks more). Killed part way, run it again; it
 skips the import once done. On Postgres the space comes back after
-autovacuum (or `VACUUM`). The
+autovacuum (or `VACUUM`).
+
+The import holds the `gc` lease, and needs a metadata store with leases
+(every backend has them; it refuses otherwise). **Precondition: nothing
+writes `gc-mark-v1` rows while it runs**, that is no `leep-server gc` (cron
+job, importer) from before this release: such a binary neither takes the
+lease nor knows the manifest, and rows it adds after the import are not in
+the imported segment. Stop or upgrade those first. A `gc` of this release
+that loses its lease to the import cannot undo it: every write of the
+mark manifest is a compare-and-swap from what the writer read, so a stale
+run fails with `conflict` and stops before it condemns or deletes
+anything. Run it again.
+
+`gc --full`, and a run that finds the manifest damaged, replace the record
+with segments of their own that do not rest on the rows. From then on the
+rows no longer count, but they stay stored, **dead weight until
+`gc --retire-mark-rows` deletes them** (its import then finds the rows
+already retired and goes straight to the feature and the delete). A full
+run names its segments only at its end: killed part way, it leaves the old
+record whole and orphan segments that later runs collect. The
 report's `changesets walked` and `referenced blobs and trees marked by this
 run` show the walk; `referenced blobs marked by earlier runs` the rest.
 Moving, deleting or recreating refs and tags never needs a full walk, because
