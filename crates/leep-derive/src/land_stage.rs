@@ -841,6 +841,14 @@ impl MetaStore for StagedMeta {
         Ok(())
     }
 
+    /// Staged rows are written later, in one batch, so a swap staged here
+    /// could not be atomic against the store; a land never swaps a row.
+    async fn cas_derived(&self, _: &str, _: &Hash, _: Option<&[u8]>, _: Bytes) -> Result<bool> {
+        Err(Error::Other(
+            "a staged land batch cannot compare-and-swap a derived row".into(),
+        ))
+    }
+
     async fn put_derived_many(&self, rows: &[DerivedRow]) -> Result<()> {
         let mut s = self.staging.lock();
         for r in rows {

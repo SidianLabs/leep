@@ -4408,6 +4408,16 @@ one segment costs one blob write and one row instead of a row per mark,
 and a run reads the segments once into memory (32 bytes a mark) instead of
 a batched row read per page of changesets, blobs and tree entries.
 
+Lookups are not free at scale: each binary-searches every trusted segment
+until one holds the hash, so a miss probes them all, about N/cap capped
+segments (cap 4 Mi marks) plus about log2(cap) smaller ones. On A and B
+that is one or two segments. At 10 million marks it is about 25 probes,
+at a billion about 250 (some 5,500 comparisons, a few microseconds), and
+condemn makes one lookup per stored blob, so a billion-object store would
+spend hours a pass on lookups alone. ADR 0103 ("Cost") names the fix if
+stores get there: a merge join against the hash-ordered listings, or one
+merged index, needing no format change.
+
 ## Changeset compression
 
 ADR 0053 stores changeset rows as zstd frames compressed with a dictionary

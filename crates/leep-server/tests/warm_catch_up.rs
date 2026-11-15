@@ -111,6 +111,16 @@ impl MetaStore for Counter {
         self.wrote();
         self.inner.put_derived(kind, key, value).await
     }
+    async fn cas_derived(
+        &self,
+        kind: &str,
+        key: &Hash,
+        expected: Option<&[u8]>,
+        new: Bytes,
+    ) -> Result<bool> {
+        self.wrote();
+        self.inner.cas_derived(kind, key, expected, new).await
+    }
     async fn put_derived_many(&self, rows: &[DerivedRow]) -> Result<()> {
         self.wrote();
         self.inner.put_derived_many(rows).await

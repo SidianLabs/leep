@@ -759,6 +759,9 @@ impl Marked {
             return Ok((out, earlier));
         }
         let rows = repo.meta().get_derived_many(GC_MARK, &ask).await?;
+        // The rows may have been retired and deleted since this run loaded
+        // the record, if it outlived its lease: then "no row" means nothing.
+        self.record.recheck(repo).await?;
         let from_rows: HashSet<Hash> = ask
             .into_iter()
             .zip(rows)
@@ -1214,6 +1217,7 @@ async fn condemn_leased(
     let live = marked.record.live();
     let retired = marked.record.retired();
     let mut retired_stored: HashSet<Hash> = HashSet::new();
+    marked.record.recheck(repo).await?;
     let grace = secs(opts.grace);
     let cutoff = started_at.saturating_sub(grace);
     let mut after: Option<Hash> = None;
@@ -1332,6 +1336,9 @@ async fn collect_leased(
     let retired = marked.record.retired();
     let mut retired_stored: HashSet<Hash> = HashSet::new();
     let mut seg = CollectReport::default();
+    // What the mark trusted must still be the record before anything is
+    // deleted; `which` checks again after each row read.
+    marked.record.recheck(repo).await?;
     let mut after: Option<Hash> = None;
     loop {
         let page = repo.blobs().list_page(after, PAGE).await?;
@@ -3072,6 +3079,113 @@ mod tests {
         assert_marks_agree(&r, "rescued segments").await;
     }
 
+    /// The closure oracle itself must fail on a record that is not closed,
+    /// or every test that relies on it proves nothing.
+    #[tokio::test]
+    async fn the_closure_oracle_rejects_a_record_that_is_not_closed() {
+        use crate::gc_segments::{encode_segment, Manifest, SegmentRef};
+        let (r, blobs) = setup();
+        let ids = build_history(&r).await;
+        let tip = *ids.last().unwrap();
+        let mut closure: Vec<Hash> = full_mark(&r).await.into_iter().collect();
+        closure.sort_unstable();
+        let put_record = |segments: Vec<Vec<Hash>>| {
+            let (r, blobs) = (r.clone(), blobs.clone());
+            async move {
+                let mut live = Vec::new();
+                for (i, mut hs) in segments.into_iter().enumerate() {
+                    hs.sort_unstable();
+                    hs.dedup();
+                    let (hash, data) = encode_segment(&hs, i as u64);
+                    blobs.put_with_hash(hash, data).await.unwrap();
+                    live.push(SegmentRef {
+                        hash,
+                        marks: hs.len() as u64,
+                    });
+                }
+                let m = Manifest {
+                    live,
+                    rows_retired: true,
+                    retired: Vec::new(),
+                };
+                r.meta()
+                    .put_derived(
+                        crate::gc_segments::GC_MARK_SEGMENTS,
+                        &crate::gc_segments::MANIFEST_KEY,
+                        m.encode(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        // The tip changeset marked without anything below it.
+        put_record(vec![vec![tip.0]]).await;
+        let e = check_mark_closure(&r).await.unwrap_err();
+        assert!(e.contains(&tip.0.to_string()), "{e}");
+        // Its closure published after it: the first prefix is not closed.
+        put_record(vec![vec![tip.0], closure.clone()]).await;
+        let e = check_mark_closure(&r).await.unwrap_err();
+        assert!(e.contains("first 1 of 2"), "{e}");
+        // A tree node marked without one of its entries.
+        let root = r.root_trees(&[tip]).await.unwrap()[0];
+        let node = r.read_tree(root).await.unwrap();
+        let child = match node.entries.values().next().unwrap() {
+            TreeEntry::File { content, .. } => *content,
+            TreeEntry::Dir { tree } => *tree,
+        };
+        let without: Vec<Hash> = closure.iter().copied().filter(|h| *h != child).collect();
+        put_record(vec![without]).await;
+        let e = check_mark_closure(&r).await.unwrap_err();
+        assert!(e.contains(&child.to_string()), "{e}");
+        // Control: the closure first, then the tip, is closed.
+        put_record(vec![closure, vec![tip.0]]).await;
+        check_mark_closure(&r).await.unwrap();
+    }
+
+    /// A run that trusted the `gc-mark-v1` rows when it loaded and then
+    /// outlived its lease while `gc --retire-mark-rows` imported and deleted
+    /// them must not read the missing rows as "not referenced": its row
+    /// reads recheck the manifest and fail with `Conflict`.
+    #[tokio::test]
+    async fn a_stale_run_does_not_trust_rows_deleted_under_it() {
+        let (r, blobs) = setup();
+        build_history(&r).await;
+        age_all(&blobs).await;
+        write_legacy_rows(&r).await;
+        let referenced: Vec<Hash> = full_mark(&r).await.into_iter().collect();
+        let mut stats = MarkStats::default();
+        let marked = mark(&r, Mark::Incremental, true, &mut stats, &[], &None)
+            .await
+            .unwrap();
+        assert!(marked.record.rows);
+        assert!(marked.walked.is_empty(), "the rows cover everything");
+        let (got, _) = marked.which(&r, &referenced).await.unwrap();
+        assert!(got.iter().all(|m| *m));
+
+        crate::gc_segments::import_mark_rows(&r).await.unwrap();
+        crate::gc_segments::delete_mark_rows(&r, &mut |_| {})
+            .await
+            .unwrap();
+        let e = marked.which(&r, &referenced).await.unwrap_err();
+        assert!(matches!(e, Error::Conflict(_)), "{e}");
+        let e = marked.record.recheck(&r).await.unwrap_err();
+        assert!(matches!(e, Error::Conflict(_)), "{e}");
+        // A dry run deletes nothing and is not checked.
+        let mut stats = MarkStats::default();
+        let dry = mark(&r, Mark::Incremental, false, &mut stats, &[], &None)
+            .await
+            .unwrap();
+        r.meta()
+            .put_derived(
+                crate::gc_segments::GC_MARK_SEGMENTS,
+                &crate::gc_segments::MANIFEST_KEY,
+                crate::gc_segments::Manifest::default().encode(),
+            )
+            .await
+            .unwrap();
+        dry.record.recheck(&r).await.unwrap();
+    }
+
     /// A run that loaded the record and then outlived its lease cannot
     /// overwrite what `gc --retire-mark-rows` wrote meanwhile: every
     /// manifest write swaps from the bytes its writer read (ADR 0103
@@ -3347,6 +3461,7 @@ mod tests {
                 .find(|(h, _)| h == hash)
                 .map(|(_, e)| match e {
                     Error::Storage(m) => Error::Storage(m.clone()),
+                    Error::NotFound(m) => Error::NotFound(m.clone()),
                     _ => Error::Other("unexpected".into()),
                 });
             match bad {
@@ -3364,8 +3479,8 @@ mod tests {
 
     /// A segment the store reports corrupt (a packed copy failing its
     /// checksum) ends the trusted prefix like one that does not decode,
-    /// instead of failing every run until `gc --full`; a transient read
-    /// error still aborts the run and keeps the record.
+    /// instead of failing every run until `gc --full`; any other read error,
+    /// even one worded "missing", still aborts the run and keeps the record.
     #[tokio::test]
     async fn a_segment_the_store_reports_corrupt_ends_the_trusted_prefix() {
         let blobs = Arc::new(MemoryBlobStore::new());
@@ -3402,6 +3517,23 @@ mod tests {
             .unwrap_err();
         assert!(e.to_string().contains("connection reset"), "{e}");
         assert_eq!(manifest(&r).await, m, "a transient error keeps the record");
+        // Errors `verify` files as damage but that a repack caught mid-swap
+        // can also give: not definite corruption, so they abort too rather
+        // than retire the manifest's tail for good.
+        for e in [
+            Error::Storage(format!(
+                "pack holding {newest} is listed but its .pack is missing"
+            )),
+            Error::NotFound(format!("blob {newest}")),
+        ] {
+            let msg = e.to_string();
+            failing.bad.lock().unwrap()[0].1 = e;
+            let e = condemn(&r, &opts(1, false), &TestClock::at(t + 10))
+                .await
+                .unwrap_err();
+            assert_eq!(e.to_string(), msg);
+            assert_eq!(manifest(&r).await, m, "{msg}: the record is kept");
+        }
 
         failing.bad.lock().unwrap()[0].1 = Error::Storage(format!(
             "corrupt packed object {newest} in pack p: checksum mismatch"
@@ -3771,6 +3903,16 @@ mod tests {
                 self.log.record(&[r.key], "claim");
             }
             self.inner.put_derived_many(rows).await
+        }
+
+        async fn cas_derived(
+            &self,
+            kind: &str,
+            key: &Hash,
+            expected: Option<&[u8]>,
+            new: Bytes,
+        ) -> Result<bool> {
+            self.inner.cas_derived(kind, key, expected, new).await
         }
     }
 

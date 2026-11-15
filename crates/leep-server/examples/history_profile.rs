@@ -237,6 +237,20 @@ impl MetaStore for Meta {
             self.0.put_derived(kind, key, value).await
         )
     }
+    async fn cas_derived(
+        &self,
+        kind: &str,
+        key: &Hash,
+        expected: Option<&[u8]>,
+        new: Bytes,
+    ) -> Result<bool> {
+        timed!(
+            self.1,
+            "cas_derived",
+            1,
+            self.0.cas_derived(kind, key, expected, new).await
+        )
+    }
     async fn put_derived_many(&self, rows: &[DerivedRow]) -> Result<()> {
         let trees = rows
             .iter()

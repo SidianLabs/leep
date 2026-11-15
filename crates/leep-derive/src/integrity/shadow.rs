@@ -124,6 +124,11 @@ impl MetaStore for ShadowMeta {
         Ok(())
     }
 
+    /// A swap coordinates writers of the real store; verification is not one.
+    async fn cas_derived(&self, _: &str, _: &Hash, _: Option<&[u8]>, _: Bytes) -> Result<bool> {
+        Err(read_only())
+    }
+
     async fn delete_derived_step(&self, _: &[&str], _: Option<&[u8]>) -> Result<DeleteStep> {
         Err(read_only())
     }

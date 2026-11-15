@@ -210,6 +210,16 @@ impl MetaStore for Meta {
     async fn schema_version(&self) -> Result<Option<u64>> {
         self.0.schema_version().await
     }
+
+    async fn cas_derived(
+        &self,
+        kind: &str,
+        key: &Hash,
+        expected: Option<&[u8]>,
+        new: Bytes,
+    ) -> Result<bool> {
+        self.0.cas_derived(kind, key, expected, new).await
+    }
 }
 
 struct Lcg(u64);

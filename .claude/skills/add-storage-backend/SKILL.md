@@ -47,7 +47,10 @@ Backends implement `leep_core::BlobStore` (in `leep-store`) or
      levels through it). Wrappers forward all four.
    - **MetaStore `cas_ref` must be one atomic conditional operation.** That
      means a conditional update/insert/delete, or a transaction at
-     serializable isolation. Never read then write.
+     serializable isolation. Never read then write. The same goes for
+     `cas_derived` (required, no default; ADR 0103): one conditional
+     statement, with "no row" as a valid expected state, and
+     `check_cas_derived_contract` races it from a value and from no row.
    - Values returned from `get_changeset` must decode, and their id must
      match the key. Otherwise return `Error::Storage`.
 3. Register a URL scheme in `open_blob_store` / `open_meta_store`. A

@@ -884,23 +884,16 @@ pub trait MetaStore: Send + Sync + 'static {
     /// a holder can outlive its lease: a stale holder's write then loses
     /// instead of overwriting a newer one (the GC mark manifest, ADR 0103).
     ///
-    /// The database backends do it in one statement. This default reads
-    /// then writes, so a writer racing through it can be overwritten; a
-    /// wrapper store forwards to the store it wraps instead.
+    /// Required, with no default: a read-then-write default would let a
+    /// new backend lose a race silently. The database backends do it in one
+    /// statement; a wrapper store forwards to the store it wraps.
     async fn cas_derived(
         &self,
         kind: &str,
         key: &Hash,
         expected: Option<&[u8]>,
         new: Bytes,
-    ) -> Result<bool> {
-        let now = self.get_derived(kind, key).await?;
-        if now.as_deref() != expected {
-            return Ok(false);
-        }
-        self.put_derived(kind, key, new).await?;
-        Ok(true)
-    }
+    ) -> Result<bool>;
 
     /// [`put_derived`](Self::put_derived) for many rows in one round trip
     /// (ADR 0031). The result is that of putting the rows one by one in

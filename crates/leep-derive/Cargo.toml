@@ -26,6 +26,11 @@ metrics.workspace = true
 diffy = "0.5"
 similar = "3"
 
+[features]
+# Hooks for integration tests in other crates (process-global limits);
+# never enabled by a binary.
+test-hooks = []
+
 [dev-dependencies]
 leep-testkit.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

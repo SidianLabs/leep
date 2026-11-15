@@ -145,6 +145,16 @@ impl MetaStore for GatedMeta {
         self.count();
         self.inner.put_derived(kind, key, value).await
     }
+    async fn cas_derived(
+        &self,
+        kind: &str,
+        key: &Hash,
+        expected: Option<&[u8]>,
+        new: Bytes,
+    ) -> Result<bool> {
+        self.count();
+        self.inner.cas_derived(kind, key, expected, new).await
+    }
 }
 
 struct Rig {

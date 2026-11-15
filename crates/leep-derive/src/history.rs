@@ -746,6 +746,16 @@ mod read_ahead_tests {
         async fn delete_derived_kind(&self, kind: &str) -> Result<u64> {
             self.inner.delete_derived_kind(kind).await
         }
+
+        async fn cas_derived(
+            &self,
+            kind: &str,
+            key: &Hash,
+            expected: Option<&[u8]>,
+            new: Bytes,
+        ) -> Result<bool> {
+            self.inner.cas_derived(kind, key, expected, new).await
+        }
     }
 
     fn probe(fail_batches: bool) -> (Repo, Arc<Probe>) {
