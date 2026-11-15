@@ -272,7 +272,7 @@ impl<'a> Pass<'a> {
                     return Err(Error::Other(format!(
                         "the {MANIFEST_KIND} row does not decode; in mode retire it may name the \
                          only copy of deleted rows, so it is not replaced automatically (see \
-                         \"Derived segments\" in RUNBOOKS.md)"
+                         LeepDerivedSegmentPassesFailing in RUNBOOKS.md)"
                     )));
                 }
                 // In build mode every row is still stored: start over.

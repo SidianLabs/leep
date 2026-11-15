@@ -50,6 +50,7 @@ every runbook.
 | [LeepConfigSkew](#leepconfigskew) | ticket | servers report different config fingerprints for 15 minutes |
 | [LeepSchemaVersionSkew](#leepschemaversionskew) | ticket | servers report different schema versions for 1 hour |
 | [LeepMixedVersions](#leepmixedversions) | ticket | servers report different `version` for 2 hours |
+| [LeepDerivedSegmentPassesFailing](#leepderivedsegmentpassesfailing) | ticket | derived segment passes failed more than three times in an hour, or kept rows that differ from their segments |
 | [LeepMirrorDown](#leepmirrordown) | page | a git mirror's metrics endpoint has not been scrapable for 5 minutes |
 | [LeepMirrorLagging](#leepmirrorlagging) | page | a mirrored ref has differed between Leep and git for 10 minutes while the mirror retries |
 | [LeepMirrorStuck](#leepmirrorstuck) | ticket | a mirrored ref is diverged, rewound, refused, remote-ahead or deleted in Leep for 15 minutes |
@@ -1608,6 +1609,57 @@ digests instead of tags.
 **Escalate / collect.** Per-instance version and digest, schema version, and the
 rollout log.
 
+## LeepDerivedSegmentPassesFailing
+
+**Meaning.** The derived segment compactor (ADR 0104; OPERATIONS.md,
+"Derived segments") failed more than three passes in an hour
+(`leep_derived_segment_passes_total{outcome="error"}`), or a pass in mode
+`retire` kept rows that differ from the value of the segment holding them
+(`leep_derived_segment_mismatch_total`). **Ticket.**
+
+**Impact.** None on answers: rows win over segments, and anything a
+segment cannot give reads as a missing row, which derives again. A failing
+pass seals and retires nothing, so the storage it saves stops growing; a
+kept row costs its bytes. Repeated `leep_derived_segment_errors_total` mean
+reads derive values again, which costs time on deep histories.
+
+**Diagnose.** The server log's `derived segments pass failed` warnings give
+the error. Then `leep-server verify --derived skiplist --derived
+history-tree-v4` (`--full` to recompute every value):
+
+- `the derived-segments-v1 row does not decode`: the manifest is damaged
+  (`bad_derived_manifest`). In mode `build` the next pass replaces it; in
+  `retire` passes refuse to, and `gc` refuses to run.
+- `bad_derived_segment`, or a note that a segment is not stored: a segment
+  blob was lost or damaged (a disk, a restore whose blob copy finished
+  before the segment was sealed, an older `gc` that collected it).
+- `derived_mismatch` on `skiplist` or `history-tree-v4`: a row or a segment
+  value is wrong. A mismatch counted by passes means the row differs from
+  the segment; `verify --full` says which of the two is wrong.
+- `conflict ... changed under this pass`: two passes overlapped (one lost its
+  lease); harmless, the next pass goes on.
+
+**Mitigate / fix.**
+
+- A damaged manifest after `retire`: `repair drop --kind skiplist --kind
+  history-tree-v4` replaces it with an empty one and drops the rows, which
+  then derive again on demand (or at once with `repair rederive --kind
+  history-tree-v4 --missing`). Expect a long derivation on a large store.
+- A lost or damaged segment: nothing is needed for correctness; the next
+  pass drops it and seals the rows again. After `retire`, run `repair
+  rederive --kind skiplist --kind history-tree-v4 --missing` to write the
+  missing rows at once.
+- A wrong value: `repair rederive --kind <kind>` writes correct rows, which
+  win. If the segment held the wrong value, `repair drop --kind <kind>`
+  stops every segment answering for that kind.
+- To stop passes while you investigate: `--derived-segments off` (segments
+  are still read). Never delete the `derived-segments-v1` row by hand after
+  `retire`: it names the only copy of the deleted rows.
+
+**Escalate / collect.** The pass warnings from the log, the `verify`
+report, and the `derived-segments-v1` row (`SELECT encode(value, 'hex')
+FROM derived WHERE kind = 'derived-segments-v1'`).
+
 ## LeepMirrorDown
 
 **Meaning.** The `leep-git mirror run` process's `--listen` endpoint has not
@@ -2155,7 +2207,12 @@ unreferenced blobs and only GC reclaims them.
    - `bad duration "..."; use e.g. 0, 90s, 30m, 24h, 7d`;
    - `the metadata store uses format features this server cannot read
      (gc-mark-segments)`: someone ran `gc --retire-mark-rows` (ADR 0103) and the
-     cron job runs an older `leep-server`. Upgrade the binary the job uses.
+     cron job runs an older `leep-server`. Upgrade the binary the job uses. The
+     same with `derived-segments`: a server runs `--derived-segments retire`
+     (ADR 0104);
+   - `the derived-segments-v1 row does not decode, so garbage collection
+     cannot tell live derived segments from orphans`: see
+     [LeepDerivedSegmentPassesFailing](#leepderivedsegmentpassesfailing).
 3. Is it simply slow or killed? Condemn and collect walk only changesets stored since
    the last run (`changesets walked` in the report; ADR 0033), but still list every
    changeset and blob, so they take longer as the store grows, and the first run

@@ -541,6 +541,11 @@ struct Args {
     /// retire.
     #[arg(long, hide = true)]
     debug_derived_segments_small: bool,
+    /// Testing only: the default limits, without the waits (seal whatever
+    /// is unsealed, retire rows at once), so a measurement settles in
+    /// seconds.
+    #[arg(long, hide = true)]
+    debug_derived_segments_quick: bool,
     /// Testing only: stop the derived segments task for good at a point of
     /// a pass (`seal-stored`, `merge-stored`, `retire-deleted`), printing
     /// `leep-derived-segments: paused at <point>`, so a crash test can kill
@@ -1341,6 +1346,12 @@ fn start_derived_segments(args: &Args, repo: &Repo) {
             ..CompactOptions::default()
         }
     };
+    if args.debug_derived_segments_quick {
+        pass.idle_rows = 1;
+        pass.idle = std::time::Duration::ZERO;
+        pass.lone_wait = std::time::Duration::ZERO;
+        pass.retire_after = std::time::Duration::ZERO;
+    }
     if let Some(at) = args.debug_derived_segments_pause_at.clone() {
         pass.pause = Some(PauseHook(Arc::new(move |point| {
             let stop = point == at;

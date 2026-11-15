@@ -126,7 +126,7 @@ pub(crate) async fn gc_view(repo: &Repo) -> Result<GcView> {
         }),
         ManifestRead::Damaged => Err(Error::Other(format!(
             "the {MANIFEST_KIND} row does not decode, so garbage collection cannot tell live \
-             derived segments from orphans; see \"Derived segments\" in RUNBOOKS.md"
+             derived segments from orphans; see LeepDerivedSegmentPassesFailing in RUNBOOKS.md"
         ))),
     }
 }

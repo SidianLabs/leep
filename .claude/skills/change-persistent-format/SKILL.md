@@ -14,7 +14,8 @@ existing history. Read docs/FORMATS.md first.
 | You want to | Do this |
 |---|---|
 | Record new metadata on changesets | Use a namespaced `extra` key. No format change. Stop here. |
-| Change a derived kind's encoding | Rename the kind (`foo-v1` → `foo-v2`). Old rows become garbage. |
+| Change a derived kind's encoding | Rename the kind (`foo-v1` → `foo-v2`). Old rows become garbage. A kind held in derived segments (`skiplist`, `history-tree-v4`, ADR 0104) takes a new column number for the new kind; the old column is never reinterpreted. |
+| Change the derived segment container (index blob, data blob, manifest) | New prefix or version byte; readers keep decoding the old one. Golden bytes in `derived_segments/tests.rs`, FORMATS.md, and ADR 0104's successor. |
 | Add an API field | `Option`/`#[serde(default)]` on the `/v1` type. |
 | Remove or rename an API field | Add `/v2` alongside `/v1`. |
 | Change `Changeset`/`TreeNode` shape or hashing | Continue below. Needs an ADR. |

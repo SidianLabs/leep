@@ -1230,3 +1230,49 @@ async fn the_view_keeps_the_store_contracts() {
     assert!(again.meta().view_base().is_some());
     assert!(again.row_meta().view_base().is_none());
 }
+
+/// A segment whose data blob cannot be read is left out for `REFRESH`,
+/// then tried again: a blob a repack was moving reads again.
+#[tokio::test(start_paused = true)]
+async fn an_unreadable_segment_is_tried_again_after_a_refresh() {
+    let r = repo();
+    let ids = build(&r, None).await;
+    let hook = feature_hook(Arc::default());
+    settle(
+        &r,
+        &CompactOptions::small(Mode::Retire),
+        &mut CompactState::default(),
+        Some(&hook),
+    )
+    .await;
+    let (_, ManifestRead::Read(m)) = read_manifest(&r).await.unwrap() else {
+        panic!("no manifest")
+    };
+    let seg = m.live[0];
+    let data = r.blobs().get(&seg.data).await.unwrap().unwrap();
+    r.blobs().delete(&seg.data).await.unwrap();
+    let v = fresh(&r);
+    let key = ids[2].0;
+    assert!(v
+        .meta()
+        .get_derived(Skiplist::NAME, &key)
+        .await
+        .unwrap()
+        .is_none());
+    r.blobs().put_with_hash(seg.data, data).await.unwrap();
+    // Still left out within the interval...
+    assert!(v
+        .meta()
+        .get_derived(Skiplist::NAME, &key)
+        .await
+        .unwrap()
+        .is_none());
+    // ...and read again after it.
+    tokio::time::advance(view::REFRESH).await;
+    assert!(v
+        .meta()
+        .get_derived(Skiplist::NAME, &key)
+        .await
+        .unwrap()
+        .is_some());
+}

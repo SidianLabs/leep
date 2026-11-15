@@ -82,9 +82,10 @@ struct State {
     damaged: bool,
     /// Live segments whose index could be read, newest first.
     segs: Vec<Arc<Live>>,
-    /// Live segments named by `raw` whose index or data cannot be read:
-    /// left out until the manifest changes.
-    broken: HashSet<Hash>,
+    /// Live segments named by `raw` whose index or data could not be read,
+    /// and when: left out for [`REFRESH`], then tried again (a blob a repack
+    /// was moving reads again), or until the manifest changes.
+    broken: BTreeMap<Hash, tokio::time::Instant>,
 }
 
 struct Caches {
@@ -165,7 +166,8 @@ impl SegmentView {
         let _held = self.apply.lock().await;
         {
             let mut s = self.state.write().unwrap();
-            if s.loaded.is_some() && s.raw == raw {
+            let retry = s.broken.values().any(|t| t.elapsed() >= self.refresh);
+            if s.loaded.is_some() && s.raw == raw && !retry {
                 s.loaded = Some(tokio::time::Instant::now());
                 return Ok(());
             }
@@ -179,7 +181,7 @@ impl SegmentView {
                     .increment(1);
                 tracing::error!(
                     "the {MANIFEST_KIND} row does not decode: derived segments are not read \
-                     (rows still are); see \"Derived segments\" in RUNBOOKS.md"
+                     (rows still are); see LeepDerivedSegmentPassesFailing in RUNBOOKS.md"
                 );
                 (Vec::new(), true)
             }
@@ -190,7 +192,7 @@ impl SegmentView {
                 s.segs.iter().map(|l| (l.r.index, l.clone())).collect();
             (have, s.broken.clone())
         };
-        broken.retain(|h| live.iter().any(|s| s.index == *h));
+        broken.retain(|h, t| live.iter().any(|s| s.index == *h) && t.elapsed() < self.refresh);
         let mut segs = Vec::with_capacity(live.len());
         for r in live.iter().rev() {
             if let Some(l) = have.get(&r.index) {
@@ -205,7 +207,7 @@ impl SegmentView {
                 }
                 continue;
             }
-            if broken.contains(&r.index) {
+            if broken.contains_key(&r.index) {
                 continue;
             }
             match load_index(&*self.blobs, r).await? {
@@ -214,7 +216,7 @@ impl SegmentView {
                     idx: Arc::new(idx),
                 })),
                 None => {
-                    broken.insert(r.index);
+                    broken.insert(r.index, tokio::time::Instant::now());
                 }
             }
         }
@@ -232,7 +234,7 @@ impl SegmentView {
     fn mark_broken(&self, index: Hash) {
         let mut s = self.state.write().unwrap();
         s.segs.retain(|l| l.r.index != index);
-        s.broken.insert(index);
+        s.broken.insert(index, tokio::time::Instant::now());
     }
 
     /// The newest live segment holding `key`'s value of `col`.
