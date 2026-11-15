@@ -1498,22 +1498,22 @@ fn run_segments_kill(backend: &str, meta_url: Option<String>, mode: &str, point:
                     .unwrap()
             }
         });
-        // Family changeset-v1 runs first: by a changeset-v2 point both
-        // families have deleted rows, and each recorded its feature first.
+        // Each family records its own feature before its own first delete.
+        // The family that goes first rotates each pass, so at a point of
+        // one family the other may not have deleted anything yet.
+        let (family, feature) = if point.starts_with("changeset-v2:") {
+            ("changeset-v2", "derived-segments-2")
+        } else {
+            ("changeset-v1", "derived-segments")
+        };
         assert!(
-            features.iter().any(|f| f == "derived-segments"),
-            "[{tag}] rows were deleted before the feature was recorded: {features:?}"
+            features.iter().any(|f| f == feature),
+            "[{tag}] {family} rows were deleted before its feature was recorded: \
+             {features:?}"
         );
-        if point.starts_with("changeset-v2:") {
-            assert!(
-                features.iter().any(|f| f == "derived-segments-2"),
-                "[{tag}] changeset-v2 rows were deleted before its feature was recorded: \
-                 {features:?}"
-            );
-        }
-        // Killed between recording changeset-v1's feature and its first
-        // delete, nothing need be deleted yet.
-        if point != "feature-recorded" {
+        // Killed between recording a family's feature and its first delete,
+        // nothing need be deleted yet (the other family may not have run).
+        if !point.ends_with("feature-recorded") {
             assert!(rows < rows_before, "[{tag}] no row was deleted");
         }
     }

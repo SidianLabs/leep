@@ -1631,10 +1631,11 @@ Then `leep-server verify --derived <the family's kinds>` (`--full` to
 recompute every value):
 
 - `the derived-segments-v1 row of family ... does not decode`: that family's
-  manifest is damaged (`bad_derived_manifest`). In mode `build` the next
-  pass replaces it unless the family's store feature (`derived-segments`,
-  `derived-segments-2`) is recorded; then passes refuse to, and `gc`
-  refuses to run.
+  manifest is damaged (`bad_derived_manifest`). In mode `build`, or in
+  `retire` while the family is held back (not named in
+  `--derived-segments-retire-families`), the next pass replaces it unless
+  the family's store feature (`derived-segments`, `derived-segments-2`) is
+  recorded; otherwise passes refuse to, and `gc` refuses to run.
 - `a derived-segments-v1 row of a derived segment family this leep-server
   does not know`: a newer `leep-server` wrote a family this one cannot read.
   `gc` refuses to run with it; run the newer `gc`.
@@ -1643,9 +1644,10 @@ recompute every value):
   `--derived-segments-retire-families` (ADR 0105); name it once every
   binary runs this release and no older `gc` is running.
 - `a derived segment's blob is condemned by blob GC; its rows are not
-  retired`: a `gc` that cannot read the family (an older binary) condemned
-  a live segment. Stop that `gc`'s schedule; the next collect deletes the
-  segment and the next pass seals the rows again, or keeps it.
+  retired` (logged once per segment per process): a `gc` that cannot read
+  the family (an older binary) condemned a live segment. Stop that `gc`'s
+  schedule; the next collect deletes the segment and the next pass seals
+  the rows again, or keeps it.
 - `bad_derived_segment`, or a note that a segment is not stored: a segment
   blob was lost or damaged (a disk, a restore whose blob copy finished
   before the segment was sealed, an older `gc` that collected it).

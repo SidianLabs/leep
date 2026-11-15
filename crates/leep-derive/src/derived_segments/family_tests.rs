@@ -705,6 +705,179 @@ async fn retire_does_not_pass_a_new_familys_door_unless_named() {
     assert_eq!(CompactOptions::default().retire_families, ["changeset-v1"]);
 }
 
+/// A `retire` server holding a family back deletes none of its rows, so it
+/// replaces the family's damaged manifest like `build`; once it names the
+/// family, or the store has its feature, it refuses.
+#[tokio::test]
+async fn a_held_back_familys_damaged_manifest_is_replaced() {
+    let r = repo();
+    build(&r, None).await;
+    let log = Arc::new(Mutex::new(vec![FEATURE]));
+    let hook = feature_hook(log.clone());
+    let unnamed = CompactOptions {
+        retire_families: vec![codec::FAMILY_CHANGESET_NAME.to_string()],
+        ..CompactOptions::small(Mode::Retire)
+    };
+    let mut st = CompactState::default();
+    settle(&r, &unnamed, &mut st, Some(&hook)).await;
+    let junk = Bytes::from_static(b"junk");
+    let damage = || async {
+        r.row_meta()
+            .put_derived(
+                MANIFEST_KIND,
+                &manifest_key(FAMILY_CHANGESET_V2),
+                junk.clone(),
+            )
+            .await
+            .unwrap();
+    };
+    damage().await;
+    let p = super::tests::pass(&r, &unnamed, &mut st, Some(&hook)).await;
+    let v2 = p.family(codec::FAMILY_CHANGESET_V2_NAME).unwrap();
+    assert!(v2.damaged_manifest, "{p:?}");
+    assert!(matches!(
+        read_manifest(&r, FAMILY_CHANGESET_V2).await.unwrap().1,
+        ManifestRead::Read(_)
+    ));
+    assert!(!log.lock().unwrap().contains(&FEATURE_2), "{log:?}");
+    // Named: it would retire, so it refuses.
+    let named = CompactOptions {
+        retire_families: CompactOptions::parse_retire_families("all").unwrap(),
+        ..unnamed.clone()
+    };
+    damage().await;
+    let err = compact_pass(&r, &named, &mut st, Some(&hook))
+        .await
+        .expect_err("named");
+    assert!(err.to_string().contains("not replaced"), "{err}");
+    // The feature recorded elsewhere: refused unnamed too.
+    log.lock().unwrap().push(FEATURE_2);
+    let err = compact_pass(&r, &unnamed, &mut CompactState::default(), Some(&hook))
+        .await
+        .expect_err("recorded");
+    assert!(err.to_string().contains("not replaced"), "{err}");
+    assert_eq!(
+        read_manifest(&r, FAMILY_CHANGESET_V2).await.unwrap().0,
+        Some(junk.clone())
+    );
+}
+
+/// A held-back family asks the store whether its feature is recorded at
+/// most once per `FEATURE_RECHECK`, not every pass, and goes on once the
+/// answer changes.
+#[tokio::test(start_paused = true)]
+async fn a_held_back_family_asks_for_its_feature_once_a_minute() {
+    let r = repo();
+    let ids = build(&r, None).await;
+    settle(
+        &r,
+        &CompactOptions::small(Mode::Build),
+        &mut CompactState::default(),
+        None,
+    )
+    .await;
+    let log = Arc::new(Mutex::new(vec![FEATURE]));
+    let asked = Arc::new(Mutex::new(0usize));
+    let inner = feature_hook(log.clone());
+    let probe = inner.recorded.clone();
+    let count = asked.clone();
+    let hook = Features {
+        record: inner.record.clone(),
+        recorded: Arc::new(move |name| {
+            if name == FEATURE_2 {
+                *count.lock().unwrap() += 1;
+            }
+            probe(name)
+        }),
+    };
+    let unnamed = CompactOptions {
+        retire_families: vec![codec::FAMILY_CHANGESET_NAME.to_string()],
+        ..CompactOptions::small(Mode::Retire)
+    };
+    let mut st = CompactState::default();
+    for _ in 0..4 {
+        super::tests::pass(&r, &unnamed, &mut st, Some(&hook)).await;
+    }
+    assert_eq!(*asked.lock().unwrap(), 1);
+    // Another server passes the door: seen after the recheck interval.
+    log.lock().unwrap().push(FEATURE_2);
+    super::tests::pass(&r, &unnamed, &mut st, Some(&hook)).await;
+    assert_eq!(
+        r.row_meta().count_derived(Generation::NAME).await.unwrap(),
+        ids.len() as u64
+    );
+    tokio::time::advance(compactor::FEATURE_RECHECK + std::time::Duration::from_secs(1)).await;
+    settle(&r, &unnamed, &mut st, Some(&hook)).await;
+    assert_eq!(*asked.lock().unwrap(), 2);
+    assert_eq!(
+        r.row_meta().count_derived(Generation::NAME).await.unwrap(),
+        0
+    );
+}
+
+/// Rows of a segment whose blob carries a blob GC condemnation are not
+/// retired, and the condemnations are read again after the family's
+/// feature is recorded: one written while it is recorded still holds.
+#[tokio::test]
+async fn condemned_segments_rows_are_not_retired() {
+    let r = repo();
+    let ids = build(&r, None).await;
+    settle(
+        &r,
+        &CompactOptions::small(Mode::Build),
+        &mut CompactState::default(),
+        None,
+    )
+    .await;
+    let blobs: Vec<Hash> = live(&r, FAMILY_CHANGESET_V2)
+        .await
+        .iter()
+        .map(|s| s.data)
+        .collect();
+    assert!(!blobs.is_empty());
+    // An older `gc` condemns the segments just as the feature is recorded.
+    let log = Arc::new(Mutex::new(vec![FEATURE]));
+    let inner = feature_hook(log.clone());
+    let record = inner.record.clone();
+    let (gc_repo, marks) = (r.clone(), blobs.clone());
+    let hook = Features {
+        record: Arc::new(move |name| {
+            let (gc_repo, marks, done) = (gc_repo.clone(), marks.clone(), record(name));
+            Box::pin(async move {
+                for h in marks.iter().filter(|_| name == FEATURE_2) {
+                    gc_repo
+                        .row_meta()
+                        .put_derived(crate::gc::BLOB_CONDEMNED, h, crate::gc::time_value(1))
+                        .await?;
+                }
+                done.await
+            })
+        }),
+        recorded: inner.recorded.clone(),
+    };
+    let all = CompactOptions {
+        retire_families: CompactOptions::parse_retire_families("all").unwrap(),
+        ..CompactOptions::small(Mode::Retire)
+    };
+    let mut st = CompactState::default();
+    settle(&r, &all, &mut st, Some(&hook)).await;
+    assert!(log.lock().unwrap().contains(&FEATURE_2), "{log:?}");
+    assert_eq!(
+        r.row_meta().count_derived(Generation::NAME).await.unwrap(),
+        ids.len() as u64
+    );
+    // Collected or cleared: the rows go.
+    r.row_meta()
+        .delete_derived_keys(&[crate::gc::BLOB_CONDEMNED], &blobs)
+        .await
+        .unwrap();
+    settle(&r, &all, &mut st, Some(&hook)).await;
+    assert_eq!(
+        r.row_meta().count_derived(Generation::NAME).await.unwrap(),
+        0
+    );
+}
+
 /// A transient error reading one family's index blob does not keep the
 /// other family's manifest from being applied.
 #[tokio::test]

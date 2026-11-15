@@ -13,7 +13,9 @@
   `changeset-v1` records its store feature and deletes rows only when named
   here, or once its feature is already recorded. A fleet already in
   `retire` therefore passes no new one-way door by upgrading; the server
-  logs once per process that it holds a family back.
+  logs once per process that it holds a family back, asks the store for
+  that family's feature at most once a minute, and replaces the family's
+  damaged manifest as `build` does (it deletes none of its rows).
 - **Changed.** Retiring `changeset-v2` records the store feature
   `derived-segments-2` before the first row is deleted: servers of the
   previous release (ADR 0104) then refuse the store, as binaries before ADR
@@ -22,7 +24,9 @@
   nothing and stays free to roll back.
 - **Changed.** A merge leaves out keys whose changeset is no longer stored,
   asked of the changesets (a sealed generation no longer counts as proof);
-  rows of a segment whose blobs `gc` condemned are not retired; a pass's
+  rows of a segment whose blobs `gc` condemned are not retired (checked
+  again before each delete, after the store feature is recorded; logged
+  once per segment); a pass's
   time and row bounds are shared by both families, the first family
   rotating; a family is listed again once its rows grew by `seal_rows`
   times its columns; `repair drop` with a damaged manifest needs every kind
