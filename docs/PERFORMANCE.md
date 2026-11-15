@@ -314,6 +314,94 @@ logical bytes of `derived` rows by kind.
   24x fewer filter bytes than whole rows
   (`patches_store_five_times_fewer_filter_bytes_than_whole_rows`).
 
+### Blob trigram patches and retention (ADR 0102)
+
+Measured with the storage plan's harness on Postgres 16, server defaults,
+release builds of 31d8dff (before) and this change (after), the same day on
+the same 4-vCPU host: corpus C (Leep's own history imported at 89fb9ad,
+then 400 CLI lands one a second: 40 edits each of five files at depths 1
+to 5, then 200 three-file edits), every head warmed; snapshots after the
+store settles, `VACUUM` and `CHECKPOINT` first. Bytes per land:
+
+| | 200 one-file lands | 200 three-file lands | All 400 |
+|---|---|---|---|
+| Database, before | 16,712 | 38,380 | 27,546 |
+| Database, after | 11,756 | 15,647 | 13,701 |
+| `derived` table, before | 10,609 | 37,028 | 23,818 |
+| `derived` table, after | 5,571 | 14,254 | 9,912 |
+| Blob rows and keyframes (key and value), before (`blob-trigrams-v1`) | 4,925 | 22,110 | 13,518 |
+| Blob rows, after (`blob-trigrams-v2`) | 263 | 1,673 | 968 |
+| Blob keyframes, after (`blob-trigrams-keyframe-v2`) | 132 | 136 | 134 |
+
+The blob rows and keyframes shrink 12x for one-file and three-file lands alike, and
+the rows fall under Postgres's TOAST threshold: `derived`'s TOAST grows 2.4
+KB a land instead of 17.3 KB. What a land still adds is the directory
+filters (3.7 KB of rows and 1.4 KB of keyframes, unchanged), the other
+kinds (about 1.5 KB) and Postgres's per-row overhead. The blob store grows
+the same (1,248 and 1,240 bytes a land, after the repack). Corpora A and B
+at rest are unchanged (A 21.49 and 21.57 MB after the repack, B 30.28 and
+30.36 MB, this harness): an import indexes only its head, whose rows are
+all whole.
+
+The keyframe constant was chosen by replaying the rule over real file
+histories (`patch² <= k × whole`, keyframe rows charged 60 bytes of
+overhead):
+
+| `k` | Leep's history, 3,858 versions (whole commits) | Corpus C, 849 versions (small edits) |
+|---|---|---|
+| 16 | 1.87x smaller than whole rows | 9.08x |
+| 32 | 2.15x | **9.25x** |
+| 64 | 2.43x | 8.76x |
+| **128** | 2.69x | 7.94x |
+| 256 | **2.84x** | 7.25x |
+| 512 | 2.82x | 6.47x |
+| no keyframes after the first | 1.49x | 5.70x |
+
+128 is within 14% of the best on both.
+
+**Search latency** (20 queries, literal, limit 100, on the final head of
+the stores above; a fresh server each run, round 1 cold, rounds 2 to 4
+warm; two runs each, milliseconds):
+
+| | Round 1 p50 / p99 | Warm p50 / p99 |
+|---|---|---|
+| Head, before | 12.0-12.1 / 87.5-101.6 | 9.4-10.2 / 24.2-24.4 |
+| Head, after | 12.5-13.5 / 84.0-90.0 | 9.3-10.0 / 23.5-25.8 |
+| Revision 200 lands back, before | 12.6-13.4 / 85.1-85.8 | 9.6-10.8 / 22.3-27.4 |
+| Revision 200 lands back, after | 11.0-11.6 / 81.9-85.4 | 9.3-10.2 / 22.4-24.9 |
+| The same, after a retention pass deleted its rows (3 rows derived again) | 11.2-11.6 / 81.9-91.9 | 9.3-10.1 / 24.6-26.7 |
+| Head with every blob row deleted (583 rows derived again) | 12.4-14.2 / 286.7-288.5 | 9.6-11.5 / 26.5-37.8 |
+
+Patches cost nothing measurable on a hit. A miss costs a blob fetch per
+probed file without a row: on a revision 200 lands back only 3 of its files
+differ from the head, and the 20 queries derived 3 rows; with every blob
+row of the head deleted (a revert to content older than the window, at its
+worst) the first broad query fetched hundreds of blobs (p99 287 ms) and
+stored their rows, and later rounds were warm again.
+
+**Ratio bench** (`scripts/perf-ratio.sh`, base 31d8dff, this host): 0 of 23
+checks failed, 1 inconclusive (swarm sync p99, whose two A runs differ
+16x); statements per land 0.89-1.09x, swarm write bytes per land 1.00x,
+database bytes per land 1.05x (the A runs 7,098 and 7,562, the B runs
+7,742 and 7,705; the bench's files are a few lines, whose rows are whole
+under either kind).
+
+**Retention** on the same corpus, with `--search-retention 1s
+--search-retention-interval 30s` (so only the five minutes the pass allows
+for clock skew keep superseded rows): each pass took 37 to 59 ms and deleted
+14 to 26 rows, so over the 400 lands the blob rows grew 833 bytes a land
+instead of 968, the rows of the last five minutes of lands still kept. A
+pass once the window had passed walked one head, kept its 802 rows and
+deleted the other 612 (350 KB of key and value bytes, 875 bytes a land)
+in 76 ms. On Postgres the deletes left 612 dead tuples and did not shrink
+`derived` (9.87 MB); `VACUUM` made the space reusable (n_dead_tup 0, the
+same size), and `VACUUM FULL derived` returned 434 KB (9.50 MB). Later rows
+fill the reusable space first, so on a server that runs passes the table
+stops growing by what retention deletes rather than shrinking. With whole
+`blob-trigrams-v1` rows the same passes would have deleted about 13.5 KB a
+land; patches leave retention a few hundred bytes a land to reclaim, and
+its value is bounding the rows a long-lived store keeps to the window's.
+
 ## Verify
 
 `leep-server verify` (ADR 0025, `docs/OPERATIONS.md`) over a store of 10 000
@@ -3105,11 +3193,26 @@ every changeset row compressed. It takes about 20 s.
 | Checked | SQLite: measured / budget | Postgres: measured / budget |
 |---|---|---|
 | Blob store bytes per land, settled | 469-474 / 700 | 469 / 700 |
-| Database bytes per land, settled | 8,669-9,830 / 14,500 | 13,380-13,789 / 20,500 |
-| All storage (database above an empty one, plus blobs) over Git's `objects/` after `git gc` (149 KB) | 5.8-6.2x / 9x | 9.2-9.5x / 14x |
+| Database bytes per land, settled | 7,850-9,966 / 14,000 | 11,605-13,107 / 19,000 |
+| All storage (database above an empty one, plus blobs) over Git's `objects/` after `git gc` (149 KB) | 5.4-6.3x / 9x | 8.8-9.4x / 14x |
 | `leep_blob_store_size_ratio` | 0.080 / 0.12 | 0.080 / 0.12 |
+| Code search blob rows and keyframes per land (key and value bytes) | 1,368-1,499 / 1,990 | 1,267-1,579 / 1,990 |
+| ... over what whole rows of the landed files take (2,001 a land) | 0.68-0.75 / 0.99 | 0.63-0.79 / 0.99 |
 
-Budgets are about 1.5 times the measured values (two runs each). The ratio
+Budgets are about 1.5 times the measured values (two runs each when set by
+ADR 0101; the database lines were measured again and tightened, and the
+search lines added, by ADR 0102, ten runs on each backend, keeping at least
+40% over the worst database run and 25% over the worst search run). The
+search blob budgets still fail if blob rows are written whole again (2,001
+bytes a land, a share of 1.0); the share is high for a
+history this short, where most files are edited about three times and
+most of the bytes are the keyframes promoted from the import's whole rows
+(on corpus C, a tenth: "Blob trigram patches and retention"). Because the
+60 lands outrun the warmer, which then indexes only some heads and may find
+no indexed predecessor, the guard counts patches directly too: 10 more
+one-file lands after the measurement, each waiting until the warmer
+indexed its head, must store at least 9 patches (10 of 10 in every run on
+both backends). The ratio
 to Git is high because the history is tiny: the search and history indexes
 and Postgres's per-table pages dominate; the corpora above are the precise
 measure. A change that stops the automatic repack or compaction fails too,

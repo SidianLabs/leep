@@ -97,15 +97,29 @@ run() {
   done
   curl -sf "$api/v1/health" >/dev/null || { cat "$dir/server.log" >&2; die "$name: server did not start"; }
   echo "== $name ($bin): land bench, $LAND_AGENTS agents for ${LAND_SECONDS}s"
+  local cpu0 tx0
+  cpu0=$(server_cpu_ticks) tx0=$(db_commits "$db")
   "${load_cpus[@]}" "$pr/leep-land-bench" --server "$api" --metrics "$metrics" --target land \
     --agents "$LAND_AGENTS" --duration "$LAND_SECONDS" --files 2 --json "$dir/land.json" \
     >"$dir/land.txt"
+  # Not gated: context for reading a wall-time verdict. Equal work per land
+  # with unequal wall time points at the runner, not the change.
+  echo "   $name land bench: server CPU $(( ($(server_cpu_ticks) - cpu0) * 1000 / $(getconf CLK_TCK) )) ms," \
+    "Postgres commits $(( $(db_commits "$db") - tx0 )), load $(cut -d' ' -f1-3 /proc/loadavg)"
   echo "== $name: swarm, $SWARM_AGENTS agents for ${SWARM_SECONDS}s"
   "${load_cpus[@]}" "$pr/leep-swarm" --server "$api" --metrics "$metrics" --database-url "$url" \
     --agents "$SWARM_AGENTS" --think-ms 500 --duration "$SWARM_SECONDS" --ramp "$SWARM_RAMP" \
     --json "$dir/swarm.json" >"$dir/swarm.txt"
   kill "$server_pid"; wait "$server_pid" 2>/dev/null || true; server_pid=""
   psql -q "$pg" -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null; db=""
+}
+
+# User plus system CPU ticks of the running server, 0 where /proc is absent.
+server_cpu_ticks() {
+  awk '{print $14 + $15}' "/proc/$server_pid/stat" 2>/dev/null || echo 0
+}
+db_commits() {
+  psql -qtA "$pg" -c "SELECT xact_commit FROM pg_stat_database WHERE datname = '$1'" 2>/dev/null || echo 0
 }
 
 started=$(date +%s)

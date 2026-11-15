@@ -310,7 +310,7 @@ async fn a_healthy_store_verifies_clean_and_verify_writes_nothing() {
         assert_eq!(r.derived[kind].mismatched, 0);
     }
     for kind in [
-        "blob-trigrams-v1",
+        "blob-trigrams-v2",
         "tree-trigrams-v2",
         "history-node-v4",
         "blame-v2",
@@ -795,7 +795,7 @@ async fn a_blob_that_cannot_be_read_does_not_stop_the_trigram_scan() {
     let r = verify(&w.repo, &opts, &Quiet)
         .await
         .unwrap_or_else(|e| panic!("verify aborted instead of reporting: {e}"));
-    assert!(r.derived["blob-trigrams-v1"].unverifiable >= 1);
+    assert!(r.derived["blob-trigrams-v2"].unverifiable >= 1);
     let p = only(&r, "corrupt_blob");
     assert_eq!(p.key.as_deref(), Some(bad.to_hex().as_str()));
 }
@@ -805,8 +805,8 @@ async fn rederive_skips_a_blob_that_cannot_be_read() {
     let w = world().await;
     let bad = Hash::of_blob(b"fin\n");
     let w = with_undecodable(w, vec![bad]).await;
-    let r = rederive_kinds(&w, &["blob-trigrams-v1"], false).await;
-    assert!(r.kind_reports["blob-trigrams-v1"].skipped >= 1);
+    let r = rederive_kinds(&w, &["blob-trigrams-v2"], false).await;
+    assert!(r.kind_reports["blob-trigrams-v2"].skipped >= 1);
 }
 
 /// A tip no one names as a parent: nothing downstream fails, so the walk's
@@ -841,10 +841,10 @@ async fn an_unreadable_tip_makes_rederive_fail() {
 async fn search_rows_are_recomputed_from_blobs_and_trees() {
     let w = world().await;
     let blob = Hash::of_blob(b"x2 needle\n");
-    put_row(&w, "blob-trigrams-v1", &blob, vec![0, 1]).await;
+    put_row(&w, "blob-trigrams-v2", &blob, vec![0, 1]).await;
     let r = run_verify(&w, &full()).await;
     let p = only(&r, "derived_mismatch");
-    assert_eq!(p.kind.as_deref(), Some("blob-trigrams-v1"));
+    assert_eq!(p.kind.as_deref(), Some("blob-trigrams-v2"));
     assert_eq!(p.key.as_deref(), Some(blob.to_hex().as_str()));
     assert!(
         r.problems.len() == 1,
@@ -852,9 +852,9 @@ async fn search_rows_are_recomputed_from_blobs_and_trees() {
         r.problems
     );
 
-    let dry = rederive_kinds(&w, &["blob-trigrams-v1"], true).await;
+    let dry = rederive_kinds(&w, &["blob-trigrams-v2"], true).await;
     assert_eq!(dry.changed(), 1);
-    let fixed = rederive_kinds(&w, &["blob-trigrams-v1"], false).await;
+    let fixed = rederive_kinds(&w, &["blob-trigrams-v2"], false).await;
     assert_eq!(fixed.changed(), 1);
     assert_clean(&w).await;
 

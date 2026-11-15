@@ -64,8 +64,11 @@ const BUDGETS: &[Limit] = &[
     Limit::linear("blame", "meta calls", 10, 3),
     Limit::fixed("blame", "meta in flight", 1),
     // A literal search of a 256-file tree on a new process, deriving the
-    // trigram index on the way (ADR 0014): every blob read once.
-    Limit::fixed("search", "meta calls", 30),
+    // trigram index on the way (ADR 0014): every blob read once. Plus, the
+    // first time a blob row is missing, one count of the retired
+    // `blob-trigrams-v1` rows, repeated at most every 10 minutes, which
+    // spares every later miss its fallback read (ADR 0102).
+    Limit::fixed("search", "meta calls", 31),
     Limit::fixed("search", "blob calls", 297),
     // The warmer's search derivation of one land that changed one file
     // three directories deep, its parent indexed: per directory on the path

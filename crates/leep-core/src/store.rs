@@ -728,6 +728,24 @@ pub trait MetaStore: Send + Sync + 'static {
         ))
     }
 
+    /// The keys of [`list_derived`](Self::list_derived)'s page, without
+    /// the values: for a pass that only needs to know which rows exist
+    /// (search row retention, ADR 0102). Database backends read the primary
+    /// key alone; the default pages through `list_derived`.
+    async fn list_derived_keys(
+        &self,
+        kind: &str,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> Result<Vec<Hash>> {
+        Ok(self
+            .list_derived(kind, after, limit)
+            .await?
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect())
+    }
+
     /// How many rows of `kind` are stored. Database backends count without
     /// reading values (ADR 0052); the default pages through
     /// [`list_derived`](Self::list_derived).
@@ -825,6 +843,20 @@ pub trait MetaStore: Send + Sync + 'static {
             out.push(self.get_derived_many(kind, keys).await?);
         }
         Ok(out)
+    }
+
+    /// Whether a row of `kind` is stored under each of `keys`, in order,
+    /// without reading values: for a check of which rows exist (search row
+    /// backfill, ADR 0102). The default reads them with
+    /// [`get_derived_many`](Self::get_derived_many); database backends read
+    /// the primary key alone.
+    async fn derived_present(&self, kind: &str, keys: &[Hash]) -> Result<Vec<bool>> {
+        Ok(self
+            .get_derived_many(kind, keys)
+            .await?
+            .into_iter()
+            .map(|v| v.is_some())
+            .collect())
     }
 
     async fn put_derived(&self, kind: &str, key: &Hash, value: Bytes) -> Result<()>;

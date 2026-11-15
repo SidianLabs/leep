@@ -471,6 +471,12 @@ fn print_report(
     }
     let mut dropped = false;
     for d in first.into_iter().chain(r.dropped.as_ref()) {
+        if d.copied > 0 {
+            outln!(
+                "  copied {} blob-trigrams-v1 row(s) to blob-trigrams-v2 first",
+                d.copied
+            );
+        }
         for (kind, n) in &d.rows {
             outln!("  dropped {n} {kind} row(s)");
             dropped = true;

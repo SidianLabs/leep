@@ -50,26 +50,58 @@ struct Budgets {
     ratio_to_git: f64,
     /// `leep_blob_store_size_ratio`, settled: stored over logical bytes.
     blob_store_ratio: f64,
+    /// Code search blob rows and keyframes per land (key and value bytes,
+    /// the same on both backends), and the most they may be of what whole
+    /// rows of the landed files would take (ADR 0102).
+    search_blob_per_land: u64,
+    search_blob_share: f64,
 }
 
-// Measured when set (two runs each): blobs 469-474 bytes a land on both;
-// database 8,669-9,830 (SQLite) and 13,380-13,789 (Postgres) a land; all
-// storage 5.8-6.2x (SQLite) and 9.2-9.5x (Postgres) git's 149 KB, most of it
-// the search and history indexes of a history this small; blob store ratio
-// 0.080.
+// Measured when set (ADR 0101, two runs each): blobs 469-474 bytes a land on
+// both; database 8,669-9,830 (SQLite) and 13,380-13,789 (Postgres) a land;
+// all storage 5.8-6.2x (SQLite) and 9.2-9.5x (Postgres) git's 149 KB, most of
+// it the search and history indexes of a history this small; blob store
+// ratio 0.080. With blob rows as patches (ADR 0102, ten runs on each
+// backend): database 7,850-9,966 (SQLite) and 11,605-13,107 (Postgres) a
+// land, all storage 5.4-6.3x and 8.8-9.4x; the budgets keep 40% or more
+// over the worst run.
 const SQLITE: Budgets = Budgets {
     blob_per_land: 700,
-    db_per_land: 14_500,
+    db_per_land: 14_000,
     ratio_to_git: 9.0,
     blob_store_ratio: 0.12,
+    search_blob_per_land: SEARCH_BLOB_PER_LAND,
+    search_blob_share: SEARCH_BLOB_SHARE,
 };
 
 const POSTGRES: Budgets = Budgets {
     blob_per_land: 700,
-    db_per_land: 20_500,
+    db_per_land: 19_000,
     ratio_to_git: 14.0,
     blob_store_ratio: 0.12,
+    search_blob_per_land: SEARCH_BLOB_PER_LAND,
+    search_blob_share: SEARCH_BLOB_SHARE,
 };
+
+/// Key and value bytes of the code search blob rows, retired kind included,
+/// and their keyframes.
+const SEARCH_BLOB_BYTES: &str =
+    "SELECT CAST(COALESCE(SUM(LENGTH(key) + LENGTH(value)), 0) AS BIGINT) \
+     FROM derived WHERE kind IN ('blob-trigrams-v1', 'blob-trigrams-v2', \
+     'blob-trigrams-keyframe-v2')";
+
+// Measured when set (ADR 0102, twenty runs on both backends): 1,267-1,579
+// bytes a land, 0.63-0.79 of the 2,001 whole rows would take
+// (`blob-trigrams-v1`, 1.0 by definition). A history this short edits each
+// file about three times, so most of it is the keyframes promoted from the
+// import's whole rows; on corpus C it is a tenth. The budgets keep 25% over
+// the worst run and still fail if blob rows are written whole again (2,001
+// bytes, a share of 1.0); the paced lands below count patches directly.
+const SEARCH_BLOB_PER_LAND: u64 = 1_990;
+const SEARCH_BLOB_SHARE: f64 = 0.99;
+/// One-file lands after the measurement, each waiting for the warmer: all
+/// but at most one must store their blob row as a patch.
+const PACED_LANDS: usize = 10;
 
 /// The server's flags: defaults, but background work runs within seconds.
 const FLAGS: &[&str] = &[
@@ -239,6 +271,10 @@ struct Sizes {
     /// Changeset rows not compressed, and dictionaries stored.
     plain_rows: i64,
     dicts: i64,
+    /// Key and value bytes of the code search blob rows and keyframes.
+    search_blobs: i64,
+    /// `blob-trigrams-v2` rows that are patches.
+    patches: i64,
 }
 
 fn blobs_dir(stores: &Stores) -> std::path::PathBuf {
@@ -263,7 +299,7 @@ fn sizes(stores: &Stores) -> Sizes {
         .enable_all()
         .build()
         .unwrap();
-    let (db, plain_rows, dicts) = rt.block_on(async {
+    let (db, plain_rows, dicts, search_blobs, patches) = rt.block_on(async {
         if stores.meta.starts_with("sqlite:") {
             let mut c = sqlx::SqliteConnection::connect(&stores.meta).await.unwrap();
             let pages: i64 = sqlx::query_scalar("PRAGMA page_count")
@@ -288,7 +324,24 @@ fn sizes(stores: &Stores) -> Sizes {
                 .fetch_one(&mut c)
                 .await
                 .unwrap();
-            (((pages - free) * size) as u64, plain, dicts)
+            let search: i64 = sqlx::query_scalar(SEARCH_BLOB_BYTES)
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+            let patches: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM derived WHERE kind = 'blob-trigrams-v2' \
+                 AND substr(value, 1, 1) = X'02'",
+            )
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+            (
+                ((pages - free) * size) as u64,
+                plain,
+                dicts,
+                search,
+                patches,
+            )
         } else {
             let mut c = sqlx::PgConnection::connect(&stores.meta).await.unwrap();
             let db: i64 = sqlx::query_scalar("SELECT pg_database_size(current_database())")
@@ -306,7 +359,18 @@ fn sizes(stores: &Stores) -> Sizes {
                 .fetch_one(&mut c)
                 .await
                 .unwrap();
-            (db as u64, plain, dicts)
+            let search: i64 = sqlx::query_scalar(SEARCH_BLOB_BYTES)
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+            let patches: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM derived WHERE kind = 'blob-trigrams-v2' \
+                 AND get_byte(value, 0) = 2",
+            )
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+            (db as u64, plain, dicts, search, patches)
         }
     });
     Sizes {
@@ -316,6 +380,8 @@ fn sizes(stores: &Stores) -> Sizes {
         db,
         plain_rows,
         dicts,
+        search_blobs,
+        patches,
     }
 }
 
@@ -499,6 +565,36 @@ fn storage_stays_within_its_budgets() {
     let after = settle(&stores, &server, true);
     let size_ratio = metric(metrics_addr, "leep_blob_store_size_ratio");
     let dictionary = metric(metrics_addr, "leep_changeset_dictionary");
+
+    // Blob rows as patches, counted directly (ADR 0102): lands that
+    // outrun the warmer leave heads unindexed, so the measurement above
+    // cannot tell patches from whole rows reliably. These lands each wait
+    // until the warmer indexed their head, as at the pace of a CLI; every
+    // one edits one file, so each should store one patch.
+    let warmed = || {
+        metric(
+            metrics_addr,
+            "leep_index_rows_total{kind=\"tree-trigrams-v2\"}",
+        )
+        .unwrap_or(0.0)
+    };
+    for k in 0..PACED_LANDS {
+        let files = corpus.edit(1);
+        let msg = corpus.message(IMPORT_COMMITS + LANDS + k);
+        let before_warm = warmed();
+        tip = land(server.addr, tip, &files, &msg);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while warmed() <= before_warm {
+            assert!(
+                Instant::now() < deadline,
+                "the warmer did not index paced land {k}\n{}",
+                server.log_text()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    // Not in Git's history below: what is compared is what `after` holds.
+    let paced_patches = sizes(&stores).patches - after.patches;
     drop(server);
 
     // Git's size for the same history.
@@ -509,18 +605,34 @@ fn storage_stays_within_its_budgets() {
     let git_bytes = dir_bytes(&repo.join(".git/objects"));
 
     let blob_per_land = (after.blobs.saturating_sub(before.blobs)) / LANDS as u64;
+    let search_per_land = (after.search_blobs - before.search_blobs).max(0) as u64 / LANDS as u64;
+    // What whole rows (`blob-trigrams-v1`) of the landed versions would take.
+    let whole_per_land = landed
+        .iter()
+        .flat_map(|(files, _)| files.iter())
+        .map(|(_, body)| {
+            32 + leep_derive::search::trigram::BlobRow::of(body.as_bytes())
+                .encode()
+                .len() as u64
+        })
+        .sum::<u64>()
+        / LANDS as u64;
+    let search_share = search_per_land as f64 / whole_per_land.max(1) as f64;
     let db_per_land = (after.db.saturating_sub(before.db)) / LANDS as u64;
     let total = after.blobs + after.db.saturating_sub(empty.db);
     let ratio = total as f64 / git_bytes as f64;
     let report = format!(
         "[{backend}] blobs {} -> {} ({blob_per_land} per land), db {} -> {} above {} \
          ({db_per_land} per land), total {total} = {ratio:.2}x git ({git_bytes}), \
-         blob store ratio {size_ratio:?}, dictionary {dictionary:?}, {:.1}s",
+         blob store ratio {size_ratio:?}, dictionary {dictionary:?}, search blob rows \
+         {search_per_land} per land ({search_share:.2} of whole rows' {whole_per_land}), {} \
+         patches over {PACED_LANDS} paced lands, {:.1}s",
         before.blobs,
         after.blobs,
         before.db - empty.db,
         after.db - empty.db,
         empty.db,
+        paced_patches,
         started.elapsed().as_secs_f64()
     );
     println!("{report}");
@@ -546,6 +658,21 @@ fn storage_stays_within_its_budgets() {
         budgets.blob_store_ratio
     );
     assert!(dictionary.unwrap_or(0.0) >= 1.0, "no dictionary: {report}");
+    assert!(
+        search_per_land <= budgets.search_blob_per_land,
+        "search blob rows per land over budget ({}): {report}",
+        budgets.search_blob_per_land
+    );
+    assert!(
+        paced_patches >= PACED_LANDS as i64 - 1,
+        "fewer than {} of {PACED_LANDS} paced lands stored a patch: {report}",
+        PACED_LANDS - 1
+    );
+    assert!(
+        search_share <= budgets.search_blob_share,
+        "search blob rows over {} of whole rows: {report}",
+        budgets.search_blob_share
+    );
     let out = server_cmd(&stores, &["verify", "--full"]);
     assert_ok(&out, "leep-server verify --full");
     drop(pg);

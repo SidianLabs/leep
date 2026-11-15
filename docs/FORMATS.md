@@ -51,7 +51,9 @@ skill.
 | derived `gc-fence-active-v1` | — | `MetaStore.derived`, one row, key = 32 zero bytes, value = unix seconds the current changeset condemnation round began, 8-byte big-endian `i64`, or 0 when none is under way |
 | derived `cs-tombstone-v1` | — | `MetaStore.derived`, key = id of a changeset the sweep deleted, value = deletion time (8-byte big-endian `i64`, the sweep host's clock), then the changeset's root tree hash (32 bytes) when it had a `root_tree` row. Written before the delete, dropped after `--tombstone-retention`; blob GC keeps the root trees of those within `--backup-fence` (ADR 0059 section 11) |
 | derived `cs-reach-v1` | — | `MetaStore.derived`, key = changeset id, value = the single byte `0x01` (a present row counts whatever it reads): a ref or ref log entry reaches the changeset, and every parent has a row. Written parents first (ADR 0059). One more row, key = 32 zero bytes, holds the `seq` of the newest ref log entry the rows cover (8-byte big-endian) |
-| derived `blob-trigrams-v1` | — | `MetaStore.derived`, key = blob hash, value = see "Code search index" below |
+| derived `blob-trigrams-v2` | — | `MetaStore.derived`, key = blob hash, value = see "Code search index" below (ADR 0102); deleted by the search row retention once no ref head has held the blob for `--search-retention` |
+| derived `blob-trigrams-keyframe-v2` | — | `MetaStore.derived`, key = blob hash, value = that blob's whole trigram set as in `blob-trigrams-v2` (`0x01` then the codes); only ever written with that one encoding, before any patch on it, and never deleted but by `repair drop --kind blob-trigrams-v2` (ADR 0102) |
+| retired `blob-trigrams-v1` | — | the same key, value = a whole row (`0x00 0x01`, `0x00 0x02` or `0x01` then the codes, the encodings `blob-trigrams-v2` keeps for whole rows); written by servers before ADR 0102; read by current servers only where a blob has no `blob-trigrams-v2` row, never written; deleted by retention like v2 rows and removed with `repair drop --kind blob-trigrams-v1` |
 | derived `tree-trigrams-v2` | — | `MetaStore.derived`, key = tree node hash (`TreeNode::hash()`), value = see "Code search index" below (ADR 0094) |
 | derived `tree-trigrams-keyframe-v2` | — | `MetaStore.derived`, key = tree node hash, value = the whole filter of that directory, dense or sparse as in `tree-trigrams-v2`; only ever written with that one encoding, before any patch on it (ADR 0094) |
 | retired `tree-trigrams-v1` | — | the same key, value = a whole filter, dense or sparse; written by servers before ADR 0094; never read by current servers; removed with `repair drop --kind tree-trigrams-v1` |
@@ -177,26 +179,58 @@ config on reload).
 
 ## Code search index (new derived kinds, no other format change)
 
-ADR 0014, ADR 0094. Three kinds, never deleted: `blob-trigrams-v1` and
-`tree-trigrams-keyframe-v2` are pure functions of content-addressed input, and
-a `tree-trigrams-v2` row may also depend on the row its predecessor had when it
-was derived. Golden bytes are asserted in `leep-derive` (`blob_row_golden_bytes`,
-`bloom_positions_are_frozen`, `tree_row_golden_bytes`, `keyframe_rule`); any
-change to an encoding, a constant below or the definition of "text" is a new
-kind name.
+ADR 0014, ADR 0094, ADR 0102. Four kinds: the keyframes
+(`tree-trigrams-keyframe-v2`, `blob-trigrams-keyframe-v2`) are pure
+functions of content-addressed input, and a `tree-trigrams-v2` or
+`blob-trigrams-v2` row may also depend on the row its predecessor had when
+it was derived. Only the search row retention deletes rows, and only
+`blob-trigrams-v2` (and retired `blob-trigrams-v1`) rows of blobs no ref
+head has held for `--search-retention`; a row is derived again when a search
+needs it. Golden bytes are asserted in `leep-derive` (`blob_row_golden_bytes`,
+`blob_v2_row_golden_bytes`, `bloom_positions_are_frozen`,
+`tree_row_golden_bytes`, `keyframe_rule`, `blob_keyframe_rule`); any change to
+an encoding, a constant below or the definition of "text" is a new kind
+name.
 
 A *trigram* is three consecutive bytes `b0 b1 b2`, coded `b0<<16 | b1<<8 | b2`
 (24 bits). A blob is *indexed* iff it is at most 1 048 576 bytes, contains no
 NUL byte and is valid UTF-8. The empty blob is indexed with an empty set. Symlink
 entries are never indexed or searched.
 
-**`blob-trigrams-v1`** value, by first byte:
+**`blob-trigrams-v2`** value, by first byte (the first three are the retired
+`blob-trigrams-v1` encoding, byte for byte, so a v1 row reads as a whole v2
+row):
 - `0x00 0x01`: not indexed, binary (NUL or invalid UTF-8);
 - `0x00 0x02`: not indexed, over the size cap (recorded without reading the blob);
 - `0x01` then the sorted, deduplicated trigram codes of the blob as LEB128 varints
   of the deltas, the first relative to zero. Delta 0 after the first value, a
   non-minimal varint, a value of 2^24 or more, and a trailing partial varint are
   invalid.
+- `0x02` *patch*: then the 32-byte hash of a blob `K`, a varint `n`, `n` bytes
+  of added codes and, to the end of the row, removed codes, both lists
+  strictly increasing delta varints as above (each below 2^24). The set is
+  that of the `blob-trigrams-keyframe-v2` row of `K`, which must start with
+  `0x01`, with the removed codes taken out and the added ones put in. Every
+  removed code must be in the keyframe's set and every added one not. A patch
+  on its own blob with both lists empty (`n` = 0) starts a new keyframe.
+
+A blob's *predecessor* is the file at the same path in the predecessor of
+its directory (the directory's predecessor as for `tree-trigrams-v2` below),
+when that is a different, non-symlink blob. A blob without one, not
+indexed, or derived by a search or a bounded query, is stored whole. With
+one whose row is a patch on `K`, it is stored as a patch on `K` if `p < w`
+and `p² <= 128 × w`, `p` being the patch's length and `w` the length of its
+own whole (`0x01`) row. With one whose row is whole and indexed, the same
+rule decides a patch on the predecessor, whose `blob-trigrams-keyframe-v2`
+row (its whole row, `0x01` then the codes) is written first. Otherwise, a
+whole row of at least 128 bytes starts a new keyframe (its whole row as its
+`blob-trigrams-keyframe-v2` row, written first, and the empty patch on
+itself) and a shorter one is stored whole. Two derivations from different
+predecessors may store different rows for one blob; both stand for the same
+set, which is what `verify` compares.
+
+**`blob-trigrams-keyframe-v2`** value: `0x01` then the codes, as above: the
+blob's whole set, never "not indexed".
 
 **`tree-trigrams-v2`** value: a bloom filter of 2^19 bits with 3 hash functions
 over the trigram codes of all indexed blobs below the directory (recursively;
@@ -241,6 +275,9 @@ compares.
 directory's whole filter, never saturated.
 
 The rows are lazily derived. A search over `path` derives only the subtree.
+A search reads a blob's `blob-trigrams-v2` row and, for a patch, its keyframe;
+for a blob without a v2 row it reads the `blob-trigrams-v1` row if the store
+holds any v1 rows (counted at most every 10 minutes per process).
 
 The `/v1/search/{rev}` endpoint only adds an endpoint and types (`SearchResponse`,
 `SearchMatch`, `SearchRange`, `SearchStats`), all with `#[serde(default)]` fields.

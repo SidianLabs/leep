@@ -25,6 +25,7 @@ pub mod read_limits;
 pub mod reload;
 pub mod review;
 mod review_requests;
+pub mod search_retention;
 pub mod sessions;
 pub mod signing;
 pub mod timing;

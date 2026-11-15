@@ -44,6 +44,7 @@ fn holder_name(job: &str) -> String {
 /// the renewals, and the lease then lapses after [`GC_LEASE_TTL`].
 pub struct GcLease {
     meta: Arc<dyn MetaStore>,
+    key: LeaseKey,
     holder: String,
     epoch: u64,
     lost: Arc<AtomicBool>,
@@ -59,14 +60,26 @@ impl GcLease {
     /// another holder's lease is live. A store without leases (test doubles
     /// only; every backend has them) runs unguarded, with a warning.
     pub async fn acquire(meta: &Arc<dyn MetaStore>, job: &str) -> Result<Option<GcLease>> {
+        Self::acquire_key(meta, LeaseKey::gc(), job).await
+    }
+
+    /// [`GcLease::acquire`] of another store-wide lease, held and renewed
+    /// the same way: the search row retention's (ADR 0102), so one server
+    /// at a time runs it.
+    pub async fn acquire_key(
+        meta: &Arc<dyn MetaStore>,
+        key: LeaseKey,
+        job: &str,
+    ) -> Result<Option<GcLease>> {
         if !meta.supports_leases() {
             tracing::warn!(
                 job,
-                "this metadata store has no leases: one GC at a time is not enforced"
+                scope = %key.scope,
+                "this metadata store has no leases: one run at a time is not enforced"
             );
             return Ok(None);
         }
-        let key = &LeaseKey::gc();
+        let key = &key;
         let take = |holder: String| async move {
             let claim = LeaseClaim {
                 key,
@@ -97,9 +110,14 @@ impl GcLease {
             ABANDONED.lock().unwrap().retain(|h| *h != holder);
         }
         if lease.holder != holder {
+            let what = if *key == LeaseKey::gc() {
+                "another garbage collection is running".to_string()
+            } else {
+                format!("another {} run holds the {} lease", key.name, key.scope)
+            };
             return Err(Error::Conflict(format!(
-                "another garbage collection is running ({}, holder {}, {}s left on its lease); \
-                 only one GC runs at a time (ADR 0059)",
+                "{what} ({}, holder {}, {}s left on its lease); \
+                 only one runs at a time (ADR 0059)",
                 if lease.meta.is_empty() {
                     "unknown job"
                 } else {
@@ -113,6 +131,7 @@ impl GcLease {
         let last_ok = Arc::new(std::sync::Mutex::new(sent));
         let renewer = tokio::spawn(renew(
             meta.clone(),
+            key.clone(),
             holder.clone(),
             lease.epoch,
             lost.clone(),
@@ -120,6 +139,7 @@ impl GcLease {
         ));
         Ok(Some(GcLease {
             meta: meta.clone(),
+            key: key.clone(),
             holder,
             epoch: lease.epoch,
             lost,
@@ -152,7 +172,8 @@ impl GcLease {
         let since = self.last_ok.lock().unwrap().elapsed();
         if self.lost.load(Ordering::SeqCst) || since >= GC_LEASE_TTL - GC_LEASE_RENEW {
             return Err(Error::Conflict(format!(
-                "lost the gc lease (not renewed for {}s, TTL {}s); stopping",
+                "lost the {} lease (not renewed for {}s, TTL {}s); stopping",
+                self.key.scope,
                 since.as_secs(),
                 GC_LEASE_TTL.as_secs()
             )));
@@ -168,7 +189,7 @@ impl GcLease {
         // Abandoned until the release is confirmed, as in `acquire`.
         ABANDONED.lock().unwrap().push(self.holder.clone());
         self.meta
-            .release_lease(&LeaseKey::gc(), &self.holder, self.epoch)
+            .release_lease(&self.key, &self.holder, self.epoch)
             .await?;
         ABANDONED.lock().unwrap().retain(|h| *h != self.holder);
         Ok(())
@@ -208,12 +229,12 @@ pub async fn release<T>(lease: Option<GcLease>, result: Result<T>) -> Result<T> 
 
 async fn renew(
     meta: Arc<dyn MetaStore>,
+    key: LeaseKey,
     holder: String,
     epoch: u64,
     lost: Arc<AtomicBool>,
     shared_ok: Arc<std::sync::Mutex<tokio::time::Instant>>,
 ) {
-    let key = LeaseKey::gc();
     let mut last_ok = *shared_ok.lock().unwrap();
     loop {
         tokio::time::sleep(GC_LEASE_RENEW).await;
@@ -231,7 +252,7 @@ async fn renew(
                 return;
             }
             Err(e) => {
-                tracing::warn!(error = %e, "renewing the gc lease failed");
+                tracing::warn!(error = %e, scope = %key.scope, "renewing a lease failed");
                 // Give up a renewal short of the TTL, so the run stops
                 // before another holder could take the lease.
                 if last_ok.elapsed() + GC_LEASE_RENEW >= GC_LEASE_TTL {

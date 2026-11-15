@@ -497,7 +497,7 @@ impl Repo {
                         self.tree_row(*tree, &counters).await.map(|_| ())
                     }
                     Some(SearchStart::File { content, size }) => self
-                        .blob_row_bytes(*content, *size, &counters)
+                        .blob_row_stored(*content, *size, &counters)
                         .await
                         .map(|_| ()),
                 };
@@ -657,8 +657,10 @@ impl Repo {
     /// search whose starting directory has no stored row yet (computing it
     /// fetches up to the budget from the blob store, so it is done only once
     /// the row exists or the wait is over), or a walk of which more than the
-    /// budget of what the last check found missing still lacks rows. Rows
-    /// are never removed by an indexer, so those are still missing now.
+    /// budget of what the last check found missing still lacks rows. Per
+    /// changeset rows are never removed by an indexer, so those are still
+    /// missing now; search blob rows may be (ADR 0102), which only makes
+    /// a search start look cheaper than it is.
     async fn still_over(
         &self,
         group: IndexGroup,
@@ -698,6 +700,10 @@ impl Repo {
                 *size > crate::search::MAX_INDEXED_BYTES
                     || meta
                         .get_derived(crate::search::BLOB_KIND, content)
+                        .await?
+                        .is_some()
+                    || meta
+                        .get_derived(crate::search::RETIRED_BLOB_KIND, content)
                         .await?
                         .is_some()
             }

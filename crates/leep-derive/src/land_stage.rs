@@ -709,6 +709,15 @@ impl MetaStore for StagedMeta {
         self.inner.list_derived(kind, after, limit).await
     }
 
+    async fn list_derived_keys(
+        &self,
+        kind: &str,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> Result<Vec<Hash>> {
+        self.inner.list_derived_keys(kind, after, limit).await
+    }
+
     async fn get_derived(&self, kind: &str, key: &Hash) -> Result<Option<Bytes>> {
         Ok(self.get_derived_many(kind, &[*key]).await?.pop().flatten())
     }
