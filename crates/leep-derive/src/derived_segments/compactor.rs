@@ -119,6 +119,11 @@ pub struct CompactOptions {
     /// store then gives the lease up between passes, so `repair` is not
     /// kept waiting for the whole backfill.
     pub max_seal_pages: usize,
+    /// Most rows one pass deletes, and the longest it spends deleting: a
+    /// pass then gives the lease up, so `repair` (which waits up to two
+    /// minutes for it) is not starved, and the next pass goes on soon.
+    pub max_retire_rows: usize,
+    pub max_retire_time: Duration,
     /// In mode `build`, the rows are listed again only once their estimated
     /// count grew by `seal_rows` since the last listing, or this long after
     /// it (so a quiet store's idle seal still happens).
@@ -142,6 +147,8 @@ impl Default for CompactOptions {
             batch: 1000,
             rest_factor: 1,
             max_seal_pages: 4,
+            max_retire_rows: 65_536,
+            max_retire_time: Duration::from_secs(60),
             list_every: Duration::from_secs(600),
             pause: None,
         }
@@ -164,6 +171,8 @@ impl CompactOptions {
             batch: 7,
             rest_factor: 0,
             max_seal_pages: 64,
+            max_retire_rows: usize::MAX,
+            max_retire_time: Duration::from_secs(3600),
             list_every: Duration::ZERO,
             pause: None,
         }
@@ -211,7 +220,9 @@ pub struct CompactState {
     /// was killed between rows and changeset): skipped until the next
     /// listing after `list_every`.
     unstored: HashSet<Hash>,
-    /// The last listing: when, the estimated row count then, and the keys.
+    /// When `unstored` was last cleared.
+    unstored_cleared: Option<Instant>,
+    /// The last listing: when, and the estimated row count then.
     listed: Option<(Instant, u64)>,
 }
 
@@ -243,6 +254,9 @@ pub struct PassReport {
     pub newer_manifest: bool,
     /// Whether the rows were listed (in mode `build` only when they grew).
     pub listed: bool,
+    /// Whether the pass stopped with work left (seal candidates beyond its
+    /// pages, rows beyond its retire bound): the next pass should run soon.
+    pub more: bool,
 }
 
 /// A row to retire: its key and column, its holding segment and where.
@@ -314,6 +328,10 @@ pub(crate) struct Pass<'a> {
     blocks: HashMap<(Hash, usize, usize), Arc<Block>>,
     /// Keys with rows, and which of the two kinds they have rows of.
     rows: Option<HashMap<Hash, u8>>,
+    /// Live segments whose data this pass could not read: no merge or
+    /// retire uses them again in this pass, and the next pass probes them
+    /// whole.
+    unreadable: HashSet<Hash>,
     report: PassReport,
 }
 
@@ -368,6 +386,7 @@ impl<'a> Pass<'a> {
             data: HashMap::new(),
             blocks: HashMap::new(),
             rows: None,
+            unreadable: HashSet::new(),
             report,
         };
         if !p.report.newer_manifest {
@@ -380,6 +399,32 @@ impl<'a> Pass<'a> {
     /// view (whose state a reader's transient error or a late read may
     /// have moved). A transient read error fails the pass.
     async fn load_segments(&mut self) -> Result<()> {
+        // Decoded indexes the view already holds are reused: an index is
+        // immutable and checked by address when loaded, so only the view's
+        // list of segments and its broken set are its own state.
+        let held: HashMap<Hash, Arc<codec::SegmentIndex>> = self
+            .repo
+            .segments()
+            .segments()
+            .into_iter()
+            .map(|l| (l.r.index, l.idx.clone()))
+            .collect();
+        for s in &self.man.live {
+            if self.segs.contains_key(&s.index) {
+                continue;
+            }
+            if let Some(idx) = held.get(&s.index) {
+                if idx.data == s.data && idx.len() == s.rows as usize {
+                    self.segs.insert(
+                        s.index,
+                        Arc::new(Live {
+                            r: *s,
+                            idx: idx.clone(),
+                        }),
+                    );
+                }
+            }
+        }
         let missing: Vec<SegmentRef> = self
             .man
             .live
@@ -473,7 +518,8 @@ impl<'a> Pass<'a> {
                 bad.push(s);
             }
         }
-        let careful = !bad.is_empty() && feature_recorded(self.features).await?;
+        let careful =
+            !bad.is_empty() && (state.feature_recorded || feature_recorded(self.features).await?);
         let mut gone = Vec::new();
         let mut suspect = HashSet::new();
         for s in bad {
@@ -529,6 +575,17 @@ impl<'a> Pass<'a> {
             let l = self.segs.get(&s.index)?;
             l.idx.locate(key, col).map(|loc| (l.clone(), loc))
         })
+    }
+
+    /// A live segment whose data this pass could not read: skipped for the
+    /// rest of the pass, and read whole by the next pass's probe (which
+    /// drops it, or on a store with the feature counts it toward the two
+    /// passes that must agree).
+    fn mark_unreadable(&mut self, index: Hash, state: &mut CompactState) {
+        if self.unreadable.insert(index) {
+            tracing::warn!(segment = %index, "a derived segment's data cannot be read now");
+        }
+        state.verified.remove(&index);
     }
 
     /// The data blob of `live`, read once per pass. `None`: not readable.
@@ -604,10 +661,11 @@ impl<'a> Pass<'a> {
             return Ok(());
         }
         if state
-            .listed
-            .is_none_or(|(at, _)| at.elapsed() >= self.opts.list_every)
+            .unstored_cleared
+            .is_none_or(|at| at.elapsed() >= self.opts.list_every)
         {
             state.unstored.clear();
+            state.unstored_cleared = Some(Instant::now());
         }
         state.listed = Some((Instant::now(), estimate));
         self.report.listed = true;
@@ -705,6 +763,12 @@ impl<'a> Pass<'a> {
             }
         }
         order.sort_unstable();
+        if order.len() > self.opts.max_rows.max(1) * self.opts.max_seal_pages.max(1) {
+            // Candidates beyond this pass's pages: list again next pass and
+            // run it soon (a backfill).
+            self.report.more = true;
+            state.listed = None;
+        }
         for page in order
             .chunks(self.opts.max_rows.max(1))
             .take(self.opts.max_seal_pages.max(1))
@@ -782,7 +846,9 @@ impl<'a> Pass<'a> {
     /// changesets no longer stored (the changeset sweep) are left out.
     async fn merge(&mut self, state: &mut CompactState) -> Result<()> {
         let f = self.opts.fanout.max(2);
-        'runs: loop {
+        // Each round merges (the live list shrinks) or skips a segment (the
+        // skip set grows), so it ends; the bound is defense in depth.
+        for _ in 0..4 * self.man.live.len() + 16 {
             let live = self.man.live.clone();
             // The first run of `f` adjacent loaded segments of one tier;
             // of it, the longest prefix (two or more) within the caps.
@@ -801,10 +867,11 @@ impl<'a> Pass<'a> {
             let found = (0..live.len().saturating_sub(f - 1)).find_map(|i| {
                 let run = &live[i..i + f];
                 let t = self.opts.tier(run[0].rows);
-                if !run
-                    .iter()
-                    .all(|s| self.opts.tier(s.rows) == t && self.segs.contains_key(&s.index))
-                {
+                if !run.iter().all(|s| {
+                    self.opts.tier(s.rows) == t
+                        && self.segs.contains_key(&s.index)
+                        && !self.unreadable.contains(&s.index)
+                }) {
                     return None;
                 }
                 let k = fits(run);
@@ -815,16 +882,14 @@ impl<'a> Pass<'a> {
                 return Ok(());
             };
             let run: Vec<SegmentRef> = live[at..at + k].to_vec();
+            let mut unreadable = None;
             // Oldest first, so a newer segment's value replaces an older's.
             let mut values: HashMap<(Hash, u8), Bytes> = HashMap::new();
             for s in &run {
                 let l = self.segs[&s.index].clone();
                 let Some(data) = self.data_of(&l).await? else {
-                    // Unreadable now: leave the run for a later pass; the
-                    // next check of live segments decides about it.
-                    self.forget_data();
-                    state.verified.remove(&s.index);
-                    continue 'runs;
+                    unreadable = Some(s.index);
+                    break;
                 };
                 for (key, col, v) in codec::read_all(&l.idx, &data)? {
                     if s.has(col) {
@@ -833,6 +898,12 @@ impl<'a> Pass<'a> {
                 }
             }
             self.forget_data();
+            if let Some(index) = unreadable {
+                // Unreadable now: no run uses it again in this pass, and
+                // the next pass reads it whole and decides about it.
+                self.mark_unreadable(index, state);
+                continue;
+            }
             let mut keys: Vec<Hash> = values.keys().map(|(k, _)| *k).collect();
             keys.sort_unstable();
             keys.dedup();
@@ -874,6 +945,8 @@ impl<'a> Pass<'a> {
             self.report.merges += 1;
             self.report.merged_away += k as u64;
         }
+        tracing::warn!("derived segment merges stopped at their round bound");
+        Ok(())
     }
 
     /// Delete rows a live segment, seen live for at least
@@ -914,6 +987,7 @@ impl<'a> Pass<'a> {
                     continue;
                 };
                 if !ripe.contains(&l.r.index)
+                    || self.unreadable.contains(&l.r.index)
                     || state.mismatched.get(&(*k, col)) == Some(&l.r.index)
                 {
                     continue;
@@ -924,12 +998,22 @@ impl<'a> Pass<'a> {
         self.rows = Some(rows);
         let mut segs: Vec<Hash> = by_seg.keys().copied().collect();
         segs.sort_unstable();
+        let retire_started = std::time::Instant::now();
         for seg in segs {
             let mut cands = by_seg.remove(&seg).unwrap_or_default();
             cands.sort_unstable_by_key(|(k, c, _, _)| (*c, *k));
             for (col, kind) in KINDS {
                 let mine: Vec<&Candidate> = cands.iter().filter(|(_, c, _, _)| *c == col).collect();
                 for chunk in mine.chunks(self.opts.batch.max(1)) {
+                    if self.report.retired_rows as usize >= self.opts.max_retire_rows
+                        || retire_started.elapsed() >= self.opts.max_retire_time
+                    {
+                        self.report.more = true;
+                        return Ok(());
+                    }
+                    if self.unreadable.contains(&seg) {
+                        break;
+                    }
                     let started = std::time::Instant::now();
                     let ks: Vec<Hash> = chunk.iter().map(|(k, _, _, _)| *k).collect();
                     let got = self.repo.row_meta().get_derived_many(kind, &ks).await?;
@@ -937,6 +1021,7 @@ impl<'a> Pass<'a> {
                     for ((k, _, l, loc), row) in chunk.iter().zip(got) {
                         let Some(row) = row else { continue };
                         let Some(value) = self.value_at(l, *loc, col).await? else {
+                            self.mark_unreadable(l.r.index, state);
                             continue;
                         };
                         let equal = if col == COL_HISTORY_TREE {

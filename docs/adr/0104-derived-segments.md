@@ -110,7 +110,10 @@ drop` refuses the kind.
   a damaged row, whose number is unknown, still sorts after what readers
   hold). A reader never applies a manifest older than the one it uses, so
   a read that raced a newer write cannot take it back to segments a merge
-  has retired.
+  has retired. Two consequences: if an earlier writer's clock was ahead, a
+  manifest written over a damaged row is ignored by running servers until
+  the clocks catch up; and a restored database may hold an older manifest
+  than servers hold. Restart servers after either (OPERATIONS.md).
 - **Damage and newer formats.** A row whose checksum fails is damaged. A
   row whose checksum holds but whose version, flags or family this binary
   does not know was written by a newer binary: it is never treated as
@@ -140,7 +143,8 @@ pass), and:
    manifest swapped to name them. A backfill is the same step, restartable
    anywhere, since "already sealed" is read from the manifest; a pass seals
    at most four pages and gives the lease up, so a long backfill does not
-   keep `repair` waiting. Keys whose changeset is no longer stored are
+   keep `repair` waiting; a pass that left candidates says so, lists again
+   next time and is followed 5 s later instead of after the interval. Keys whose changeset is no longer stored are
    remembered and skipped until the next periodic listing.
 2. **Merges** runs of four adjacent live segments of one tier (`floor(log4(keys
    / 1,024))`), the longest prefix of the run that fits the caps (two or
@@ -160,7 +164,8 @@ pass), and:
    again while the same segment holds the key. The store feature
    `derived-segments` is recorded before the first delete of each process.
    Candidates are taken one holding segment at a time, so one data blob is
-   in memory at once.
+   in memory at once. A pass deletes at most 65,536 rows or for at most a
+   minute, then gives the lease up and is followed 5 s later.
 
 It probes every live segment itself: the index blob, and the data blob read
 whole and decoded the first time this process sees the segment (only its
@@ -169,7 +174,13 @@ presence afterwards). A segment whose blobs are definitely lost or damaged
 is dropped from the manifest (its keys read as rows or derive again, and
 seal again); on a store with the feature `derived-segments` recorded, only
 when two passes in a row agree, so a blob a repack was moving is not lost
-for good. Any other read error fails the pass and drops nothing. Retired
+for good (counted as such also on a store that cannot record features
+once this process has retired rows). Any other read error fails the pass
+and drops nothing. A segment whose data a merge or a retirement cannot read
+is left alone for the rest of the pass (a merge never picks it again, so
+the pass ends) and read whole by the next pass's probe. Decoded indexes the
+read view already holds are reused (immutable, checked by address); its
+segment list and broken set are not. Retired
 blobs no longer stored are forgotten. A manifest that does not decode is
 replaced only by a pass in mode `build` on a store without the feature
 recorded (asked of the store, not this process's flag: another server may
@@ -240,7 +251,10 @@ them; `leep_derived_segment_index_bytes` reports what they hold.
   from the old manifest until they read it again, up to a minute (they do
   so at their next miss after 60 s): the values are the same pure
   functions, but to make every server derive again at once, restart them
-  or wait a minute (OPERATIONS.md, "Derived segments").
+  or wait a minute (OPERATIONS.md, "Derived segments"). Within that minute
+  a server may derive and store new rows from a stale segment value, so a
+  drop meant to purge wrong values needs the other servers stopped or
+  restarted first, or a second drop after a minute.
 - **`repair rederive`** of the two kinds writes rows where the value read
   (row or segment) is missing or wrong; rows win. It holds the lease, and a
   pass deletes a row only if it still holds the bytes the pass compared, so
@@ -323,6 +337,11 @@ the operating system only on `VACUUM FULL derived` (or `pg_repack`) and
   one segment of 0.27 MB, as the design's model said; about 1,264 bytes of
   rows a changeset become about 120. Before a vacuum Postgres keeps the
   freed pages for later rows.
+- Changed after a second review: a merge or retirement skips a segment
+  it cannot read for the rest of the pass (it used to pick the same run
+  again forever with the lease held); backfills and long retirements are
+  bounded per pass and continued 5 s later; passes reuse the view's decoded
+  indexes; the Postgres conditional delete locks rows in key order.
 - Changed after review, before release: the manifest gained its sequence
   number; a damaged manifest is replaced only where the store has no
   `derived-segments` feature, and a newer one never; passes load and probe

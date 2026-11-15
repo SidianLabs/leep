@@ -3803,12 +3803,25 @@ segment, is missing or wrong; the row then wins. `repair drop --kind
 skiplist` (or `history-tree-v4`) first stops every segment answering for
 that kind (its column is cleared in the manifest), then deletes the rows,
 so everything derives again. Both hold the derived-segments lease, waiting
-up to two minutes for a running pass (a pass seals at most four segments of
-16,384 changesets, then gives the lease up); `repair drop` refuses
+up to two minutes for a running pass (a pass seals at most four pages of
+16,384 changesets and deletes at most 65,536 rows or for at most a minute,
+then gives the lease up, and the next pass follows 5 s later while work is
+left); `repair drop` refuses
 `derived-segments-v1` itself. **Other running servers keep answering from
 the segments for up to a minute** (they read the manifest again at their
 next miss after 60 s): restart them, or wait a minute, before checking
-that a dropped kind derives again, as for the search kinds above. A pass
+that a dropped kind derives again, as for the search kinds above. Within
+that minute such a server may also derive and store new rows from a stale
+segment value; when a drop is meant to purge wrong values, stop or restart
+the other servers before the drop, or drop again after a minute.
+
+**Restart servers after a damaged manifest is replaced, or after a
+metadata restore.** A manifest written over a damaged row takes the
+writer's clock as its sequence number; if an earlier writer's clock was
+ahead, running servers keep the manifest they hold (they never apply a
+lower sequence) until the clocks catch up. A restored database can hold a
+manifest older than the one servers hold, for the same reason. A restart
+reads the manifest afresh. A pass
 deletes a row only if it still holds the bytes it compared, so a row
 `repair rederive` wrote is never deleted as equal to the old value.
 
@@ -3817,7 +3830,10 @@ estimated count grew by 1,024 since its last listing, or 10 minutes
 passed. It never replaces a manifest written by a newer `leep-server`, and
 replaces a damaged one only if the store has no `derived-segments` feature
 recorded. On a store with the feature it drops a segment it cannot read
-only when two passes in a row agree.
+only when two passes in a row agree (also on stores that cannot record
+features, once this process has retired rows). A pass that cannot read a
+segment's data while merging or retiring leaves it alone for the rest of
+the pass, and the next pass reads it whole.
 
 **Backups and restores.** Segments are blobs, so `backup` copies them. A
 metadata snapshot can name a segment the blob copy lacks (sealed between

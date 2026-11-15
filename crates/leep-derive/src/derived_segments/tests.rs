@@ -861,6 +861,10 @@ async fn a_lost_segment_reads_as_missing_rows() {
     assert_eq!(values(&r, &ids).await, want);
     // Reading derived the values again as rows; a pass drops the segment
     // and seals them again.
+    // This process retired rows, so it drops a segment only when two
+    // passes agree.
+    let p = pass(&r, &CompactOptions::small(Mode::Build), &mut st, None).await;
+    assert_eq!(p.dropped, 0, "{p:?}");
     let p = pass(&r, &CompactOptions::small(Mode::Build), &mut st, None).await;
     assert_eq!(p.dropped, 1, "{p:?}");
     let (_, ManifestRead::Read(m)) = read_manifest(&r).await.unwrap() else {
@@ -1563,4 +1567,108 @@ async fn build_mode_lists_rows_only_when_they_grew() {
     assert!(!pass(&r, &opts, &mut st, None).await.listed);
     tokio::time::advance(Duration::from_secs(600)).await;
     assert!(pass(&r, &opts, &mut st, None).await.listed);
+}
+
+/// Four small segments of one tier, sealed without merging.
+async fn four_segments(r: &Repo, st: &mut CompactState) -> Vec<SegmentRef> {
+    let opts = CompactOptions {
+        fanout: 64,
+        ..CompactOptions::small(Mode::Build)
+    };
+    let mut tip = commit(r, &[], &[("f", Some("0"))], "0").await;
+    for b in 0..4 {
+        for i in 0..4 {
+            tip = commit(r, &[tip], &[("f", Some(&format!("{b}.{i}")))], "x").await;
+        }
+        derive::<HistoryTree>(r, tip).await.unwrap();
+        pass(r, &opts, st, None).await;
+    }
+    let (_, ManifestRead::Read(m)) = read_manifest(r).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(m.live.len(), 4, "{m:?}");
+    m.live
+}
+
+/// A merge whose run holds a segment it cannot read skips that segment for
+/// the rest of the pass instead of picking the same run forever (with the
+/// lease held). On a store with the feature the next passes drop it once
+/// two agree.
+#[tokio::test(start_paused = true)]
+async fn a_merge_over_an_unreadable_segment_ends_the_pass() {
+    let r = repo();
+    let mut st = CompactState::default();
+    let live = four_segments(&r, &mut st).await;
+    r.blobs().delete(&live[1].data).await.unwrap();
+    let f = recorded_features();
+    let merge = CompactOptions::small(Mode::Build);
+    let p = tokio::time::timeout(
+        Duration::from_secs(30),
+        compact_pass(&r, &merge, &mut st, Some(&f)),
+    )
+    .await
+    .expect("the pass ends")
+    .unwrap()
+    .expect("lease");
+    assert_eq!((p.merges, p.dropped), (0, 0), "{p:?}");
+    // The lease was given up: the next pass runs, and agrees.
+    let p = pass(&r, &merge, &mut st, Some(&f)).await;
+    assert_eq!(p.dropped, 1, "{p:?}");
+}
+
+/// In mode build, a segment verified earlier whose data later reads
+/// damaged: the merge skips it, the next pass reads it whole and drops it.
+#[tokio::test(start_paused = true)]
+async fn a_verified_segment_turning_corrupt_is_dropped_next_pass() {
+    let r = repo();
+    let mut st = CompactState::default();
+    let live = four_segments(&r, &mut st).await;
+    r.blobs().delete(&live[2].data).await.unwrap();
+    r.blobs()
+        .put_with_hash(
+            live[2].data,
+            Bytes::from_static(b"leep:derived-segment-data-v1\0x"),
+        )
+        .await
+        .unwrap();
+    let merge = CompactOptions::small(Mode::Build);
+    let p = tokio::time::timeout(
+        Duration::from_secs(30),
+        compact_pass(&r, &merge, &mut st, None),
+    )
+    .await
+    .expect("the pass ends")
+    .unwrap()
+    .expect("lease");
+    assert_eq!(p.dropped, 0, "{p:?}");
+    let p = pass(&r, &merge, &mut st, None).await;
+    assert_eq!(p.dropped, 1, "{p:?}");
+}
+
+/// A first seal of more candidates than a pass's pages says there is more,
+/// and the next pass lists again and goes on.
+#[tokio::test]
+async fn a_backfill_continues_promptly() {
+    let r = repo();
+    let ids = build(&r, None).await;
+    let opts = CompactOptions {
+        max_rows: 8,
+        max_seal_pages: 2,
+        list_every: Duration::from_secs(600),
+        fanout: 64,
+        ..CompactOptions::small(Mode::Build)
+    };
+    let mut st = CompactState::default();
+    let p = pass(&r, &opts, &mut st, None).await;
+    assert!(p.more && p.sealed_keys == 16, "{p:?}");
+    let mut sealed = p.sealed_keys;
+    for _ in 0..20 {
+        let p = pass(&r, &opts, &mut st, None).await;
+        assert!(p.listed || p.sealed_keys == 0, "{p:?}");
+        sealed += p.sealed_keys;
+        if !p.more {
+            break;
+        }
+    }
+    assert_eq!(sealed as usize, ids.len());
 }

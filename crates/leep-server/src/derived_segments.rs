@@ -11,6 +11,10 @@ use leep_derive::derived_segments::{
 };
 use leep_derive::Repo;
 
+/// The rest after a pass that left work, instead of the interval: long
+/// enough for `repair` waiting on the lease to take it.
+const MORE_DELAY: Duration = Duration::from_secs(5);
+
 /// When passes run, and what they do.
 #[derive(Clone)]
 pub struct Schedule {
@@ -98,15 +102,26 @@ pub fn spawn(repo: Repo, schedule: Schedule) -> Option<tokio::task::JoinHandle<(
         let mut state = CompactState::default();
         loop {
             let started = std::time::Instant::now();
+            let mut more = false;
             match compact_pass(&repo, &schedule.pass, &mut state, schedule.feature.as_ref()).await {
-                Ok(r) => record(&r, started.elapsed()),
+                Ok(r) => {
+                    more = r.as_ref().is_some_and(|r| r.more);
+                    record(&r, started.elapsed())
+                }
                 Err(e) => {
                     metrics::counter!("leep_derived_segment_passes_total", "outcome" => "error")
                         .increment(1);
                     tracing::warn!(error = %e, "derived segments pass failed; trying again later");
                 }
             }
-            tokio::time::sleep(schedule.interval).await;
+            // A pass that stopped with work left (a backfill, a long
+            // retirement) is followed soon, after giving the lease up.
+            let rest = if more {
+                MORE_DELAY.min(schedule.interval)
+            } else {
+                schedule.interval
+            };
+            tokio::time::sleep(rest).await;
         }
     })))
 }
