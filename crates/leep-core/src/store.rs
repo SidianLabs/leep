@@ -699,8 +699,6 @@ pub trait MetaStore: Send + Sync + 'static {
         ))
     }
 
-    /// Ref log entries, newest first: those of `name` or of every ref, with
-    /// `seq` below `before_seq` when given, at most `limit`.
     /// Delete each `(key, value)` row of `kind` whose value is still
     /// exactly `value`; a row rewritten meanwhile stays. Returns the rows
     /// deleted. One statement in the SQL backends, so a compare and a delete
@@ -723,6 +721,8 @@ pub trait MetaStore: Send + Sync + 'static {
         self.delete_derived_keys(&[kind], &equal).await
     }
 
+    /// Ref log entries, newest first: those of `name` or of every ref, with
+    /// `seq` below `before_seq` when given, at most `limit`.
     async fn ref_log(
         &self,
         name: Option<&str>,
