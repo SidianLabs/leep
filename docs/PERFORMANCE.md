@@ -3060,6 +3060,65 @@ other B run 43 ms; swarm sync p99 99.3 ms once), the same size of outlier
 as the A runs show (swarm land p99 146.5 ms against 21.2 ms). Counts
 (statements and bytes per land, CAS losses, pool use) matched in every run.
 
+### Consolidating delta repack
+
+ADR 0107. The land-driven corpus: corpus B's base imported, then its 2,000
+edits landed as 400 heads (every fifth edit, `leep-git import --rev`, one
+every 0.3 s) beside a release `leep-server` with the warmer on and the
+background intervals cut (`--auto-repack-check-interval 1s`,
+`--auto-repack-max-age 2s`, `--background-repack-fence 3s`,
+`--auto-compact-interval 2s`, and for this change
+`--auto-repack-consolidate-age 2s`), then `gc` and `VACUUM FULL`, a second
+server in `--derived-segments retire` for every family, `gc` and `VACUUM
+FULL` again. Postgres 16, Git's `objects/` after `git gc` 6.354 MB, shared
+4-core host. The breakdown of the blob store is by object kind and pack
+record.
+
+| | Before (bc38483) | ADR 0107 |
+|---|---|---|
+| File versions, whole frames | 2,485 frames, 12.76 MB | 811 frames, 2.45 MB |
+| File versions, deltas | 3,483 frames, 1.80 MB | 5,157 frames, 1.90 MB |
+| Tree nodes, whole frames | 1,082 frames, 0.67 MB | 344 frames, 0.16 MB |
+| Tree nodes, deltas | 9,001 frames, 0.62 MB | 9,739 frames, 0.65 MB |
+| Pack indexes | 0.71 MB | 0.71 MB |
+| **History objects** | **16.56 MB** | **5.87 MB** |
+| Derived segments, live (data and index) | 6.16 MB | 6.32 MB |
+| GC mark segment | 0.59 MB | 0.59 MB |
+| Segment blobs tombstoned, still in a pack | 0.95 MB | 0.38 MB |
+| **Blob store** | **24.46 MB** | **13.15 MB** |
+| Database | 2.46 MB | 2.46 MB |
+| **All storage** | **26.92 MB (4.24x Git)** | **15.61 MB (2.46x Git)** |
+
+- The "before" breakdown is of the same run on SQLite (blob store
+  24.25 MB); the totals are Postgres. History objects end where
+  `repack --full` puts them (6.07 MB at bc38483, the same frames), less
+  0.20 MB because first versions are now compressed at level 9 instead of
+  copied from level-1 land frames.
+- 52 delta runs and 41 consolidations (judged after each run and when
+  nothing waited) over the 400 heads, each 0.19 to 0.75 s (10.4 s in all)
+  for 4.8 to 12.5 MB of packs, the walk reused from the judgement. Each
+  saved 95 to 110% of what its sample predicted (12.28 MB saved of
+  12.35 MB predicted). The retire phase's server found no frame to
+  compress in the largest pack's history and ran one consolidation, which
+  dropped the 1.12 MB of segment blobs the first `gc` had deleted, as
+  predicted to the byte.
+- The tombstoned segment blobs are those the last `gc` deleted, after the
+  server stopped; a running server drops them at its next consolidation
+  once they pass the floor.
+- What remains above 2x is not in packs: the derived segments of the 400
+  indexed heads (6.32 MB, of which the code search rows of `content-v1`
+  are most; the whole import alone holds 3.03 MB) and the GC mark
+  segment. Every head is inside the 14-day search retention window here.
+  If the content segments shrank to the import's size once retention
+  lapses, the total would be about 12.2 MB, 1.9x Git: an estimate, not
+  measured (retention reads the ref log 300 s past its window, so a short
+  run cannot show it).
+
+Per land, on wide edits (each land edits a file the recent ones did not),
+the storage size guard's wide phase settles at 414 to 422 blob bytes a land
+on both backends, against 1,900 with `--auto-repack-consolidate off`
+(below).
+
 ### Automatic changeset compaction, chain cap 63 (ADR 0101)
 
 The corpora of "Automatic delta repack" above (A: Leep's own history,
@@ -3185,10 +3244,11 @@ messages) is generated in the test, imported with `leep-git`, and 60
 edits (one file, one in five three files) land through the HTTP API.
 Every storage flag is at its default except how soon background work runs:
 `--auto-repack-check-interval 1s`, `--auto-repack-max-age 2s`,
+`--auto-repack-consolidate-age 2s`,
 `--background-repack-interval 1s`, `--background-repack-fence 3s` (with
 `--request-timeout 2s`) and `--auto-compact-interval 2s`. Sizes are read
 once nothing changes for 2 s with no loose object, no retired pack and
-every changeset row compressed. It takes about 20 s.
+every changeset row compressed. It takes about a minute.
 
 | Checked | SQLite: measured / budget | Postgres: measured / budget |
 |---|---|---|
@@ -3204,6 +3264,7 @@ every changeset row compressed. It takes about 20 s.
 | ... over the key and value bytes of the `skiplist` and `history-tree-v4` rows they replace (64.5 KB) | 0.106-0.111 / 0.14 | 0.106 / 0.14 |
 | ... family `changeset-v2` (ADR 0105): segment bytes per changeset | 73.5 / 92 | 73.5 / 92 |
 | ... over the key and value bytes of the `generation`, `last_merge-v1`, `root_tree` and `log-filter-v1` rows they replace (27.9 KB) | 0.316 / 0.40 | 0.316 / 0.40 |
+| Blob store bytes per wide land (48 lands, each editing the next file, 0.4 s apart, at the end), settled | 414-422 / 530 | 414-422 / 530 |
 
 Budgets were about 1.5 times the measured values (two runs each when set
 by ADR 0101; the database lines were measured again and tightened, and the
@@ -3235,6 +3296,22 @@ and Postgres's per-table pages dominate; the corpora above are the precise
 measure. A change that stops the automatic repack or compaction fails too,
 as the store never settles (90 s). When a change moves a line on purpose,
 measure again and move the budget in the same change, with the reason.
+
+Since ADR 0107 the guard ends with 48 wide edits on a server started
+again after every other check (each edits the next of the 24 files, 0.4 s
+apart, so each delta run stores the first version it sees at each path
+whole) and checks the blob bytes per wide land once the delta packs are
+consolidated (`--auto-repack-consolidate-age 2s`, and ratio 64 for this
+phase: its packs now hold the gc mark and derived segments, and in a store
+this small an eighth of them is more than 48 lands gain): 414 to 422 in
+nine runs over both backends, budget 530, against 1,900 with consolidation
+off, so the budget fails without it. The other lines read as before
+(blobs 469 to 474 a land). The `content-v1` share depends on how many
+search row bytes the lands leave, which follows how far the warmer keeps
+up: on a host shared with other heavy work, 8 of about 30 runs of this
+change read 0.27 to 0.41 against its budget of 0.24 (search rows of 687 to
+695 bytes a land instead of about 1,500; two of them with consolidation
+off), and bc38483 read 0.19 and 0.23 in the same hours.
 
 Since ADR 0106 the guard's retire step names every family, so the code
 search rows (all live in this short history) are sealed and retired too:

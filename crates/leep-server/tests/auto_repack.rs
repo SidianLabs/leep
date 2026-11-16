@@ -18,7 +18,8 @@ use leep_core::{RepoPath, TreeEntry};
 use leep_derive::gc::{self, Clock, GcOptions};
 use leep_derive::Repo;
 use leep_server::background_repack::{
-    AutoOutcome, AutoRepackOptions, BackgroundRepack, BackgroundRepackOptions, PackStore,
+    AutoOutcome, AutoRepackOptions, BackgroundRepack, BackgroundRepackOptions, ConsolidateOptions,
+    ConsolidateOutcome, PackStore,
 };
 use leep_store::{FsBlobStore, ObjectBlobStore, PackWrites};
 
@@ -160,6 +161,14 @@ fn copy_dir(from: &Path, to: &Path) {
 
 /// The pack bytes `leep-server repack --full` makes of the store at `root`.
 async fn full_repack_bytes(root: &tempfile::TempDir, meta: &Arc<MemoryMetaStore>) -> u64 {
+    full_repack(root, meta).await.pack_bytes
+}
+
+/// What `leep-server repack --full` makes of the store at `root`.
+async fn full_repack(
+    root: &tempfile::TempDir,
+    meta: &Arc<MemoryMetaStore>,
+) -> leep_store::RepackReport {
     let store = FsBlobStore::new(root.path());
     let repo = Repo::new(Arc::new(store.clone()), meta.clone());
     let order = leep_derive::pack_order::pack_order(&repo).await.unwrap();
@@ -168,7 +177,7 @@ async fn full_repack_bytes(root: &tempfile::TempDir, meta: &Arc<MemoryMetaStore>
         ..leep_store::RepackOptions::default()
     };
     let p = store.repack_publish(order.objects, opts).await.unwrap();
-    p.report().pack_bytes
+    p.report().clone()
 }
 
 fn fs_store(root: &Path) -> FsBlobStore {
@@ -258,32 +267,498 @@ async fn whole_import_packs_are_compressed_once() {
     assert_main_readable(Arc::new(FsBlobStore::new(dir.path())), &meta, "contract").await;
 }
 
-/// New versions landed loose after a repack are compressed against each
-/// other; the first new version at each path has its base in the older
-/// pack, which the geometric rule leaves alone here, so it is the only
-/// one stored whole (ADR 0039: a pack is self-contained).
+fn no_consolidation() -> AutoRepackOptions {
+    AutoRepackOptions {
+        consolidate: None,
+        ..eager()
+    }
+}
+
+/// Consolidation with only the ratio rule, at `1 / ratio`.
+fn consolidating(ratio: u64) -> AutoRepackOptions {
+    AutoRepackOptions {
+        consolidate: Some(ConsolidateOptions {
+            ratio,
+            age: None,
+            ..ConsolidateOptions::default()
+        }),
+        ..eager()
+    }
+}
+
+fn task(
+    store: &FsBlobStore,
+    meta: &Arc<MemoryMetaStore>,
+    o: BackgroundRepackOptions,
+) -> BackgroundRepack {
+    let bg = BackgroundRepack::new(PackStore::Fs(store.clone()), o);
+    let walk = bg.walk_repo(meta.clone());
+    bg.with_repo(walk)
+}
+
+fn consolidated(o: ConsolidateOutcome) -> (leep_store::RepackReport, u64, u64) {
+    match o {
+        ConsolidateOutcome::Ran {
+            report,
+            gain,
+            walked,
+        } => (*report, gain, walked),
+        other => panic!("expected a consolidation, got {other:?}"),
+    }
+}
+
+/// Frames stored whole across the store's packs.
+fn whole_frames(store: &FsBlobStore) -> u64 {
+    let ids: HashSet<String> = store
+        .pack_sizes()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    let details = store.pack_details(&ids).unwrap();
+    details.iter().map(|d| d.objects - d.deltas).sum()
+}
+
+/// An import compressed by one delta run, then `rounds` rounds of two
+/// lands, each compressed by a run of its own without consolidation: each
+/// run stores the first new version at each path whole, its previous
+/// version being in an older pack.
+async fn heads_world(dir: &Path, rounds: usize) -> (FsBlobStore, Arc<MemoryMetaStore>, Repo) {
+    let store = fs_store(dir);
+    let meta = Arc::new(MemoryMetaStore::new());
+    let repo = Repo::new(Arc::new(store.clone()), meta.clone());
+    import(&repo, &meta, 30).await;
+    let mut bg = task(&store, &meta, opts(no_consolidation()));
+    ran(bg.tick().await.unwrap().auto);
+    bg.finish_all().await.unwrap();
+    for round in 0..rounds {
+        for v in 0..2 {
+            land_one(&repo, &meta, 30 + 2 * round + v).await;
+        }
+        let tick = bg.tick().await.unwrap();
+        ran(tick.auto);
+        assert_eq!(tick.consolidate, ConsolidateOutcome::NotChecked);
+        bg.finish_all().await.unwrap();
+    }
+    (store, meta, repo)
+}
+
+/// The first new version at each path that a delta run stored whole (its
+/// base in an older pack, ADR 0039) is compressed against that base once
+/// the consolidation merges the packs (ADR 0107): afterwards only the first
+/// versions are whole, the store is as small as `repack --full` makes it,
+/// and neither the next check nor a restarted task rewrites it again.
 #[tokio::test]
-async fn later_runs_store_one_whole_frame_per_path() {
+async fn after_a_consolidation_only_first_versions_are_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, meta, _repo) = heads_world(dir.path(), 4).await;
+    let before = whole_frames(&store);
+    // Each land: three contents and three tree nodes (/, src, src/deep),
+    // whole at the first version of each run.
+    assert!(before >= 6 * 5, "{before} whole frames");
+    let copy = tempfile::tempdir().unwrap();
+    copy_dir(dir.path(), copy.path());
+
+    // Any gain is worth it here (the world is small).
+    let mut bg = task(&store, &meta, opts(consolidating(u64::MAX)));
+    let tick = bg.tick().await.unwrap();
+    assert_eq!(tick.auto, AutoOutcome::Nothing);
+    let (r, gain, walked) = consolidated(tick.consolidate);
+    assert!(r.packs_merged >= 2 && gain > 0 && walked > 0, "{r:?}");
+    bg.finish_all().await.unwrap();
+    assert_eq!(store.pack_sizes().unwrap().len(), 1);
+    // As a full repack: the first versions, and the small tree nodes a
+    // delta does not shrink.
+    let full = full_repack(&copy, &meta).await;
+    let after = whole_frames(&store);
+    assert!(
+        after <= full.whole && after < before,
+        "{after} whole (was {before}, a full repack {}), {r:?}",
+        full.whole
+    );
+    assert!(
+        r.pack_bytes as f64 <= full.pack_bytes as f64 * 1.05,
+        "{} bytes, a full repack {}",
+        r.pack_bytes,
+        full.pack_bytes
+    );
+    assert_main_readable(
+        Arc::new(FsBlobStore::new(dir.path())),
+        &meta,
+        "consolidated",
+    )
+    .await;
+
+    // Nothing more to gain: no rewrite, now or after a restart.
+    let tick = bg.tick().await.unwrap();
+    assert_eq!(tick.consolidate, ConsolidateOutcome::Nothing);
+    let mut bg = task(&store, &meta, opts(consolidating(u64::MAX)));
+    let tick = bg.tick().await.unwrap();
+    assert!(
+        matches!(
+            tick.consolidate,
+            ConsolidateOutcome::Nothing | ConsolidateOutcome::Below { gain: 0, .. }
+        ),
+        "{:?}",
+        tick.consolidate
+    );
+    check_blob_store_contract(&FsBlobStore::new(dir.path())).await;
+    assert_main_readable(Arc::new(FsBlobStore::new(dir.path())), &meta, "contract").await;
+}
+
+/// New files have no previous version: however many runs store them
+/// whole, they never make a consolidation worth it. Only the tree nodes
+/// that name them have bases to gain against.
+#[tokio::test]
+async fn new_files_alone_never_trigger_a_rewrite() {
     let dir = tempfile::tempdir().unwrap();
     let store = fs_store(dir.path());
     let meta = Arc::new(MemoryMetaStore::new());
     let repo = Repo::new(Arc::new(store.clone()), meta.clone());
-    import(&repo, &meta, 30).await;
-    let bg = BackgroundRepack::new(PackStore::Fs(store.clone()), opts(eager()));
-    let walk = bg.walk_repo(meta.clone());
-    let mut bg = bg.with_repo(walk);
-    ran(bg.tick().await.unwrap().auto);
+    let mut bg = task(&store, &meta, opts(consolidating(8)));
+    let mut last = None;
+    for round in 0..6 {
+        let mut files = Vec::new();
+        for i in 0..4 {
+            let body: String = (0..300)
+                .map(|l| {
+                    format!(
+                        "{round}.{i}.{l}: {}\n",
+                        Hash::of_blob(format!("{round} {i} {l}").as_bytes())
+                    )
+                })
+                .collect();
+            repo.blobs().put(Bytes::from(body.clone())).await.unwrap();
+            files.push((format!("new/{round}/{i}.txt"), body));
+        }
+        let refs: Vec<(&str, String)> =
+            files.iter().map(|(p, b)| (p.as_str(), b.clone())).collect();
+        let head = meta.get_ref("main").await.unwrap();
+        let tip = commit(&repo, head, &refs).await;
+        assert!(meta.cas_ref("main", head, Some(tip)).await.unwrap());
+        ran(bg.tick().await.unwrap().auto);
+        bg.finish_all().await.unwrap();
+        let tick = bg.tick().await.unwrap();
+        assert_eq!(tick.auto, AutoOutcome::Nothing);
+        match tick.consolidate {
+            ConsolidateOutcome::Nothing => {}
+            ConsolidateOutcome::Below { gain, .. } => last = Some(gain),
+            other => panic!("round {round}: {other:?}"),
+        }
+    }
+    let whole: u64 = {
+        let ids: HashSet<String> = store
+            .pack_sizes()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        store
+            .pack_details(&ids)
+            .unwrap()
+            .iter()
+            .map(|d| d.whole_bytes)
+            .sum()
+    };
+    let gain = last.expect("a walk judged the packs");
+    assert!(gain * 20 < whole, "only tree nodes gain: {gain} of {whole}");
+}
+
+/// The ratio rule runs a consolidation at once; below it, the gain is
+/// remembered (no walk while the packs stay the same) and the age rule
+/// runs it once the gain has waited long enough.
+#[tokio::test(start_paused = true)]
+async fn the_ratio_and_age_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, meta, _) = heads_world(dir.path(), 2).await;
+    let copy = tempfile::tempdir().unwrap();
+    copy_dir(dir.path(), copy.path());
+    let aged = |ratio| AutoRepackOptions {
+        consolidate: Some(ConsolidateOptions {
+            ratio,
+            age: Some(Duration::from_secs(600)),
+            min_gain: 1,
+            ..ConsolidateOptions::default()
+        }),
+        ..eager()
+    };
+
+    // Below the ratio (all of the packs' bytes), it waits, without
+    // walking again while the packs stay the same.
+    let mut bg = task(&store, &meta, opts(aged(1)));
+    let tick = bg.tick().await.unwrap();
+    let ConsolidateOutcome::Below { gain, walked } = tick.consolidate else {
+        panic!("{:?}", tick.consolidate)
+    };
+    assert!(gain > 0 && walked > 0, "{gain} {walked}");
+    tokio::time::advance(Duration::from_secs(300)).await;
+    let tick = bg.tick().await.unwrap();
+    assert_eq!(
+        tick.consolidate,
+        ConsolidateOutcome::Below { gain, walked: 0 }
+    );
+    tokio::time::advance(Duration::from_secs(301)).await;
+    let (_, g, _) = consolidated(bg.tick().await.unwrap().consolidate);
+    assert_eq!(g, gain);
     bg.finish_all().await.unwrap();
-    for v in 30..34 {
+    assert_main_readable(Arc::new(FsBlobStore::new(dir.path())), &meta, "age").await;
+
+    // A ratio the gain reaches runs at once; with no age rule, one it
+    // does not reach never runs.
+    let store = fs_store(copy.path());
+    let mut bg = task(&store, &meta, opts(consolidating(1)));
+    let tick = bg.tick().await.unwrap();
+    assert!(
+        matches!(
+            tick.consolidate,
+            ConsolidateOutcome::Nothing | ConsolidateOutcome::Below { .. }
+        ),
+        "{:?}",
+        tick.consolidate
+    );
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    let tick = bg.tick().await.unwrap();
+    assert!(!matches!(tick.consolidate, ConsolidateOutcome::Ran { .. }));
+    let ratio = (store
+        .pack_sizes()
+        .unwrap()
+        .iter()
+        .map(|p| p.bytes)
+        .sum::<u64>()
+        / gain)
+        .max(1);
+    let mut bg = task(&store, &meta, opts(consolidating(ratio + 1)));
+    let (_, g, _) = consolidated(bg.tick().await.unwrap().consolidate);
+    assert_eq!(g, gain);
+    bg.finish_all().await.unwrap();
+    assert_main_readable(Arc::new(FsBlobStore::new(copy.path())), &meta, "ratio").await;
+}
+
+/// The largest pack's history is walked once per process (it may hold
+/// frames older merges left whole); after that, a consolidation walks only
+/// the changesets written since it.
+#[tokio::test]
+async fn the_walk_stops_at_the_largest_pack() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = fs_store(dir.path());
+    let meta = Arc::new(MemoryMetaStore::new());
+    let repo = Repo::new(Arc::new(store.clone()), meta.clone());
+    import(&repo, &meta, 60).await;
+    let mut bg = task(&store, &meta, opts(consolidating(u64::MAX)));
+    // The check after the run walks the largest pack's own history:
+    // nothing there has a base to gain against.
+    let tick = bg.tick().await.unwrap();
+    ran(tick.auto);
+    bg.finish_all().await.unwrap();
+    let ConsolidateOutcome::Below { gain: 0, walked } = tick.consolidate else {
+        panic!("{:?}", tick.consolidate)
+    };
+    assert!(walked >= 60, "{walked}");
+    for v in 60..63 {
         land_one(&repo, &meta, v).await;
     }
+    let before = whole_frames(&store);
+    let tick = bg.tick().await.unwrap();
+    let run = ran(tick.auto);
+    let (r, gain, walked) = consolidated(tick.consolidate);
+    assert_eq!(walked, 3, "only the three new changesets: {r:?}");
+    assert!(gain > 0 && r.packs_merged == 2, "{r:?}");
+    bg.finish_all().await.unwrap();
+    // The run stored the first new version at each path whole.
+    assert!(r.whole < before + run.whole, "{r:?} {run:?}");
+    assert_main_readable(Arc::new(FsBlobStore::new(dir.path())), &meta, "walk").await;
+}
+
+/// A consolidation may pass the cap on bytes waiting for cleanup when no
+/// other cleanup waits (a store that is mostly one pack could never
+/// consolidate otherwise), and is held while a large one does; delta runs
+/// then wait for it, so a busy store still consolidates.
+#[tokio::test]
+async fn a_consolidation_passes_the_pending_cap_only_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, meta, repo) = heads_world(dir.path(), 2).await;
+    let o = BackgroundRepackOptions {
+        fence: Duration::from_secs(3600),
+        pending_share: 0.0,
+        min_pending_bytes: 1,
+        max_pending_bytes: 1,
+        ..opts(consolidating(u64::MAX))
+    };
+    let mut bg = task(&store, &meta, o);
+    consolidated(bg.tick().await.unwrap().consolidate);
+    assert_eq!(bg.pending(), 1);
+    bg.finish_all().await.unwrap();
+    // A delta pack `leep-server repack` wrote (heads included), then a
+    // merge waiting for its fence.
+    for v in 40..42 {
+        land_one(&repo, &meta, v).await;
+    }
+    let walk = Repo::new(Arc::new(store.clone()), meta.clone());
+    let loose: HashSet<Hash> = store
+        .loose_listing()
+        .unwrap()
+        .into_iter()
+        .map(|(h, _)| h)
+        .collect();
+    let order = leep_derive::pack_order::pack_order_loose(&walk, &|h: &Hash| loose.contains(h))
+        .await
+        .unwrap();
+    let manual = leep_store::RepackOptions {
+        mode: leep_store::RepackMode::Incremental {
+            factor: 2,
+            max_packs: 8,
+        },
+        leave: store
+            .pack_sizes()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect(),
+        mark: true,
+        ..leep_store::RepackOptions::default()
+    };
+    store
+        .repack_publish(order.objects, manual)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    for b in 0..4 {
+        let items: Vec<(Hash, Bytes)> = (0..5)
+            .map(|i| Bytes::from(format!("land batch {b} object {i}\n")))
+            .map(|d| (Hash::of_blob(&d), d))
+            .collect();
+        store.put_many(items).await.unwrap();
+    }
+    // No cleanup counts as small here, so the delta run's holds it.
+    let mut bg = task(
+        &store,
+        &meta,
+        BackgroundRepackOptions {
+            fence: Duration::from_secs(3600),
+            pending_share: 0.0,
+            min_pending_bytes: 1,
+            max_pending_bytes: 1,
+            small_merge_bytes: 0,
+            ..opts(consolidating(u64::MAX))
+        },
+    );
+    let tick = bg.tick().await.unwrap();
+    ran(tick.auto);
+    assert_eq!(tick.consolidate, ConsolidateOutcome::Held("pending"));
+    // Delta runs wait for the held consolidation: no new cleanup meanwhile.
+    for v in 42..44 {
+        land_one(&repo, &meta, v).await;
+    }
+    let tick = bg.tick().await.unwrap();
+    assert_eq!(tick.auto, AutoOutcome::Held("consolidation"));
+    assert_eq!(tick.consolidate, ConsolidateOutcome::Held("pending"));
+    bg.finish_all().await.unwrap();
+    let tick = bg.tick().await.unwrap();
+    consolidated(tick.consolidate);
+    bg.finish_all().await.unwrap();
+    ran(bg.tick().await.unwrap().auto);
+    bg.finish_all().await.unwrap();
+    assert_main_readable(Arc::new(FsBlobStore::new(dir.path())), &meta, "pending").await;
+}
+
+/// Frames the writer keeps whole because their base is at the chain cap
+/// (every 64th version of a file edited often) gain nothing: a restarted
+/// task, walking the largest pack's own history, does not rewrite it.
+#[tokio::test]
+async fn whole_frames_at_the_chain_cap_are_not_a_gain() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = fs_store(dir.path());
+    let meta = Arc::new(MemoryMetaStore::new());
+    let repo = Repo::new(Arc::new(store.clone()), meta.clone());
+    import(&repo, &meta, 150).await;
+    let mut bg = task(&store, &meta, opts(consolidating(u64::MAX)));
     let r = ran(bg.tick().await.unwrap().auto);
     bg.finish_all().await.unwrap();
-    // Each land: three contents and three tree nodes (/, src, src/deep).
-    assert_eq!((r.loose_before, r.packs_merged), (24, 0), "{r:?}");
-    // One whole frame per path (small tree nodes may be smaller whole).
-    assert!(r.whole >= 6 && r.deltas > r.whole, "{r:?}");
-    assert_main_readable(Arc::new(FsBlobStore::new(dir.path())), &meta, "second run").await;
+    // Three files of 150 versions: chains of 64 start whole twice more.
+    assert!(r.whole >= 6 + 6, "{r:?}");
+    for restart in 0..2 {
+        let mut bg = task(&store, &meta, opts(consolidating(u64::MAX)));
+        let tick = bg.tick().await.unwrap();
+        assert!(
+            matches!(
+                tick.consolidate,
+                ConsolidateOutcome::Nothing | ConsolidateOutcome::Below { gain: 0, .. }
+            ),
+            "restart {restart}: {:?}",
+            tick.consolidate
+        );
+    }
+}
+
+/// Objects GC deleted from delta packs count toward the gain: a
+/// consolidation drops their bytes (dead segment blobs, history the
+/// changeset sweep removed) instead of leaving them until `repack --full`.
+#[tokio::test]
+async fn deleted_objects_in_delta_packs_are_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, meta, repo) = heads_world(dir.path(), 1).await;
+    // Uploads no ref reaches, packed whole by a delta run, then deleted.
+    let junk: Vec<Bytes> = (0..40)
+        .map(|i| Bytes::from(format!("{i}: {}\n", "unreferenced bytes ".repeat(200 + i))))
+        .collect();
+    let hashes = repo.put_blobs(junk).await.unwrap();
+    let mut bg = task(&store, &meta, opts(consolidating(8)));
+    ran(bg.tick().await.unwrap().auto);
+    bg.finish_all().await.unwrap();
+    for h in &hashes {
+        store.delete(h).await.unwrap();
+    }
+    let tick = bg.tick().await.unwrap();
+    let (r, gain, _) = consolidated(tick.consolidate);
+    assert_eq!(r.dropped_tombstoned, 40, "{r:?}");
+    assert!(gain >= r.pack_bytes_before / 8, "{gain} {r:?}");
+    bg.finish_all().await.unwrap();
+    let fresh = FsBlobStore::new(dir.path());
+    for h in &hashes {
+        assert!(!fresh.contains(h).await.unwrap());
+    }
+    assert_main_readable(Arc::new(fresh), &meta, "dropped").await;
+}
+
+/// A delta pack over the size limit is never rewritten in the background:
+/// the others are judged without it (their heads based in it gain nothing
+/// then), and a larger limit takes it in.
+#[tokio::test]
+async fn packs_over_the_limit_are_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, meta, _) = heads_world(dir.path(), 2).await;
+    let mut sizes = store.pack_sizes().unwrap();
+    sizes.sort_by_key(|p| p.bytes);
+    assert!(sizes.len() >= 2, "{sizes:?}");
+    let largest = sizes.last().unwrap().clone();
+    let limited = |max_bytes| AutoRepackOptions {
+        consolidate: Some(ConsolidateOptions {
+            ratio: u64::MAX,
+            age: None,
+            max_bytes,
+            ..ConsolidateOptions::default()
+        }),
+        ..eager()
+    };
+    let mut bg = task(&store, &meta, opts(limited(largest.bytes - 1)));
+    let tick = bg.tick().await.unwrap();
+    if let ConsolidateOutcome::Ran { report, .. } = &tick.consolidate {
+        assert_eq!(report.packs_merged as usize, sizes.len() - 1, "{report:?}");
+    }
+    bg.finish_all().await.unwrap();
+    assert!(store
+        .pack_sizes()
+        .unwrap()
+        .iter()
+        .any(|p| p.id == largest.id));
+    let sizes = store.pack_sizes().unwrap();
+    let mut bg = task(&store, &meta, opts(limited(largest.bytes)));
+    let (r, _, _) = consolidated(bg.tick().await.unwrap().consolidate);
+    assert_eq!(r.packs_merged as usize, sizes.len(), "{r:?}");
+    bg.finish_all().await.unwrap();
+    assert_main_readable(Arc::new(FsBlobStore::new(dir.path())), &meta, "limit").await;
 }
 
 /// Below every threshold nothing runs and nothing is written; a check

@@ -2432,6 +2432,12 @@ Postgres cannot write, backups fail (see [LeepBackupStale](#leepbackupstale)).
 7. Is the store packed? A filesystem store with no `packs/*.pack` keeps one file
    per object, uncompressed; `leep-server repack` usually shrinks a long history
    ten to thirty times (OPERATIONS.md, "Packing blobs").
+8. Are the delta packs consolidated (ADR 0107)? `leep_blob_store_size_ratio`
+   creeping up and `leep_repack_whole_bytes_outside_largest` growing between
+   `leep_repack_consolidate_runs_total{outcome="ran"}` steps is normal; a log
+   line "a delta pack is larger than --auto-repack-consolidate-max-bytes", or
+   `leep_repack_consolidate_runs_total{outcome="held"}` climbing, means the
+   server is leaving work to `repack --full`, or cannot find room for it.
 
 **Likely causes.**
 
@@ -2445,6 +2451,8 @@ Postgres cannot write, backups fail (see [LeepBackupStale](#leepbackupstale)).
 5. Postgres WAL retained by a stuck slot or failing archive. Confirm: step 2.
 6. Leftover `.tmp-*` after crashes. Confirm: step 4.
 7. A filesystem blob store that is never repacked. Confirm: step 7.
+8. Delta packs over the consolidation limit, or consolidation off. Confirm:
+   step 8.
 
 **Mitigate / fix**, in this order:
 
@@ -2455,13 +2463,19 @@ Postgres cannot write, backups fail (see [LeepBackupStale](#leepbackupstale)).
    once. On a filesystem blob store, then run `leep-server repack`: it needs room
    for the new pack (a fraction of the loose size) before it frees the loose copies,
    after its fence.
-3. Grow the volume: that is the fix for steady growth. On SQLite, freed pages are
+3. For cause 8: run `leep-server repack --full` (it needs room for the new
+   pack, about the store's packed size, until its fence passes), or raise
+   `--auto-repack-consolidate-max-bytes` if the volume has that room to spare
+   for every consolidation. A consolidation also holds the packs it replaced
+   for the fence, so a store that is mostly one large pack briefly needs
+   about twice its size.
+4. Grow the volume: that is the fix for steady growth. On SQLite, freed pages are
    reused inside the file but the file does not shrink by itself.
    If `changesets` was never compacted, `leep-server compact-changesets` (every
    server must be on a release that reads compressed rows; OPERATIONS.md,
    "Upgrading") halves it, then `VACUUM FULL changesets` returns the space (each
    needs free room of about half the table while it runs).
-4. Last resort for metadata: `leep-server repair drop --kind blob-trigrams-v2
+5. Last resort for metadata: `leep-server repair drop --kind blob-trigrams-v2
    tree-trigrams-v2 blob-trigrams-v1 tree-trigrams-v1` removes the search
    index rows (and the rows an older version left); they rebuild on demand
    and the first searches are slow (`derive-search main` warms them). Take a

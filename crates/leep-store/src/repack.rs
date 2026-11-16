@@ -184,6 +184,10 @@ pub struct PackDetail {
     /// Bytes the records decode to, and the `.pack` size.
     pub logical_bytes: u64,
     pub bytes: u64,
+    /// Stored bytes of the frames written whole. In a pack a delta repack
+    /// wrote, an upper bound on what compressing them against their
+    /// previous versions can save (ADR 0107).
+    pub whole_bytes: u64,
     /// The earliest write time its records carry (unix seconds), to take
     /// the oldest packs first.
     pub oldest: i64,
@@ -191,9 +195,12 @@ pub struct PackDetail {
 
 impl PackDetail {
     pub(crate) fn of(id: &str, index: &pack::PackIndex) -> PackDetail {
-        let (mut deltas, mut logical, mut oldest) = (0u64, 0u64, i64::MAX);
+        let (mut deltas, mut logical, mut whole, mut oldest) = (0u64, 0u64, 0u64, i64::MAX);
         for e in index.iter() {
             deltas += u64::from(e.base.is_some());
+            if e.base.is_none() {
+                whole += e.stored_len;
+            }
             logical += e.len;
             oldest = oldest.min(e.modified);
         }
@@ -203,6 +210,7 @@ impl PackDetail {
             deltas,
             logical_bytes: logical,
             bytes: index.pack_len(),
+            whole_bytes: whole,
             oldest,
         }
     }
@@ -588,6 +596,12 @@ struct Sources {
     /// `pack << 32 | rank` of the packed copy in `packs`, or `u64::MAX`.
     packed: Vec<u64>,
     packs: Vec<Arc<Pack>>,
+    /// By pack, as `packs`: its whole frames are compressed again rather
+    /// than copied. Set for the packs written whole (land batches and
+    /// imports, at zstd level 1, ADR 0068; not those a delta repack wrote)
+    /// that an incremental repack names, so their first versions end at the
+    /// repack's level too.
+    recompress: Vec<bool>,
 }
 
 impl Sources {
@@ -622,6 +636,11 @@ impl PackSource for FsSource<'_> {
             return Ok(None);
         };
         let e = p.index.entry(rank);
+        if e.base.is_none()
+            && self.sources.recompress[(self.sources.packed[id as usize] >> 32) as usize]
+        {
+            return Ok(None);
+        }
         let base = e.base.map(|r| p.index.hash_at(r as usize));
         Ok(Some((p.frame(&e)?, base)))
     }
@@ -809,10 +828,29 @@ impl FsBlobStore {
         // loose listing at once; an object's id is its position.
         let most = loose.len() + merging.iter().map(|(_, p, _)| p.index.len()).sum::<usize>();
         let mut hashes: Vec<Hash> = Vec::with_capacity(most);
+        let named: HashSet<&String> = opts.packs.iter().collect();
+        // A delta repack wrote the considered ones, at its own level.
+        let considered = if named.is_empty() {
+            HashSet::new()
+        } else {
+            crate::considered::read_fs(&dir).unwrap_or_default()
+        };
+        let recompress = view
+            .packs
+            .iter()
+            .map(|(p, _)| {
+                matches!(opts.mode, RepackMode::Incremental { .. })
+                    && named.contains(&p.id)
+                    && !considered.contains(&p.id)
+                    && p.index.iter().all(|e| e.base.is_none())
+            })
+            .collect();
+        drop((named, considered));
         let mut sources = Sources {
             loose: Vec::with_capacity(most),
             packed: Vec::with_capacity(most),
             packs: view.packs.iter().map(|(p, _)| p.clone()).collect(),
+            recompress,
         };
         {
             let mut packed = merge_packs(&merging).peekable();
@@ -1092,6 +1130,73 @@ impl FsBlobStore {
                 .iter()
                 .any(|(p, dead)| p.index.find(h).is_some() && !dead.contains(h))
         })
+    }
+
+    /// The stored size of `hash`'s frame if it has a live copy stored
+    /// whole in one of the packs `ids` names: what a consolidating repack
+    /// (ADR 0107) may compress against a previous version. An in-memory
+    /// lookup.
+    pub fn whole_in(
+        &self,
+        ids: &HashSet<String>,
+    ) -> Result<impl Fn(&Hash) -> Option<u64> + Send + Sync> {
+        let view = self.packs.view()?;
+        let packs: Vec<(Arc<Pack>, HashSet<Hash>)> = view
+            .packs
+            .iter()
+            .filter(|(p, _)| ids.contains(&p.id))
+            .cloned()
+            .collect();
+        Ok(move |h: &Hash| {
+            packs.iter().find_map(|(p, dead)| match p.index.find(h) {
+                Some(e) if e.base.is_none() && !dead.contains(h) => Some(e.stored_len),
+                _ => None,
+            })
+        })
+    }
+
+    /// How many deltas deep `hash`'s live copy in one of the packs `ids`
+    /// names is (0 for a whole frame): a frame based on one already
+    /// [`MAX_CHAIN`](crate::pack::MAX_CHAIN) deep is written whole, so a
+    /// consolidation (ADR 0107) gains nothing on it. An in-memory lookup.
+    pub fn depth_in(
+        &self,
+        ids: &HashSet<String>,
+    ) -> Result<impl Fn(&Hash) -> Option<usize> + Send + Sync> {
+        let view = self.packs.view()?;
+        let packs: Vec<(Arc<Pack>, HashSet<Hash>)> = view
+            .packs
+            .iter()
+            .filter(|(p, _)| ids.contains(&p.id))
+            .cloned()
+            .collect();
+        Ok(move |h: &Hash| {
+            packs.iter().find_map(|(p, dead)| {
+                let mut e = p.index.find(h).filter(|_| !dead.contains(h))?;
+                let mut depth = 0;
+                while let Some(b) = e.base {
+                    if depth > pack::READ_CHAIN_LIMIT {
+                        return None;
+                    }
+                    e = p.index.entry(b);
+                    depth += 1;
+                }
+                Some(depth)
+            })
+        })
+    }
+
+    /// Stored bytes of the tombstoned frames of the packs `ids` names: what
+    /// a merge of them drops (ADR 0107).
+    pub fn tombstoned_bytes(&self, ids: &HashSet<String>) -> Result<u64> {
+        let view = self.packs.view()?;
+        Ok(view
+            .packs
+            .iter()
+            .filter(|(p, _)| ids.contains(&p.id))
+            .flat_map(|(p, dead)| dead.iter().filter_map(|h| p.index.find(h)))
+            .map(|e| e.stored_len)
+            .sum())
     }
 
     /// Objects of the new pack whose source GC deleted while it was written:

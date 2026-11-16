@@ -43,8 +43,10 @@ it when it is true of your deployment, and redo the list after an upgrade.
   [Automatic delta repack](#automatic-delta-repack)); if it is turned off,
   an incremental `leep-server repack` runs nightly and after load tests or
   large imports, so loose files do not use up the volume's inodes
-  ([Packing blobs](#packing-blobs)). A `repack --full` weekly to monthly
-  still drops what GC deleted from packs. The blob
+  ([Packing blobs](#packing-blobs)). It also consolidates its delta packs
+  (ADR 0107), which drops what GC deleted from them; delta packs over
+  `--auto-repack-consolidate-max-bytes` (2 GiB) still need a
+  `repack --full` now and then. The blob
   volume has inodes to spare: ext4 fixes the count when the filesystem is
   made, so a dedicated blob volume gets a smaller inode ratio
   (`mkfs.ext4 -i 4096`), or blobs live in packs or `s3://`. If
@@ -145,11 +147,15 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_repack_background_cleanup_seconds` | histogram | none | Time of each cleanup a fence after a merge (deleting the merged packs). |
 | `leep_repack_retired_removed_total` | counter | none | Retired packs deleted by the sweep at server start and at each background interval once their fence passed (ADR 0080). Grows after restarts that left merged packs waiting; the merges' own cleanups are under `leep_repack_background_cleanup_seconds`. |
 | `leep_repack_auto_runs_total` | counter | `outcome` = `ran`, `error` | Automatic delta repacks published (ADR 0100). An error is logged and retried at the next check. |
-| `leep_repack_auto_skipped_total` | counter | `reason` = `threshold`, `pending`, `interval`, `busy` | Checks that did not run: below every threshold, cleanups waiting on too many bytes, an object store's full repack ran within its interval, or another repack held the store. |
+| `leep_repack_auto_skipped_total` | counter | `reason` = `threshold`, `pending`, `interval`, `busy`, `consolidation` | Checks that did not run: below every threshold, cleanups waiting on too many bytes, a consolidation that is due waits for those cleanups (ADR 0107; at most a fence), an object store's full repack ran within its interval, or another repack held the store. |
 | `leep_repack_auto_seconds` | histogram | none | Time of each automatic delta repack: walk, write and publish. |
 | `leep_repack_auto_input_bytes_total` / `leep_repack_auto_delta_bytes_total` | counter | none | Bytes that waited (loose files and whole packs) and pack bytes written for them. Their ratio is the compression the runs achieve. |
 | `leep_repack_auto_objects_total` | counter | none | Objects the automatic runs wrote. |
 | `leep_repack_auto_waiting_objects` / `leep_repack_auto_waiting_bytes` | gauge | none | Objects (and their bytes on disk) waiting to be compressed at the last check: loose, or in packs written whole. Falls to near zero after each run; climbing past the thresholds means runs are held or failing. |
+| `leep_repack_consolidate_runs_total` | counter | `outcome` = `ran`, `error`, `held` | Consolidations of the delta packs (ADR 0107). `held`: due, but other cleanups wait on too many bytes, or another repack holds the store. An error is logged and retried at the next check. |
+| `leep_repack_consolidate_gain_bytes_total` | counter | none | Bytes the consolidations that ran expected to save (measured on a sample before each run). |
+| `leep_repack_consolidate_seconds` | histogram | none | Time of each consolidation: walk, write and publish. |
+| `leep_repack_whole_bytes_outside_largest` | gauge | none | Stored bytes of whole frames in the delta packs other than the largest, at the last check: an upper bound on what a consolidation could find there. Climbs between consolidations, falls after one. |
 | `leep_blob_store_bytes` / `leep_blob_store_logical_bytes` / `leep_blob_store_size_ratio` | gauge | none | Bytes on disk of loose objects and searched packs, the bytes they decode to, and the ratio, at the last check. About 0.03–0.1 on source code once compressed; near 1 means nothing is being delta-compressed. |
 | `leep_changeset_compact_steps_total` | counter | `outcome` = `ok`, `busy`, `error` | Steps of the automatic changeset compaction (ADR 0101). `busy`: another server held the compaction's lock (Postgres). An error is logged and retried at the next interval. |
 | `leep_changeset_compact_corrupt_total` | counter | none | Changeset rows a pass found that do not decode; left as they are. Run `leep-server verify`. |
@@ -2763,9 +2769,43 @@ compresses them again; deleting that file only costs one more pass.
 Corrupt loose objects it meets stay in place, are logged in its report,
 and are not counted again (run `leep-server verify --full --rehash`).
 
-**After upgrading an existing store,** run `leep-server repack --full`
-once: whole frames that earlier background merges folded into delta packs
-are no longer recognised as waiting.
+**Consolidation** (ADR 0107). A delta run can only compress an object
+against a base in the pack it writes, so the first new version at each
+path in each run is stored whole (its previous version is in an older
+pack). Once nothing waits for a delta run, the task judges its delta
+packs: if merging them all into one, and compressing each of those frames
+against its previous version, now in the same pack, would save an eighth
+of their bytes (`--auto-repack-consolidate-ratio`), or a 64th (at least
+64 KiB) for a day (`--auto-repack-consolidate-age`), it does so. Objects
+GC deleted from those packs count toward the saving and are dropped. The
+history walk stops at the largest delta pack, so it costs the history
+written since; the largest pack's own history is walked once per server
+start, which finds frames older merges or servers left whole next to their
+bases. The saving is measured on a sample before each run, so new files
+(no previous version) never cause a rewrite. On the land-driven corpus the
+packs end at the size `repack --full` gives (PERFORMANCE.md,
+"Consolidating delta repack"). A consolidation holds the packs it replaced
+for the fence, like a merge; it may pass the cap on bytes waiting for
+cleanup when only small merges wait, and otherwise delta runs wait for it
+(at most a fence) so a busy server still gets it. It is checked when
+nothing is due for a delta run and right after each delta run.
+
+**The largest packs.** A delta pack larger than
+`--auto-repack-consolidate-max-bytes` (2 GiB) is never rewritten in the
+background: the server logs "a delta pack is larger than
+--auto-repack-consolidate-max-bytes" once per pack and process, leaves it
+as it is, and its walks stop at it. Frames whose previous version is in
+such a pack stay whole until a `leep-server repack --full`. Raise the limit
+if the volume has room for the pack twice over for the fence and a rewrite
+of that size at the lowest priority suits you; otherwise schedule
+`repack --full` (monthly, say) on such stores.
+
+**After upgrading an existing store** nothing needs to be run: once nothing
+waits, the first consolidation check walks the delta packs' history (within
+the size limit) and compresses the whole frames that earlier background
+merges folded into delta packs, if the saving passes the rules above.
+Packs over the size limit are the exception; `repack --full` compresses
+those.
 
 | Flag / env | Default | What it does |
 |---|---|---|
@@ -2777,12 +2817,18 @@ are no longer recognised as waiting.
 | `--auto-repack-batch-bytes B` / `LEEP_AUTO_REPACK_BATCH_BYTES` | `1G` | Bytes one run takes at most (whole packs oldest first, then loose objects; also at most 500,000 objects and 256 packs). The rest runs as further batches, one a background tick, with merges and cleanups between them. |
 | `--auto-repack-level N` / `LEEP_AUTO_REPACK_LEVEL` | `9` | zstd level of the packs it writes, 1 to 22. |
 | `--auto-repack-object-store-interval D` / `LEEP_AUTO_REPACK_OBJECT_STORE_INTERVAL` | `24h` | Object stores: the shortest time between two automatic full repacks, kept in the bucket (`packs/.last-full`), so restarts and replicas share it. |
+| `--auto-repack-consolidate on\|off` / `LEEP_AUTO_REPACK_CONSOLIDATE` | `on` | Consolidate the delta packs (ADR 0107; filesystem stores). Off leaves the first new version at each path per run whole until a `repack --full`. |
+| `--auto-repack-consolidate-ratio N` / `LEEP_AUTO_REPACK_CONSOLIDATE_RATIO` | `8` | Consolidate once it would save `1/N` of the bytes of the packs it rewrites. |
+| `--auto-repack-consolidate-age D` / `LEEP_AUTO_REPACK_CONSOLIDATE_AGE` | `24h` | Also consolidate once it would have saved a 64th of those bytes (at least 64 KiB) for this long; `off` leaves only the ratio. |
+| `--auto-repack-consolidate-max-bytes B` / `LEEP_AUTO_REPACK_CONSOLIDATE_MAX_BYTES` | `2G` | Never rewrite a delta pack larger than this in the background; logged once, left to `repack --full`. |
 
 What operators no longer need: the nightly or hourly incremental `repack`
-cron, and the loose-object count job, on servers with the defaults. Keep
-`gc`, and a `repack --full` weekly to monthly: it drops objects GC deleted
-from packs, and writes the first new version at each path as a delta where
-the automatic runs (like any incremental repack) store it whole.
+cron, the loose-object count job, and (since ADR 0107) the weekly
+`repack --full`, on filesystem servers with the defaults and delta packs
+under `--auto-repack-consolidate-max-bytes`: consolidation drops objects GC
+deleted from the delta packs and compresses the first new versions the runs
+stored whole. Keep `gc`, and a `repack --full` now and then on stores with
+packs over the limit.
 
 **Delta chains** are capped at 63 (32 before ADR 0101), so a file edited
 hundreds of times stores a whole version every 64 instead of every 33. A
@@ -2818,10 +2864,12 @@ the delta repack.
 
 Metrics: `leep_repack_auto_runs_total{outcome}`,
 `leep_repack_auto_skipped_total{reason}`, `leep_repack_auto_seconds`,
-`leep_repack_auto_waiting_objects` and `_bytes`, and
-`leep_blob_store_size_ratio` ([Metrics](#metrics)). The log line
-"automatic delta repack published a pack" (level info) gives each run's
-objects, deltas, whole frames and time.
+`leep_repack_auto_waiting_objects` and `_bytes`,
+`leep_repack_consolidate_runs_total{outcome}`,
+`leep_repack_whole_bytes_outside_largest`, and
+`leep_blob_store_size_ratio` ([Metrics](#metrics)). The log lines
+"automatic delta repack published a pack" and "consolidated delta packs"
+(level info) give each run's objects, deltas, whole frames and time.
 
 **Leftovers from before ADR 0080.** Older servers stopped inside a fence
 left merged packs published beside the pack that replaced them, and each
@@ -2847,7 +2895,7 @@ every 5 s and may briefly miss the objects of a land pack another server
 just wrote.
 
 When to run it, with `--auto-repack off` (with it on, only `--full` needs a
-schedule): after a large import, then incremental runs often and a full
+schedule, and only for delta packs over `--auto-repack-consolidate-max-bytes`): after a large import, then incremental runs often and a full
 one rarely. The incremental run's cost follows the new history, so daily or
 hourly both suit. Run `--full` weekly to monthly, depending on how much
 GC deletes and how much the pack bytes grow between full runs. Run both after

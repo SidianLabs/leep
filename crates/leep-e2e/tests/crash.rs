@@ -1097,6 +1097,34 @@ fn killed_server_with_eager_auto_repack_loses_nothing_postgres() {
     drop(db);
 }
 
+/// ADR 0107: the eager automatic repack with consolidation at any gain, so
+/// kills also land while a consolidation walks, rewrites the delta packs or
+/// waits for its cleanup. Nothing is lost and every store verifies.
+const CONSOLIDATE: &[&str] = &[
+    "--background-repack-interval",
+    "1s",
+    "--auto-repack-objects",
+    "1",
+    "--auto-repack-check-interval",
+    "0",
+    "--auto-repack-consolidate-age",
+    "1s",
+];
+
+#[test]
+fn killed_server_with_eager_consolidation_loses_nothing_sqlite() {
+    run_crash_rounds_with("sqlite, consolidation", None, CONSOLIDATE);
+}
+
+#[test]
+fn killed_server_with_eager_consolidation_loses_nothing_postgres() {
+    let Some(db) = PgDb::create("leep_e2e") else {
+        return;
+    };
+    run_crash_rounds_with("postgres, consolidation", Some(db.url.clone()), CONSOLIDATE);
+    drop(db);
+}
+
 /// ADR 0101: the automatic changeset compaction looks every second, over
 /// a store that starts with 300 changesets on `main` (rows a
 /// dictionary pays for), in batches of eight, so kills land while it
