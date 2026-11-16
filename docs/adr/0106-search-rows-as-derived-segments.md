@@ -71,15 +71,26 @@ Accepted by the maintainer on 2026-11-15.
 
 - A pass seals a `blob-trigrams-v2` or `tree-trigrams-v2` row only while
   retention keeps it live: its blob or tree is below a head current now
-  or within the server's own `--search-retention` (all rows when it is
-  `off`). Superseded rows stay rows, for retention to delete as before.
+  or within the `--search-retention` of the server whose pass holds the
+  lease (all rows when it is `off`), so a fleet must run one window.
+  Superseded rows are not sealed and stay rows: retention deletes the
+  superseded `blob-trigrams-v2` (and `blob-trigrams-v1`) rows as before,
+  and superseded `tree-trigrams-v2` rows, which retention never deletes
+  (ADR 0094, 0102), stay as they did before this ADR. A pass in mode
+  `retire` skips the keys of such rows until its next periodic listing
+  (`list_every`), and lists again only when the rows' count moved, a
+  segment ripened or `list_every` passed, so they cost no work every
+  pass.
 - Keyframes are always sealed and never left out of a merge: a live patch
   may stand on the keyframe of a version no head holds, and retention
   never deletes them either.
 - A merge leaves out keys retention no longer keeps, and a segment of
-  which a third or more of the values are such keys is rewritten alone. A
-  sealed row that becomes superseded therefore outlives its window until
-  then. Keys are left out only while the walk that judged them is current
+  which a third or more of the values are such keys (or values of a column
+  `repair drop` cleared) is rewritten alone. A sealed blob row that becomes
+  superseded therefore outlives its window until then. A directory filter
+  sealed while live is dropped by such a merge: a deletion neither ADR
+  0094 nor 0102 makes (they keep every directory filter), and part of the
+  maintainer's decision; the filter is derived again if a search needs it. Keys are left out only while the walk that judged them is current
   (the newest ref log entry has not moved since), and the walk is redone
   when the ref log moved (at most every `list_every`, 10 minutes) or
   after an hour.
@@ -91,16 +102,21 @@ Accepted by the maintainer on 2026-11-15.
 ### 4. Patches and keyframes together
 - A row is deleted only when the row and the segment's value stand for the
   same set or filter, each patch resolved against its keyframe as any read
-  finds it (a row, or a live segment's value). A patch whose keyframe is
-  not found is equal to nothing: the row stays, uncounted, and is compared
-  again after the next listing. So a patch row is never retired against a
+  finds it (a row, or a live segment's value). Byte-identical values are
+  equal without resolving (they stand for the same thing whatever their
+  keyframe). Otherwise a patch whose keyframe is not found is equal to
+  nothing: the row stays, uncounted, and is not compared again while that
+  segment holds it. So a patch row is never retired against a different
   value its keyframe is missing for, and a keyframe row goes only once a
   live segment holds the same bytes.
 - A keyframe lost later (its segment dropped as damaged, a `repair drop`
   racing a derivation, a column cleared) is covered by the rule of ADR
   0094 and 0102: a patch whose keyframe is not stored reads as not stored,
-  so search derives the row whole and writes it; the pass then keeps that
-  row (its sealed patch cannot be resolved).
+  so search derives the row whole and writes it. A row that resolves
+  while its holding segment's value does not is sealed again into a new
+  segment, which then answers for it (the newest segment wins), and the
+  row is retired against it; the store converges instead of rereading the
+  pair every pass.
 - `repair drop --kind blob-trigrams-v2` (or `tree-trigrams-v2`) clears both
   of its columns, keyframes with patches, by swap before deleting the rows
   (the kinds' `also`, as before).
@@ -117,13 +133,18 @@ Accepted by the maintainer on 2026-11-15.
   writer's choice: the block directory says where each lies.
 - A seal reads a page a batch of keys at a time and closes a segment once
   its rows reach four thirds of the cap, so a pass holds about one
-  segment's rows at once (a dense filter is 64 KiB).
-- Two tiers: segments under half of both caps (1 MiB, and 16,384 keys)
-  merge with up to three neighbours while the result fits, so segments end
-  between half the cap and the cap; full ones are only rewritten once a
-  third dead. A row is written about twice. (A first version kept every
-  segment over a quarter of the byte cap apart: in a soak with small
-  limits, 1,978 such segments of 8 to 32 KiB accumulated.)
+  segment's rows at once (a dense filter is 64 KiB). Encoding runs on the
+  blocking pool, off the async workers.
+- Merges: the first run of two or more adjacent small segments (under half
+  of both caps, 1 MiB and 16,384 keys), up to four, as far as they fit;
+  failing that, a small segment between larger ones (not the newest, which
+  waits for the next seal) with its smaller neighbour when the two fit.
+  Every adjacent pair that cannot merge then sums over the cap, so the
+  family has at most about twice its bytes over the cap live segments
+  (plus the newest). Larger segments are only rewritten once a third dead.
+  Merges share the pass's time bound. (A first version kept every segment
+  over a quarter of the byte cap apart: in a soak with small limits, 1,978
+  such segments of 8 to 32 KiB accumulated.)
 - `--derive-cache-bytes` is not raised: the 32 MiB data cache and 16 MiB
   block cache are shared with the other families (measured below).
 
@@ -175,12 +196,20 @@ the view), the sweep and blob GC (every family's manifest, ADR 0105).
 The view serves the four kinds like the others. A batched read's miss now
 refreshes every family's manifest with one batched read even for one key
 (a single-row read's miss still uses single-row reads, ADR 0105): the
-search paths read rows with `get_derived_many`, often of one key.
+search paths read rows with `get_derived_many`, often of one key. A read
+fails only for an error of the family it asks for (the manifests' read
+itself, or that family's index blobs): another family's failed manifest or
+index load is logged, so a `content-v1` index that cannot be read now does
+not fail a `generation` read. `estimate_derived` and `count_derived` count
+sealed keys from the indexes without building a set of them.
 
 ## Cost
 - A pass walks the live set when the ref log moved (one batched read per
   level of distinct trees of the window's heads) and holds it while it
-  seals or merges: about 50 bytes a live blob or tree.
+  seals or merges: about 50 bytes a live blob or tree. While walking it
+  also holds, transiently, every distinct tree node's list of files and
+  subdirectories (about 32 bytes an entry plus a map entry a node), and
+  sizes the order map for eight entries a node up front.
 - `budget_tests`: a search on a new process makes 32 metadata calls, not
   31 (the first miss of a search row reads the three manifests in one
   batched read, at most once a minute); search land stays 11 and create
@@ -189,6 +218,21 @@ search paths read rows with `get_derived_many`, often of one key.
   milliseconds on a filesystem, 50 to 150 ms on an object store, where
   ranged reads are the follow-up).
 
+## Follow-ups (not in this change)
+- Reads of a key are linear in the family's live segments (each index is
+  looked up, newest first); a per-family key-to-segment map or a
+  fingerprint filter would make them constant, which matters once a large
+  store holds hundreds of `content-v1` segments.
+- The live walk is redone whole when the ref log moved; an incremental
+  walk (only new heads' changed subtrees) would make it proportional to
+  lands.
+- A cold process's first miss of a `content-v1` key waits for every live
+  segment's index to load (8 at a time); with ranged reads of data blobs
+  (needed before large object-store deployments retire this family) the
+  indexes could load lazily too.
+- Keyframes no live patch stands on are kept forever, as rows were (ADR
+  0102); retiring them needs every live patch's base.
+
 ## Consequences
 - Corpus B, measured as in ADR 0105 (release builds of 784bed6 and this
   change, every family named in `--derived-segments-retire-families`, `gc`,
@@ -196,11 +240,16 @@ search paths read rows with `get_derived_many`, often of one key.
 
   | Backend | Before | After | x 6.35 MB (rebuilt) | x 6.58 MB (ADR 0104) |
   |---|---|---|---|---|
-  | Postgres | 14.31 MB | **12.04 MB** (2.34 db + 9.69 blobs) | 2.25x -> **1.90x** | 2.17x -> **1.83x** |
+  | Postgres | 14.31 MB | **12.04 MB** (2.34 db + 9.69 blobs; 12.03 MB with the final build) | 2.25x -> **1.90x** | 2.17x -> **1.83x** |
   | SQLite | 14.69 MB | **12.48 MB** (2.79 + 9.69) | 2.31x -> **1.97x** | 2.23x -> **1.90x** |
 
   The ≤2x target is met on both backends against both Git figures, in
-  `retire` after `VACUUM FULL`. The search rows (4.23 MB of key and value
+  `retire` after `VACUUM FULL`. Corpus B indexes only its head (the import
+  warms one tree, all whole rows), so these figures do not show a store
+  whose lands the warmer indexed one by one (patches, keyframes and
+  superseded directory filters): that case is measured below (land-driven
+  corpus). The default mode, `build`, keeps every row and grows the blob
+  store by the segments (2.6 MB on B) until `retire`. The search rows (4.23 MB of key and value
   bytes) became 4 segments of 2.62 MB. The design estimated about -1.25 MB
   (±0.3) with 64 KiB blocks; measured with them -1.97 MB on Postgres
   (12.34 MB, 1.94x / 1.88x) and -1.92 MB on SQLite (12.77 MB, 2.01x of
@@ -215,13 +264,29 @@ search paths read rows with `get_derived_many`, often of one key.
   rows (new lines, `crates/leep-e2e/tests/storage_size.rs`).
 - `budget_tests`: search on a new process 31 -> 32 metadata calls (the
   manifests, once a minute); search land 11 and create 13 unchanged.
+- A land-driven corpus (the same history, 6.35 MB in Git: Leep's history
+  imported to 89fb9ad, then the 2,000 edits imported five at a time, 400
+  heads, with a server's warmer indexing each head; then `retire` naming
+  every family, `gc`, `VACUUM FULL`; Postgres): the search rows are 11.8
+  MB of key and value bytes (4,246 directory filters, 2,797 blob rows, 595
+  blob and 73 directory keyframes; every head is inside the 14-day window,
+  so all are live), and become 8 `content-v1` segments of 5.6 MB. The
+  database goes from 16.68 MB (release of 784bed6) to 2.46 MB; the store
+  from 34.69 MB (5.46x Git) to 26.92 MB (4.24x). What remains over 2x is
+  the blob objects (18 to 23.5 MB between runs, the automatic delta
+  repack's timing), which five-commit imports do not delta as a whole
+  import does: thin packs' concern (storage plan PR 7), not this one's.
 - Soak (8 minutes, 50 agents and 2 CLI agents, Postgres, `retire` naming
-  every family, the small limits): passes, 6.0 lands a second, land p99
-  42 ms; `content-v1` 294 live segments, 32,306 rows retired. With the
-  first tier rule the same soak failed twice the same way: 1,978
-  `content-v1` segments accumulated and a CLI agent made no progress for
-  120 s about five minutes in (no command finished, so which one stalled
-  was not recorded); with the rule above it did not recur.
+  every family, the small limits). With the first merge rule, 1,978
+  `content-v1` segments accumulated in 8 minutes, and the soak failed
+  four times out of four with a CLI agent making no progress for 120 s. Recording
+  each CLI step showed the agent `thinking`: the CLI agents' think time is
+  drawn up to ten times its 18 s mean, past the watchdog's 120 s, and seed
+  1 draws such a time for the first CLI agent about five minutes in; a
+  harness flaw, reached or not depending on how many iterations the agent
+  ran by then. The harness now counts a thinking agent as alive. The
+  segment count is bounded by the merge rule above; a 50-minute soak is
+  reported below.
 - Deviations from the design: blocks of 512 KiB at zstd level 17 instead
   of the other families' 64 KiB at 9 (measured, above); a merge leaves keys
   out only while its walk is current; keyframes are never left out (they

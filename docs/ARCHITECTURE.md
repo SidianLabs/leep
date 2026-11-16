@@ -299,10 +299,14 @@ tree node and numbered by a depth-first walk of the heads' trees (a
 directory, its files, its subdirectories), in blocks of 512 KiB and data
 blobs of at most 1 MiB. It seals a blob or directory row only while search
 row retention keeps it live (a head now or within the window; keyframes
-always), leaves out at merge what retention no longer keeps, rewrites a
-segment once a third is dead, and compares a row with its sealed value by
-the set or filter they stand for, patches resolved against their keyframes
-(never equal when a keyframe is missing). Retention keeps its own lease
+always; superseded directory filters, which retention never deletes, stay
+rows), leaves out at merge what retention no longer keeps (directory
+filters included), rewrites a segment once a third is dead, merges small
+segments so their number stays near twice the family's bytes over the
+cap, and compares a row with its sealed value by the set or filter they
+stand for, patches resolved against their keyframes (never equal when a
+keyframe is missing, unless byte-identical; a row that resolves is then
+sealed again). A view read fails only for its own family's errors. Retention keeps its own lease
 and touches rows only. `verify` and `repair rederive` scan the keys only a
 segment holds too (`RowScan::of`), since listings stay rows.
 

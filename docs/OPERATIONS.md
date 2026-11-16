@@ -3767,12 +3767,17 @@ Since ADR 0106 a third family, `content-v1` (feature `derived-segments-3`),
 holds the code search rows (`blob-trigrams-v2`, `tree-trigrams-v2`) and
 their keyframes, keyed by blob and tree node. It seals a blob or directory
 row only while the search row retention keeps it (below a head current now
-or within this server's `--search-retention`; every row with `off`), and
-every keyframe; superseded rows stay rows for retention to delete, and a
-sealed row that becomes superseded stays in its segment until a merge
-leaves it out (a segment is rewritten once a third of it is). A row and its
-segment value are compared by the trigram set or filter they stand for, not
-their bytes. Its segments hold at most 1 MiB of data, in 512 KiB blocks. On
+or within the `--search-retention` of the server whose pass holds the
+lease; every row with `off`), and every keyframe. **Run every server with
+the same `--search-retention`**: whichever holds the lease decides what is
+live. Superseded rows are not sealed: retention deletes superseded blob
+rows as before, and superseded directory filters (`tree-trigrams-v2`),
+which retention never deletes, stay rows as before. A sealed row that
+becomes superseded stays in its segment until a merge leaves it out (a
+segment is rewritten once a third of it is); that also drops a directory
+filter sealed while it was live, which derives again if a search needs it.
+A row and its segment value are compared by the trigram set or filter they
+stand for, not their bytes. Its segments hold at most 1 MiB of data, in 512 KiB blocks. On
 Leep's history plus 2,000 edits the search rows' about 4.4 MB (with
 Postgres overhead) become about 2.6 MB of segments (docs/PERFORMANCE.md,
 "Derived segments, family content-v1").
@@ -3780,7 +3785,10 @@ Postgres overhead) become about 2.6 MB of segments (docs/PERFORMANCE.md,
 The storage target (at most twice Git) is met with `retire` naming every
 family (`--derived-segments-retire-families all`), `gc` and a `VACUUM
 FULL derived` (or `VACUUM` on SQLite): that is the operator step for the
-full savings. `build`, the default, keeps every row and adds the segments.
+full savings. `build`, the default, keeps every row and adds the segments
+(about 2.6 MB of blobs on that history). Corpus B indexes only its head;
+a store whose every land the warmer indexed keeps more search rows
+(patches, keyframes, superseded filters): ADR 0106 measures both.
 
 | Flag / env | Default | What it does |
 |---|---|---|

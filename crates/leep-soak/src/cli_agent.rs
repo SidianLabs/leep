@@ -257,11 +257,17 @@ impl CliAgent {
                 break;
             }
             self.sh.beat(self.beat);
+            self.sh.doing(self.beat, Some("thinking".into()));
             let t = self.rng.think(self.sh.args.think * 3);
             let end = Instant::now() + t;
+            // Think times are drawn up to ten times their mean (three times
+            // `--think`, 180 s by default), past the stall watchdog's 120 s:
+            // an agent thinking is alive, not stalled.
             while Instant::now() < end && !self.sh.stopped() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
+                self.sh.alive(self.beat);
             }
+            self.sh.doing(self.beat, None);
         }
         self.finish().await;
     }
@@ -510,10 +516,18 @@ impl CliAgent {
         self.sh.stats.inc("branches_created");
         // The branch starts at the working copy's base, which is a main head
         // or an older ancestor of it.
-        let Ok(Some(head)) = self.api.get_ref(&name).await else {
+        self.sh
+            .doing(self.beat, Some(format!("GET /v1/refs/{name}")));
+        let head = self.api.get_ref(&name).await;
+        self.sh.doing(self.beat, None);
+        let Ok(Some(head)) = head else {
             return false;
         };
-        if let Ok(info) = self.api.changeset(head).await {
+        self.sh
+            .doing(self.beat, Some(format!("GET /v1/changesets/{head}")));
+        let info = self.api.changeset(head).await;
+        self.sh.doing(self.beat, None);
+        if let Ok(info) = info {
             self.sh
                 .ledger
                 .0
@@ -653,10 +667,18 @@ impl CliAgent {
             return self.recover().await;
         }
         self.sh.stats.inc("branches_created");
-        let Ok(Some(head)) = self.api.get_ref(&name).await else {
+        self.sh
+            .doing(self.beat, Some(format!("GET /v1/refs/{name}")));
+        let head = self.api.get_ref(&name).await;
+        self.sh.doing(self.beat, None);
+        let Ok(Some(head)) = head else {
             return false;
         };
-        if let Ok(info) = self.api.changeset(head).await {
+        self.sh
+            .doing(self.beat, Some(format!("GET /v1/changesets/{head}")));
+        let info = self.api.changeset(head).await;
+        self.sh.doing(self.beat, None);
+        if let Ok(info) = info {
             self.sh
                 .ledger
                 .0

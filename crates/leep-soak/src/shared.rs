@@ -275,6 +275,14 @@ impl Shared {
         }
     }
 
+    /// `agent` is alive but idle by design (thinking between iterations):
+    /// not a stall, though not an iteration either.
+    pub fn alive(&self, agent: usize) {
+        if let Some(b) = self.beats.get(agent) {
+            b.store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
+        }
+    }
+
     pub fn beat(&self, agent: usize) {
         self.iterations.fetch_add(1, Ordering::Relaxed);
         if let Some(b) = self.beats.get(agent) {

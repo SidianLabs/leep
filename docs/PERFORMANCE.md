@@ -4557,6 +4557,26 @@ the same 4-vCPU host. Database above an empty one plus blob store:
   subdirectories, gained a little more (2.59 MB of data in segments).
 - The default mode, `build`, keeps every row and adds the segments: B grows
   by 2.6 MB of blobs until `retire`.
+- Corpus B is imported, so only its head is indexed and every search row
+  is whole: the figures above do not show a store whose lands the warmer
+  indexed one by one. **Land-driven corpus**: the same history (Git 6.35
+  MB), Leep's history imported to 89fb9ad and the 2,000 edits imported
+  five at a time (400 heads) while a server's warmer indexed each head,
+  then the same `retire`, `gc` and `VACUUM FULL`, Postgres:
+
+  | | 784bed6 | This change |
+  |---|---|---|
+  | Search rows, key and value bytes (directory filters 5.27 MB, blob rows 2.58, blob keyframes 2.10, directory keyframes 1.84) | 11.80 MB, rows | 8 `content-v1` segments of 5.60 MB |
+  | Database above an empty one | 16.68 MB | 2.46 MB |
+  | Blob store | 18.01 MB | 24.46 MB |
+  | All (x Git) | 34.69 MB (5.46x) | 26.92 MB (4.24x) |
+
+  Every head is inside the 14-day window, so every row is live and sealed
+  (patches and keyframes compress to under half: successive versions'
+  rows repeat each other). The blob objects alone take 18 to 23.5 MB
+  between runs (the automatic delta repack's timing): imports of five
+  commits are not deltified as one whole import is, and that, not search,
+  keeps this store over twice Git.
 
 **Search latency** (20 literal queries, limit 100, on B's head over HTTP;
 a fresh server with passes and retention off each run, round 1 cold,

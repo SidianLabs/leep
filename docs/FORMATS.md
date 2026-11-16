@@ -1866,8 +1866,9 @@ and 0105's:
 - Equality before a delete: a `blob-trigrams-v2` row and a segment value
   are equal when they stand for the same trigram set, a `tree-trigrams-v2`
   row and value when they stand for the same filter, each patch applied to
-  its keyframe as any read finds it (a row, or a live segment's value); a
-  patch whose keyframe is not found is never equal (the row stays).
+  its keyframe as any read finds it (a row, or a live segment's value);
+  byte-identical values are equal, and otherwise a patch whose keyframe
+  is not found is never equal (the row stays).
   Keyframes compare by bytes.
 - Before the first `content-v1` row is deleted the store feature
   `derived-segments-3` is recorded, only by a server that names the family
