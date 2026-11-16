@@ -116,7 +116,11 @@ Accepted by the maintainer on 2026-11-15.
   while its holding segment's value does not is sealed again into a new
   segment, which then answers for it (the newest segment wins), and the
   row is retired against it; the store converges instead of rereading the
-  pair every pass.
+  pair every pass. Such rows are sealed at the next listing that is due,
+  whatever the seal thresholds, and are forgotten as soon as they stop
+  being listed or their holder changes. A pair whose row's own keyframe is
+  missing stays unresolved (residue, the row winning) until a merge
+  rewrites the holder or the process restarts.
 - `repair drop --kind blob-trigrams-v2` (or `tree-trigrams-v2`) clears both
   of its columns, keyframes with patches, by swap before deleting the rows
   (the kinds' `also`, as before).
@@ -139,9 +143,11 @@ Accepted by the maintainer on 2026-11-15.
   of both caps, 1 MiB and 16,384 keys), up to four, as far as they fit;
   failing that, a small segment between larger ones (not the newest, which
   waits for the next seal) with its smaller neighbour when the two fit.
-  Every adjacent pair that cannot merge then sums over the cap, so the
-  family has at most about twice its bytes over the cap live segments
-  (plus the newest). Larger segments are only rewritten once a third dead.
+  Every adjacent pair that cannot merge then exceeds one cap (bytes or
+  keys) together, so the family has at most about 2·bytes/cap +
+  2·keys/keycap + 1 live segments, plus any that are never merged
+  (unknown columns, unreadable for now, or a run whose merge came out over
+  the cap). Larger segments are only rewritten once a third dead.
   Merges share the pass's time bound. (A first version kept every segment
   over a quarter of the byte cap apart: in a soak with small limits, 1,978
   such segments of 8 to 32 KiB accumulated.)
@@ -240,6 +246,9 @@ sealed keys from the indexes without building a set of them.
   indexes could load lazily too.
 - Keyframes no live patch stands on are kept forever, as rows were (ADR
   0102); retiring them needs every live patch's base.
+- `count_derived`'s distinct count of sealed keys is quadratic in the
+  family's segments (each key checked against every newer one); an
+  operator tool's call, but a key-to-segment map would fix it too.
 
 ## Consequences
 - Corpus B, measured as in ADR 0105 (release builds of 784bed6 and this
@@ -294,17 +303,21 @@ sealed keys from the indexes without building a set of them.
   harness flaw, reached or not depending on how many iterations the agent
   ran by then (it reproduces on 784bed6 too). The harness now counts a
   thinking agent as alive.
-- A 50-minute soak at the final merge rule (same settings, 18,039 lands):
-  the `content-v1` live segments grew with the family's bytes, never past
-  the rule's bound: 95 at 2.4 minutes, 408 at 12 (37.2 MB of data, 91 KB a
-  segment against the small limits' 128 KiB cap), 1,093 at 31, 1,654 at
-  44 (152 MB, 92 KB a segment; bound 2,324), 1,929 at 48. Every head is
-  inside the 14-day window, so nothing dies and the family only grows; at
-  the default 1 MiB cap the same bytes take an eighth of the segments.
-  The soak's final `verify --full --rehash` of that store ran for over an
-  hour (it rereads every search row a directory filter covers, one
-  statement each, as with rows, plus a segment lookup that misses the
-  32 MiB data cache across 2,000 segments).
+- A 50-minute soak (same settings, 18,039 lands) of a binary before the
+  live walk's memory fix (372e252, the merge rule above) **failed**, with
+  two violations: the server's RSS grew 462 MiB/h over the second half
+  (limit 64; 901 to 1,081 MiB; 784bed6's own slope is high at this
+  length, the bounded caches filling), and its final `verify --full
+  --rehash` was killed by SIGTERM at 8,628 s, unfinished (0 problems so
+  far). For scale, on the 8-minute soaks the final verify takes 980 s on
+  784bed6 and 933 s with this change, the same per changeset within
+  noise; the 50-minute store has about seven times the changesets. The
+  `content-v1` live segments grew with the family's bytes, under the
+  merge rule's bound: 95 at 2.4 minutes, 408 at 12 (37.2 MB of data, 91 KB
+  a segment against the small limits' 128 KiB cap), 1,093 at 31, 1,654 at
+  44 (152 MB, 92 KB a segment), 1,929 at 48. Every head is inside the
+  14-day window, so nothing dies and the family only grows; at the
+  default 1 MiB cap the same bytes take an eighth of the segments.
 - RSS (20-minute soak, Postgres, the same harness against 784bed6's
   server): 784bed6 324 / 429 / 539 / 602 MiB at 5, 10, 15 and 20 minutes;
   this change 357 / 467 / 599 / 649 MiB (+47 MiB, about the segment

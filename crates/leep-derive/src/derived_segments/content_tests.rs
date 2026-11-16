@@ -1208,3 +1208,102 @@ impl MetaStore for Racing {
         self.inner.release_lease(key, holder, epoch).await
     }
 }
+
+/// A row marked to seal again whose row then goes (deleted here, as
+/// retention or `repair drop` would) is forgotten at the next listing: it
+/// does not make every later listing seal at once, below the thresholds.
+#[tokio::test]
+async fn a_stale_reseal_mark_does_not_bypass_the_seal_threshold() {
+    let r = repo();
+    let ids = chain(&r, 9).await;
+    let head = *ids.last().unwrap();
+    let mut st = CompactState::default();
+    let hook = feature_hook(Arc::default());
+    settle(&r, &opts(Mode::Retire), &mut st, Some(&hook)).await;
+    let lease = acquire_for(&r, "test").await.unwrap();
+    drop_columns(
+        &r,
+        &lease,
+        FAMILY_CONTENT,
+        &[COL_BLOB_KEYFRAME, COL_TREE_KEYFRAME],
+    )
+    .await
+    .unwrap();
+    crate::gc_lease::release(lease, Ok(())).await.unwrap();
+    // A search writes whole rows for the patched blobs it probes.
+    answers(&r, head).await;
+    let restored: Vec<(&'static str, Hash)> = rows(&r).await.into_keys().collect();
+    assert!(restored.iter().any(|(k, _)| *k == BLOB_KIND));
+    let hold = CompactOptions {
+        seal_rows: 1_000,
+        idle_rows: 1_000,
+        ..opts(Mode::Retire)
+    };
+    // This pass marks them to seal again (their sealed patches cannot be
+    // resolved); then their rows go.
+    pass(&r, &hold, &mut st, Some(&hook)).await;
+    for (kind, key) in &restored {
+        r.row_meta()
+            .delete_derived_keys(&[kind], &[*key])
+            .await
+            .unwrap();
+    }
+    // A new land: a few unsealed rows, far below the thresholds.
+    let one = Files::from([(
+        "src/d3/f4.rs".to_string(),
+        file("fn later() { fresh_token }\n".repeat(5)),
+    )]);
+    let id = commit_files(&r, &[head], &one).await;
+    r.meta()
+        .cas_ref("main", Some(head), Some(id))
+        .await
+        .unwrap();
+    r.derive_search(id).await.unwrap();
+    let hold = CompactOptions {
+        content_now: Some(now() + 10),
+        ..hold
+    };
+    for _ in 0..3 {
+        let p = pass(&r, &hold, &mut st, Some(&hook)).await;
+        let c = p.family(codec::FAMILY_CONTENT_NAME).cloned().unwrap();
+        assert_eq!(c.sealed_segments, 0, "{c:?}");
+    }
+}
+
+/// A blob held by two directories (and by two versions of a directory) is
+/// numbered once, after the first directory that holds it, and is live.
+#[tokio::test]
+async fn a_file_shared_across_directories_is_numbered_once() {
+    let r = repo();
+    let body = file("fn shared() { same_bytes }\n".repeat(4));
+    let mut files = Files::new();
+    files.insert("a/x.rs".into(), body.clone());
+    files.insert("b/y.rs".into(), body.clone());
+    files.insert("b/z.rs".into(), file("fn z() {}\n".into()));
+    let base = commit_files(&r, &[], &files).await;
+    let next = commit_files(
+        &r,
+        &[base],
+        &Files::from([("b/z.rs".to_string(), file("fn z2() {}\n".into()))]),
+    )
+    .await;
+    r.meta().cas_ref("main", None, Some(base)).await.unwrap();
+    r.meta()
+        .cas_ref("main", Some(base), Some(next))
+        .await
+        .unwrap();
+    let blob = Hash::of_blob(&body.0);
+    for keep in [None, Some(Duration::from_secs(3600))] {
+        let l = r.content_live(keep, Duration::ZERO, now()).await.unwrap();
+        assert!(l.live(&blob));
+        let root = r.root_tree(next).await.unwrap();
+        let at = l.order(&blob).unwrap();
+        assert!(at > l.order(&root).unwrap());
+        // `a/` comes first in the walk: the shared file sits right after it.
+        let node = r.read_tree(root).await.unwrap();
+        let leep_core::TreeEntry::Dir { tree: a } = node.entries["a"] else {
+            panic!()
+        };
+        assert_eq!(l.order(&a).unwrap() + 1, at);
+    }
+}

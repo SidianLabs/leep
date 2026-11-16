@@ -1244,11 +1244,23 @@ impl<'a> Pass<'a> {
         let now = Instant::now();
         let mut rows = self.rows.take().unwrap_or_default();
         self.place_holders(&mut rows);
+        // A row to seal again stays one only while it is listed and its
+        // holder is still the segment it could not be resolved against (its
+        // row deleted, gone dead, or its holder merged or dropped: forgotten).
+        state.reseal.retain(|(k, col)| {
+            rows.get(k).is_some_and(|r| {
+                let at = r.holder[slot(*col)];
+                r.have & bit(*col) != 0
+                    && at != NONE
+                    && state.unresolved.get(&(*k, *col)) == Some(&self.man.live[at as usize].index)
+            })
+        });
         let mut unsealed_rows = 0u64;
         let mut lone_now: HashSet<Hash> = HashSet::new();
         let mut cands: Vec<(Hash, u64)> = Vec::new();
         let expected = self.fam.expected;
         let mut dead_now: Vec<Hash> = Vec::new();
+        let mut resealing = false;
         for (k, r) in &rows {
             let mut open = 0u64;
             let mut present = r.have;
@@ -1272,6 +1284,11 @@ impl<'a> Pass<'a> {
             if open == 0 {
                 continue;
             }
+            resealing |= self
+                .fam
+                .columns
+                .iter()
+                .any(|c| open & bit(c.id) != 0 && state.reseal.contains(&(*k, c.id)));
             unsealed_rows += open.count_ones() as u64;
             // Columns with no row may be sealed already.
             for c in self.fam.columns {
@@ -1293,6 +1310,10 @@ impl<'a> Pass<'a> {
         }
         let keyed = rows.len();
         self.rows = Some(rows);
+        if !state.reseal.is_empty() {
+            let dead: HashSet<&Hash> = dead_now.iter().collect();
+            state.reseal.retain(|(k, _)| !dead.contains(k));
+        }
         state.unstored.extend(dead_now);
         state.lone_since.retain(|k, _| lone_now.contains(k));
         self.report.unsealed_rows = unsealed_rows;
@@ -1304,9 +1325,9 @@ impl<'a> Pass<'a> {
             .last_growth
             .is_some_and(|t| now.duration_since(t) >= self.opts.idle);
         let n = cands.len();
-        // Rows to seal again (their sealed value cannot be resolved) go at
-        // once: they are few and would otherwise be compared every pass.
-        let resealing = !state.reseal.is_empty();
+        // Rows to seal again (their sealed value cannot be resolved) among
+        // the candidates are sealed at the listing that finds them, whatever
+        // the thresholds: they are few, and are not compared meanwhile.
         if n == 0 || (n < self.opts.seal_rows && !(n >= self.opts.idle_rows && idle) && !resealing)
         {
             return Vec::new();
@@ -1458,13 +1479,13 @@ impl<'a> Pass<'a> {
         }
         let (fam, cap) = (self.fam.id, self.max_bytes());
         // zstd at level 17 takes a while: off the async workers.
-        let (out, seal) = tokio::task::spawn_blocking(move || {
+        let out = tokio::task::spawn_blocking(move || {
             let mut out = Vec::new();
-            encode_capped(fam, cap, &seal, &mut out).map(|()| (out, seal))
+            encode_capped(fam, cap, &seal, &mut out).map(|()| out)
         })
         .await
         .map_err(|e| Error::Other(format!("encoding a derived segment: {e}")))??;
-        for (enc, bad) in out {
+        for (enc, bad, keys) in out {
             for b in &bad {
                 tracing::warn!(
                     key = %b.key,
@@ -1484,12 +1505,13 @@ impl<'a> Pass<'a> {
             self.man.live.push(enc.seg);
             self.write().await?;
             self.pause("seal-swapped").await;
+            // Only this segment's rows: a later one that fails to store
+            // leaves its rows to seal again.
             if !state.reseal.is_empty() {
-                state.reseal.retain(|(k, c)| {
-                    !seal
-                        .iter()
-                        .any(|r| r.key == *k && r.values.iter().any(|(vc, _)| vc == c))
-                });
+                let keys: HashSet<Hash> = keys.into_iter().collect();
+                state
+                    .reseal
+                    .retain(|(k, c)| !(keys.contains(k) && enc.seg.has(*c)));
             }
             state.known.insert(enc.seg.index, enc.seg.columns);
             state.live_since.insert(enc.seg.index, Instant::now());
@@ -1690,9 +1712,10 @@ impl<'a> Pass<'a> {
     /// adjacent small segments (under half of both caps), up to `fanout`,
     /// its longest prefix that fits; else a small segment between larger
     /// ones (not the newest, which waits for the next seal) with its
-    /// smaller neighbour, if the two fit. Adjacent pairs that do not fit
-    /// together average over half the cap, so the live segments number at
-    /// most about twice the family's bytes over the cap.
+    /// smaller neighbour, if the two fit. Adjacent pairs that cannot merge
+    /// exceed one cap together, so the live segments number about
+    /// 2·bytes/cap + 2·keys/keycap + 1 at most, plus those never merged
+    /// (unknown columns, unreadable, a run found oversize).
     pub(crate) fn content_run(
         &self,
         live: &[SegmentRef],
@@ -1963,7 +1986,9 @@ impl<'a> Pass<'a> {
                 Some(true) => del.push((k, row)),
                 // A keyframe is not stored: they are not known equal, so
                 // the row stays, and is not compared again while this
-                // segment holds it. If the row resolves alone (whole, or
+                // segment holds it (also when the row's own keyframe is the
+                // one missing: residue until a merge rewrites the segment
+                // or the process restarts, the row winning meanwhile). If the row resolves alone (whole, or
                 // its keyframe found) it is sealed again into a new
                 // segment, which then answers for it and lets it go.
                 None => {
@@ -2073,7 +2098,7 @@ fn encode_capped(
     family: u8,
     max_bytes: usize,
     rows: &[SealRow],
-    out: &mut Vec<(codec::Encoded, Vec<codec::BadValue>)>,
+    out: &mut Vec<(codec::Encoded, Vec<codec::BadValue>, Vec<Hash>)>,
 ) -> Result<()> {
     let (enc, bad) = codec::encode(family, rows, codec::nonce())?;
     if enc.seg.data_len as usize > max_bytes && rows.len() > 1 {
@@ -2081,7 +2106,7 @@ fn encode_capped(
         encode_capped(family, max_bytes, a, out)?;
         return encode_capped(family, max_bytes, b, out);
     }
-    out.push((enc, bad));
+    out.push((enc, bad, rows.iter().map(|r| r.key).collect()));
     Ok(())
 }
 
