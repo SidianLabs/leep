@@ -331,6 +331,13 @@ struct FamilyState {
     /// Rows found unequal to their holding segment's value, with that
     /// segment: not read and reported again while it holds them.
     mismatched: HashMap<(Hash, u8), Hash>,
+    /// Rows whose holding segment's value cannot be resolved (`content-v1`:
+    /// a patch whose keyframe is lost), with that segment: not compared
+    /// again while it holds them.
+    unresolved: HashMap<(Hash, u8), Hash>,
+    /// Rows that resolve while their holding segment's value does not:
+    /// sealed again into a new segment, which then answers for them.
+    reseal: HashSet<(Hash, u8)>,
     /// Keys with rows whose changeset is not stored (the changeset sweep
     /// was killed between rows and changeset): skipped until the next
     /// listing after `list_every`.
@@ -771,6 +778,10 @@ impl<'a> Pass<'a> {
         state.verified.retain(|h| live.contains(h));
         state.condemned_warned.retain(|h| live.contains(h));
         state.mismatched.retain(|_, h| live.contains(h));
+        state.unresolved.retain(|_, h| live.contains(h));
+        state
+            .oversize
+            .retain(|run| run.iter().all(|h| live.contains(h)));
         let accounted = self
             .man
             .live
@@ -1158,7 +1169,21 @@ impl<'a> Pass<'a> {
         let due = match state.listed {
             None => true,
             Some((at, n)) => {
-                (self.opts.mode == Mode::Retire && state.retire_left.is_none())
+                // In mode retire only unsealed rows, rows retention no longer
+                // keeps (search rows never sealed) and rows awaiting their
+                // segment's age remain: listed again when their count moved,
+                // a segment ripened since, or `list_every` passed, not every
+                // pass (ADR 0106).
+                let retire_due = self.opts.mode == Mode::Retire
+                    && state.retire_left.is_none()
+                    && (estimate != n || {
+                        let now = Instant::now();
+                        state.live_since.values().any(|t| {
+                            let ripe = *t + self.opts.retire_after;
+                            ripe > at && ripe <= now
+                        })
+                    });
+                retire_due
                     || estimate >= n + (self.opts.seal_rows * self.fam.columns.len().max(1)) as u64
                     || at.elapsed() >= self.opts.list_every
             }
@@ -1221,17 +1246,27 @@ impl<'a> Pass<'a> {
         let mut lone_now: HashSet<Hash> = HashSet::new();
         let mut cands: Vec<(Hash, u64)> = Vec::new();
         let expected = self.fam.expected;
+        let mut dead_now: Vec<Hash> = Vec::new();
         for (k, r) in &rows {
             let mut open = 0u64;
             let mut present = r.have;
             for c in self.fam.columns {
                 let col = c.id;
-                if r.have & bit(col) != 0 && r.holder[slot(col)] == NONE {
+                if r.have & bit(col) != 0
+                    && (r.holder[slot(col)] == NONE || state.reseal.contains(&(*k, col)))
+                {
                     open |= bit(col);
                 }
             }
-            // `content-v1` seals only what retention keeps (ADR 0106).
-            open &= self.keep_mask(k);
+            // `content-v1` seals only what retention keeps (ADR 0106); a key
+            // with nothing it keeps is skipped like an unstored one until the
+            // next listing after `list_every`, so mode retire does not
+            // handle the never-sealed rows again every pass.
+            let kept = open & self.keep_mask(k);
+            if open != 0 && kept == 0 {
+                dead_now.push(*k);
+            }
+            open = kept;
             if open == 0 {
                 continue;
             }
@@ -1256,6 +1291,7 @@ impl<'a> Pass<'a> {
         }
         let keyed = rows.len();
         self.rows = Some(rows);
+        state.unstored.extend(dead_now);
         state.lone_since.retain(|k, _| lone_now.contains(k));
         self.report.unsealed_rows = unsealed_rows;
         if keyed > state.last_unsealed || state.last_growth.is_none() {
@@ -1266,7 +1302,11 @@ impl<'a> Pass<'a> {
             .last_growth
             .is_some_and(|t| now.duration_since(t) >= self.opts.idle);
         let n = cands.len();
-        if n == 0 || (n < self.opts.seal_rows && !(n >= self.opts.idle_rows && idle)) {
+        // Rows to seal again (their sealed value cannot be resolved) go at
+        // once: they are few and would otherwise be compared every pass.
+        let resealing = !state.reseal.is_empty();
+        if n == 0 || (n < self.opts.seal_rows && !(n >= self.opts.idle_rows && idle) && !resealing)
+        {
             return Vec::new();
         }
         cands
@@ -1414,8 +1454,14 @@ impl<'a> Pass<'a> {
         if seal.is_empty() {
             return Ok(());
         }
-        let mut out = Vec::new();
-        encode_capped(self.fam.id, self.max_bytes(), &seal, &mut out)?;
+        let (fam, cap) = (self.fam.id, self.max_bytes());
+        // zstd at level 17 takes a while: off the async workers.
+        let (out, seal) = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            encode_capped(fam, cap, &seal, &mut out).map(|()| (out, seal))
+        })
+        .await
+        .map_err(|e| Error::Other(format!("encoding a derived segment: {e}")))??;
         for (enc, bad) in out {
             for b in &bad {
                 tracing::warn!(
@@ -1436,6 +1482,13 @@ impl<'a> Pass<'a> {
             self.man.live.push(enc.seg);
             self.write().await?;
             self.pause("seal-swapped").await;
+            if !state.reseal.is_empty() {
+                state.reseal.retain(|(k, c)| {
+                    !seal
+                        .iter()
+                        .any(|r| r.key == *k && r.values.iter().any(|(vc, _)| vc == c))
+                });
+            }
             state.known.insert(enc.seg.index, enc.seg.columns);
             state.live_since.insert(enc.seg.index, Instant::now());
             state.verified.insert(enc.seg.index);
@@ -1478,11 +1531,11 @@ impl<'a> Pass<'a> {
         let cap = self.max_bytes();
         let max_rows = self.max_rows();
         // Segments a third dead, found once a pass: each is rewritten alone.
-        let mut dead: VecDeque<Hash> = if omit {
+        let mut dead: VecDeque<Hash> = if self.fam.keys == Keys::Content {
             self.man
                 .live
                 .iter()
-                .filter(|s| self.mostly_dead(s))
+                .filter(|s| self.mostly_dead(s, omit))
                 .map(|s| s.index)
                 .collect()
         } else {
@@ -1491,7 +1544,14 @@ impl<'a> Pass<'a> {
         // Each round merges (the live list shrinks), rewrites a segment once
         // (the dead list shrinks) or skips one (the skip set grows), so it
         // ends; the bound is defense in depth.
+        let deadline = self.started + self.opts.max_seal_time;
+        let mut merged = false;
         for _ in 0..4 * self.man.live.len() + 16 {
+            // Bounded like a backfill: with work left, the next pass soon.
+            if merged && std::time::Instant::now() >= deadline {
+                self.report.more = true;
+                return Ok(());
+            }
             let live = self.man.live.clone();
             let found = {
                 let mergeable = |s: &SegmentRef| {
@@ -1518,8 +1578,10 @@ impl<'a> Pass<'a> {
                     }
                     k
                 };
-                (0..live.len().saturating_sub(f - 1))
-                    .find_map(|i| {
+                let tiered = if self.fam.keys == Keys::Content {
+                    self.content_run(&live, &mergeable, &fits, &state.oversize)
+                } else {
+                    (0..live.len().saturating_sub(f - 1)).find_map(|i| {
                         let run = &live[i..i + f];
                         let t = self.tier(&run[0])?;
                         if !run.iter().all(|s| self.tier(s) == Some(t) && mergeable(s)) {
@@ -1529,15 +1591,15 @@ impl<'a> Pass<'a> {
                         let ids: Vec<Hash> = run[..k].iter().map(|s| s.index).collect();
                         (k >= 2 && !state.oversize.contains(&ids)).then_some((i, k))
                     })
-                    .or_else(|| {
-                        while let Some(h) = dead.pop_front() {
-                            if let Some(i) = live.iter().position(|s| s.index == h && mergeable(s))
-                            {
-                                return Some((i, 1));
-                            }
+                };
+                tiered.or_else(|| {
+                    while let Some(h) = dead.pop_front() {
+                        if let Some(i) = live.iter().position(|s| s.index == h && mergeable(s)) {
+                            return Some((i, 1));
                         }
-                        None
-                    })
+                    }
+                    None
+                })
             };
             let Some((at, k)) = found else {
                 return Ok(());
@@ -1587,7 +1649,11 @@ impl<'a> Pass<'a> {
                     values: v,
                 });
             }
-            let (enc, bad) = codec::encode(self.fam.id, &rows, codec::nonce())?;
+            let fam = self.fam.id;
+            let (enc, bad) =
+                tokio::task::spawn_blocking(move || codec::encode(fam, &rows, codec::nonce()))
+                    .await
+                    .map_err(|e| Error::Other(format!("encoding a derived segment: {e}")))??;
             self.report.bad_values += bad.len() as u64;
             if enc.seg.data_len as usize > cap {
                 state.oversize.insert(run.iter().map(|s| s.index).collect());
@@ -1612,25 +1678,86 @@ impl<'a> Pass<'a> {
             state.verified.insert(enc.seg.index);
             self.report.merges += 1;
             self.report.merged_away += k as u64;
+            merged = true;
         }
         tracing::warn!("derived segment merges stopped at their round bound");
         Ok(())
     }
 
-    /// `content-v1`: whether a third or more of `s`'s values are rows
-    /// retention no longer keeps (keyframes always count as kept).
-    fn mostly_dead(&self, s: &SegmentRef) -> bool {
+    /// `content-v1`: the run to merge, if any. First a run of two or more
+    /// adjacent small segments (under half of both caps), up to `fanout`,
+    /// its longest prefix that fits; else a small segment between larger
+    /// ones (not the newest, which waits for the next seal) with its
+    /// smaller neighbour, if the two fit. Adjacent pairs that do not fit
+    /// together average over half the cap, so the live segments number at
+    /// most about twice the family's bytes over the cap.
+    pub(crate) fn content_run(
+        &self,
+        live: &[SegmentRef],
+        mergeable: &dyn Fn(&SegmentRef) -> bool,
+        fits: &dyn Fn(&[SegmentRef]) -> usize,
+        oversize: &HashSet<Vec<Hash>>,
+    ) -> Option<(usize, usize)> {
+        let f = self.opts.fanout.max(2);
+        let small = |s: &SegmentRef| self.tier(s).is_some() && mergeable(s);
+        let ok = |at: usize, k: usize| {
+            let ids: Vec<Hash> = live[at..at + k].iter().map(|s| s.index).collect();
+            !oversize.contains(&ids)
+        };
+        for i in 0..live.len() {
+            if !small(&live[i]) {
+                continue;
+            }
+            let mut j = i;
+            while j < live.len() && j - i < f && small(&live[j]) {
+                j += 1;
+            }
+            let k = fits(&live[i..j]);
+            if k >= 2 && ok(i, k) {
+                return Some((i, k));
+            }
+        }
+        for i in 0..live.len().saturating_sub(1) {
+            if !small(&live[i]) {
+                continue;
+            }
+            let mut sides: Vec<usize> = Vec::new();
+            if i > 0 && mergeable(&live[i - 1]) {
+                sides.push(i - 1);
+            }
+            if mergeable(&live[i + 1]) {
+                sides.push(i + 1);
+            }
+            sides.sort_by_key(|&n| live[n].data_len);
+            for n in sides {
+                let at = i.min(n);
+                if fits(&live[at..at + 2]) == 2 && ok(at, 2) {
+                    return Some((at, 2));
+                }
+            }
+        }
+        None
+    }
+
+    /// `content-v1`: whether a third or more of `s`'s values are dead:
+    /// values of a column `repair drop` cleared from its mask, and with
+    /// `by_liveness` rows retention no longer keeps (keyframes always count
+    /// as kept).
+    fn mostly_dead(&self, s: &SegmentRef, by_liveness: bool) -> bool {
         let Some(l) = self.segs.get(&s.index) else {
             return false;
         };
         let (mut total, mut dead) = (0usize, 0usize);
         for c in self.fam.columns {
+            let n = l.idx.keys_with(c.id).count();
             if !s.has(c.id) {
+                total += n;
+                dead += n;
                 continue;
             }
             for k in l.idx.keys_with(c.id) {
                 total += 1;
-                if self.keep_mask(k) & bit(c.id) == 0 {
+                if by_liveness && self.keep_mask(k) & bit(c.id) == 0 {
                     dead += 1;
                 }
             }
@@ -1708,7 +1835,11 @@ impl<'a> Pass<'a> {
                 }
                 let chunk: Vec<(Hash, Loc)> = cands[i..j]
                     .iter()
-                    .filter(|(k, _)| l.r.has(col) && state.mismatched.get(&(*k, col)) != Some(&seg))
+                    .filter(|(k, _)| {
+                        l.r.has(col)
+                            && state.mismatched.get(&(*k, col)) != Some(&seg)
+                            && state.unresolved.get(&(*k, col)) != Some(&seg)
+                    })
                     .filter_map(|(k, _)| l.idx.locate(k, col).map(|loc| (*k, loc)))
                     .collect();
                 i = j;
@@ -1772,6 +1903,7 @@ impl<'a> Pass<'a> {
                 if !ripe.contains(&seg)
                     || self.unreadable.contains(&seg)
                     || state.mismatched.get(&(*k, col)) == Some(&seg)
+                    || state.unresolved.get(&(*k, col)) == Some(&seg)
                 {
                     continue;
                 }
@@ -1827,11 +1959,21 @@ impl<'a> Pass<'a> {
                 .same(&row, &value, &|h| keyframes.get(h).cloned())
             {
                 Some(true) => del.push((k, row)),
-                // A keyframe is not stored: neither is known to stand for
-                // anything, so the row stays, and is compared again after
-                // the next listing. A patch is never retired without its
-                // keyframe.
-                None => {}
+                // A keyframe is not stored: they are not known equal, so
+                // the row stays, and is not compared again while this
+                // segment holds it. If the row resolves alone (whole, or
+                // its keyframe found) it is sealed again into a new
+                // segment, which then answers for it and lets it go.
+                None => {
+                    state.unresolved.insert((k, col), live.r.index);
+                    let resolves = match column.equal.base(&row) {
+                        None => true,
+                        Some(b) => keyframes.contains_key(&b),
+                    };
+                    if resolves {
+                        state.reseal.insert((k, col));
+                    }
+                }
                 Some(false) => {
                     unequal += 1;
                     self.report.mismatched += 1;

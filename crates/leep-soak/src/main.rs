@@ -622,7 +622,11 @@ async fn drive(
                     if now.saturating_sub(last) > stall.as_millis() as u64 && !sh.stopped() {
                         sh.violate(
                             "deadlock",
-                            format!("agent {i} made no progress for {}s", (now - last) / 1000),
+                            format!(
+                                "agent {i} made no progress for {}s ({})",
+                                (now - last) / 1000,
+                                sh.doing_now(i)
+                            ),
                         );
                         return;
                     }

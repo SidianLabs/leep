@@ -122,7 +122,12 @@ impl CliAgent {
             } else {
                 c.env_remove("LEEP_TOKEN");
             }
-            let out = match tokio::time::timeout(Duration::from_secs(180), c.output()).await {
+            // Recorded at start, so a command that never returns is named.
+            self.sh
+                .doing(self.beat, Some(format!("leep {}", args.join(" "))));
+            let out = tokio::time::timeout(Duration::from_secs(180), c.output()).await;
+            self.sh.doing(self.beat, None);
+            let out = match out {
                 Ok(Ok(o)) => o,
                 Ok(Err(e)) => {
                     self.sh

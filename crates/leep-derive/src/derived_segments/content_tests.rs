@@ -12,8 +12,8 @@ use leep_core::memory::{MemoryBlobStore, MemoryMetaStore};
 use leep_core::{Changeset, ChangesetId, FileKind, Hash, MetaStore, Result};
 
 use super::codec::{
-    self, SealRow, COL_BLOB_KEYFRAME, COL_BLOB_TRIGRAMS, COL_TREE_KEYFRAME, COL_TREE_TRIGRAMS,
-    FAMILY_CONTENT,
+    self, SealRow, SegmentRef, COL_BLOB_KEYFRAME, COL_BLOB_TRIGRAMS, COL_TREE_KEYFRAME,
+    COL_TREE_TRIGRAMS, FAMILY_CONTENT,
 };
 use super::tests::{feature_hook, fresh, pass, settle};
 use super::*;
@@ -22,6 +22,9 @@ use crate::search::tests::{commit_files, Files};
 use crate::search::trigram::{BlobRow, Bloom, StoredBlob, TreeRow};
 use crate::search::{SearchQuery, BLOB_KEYFRAME_KIND, BLOB_KIND, KEYFRAME_KIND, TREE_KIND};
 use crate::Repo;
+
+/// `generation`, a kind of family `changeset-v2`.
+const GENERATION: &str = <crate::derived::Generation as crate::derived::DerivedKind>::NAME;
 
 /// The kinds of `content-v1`, in column order.
 const KINDS: [&str; 4] = [BLOB_KIND, BLOB_KEYFRAME_KIND, TREE_KIND, KEYFRAME_KIND];
@@ -592,14 +595,193 @@ async fn a_sealed_patch_whose_keyframe_is_lost_reads_as_not_stored() {
         assert_eq!(written[&(BLOB_KIND, **k)].first(), Some(&1));
     }
     // A pass compares them with patches it cannot resolve: neither equal
-    // nor counted unequal; the rows stay.
+    // nor counted unequal. The rows resolve alone, so they are sealed again
+    // into a new segment, which answers for them, and then retired: the
+    // store converges instead of comparing them every pass.
     let report = settle(&r, &opts(Mode::Retire), &mut st, Some(&hook)).await;
     assert_eq!(report.mismatched, 0, "{report:?}");
+    // The pass that finds them only marks them; the next ones seal and
+    // retire.
+    let report = settle(&r, &opts(Mode::Retire), &mut st, Some(&hook)).await;
+    assert_eq!(report.mismatched, 0, "{report:?}");
+    assert!(
+        report.sealed_segments > 0 && report.retired_rows > 0,
+        "{report:?}"
+    );
     let still = rows(&r).await;
+    let f = fresh(&r);
     for k in &restored {
-        assert!(still.contains_key(&(BLOB_KIND, **k)));
+        assert!(!still.contains_key(&(BLOB_KIND, **k)), "{k} was retired");
+        let v = f.meta().get_derived(BLOB_KIND, k).await.unwrap().unwrap();
+        assert_eq!(v.first(), Some(&1), "the whole row answers now");
     }
+    let again = settle(&r, &opts(Mode::Retire), &mut st, Some(&hook)).await;
+    assert_eq!(
+        (again.sealed_segments, again.retired_rows),
+        (0, 0),
+        "{again:?}"
+    );
     assert_eq!(answers(&r, head).await, want);
+}
+
+/// A content-v1 read never fails for another family's segments, and the
+/// reverse: an index blob of `content-v1` that cannot be read now (a
+/// transient error) does not fail a `generation` read.
+#[tokio::test]
+async fn one_familys_failing_index_does_not_fail_anothers_reads() {
+    let blobs: Arc<dyn leep_core::BlobStore> = Arc::new(MemoryBlobStore::new());
+    let flaky = Arc::new(super::tests::Flaky {
+        inner: blobs.clone(),
+        failing: Mutex::default(),
+    });
+    let r = Repo::new(flaky.clone(), Arc::new(MemoryMetaStore::new()));
+    let ids = chain(&r, 5).await;
+    let hook = feature_hook(Arc::default());
+    settle(
+        &r,
+        &opts(Mode::Retire),
+        &mut CompactState::default(),
+        Some(&hook),
+    )
+    .await;
+    assert_eq!(r.row_meta().count_derived(GENERATION).await.unwrap(), 0);
+    let (_, view::ManifestRead::Read(m)) = read_manifest(&r, FAMILY_CONTENT).await.unwrap() else {
+        panic!()
+    };
+    for s in &m.live {
+        flaky.failing.lock().unwrap().insert(s.index);
+    }
+    let keys: Vec<Hash> = ids.iter().map(|i| i.0).collect();
+    let f = fresh(&r);
+    let one = f.meta().get_derived(GENERATION, &keys[3]).await.unwrap();
+    assert!(one.is_some());
+    let f = fresh(&r);
+    let many = f.meta().get_derived_many(GENERATION, &keys).await.unwrap();
+    assert!(many.iter().all(Option::is_some));
+    let f = fresh(&r);
+    let kinds = f
+        .meta()
+        .get_derived_kinds(&[(GENERATION, &keys)])
+        .await
+        .unwrap();
+    assert!(kinds[0].iter().all(Option::is_some));
+    // The search rows' own read reports it.
+    let f = fresh(&r);
+    let root = f.root_tree(ids[5]).await.unwrap();
+    assert!(f.meta().get_derived(TREE_KIND, &root).await.is_err());
+}
+
+/// Small segments are merged even when larger ones sit between them: a
+/// small one between two others joins its smaller neighbour when they fit
+/// (the newest waits for the next seal), and a run of small ones merges.
+#[tokio::test]
+async fn isolated_small_segments_merge_with_a_neighbour() {
+    let r = repo();
+    let o = CompactOptions {
+        content_max_bytes: 1000,
+        content_max_rows: 1000,
+        ..opts(Mode::Build)
+    };
+    let none = None;
+    let fam = codec::family(FAMILY_CONTENT).unwrap();
+    let p = compactor::Pass::load(&r, fam, &o, &none, None)
+        .await
+        .unwrap();
+    let seg = |n: u8, len: u32| SegmentRef {
+        index: Hash([n; 32]),
+        data: Hash([n + 100; 32]),
+        rows: 10,
+        columns: 2,
+        data_len: len,
+    };
+    let fits = |run: &[SegmentRef]| {
+        let mut b = 0;
+        run.iter()
+            .take_while(|s| {
+                b += s.data_len;
+                b <= 1000
+            })
+            .count()
+    };
+    let all = |_: &SegmentRef| true;
+    let oversize = HashSet::new();
+    // [F F r F F r]: the middle small one joins a neighbour.
+    let live = [
+        seg(1, 600),
+        seg(2, 600),
+        seg(3, 100),
+        seg(4, 600),
+        seg(5, 600),
+        seg(6, 100),
+    ];
+    assert_eq!(p.content_run(&live, &all, &fits, &oversize), Some((1, 2)));
+    // Only the newest is small: it waits.
+    assert_eq!(p.content_run(&live[3..], &all, &fits, &oversize), None);
+    // A run of small ones merges, as many as fit.
+    let live = [
+        seg(1, 300),
+        seg(2, 300),
+        seg(3, 300),
+        seg(4, 300),
+        seg(5, 900),
+    ];
+    assert_eq!(p.content_run(&live, &all, &fits, &oversize), Some((0, 3)));
+}
+
+/// Over many small seals the live segments stay bounded: about twice the
+/// family's bytes over the cap.
+#[tokio::test]
+async fn content_segments_stay_bounded_over_many_seals() {
+    let r = repo();
+    let o = CompactOptions {
+        content_max_bytes: 4096,
+        ..opts(Mode::Build)
+    };
+    let mut st = CompactState::default();
+    let mut files = Files::new();
+    let base = {
+        for d in 0..6 {
+            for f in 0..4 {
+                files.insert(
+                    format!("src/d{d}/f{f}.rs"),
+                    file(format!("fn d{d}_f{f}() {{ token_{d}_{f} }}\n").repeat(8)),
+                );
+            }
+        }
+        commit_files(&r, &[], &files).await
+    };
+    r.meta().cas_ref("main", None, Some(base)).await.unwrap();
+    r.derive_search(base).await.unwrap();
+    let mut prev = base;
+    for i in 0..40 {
+        let one = Files::from([(
+            format!("src/d{}/f{}.rs", i % 6, i % 4),
+            file(format!("fn land_{i}() {{ edit_{i} }}\n").repeat(6)),
+        )]);
+        let id = commit_files(&r, &[prev], &one).await;
+        r.meta()
+            .cas_ref("main", Some(prev), Some(id))
+            .await
+            .unwrap();
+        r.derive_search(id).await.unwrap();
+        prev = id;
+        let o = CompactOptions {
+            content_now: Some(now() + 10),
+            ..o.clone()
+        };
+        settle(&r, &o, &mut st, None).await;
+    }
+    let (_, view::ManifestRead::Read(m)) = read_manifest(&r, FAMILY_CONTENT).await.unwrap() else {
+        panic!()
+    };
+    let bytes: u64 = m.live.iter().map(|s| s.data_len as u64).sum();
+    let bound = 2 * bytes / 4096 + 2;
+    assert!(
+        m.live.len() as u64 <= bound,
+        "{} live segments for {bytes} bytes (bound {bound})",
+        m.live.len()
+    );
+    assert!(m.live.len() > 1, "the cap splits the family");
 }
 
 /// Retention deletes rows a pass is sealing (the head moved back between

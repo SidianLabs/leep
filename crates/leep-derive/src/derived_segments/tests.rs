@@ -1949,7 +1949,7 @@ async fn a_lost_index_blob_is_noticed_while_the_view_holds_it() {
 
 /// Rows whose values do not decode, ahead of good ones in generation
 /// order: the backfill goes past them and ends, and they are not made
-/// candidates again by every listing (mode `retire` lists every pass).
+/// candidates again by later passes.
 #[tokio::test(start_paused = true)]
 async fn undecodable_rows_ahead_of_good_ones_do_not_keep_passes_busy() {
     let r = repo();
@@ -1988,7 +1988,7 @@ async fn undecodable_rows_ahead_of_good_ones_do_not_keep_passes_busy() {
     for _ in 0..3 {
         let p = v1(&pass(&r, &opts, &mut st, Some(&hook)).await);
         // Every good row is held; the bad ones are not candidates.
-        assert!(p.listed && !p.more && p.unsealed_rows == 0, "{p:?}");
+        assert!(!p.more && p.unsealed_rows == 0, "{p:?}");
         assert_eq!((p.sealed_keys, p.bad_values), (0, 0), "{p:?}");
     }
 }

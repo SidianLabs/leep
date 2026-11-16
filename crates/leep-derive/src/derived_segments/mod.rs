@@ -281,11 +281,14 @@ pub(crate) async fn drop_columns(
         ManifestRead::Read(m) => m,
         ManifestRead::Damaged => {
             let fam = codec::family(family).expect("a family this binary knows");
+            // Kinds dropped only with another (keyframes with their
+            // patches) are not named: naming that one brings them.
             let missing: Vec<&str> = fam
                 .columns
                 .iter()
                 .filter(|c| !cols.contains(&c.id))
                 .map(|c| c.kind)
+                .filter(|k| crate::integrity::kinds::check_droppable(k).is_ok())
                 .collect();
             if !missing.is_empty() {
                 return Err(Error::Invalid(format!(
