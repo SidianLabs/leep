@@ -170,9 +170,14 @@ pub(crate) fn describe(kind: &str, stored: &[u8], expected: &[u8]) -> String {
 
 /// Which rows of a kind a scan visits: all of them, or a sample taken from
 /// evenly spaced places in key order. Keys are hashes, so the places are
-/// unbiased, and the same sample is taken every time.
+/// unbiased, and the same sample is taken every time. Made with
+/// [`RowScan::of`], it also visits the keys only a live derived segment
+/// holds (their rows retired, ADR 0104 to 0106), in the same key order:
+/// listings stay rows, so a scan of rows alone would skip them.
 pub(crate) struct RowScan {
     kind: &'static str,
+    /// Keys live derived segments hold a value of `kind` for, ascending.
+    sealed: Vec<Hash>,
     full: bool,
     windows: usize,
     per_window: usize,
@@ -188,6 +193,7 @@ impl RowScan {
     pub fn new(kind: &'static str, full: bool, sample: usize) -> Self {
         RowScan {
             kind,
+            sealed: Vec::new(),
             full,
             windows: WINDOWS,
             per_window: sample.div_ceil(WINDOWS).max(1),
@@ -196,6 +202,61 @@ impl RowScan {
             cursor: None,
             done: sample == 0 && !full,
         }
+    }
+
+    /// [`RowScan::new`], visiting the keys live segments hold too (read
+    /// through `repo`'s view, which a row still wins over).
+    pub async fn of(repo: &Repo, kind: &'static str, full: bool, sample: usize) -> Result<Self> {
+        let mut scan = RowScan::new(kind, full, sample);
+        if let Some((family, col)) = crate::derived_segments::codec::kind_column(kind) {
+            repo.segments().refresh(&**repo.row_meta()).await?;
+            let mut keys: Vec<Hash> = repo
+                .segments()
+                .family(family)
+                .keys_with(col)
+                .into_iter()
+                .collect();
+            keys.sort_unstable();
+            scan.sealed = keys;
+        }
+        Ok(scan)
+    }
+
+    /// `page` (rows after the cursor, at most `limit`) with the sealed keys
+    /// up to its last key (or to the end, for a short page) that it lacks,
+    /// their values read through `meta`, in key order and cut to `limit`.
+    async fn with_sealed(
+        &self,
+        meta: &dyn MetaStore,
+        page: Vec<(Hash, Bytes)>,
+        limit: usize,
+    ) -> Result<Vec<(Hash, Bytes)>> {
+        let upper = (page.len() >= limit)
+            .then(|| page.last().map(|(k, _)| *k))
+            .flatten();
+        let start = self.sealed.partition_point(|k| Some(*k) <= self.cursor);
+        let have: std::collections::HashSet<Hash> = page.iter().map(|(k, _)| *k).collect();
+        let extra: Vec<Hash> = self.sealed[start..]
+            .iter()
+            .take_while(|k| upper.is_none_or(|u| **k <= u))
+            .filter(|k| !have.contains(k))
+            .take(limit)
+            .copied()
+            .collect();
+        if extra.is_empty() {
+            return Ok(page);
+        }
+        let values = meta.get_derived_many(self.kind, &extra).await?;
+        let mut all = page;
+        all.extend(
+            extra
+                .into_iter()
+                .zip(values)
+                .filter_map(|(k, v)| Some((k, v?))),
+        );
+        all.sort_unstable_by_key(|(k, _)| *k);
+        all.truncate(limit);
+        Ok(all)
     }
 
     fn window_start(&self) -> Option<Hash> {
@@ -217,7 +278,10 @@ impl RowScan {
             } else {
                 PAGE.min(self.per_window - self.taken)
             };
-            let page = meta.list_derived(self.kind, self.cursor, limit).await?;
+            let mut page = meta.list_derived(self.kind, self.cursor, limit).await?;
+            if !self.sealed.is_empty() {
+                page = self.with_sealed(meta, page, limit).await?;
+            }
             if page.is_empty() {
                 self.advance_window();
                 continue;

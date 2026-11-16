@@ -518,14 +518,15 @@ struct Args {
     /// for in the ref log's times (default 5 minutes).
     #[arg(long, hide = true, value_parser = parse_interval)]
     debug_search_retention_skew: Option<std::time::Duration>,
-    /// Derived segments (ADR 0104, 0105): `build` seals `skiplist`,
+    /// Derived segments (ADR 0104 to 0106): `build` seals `skiplist`,
     /// `history-tree-v4` (family `changeset-v1`), `generation`,
     /// `last_merge-v1`, `root_tree` and `log-filter-v1` (family
-    /// `changeset-v2`) rows into immutable segments in the blob store in the
-    /// background and keeps the rows (free to roll back); `retire` also
+    /// `changeset-v2`) rows, and the code search rows retention keeps with
+    /// their keyframes (family `content-v1`), into immutable segments in the
+    /// blob store in the background and keeps the rows; `retire` also
     /// deletes rows a live segment holds the same value for. `retire` is the
     /// one-way door: it records the store feature of each family
-    /// (`derived-segments`, `derived-segments-2`) before the family's first
+    /// (`derived-segments`, `derived-segments-2`, `derived-segments-3`) before the family's first
     /// delete, and binaries older than this release then refuse the store.
     /// `off` runs no passes; existing segments are still read. Passes run
     /// under a store-wide lease, one server at a time, in the index lane.
@@ -533,7 +534,7 @@ struct Args {
     derived_segments: leep_derive::derived_segments::Mode,
     /// In `--derived-segments retire`, the segment families whose one-way
     /// door this server may pass (ADR 0105): record the family's store
-    /// feature and delete its rows. Comma-separated names (`changeset-v2`),
+    /// feature and delete its rows. Comma-separated names (`changeset-v2`, `content-v1`),
     /// or `all`; `changeset-v1` (ADR 0104's) is always included. A family
     /// not named deletes rows only once its feature is already recorded in
     /// the store, so a fleet in `retire` does not pass a new family's door
@@ -559,7 +560,7 @@ struct Args {
     debug_derived_segments_quick: bool,
     /// Testing only: stop the derived segments task for good at a point of
     /// a pass (`seal-stored`, `seal-swapped`, `merge-stored`,
-    /// `retire-deleted`; `changeset-v2:` before one for that family), printing
+    /// `retire-deleted`; `changeset-v2:` or `content-v1:` before one of those families), printing
     /// `leep-derived-segments: paused at <point>`, so a crash test can kill
     /// the server there.
     #[arg(long, hide = true)]
@@ -1384,6 +1385,15 @@ fn start_derived_segments(args: &Args, repo: &Repo) {
         pass.lone_wait = std::time::Duration::ZERO;
         pass.retire_after = std::time::Duration::ZERO;
     }
+    // `content-v1` seals only the search rows retention keeps (ADR 0106),
+    // with this server's window.
+    pass.content_keep = match args.search_retention {
+        DurationOrOff::For(keep) => Some(keep),
+        DurationOrOff::Off => None,
+    };
+    if let Some(skew) = args.debug_search_retention_skew {
+        pass.content_skew = skew;
+    }
     // Checked by the flag's parser; an empty list would drop `changeset-v1`.
     pass.retire_families =
         CompactOptions::parse_retire_families(&args.derived_segments_retire_families)
@@ -1412,7 +1422,7 @@ fn start_derived_segments(args: &Args, repo: &Repo) {
             leep_meta::features::add_store_feature(&url, schema, name).await?;
             tracing::warn!(
                 "recorded the store feature {name}: binaries older than this release now refuse \
-                 this store (ADR 0104, 0105)"
+                 this store (ADR 0104, 0105, 0106)"
             );
             Ok(())
         })
@@ -1436,7 +1446,7 @@ fn start_derived_segments(args: &Args, repo: &Repo) {
         Some(_) => tracing::info!(
             mode = %mode,
             interval_s = args.derived_segments_interval.as_secs_f64(),
-            "sealing pure-function derived rows into derived segments (ADR 0104, 0105)"
+            "sealing pure-function derived rows into derived segments (ADR 0104, 0105, 0106)"
         ),
         None if mode == Mode::Off => {
             tracing::info!("derived segments off (--derived-segments off); segments still read")
@@ -1848,6 +1858,10 @@ mod feature_name_tests {
         assert_eq!(
             leep_derive::derived_segments::FEATURE_2,
             leep_meta::features::DERIVED_SEGMENTS_2
+        );
+        assert_eq!(
+            leep_derive::derived_segments::FEATURE_3,
+            leep_meta::features::DERIVED_SEGMENTS_3
         );
         for fam in leep_derive::derived_segments::FAMILIES {
             assert!(leep_meta::features::KNOWN.contains(&fam.feature));

@@ -1,7 +1,8 @@
-//! Derived segments (ADR 0104) with the real binaries: a store moves from
-//! rows to segments in mode `build` (every row stays, so a binary that
+//! Derived segments (ADR 0104 to 0106) with the real binaries: a store moves
+//! from rows to segments in mode `build` (every row stays, so a binary that
 //! predates segments reads everything and rolling back is free), then
-//! `retire` deletes the rows after recording the store feature; and a
+//! `retire` deletes the rows after recording each family's store feature
+//! (the code search rows of `content-v1` only those retention keeps); and a
 //! restore drill with a metadata snapshot naming a segment the blob copy
 //! lacks. Run `cargo build --workspace` first.
 
@@ -69,7 +70,62 @@ fn plant(stores: &Stores, n: usize) -> Vec<ChangesetId> {
         leep_derive::derived::derive::<leep_derive::derived::HistoryTree>(&repo, tip.unwrap())
             .await
             .unwrap();
+        // The search rows of the head patched on its parent's (family
+        // content-v1): whole rows, patches and keyframes; the parent's own
+        // versions are rows retention no longer keeps.
+        repo.derive_search(made[n - 2]).await.unwrap();
+        repo.derive_search(made[n - 1]).await.unwrap();
         made
+    })
+}
+
+/// The search kinds of `content-v1`.
+const CONTENT_KINDS: [&str; 4] = [
+    "blob-trigrams-v2",
+    "blob-trigrams-keyframe-v2",
+    "tree-trigrams-v2",
+    "tree-trigrams-keyframe-v2",
+];
+
+/// The tree nodes and blobs below `id`'s tree.
+fn head_content(stores: &Stores, id: ChangesetId) -> Vec<Hash> {
+    let repo = open_repo(stores);
+    rt().block_on(async {
+        let mut keys = Vec::new();
+        let mut stack = vec![repo.root_tree(id).await.unwrap()];
+        while let Some(t) = stack.pop() {
+            keys.push(t);
+            for e in repo.read_tree(t).await.unwrap().entries.values() {
+                match *e {
+                    leep_core::TreeEntry::Dir { tree } => stack.push(tree),
+                    leep_core::TreeEntry::File { content, .. } => keys.push(content),
+                }
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    })
+}
+
+/// Rows of the search kinds as the database holds them: of keys a head
+/// holds, and of the others.
+fn content_rows(stores: &Stores, head: &[Hash]) -> (u64, u64) {
+    let meta = rt()
+        .block_on(leep_meta::open_meta_store(&stores.meta))
+        .unwrap();
+    rt().block_on(async {
+        let (mut held, mut other) = (0, 0);
+        for kind in CONTENT_KINDS {
+            for k in meta.list_derived_keys(kind, None, 1 << 20).await.unwrap() {
+                if head.contains(&k) && !kind.contains("keyframe") {
+                    held += 1;
+                } else {
+                    other += 1;
+                }
+            }
+        }
+        (held, other)
     })
 }
 
@@ -113,6 +169,29 @@ fn values(stores: &Stores, ids: &[ChangesetId]) -> Vec<Option<Vec<u8>>> {
         }
         out
     })
+    .into_iter()
+    .chain(search_values(stores, *ids.last().unwrap()))
+    .collect()
+}
+
+/// The search rows of `head`'s content as a new process reads them.
+fn search_values(stores: &Stores, head: ChangesetId) -> Vec<Option<Vec<u8>>> {
+    let keys = head_content(stores, head);
+    let repo = open_repo(stores);
+    rt().block_on(async {
+        let mut out = Vec::new();
+        for kind in ["blob-trigrams-v2", "tree-trigrams-v2"] {
+            out.extend(
+                repo.meta()
+                    .get_derived_many(kind, &keys)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|v| v.map(|b| b.to_vec())),
+            );
+        }
+        out
+    })
 }
 
 /// Rows of `skiplist`, `history-tree-v4`, `generation` and `root_tree` as
@@ -128,6 +207,26 @@ fn rows(stores: &Stores) -> (u64, u64, u64, u64) {
             meta.count_derived("generation").await.unwrap(),
             meta.count_derived("root_tree").await.unwrap(),
         )
+    })
+}
+
+/// Whether live `content-v1` segments hold every search row of the head's
+/// content that has a value.
+fn search_sealed(stores: &Stores, head: &[Hash]) -> bool {
+    let repo = open_repo(stores);
+    rt().block_on(async {
+        repo.segments().refresh(&**repo.row_meta()).await.unwrap();
+        let c = repo.segments().family(ds::FAMILY_CONTENT).clone();
+        for (kind, col) in [
+            ("blob-trigrams-v2", ds::COL_BLOB_TRIGRAMS),
+            ("tree-trigrams-v2", ds::COL_TREE_TRIGRAMS),
+        ] {
+            let have = repo.row_meta().derived_present(kind, head).await.unwrap();
+            if head.iter().zip(have).any(|(k, h)| h && !c.holds(k, col)) {
+                return false;
+            }
+        }
+        true
     })
 }
 
@@ -209,17 +308,28 @@ fn verify_full(stores: &Stores, what: &str) -> String {
 fn build_then_retire(stores: Stores, root: &Path) {
     let made = plant(&stores, 120);
     let want = values(&stores, &made);
-    assert!(want.iter().all(Option::is_some));
+    assert!(want[..4 * made.len()].iter().all(Option::is_some));
+    assert!(want[4 * made.len()..].iter().any(Option::is_some));
     let before = rows(&stores);
     assert_eq!(before, (120, 120, 120, 120));
+    let head = head_content(&stores, *made.last().unwrap());
+    let search_before = content_rows(&stores, &head);
+    assert!(
+        search_before.0 > 0 && search_before.1 > 0,
+        "{search_before:?}"
+    );
 
     // Build: segments appear, every row stays.
     let server = segment_server(&stores, root, "build");
     wait_for("build seals every changeset", &server, || {
         sealed(&stores, &made) == made.len()
     });
+    wait_for("build seals the head's search rows", &server, || {
+        search_sealed(&stores, &head)
+    });
     drop(server);
     assert_eq!(rows(&stores), before, "build mode deletes no row");
+    assert_eq!(content_rows(&stores, &head), search_before);
     assert!(
         !features(&stores)
             .iter()
@@ -254,12 +364,13 @@ fn build_then_retire(stores: Stores, root: &Path) {
             let keys = [
                 ds::manifest_key(ds::FAMILY_CHANGESET),
                 ds::manifest_key(ds::FAMILY_CHANGESET_V2),
+                ds::manifest_key(ds::FAMILY_CONTENT),
             ];
             assert_eq!(
                 meta.delete_derived_keys(&[ds::MANIFEST_KIND], &keys)
                     .await
                     .unwrap(),
-                2
+                3
             );
         });
         drop(meta);
@@ -292,19 +403,33 @@ fn build_then_retire(stores: Stores, root: &Path) {
     std::thread::sleep(Duration::from_secs(2));
     drop(server);
     assert_eq!(rows(&stores), (0, 0, 120, 120));
+    assert_eq!(content_rows(&stores, &head), search_before);
     let f = features(&stores);
     assert!(f.iter().any(|g| g == "derived-segments"), "{f:?}");
     assert!(!f.iter().any(|g| g == "derived-segments-2"), "{f:?}");
+    assert!(!f.iter().any(|g| g == "derived-segments-3"), "{f:?}");
     assert_eq!(values(&stores, &made), want);
 
     // Retire naming every family: the feature first, then the rows go;
     // everything still reads.
     let server = segment_server(&stores, root, "retire");
     wait_for("retire deletes the rows", &server, || {
-        rows(&stores) == (0, 0, 0, 0)
+        rows(&stores) == (0, 0, 0, 0) && content_rows(&stores, &head).0 == 0
     });
     drop(server);
-    for f in ["derived-segments", "derived-segments-2"] {
+    // Of the search rows, those of the head and every keyframe went; the
+    // parent's own versions (no head holds them) stay rows, for retention.
+    let (held, other) = content_rows(&stores, &head);
+    assert_eq!(held, 0);
+    assert!(
+        other > 0 && other < search_before.1,
+        "{other} of {search_before:?}"
+    );
+    for f in [
+        "derived-segments",
+        "derived-segments-2",
+        "derived-segments-3",
+    ] {
         assert!(
             features(&stores).iter().any(|g| g == f),
             "{f}: {:?}",
@@ -406,7 +531,11 @@ fn restore_drill_with_a_manifest_ahead_of_the_blob_copy() {
     assert_ok(&out, "restore");
     // Rows of the lost segment's keys read as missing: noted, not damage.
     let got = values(&dest, &made);
-    let missing = got.iter().filter(|v| v.is_none()).count();
+    let missing = got
+        .iter()
+        .zip(&want)
+        .filter(|(g, w)| g.is_none() && w.is_some())
+        .count();
     assert!(
         missing > 0 && missing <= 2 * lost.rows as usize,
         "{missing}"

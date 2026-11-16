@@ -1,5 +1,7 @@
 # 0102. Blob trigram rows as patches on keyframes, and their retention
-Status: Accepted
+Status: Accepted; amended by [0106](0106-search-rows-as-derived-segments.md)
+(a row sealed into a derived segment while live outlives its window until
+the segment is rewritten)
 Date: 2026-11-14
 
 Amends [0014](0014-code-search.md) (the blob rows) and

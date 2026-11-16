@@ -3236,6 +3236,12 @@ measure. A change that stops the automatic repack or compaction fails too,
 as the store never settles (90 s). When a change moves a line on purpose,
 measure again and move the budget in the same change, with the reason.
 
+Since ADR 0106 the guard's retire step names every family, so the code
+search rows (all live in this short history) are sealed and retired too:
+394 to 470 bytes of `content-v1` segment a key, 0.148 to 0.185 of the 380
+to 483 KB of rows they replace (six runs, both backends; budgets 590 and
+0.24).
+
 `leep-soak --max-blob-store-ratio` (default 0.9) fails a soak whose
 `leep_blob_store_size_ratio` exceeds it in the second half, on samples
 taken after the server's first automatic delta repack; the soak's server
@@ -4519,6 +4525,55 @@ filesystem blob store; `VACUUM FULL` / `VACUUM` after the last `gc`.
 - Breakdown and candidate encodings: `cargo run --release -p leep-server
   --example derived_breakdown -- <meta url> <blob url>` (ADR 0105, "Stage
   0", has the table).
+
+### Derived segments, family content-v1 (ADR 0106)
+
+Measured like the section above (corpus B reconstructed, Git 6.35 MB after
+`git repack -adf`; ADR 0104's figure 6.58 MB): import, a server with
+default flags until nothing changes for 30 s, `gc --grace 0 --fence 0s
+--unsafe-no-fence`, then a server in `retire` with
+`--derived-segments-retire-families all` and its waits cut until the rows
+are gone, `gc` again, `VACUUM FULL` (Postgres) or `VACUUM` (SQLite).
+Release builds of 784bed6 ("before", ADR 0105, both changeset families
+retired) and this change ("after", every family retired), the same day on
+the same 4-vCPU host. Database above an empty one plus blob store:
+
+| Backend | Before | After | Change | x 6.35 MB | x 6.58 MB |
+|---|---|---|---|---|---|
+| Postgres | 14.31 MB (7.23 db + 7.07 blobs) | 12.04 MB (2.34 + 9.69) | -2.27 MB | 2.25x -> 1.90x | 2.17x -> 1.83x |
+| SQLite | 14.69 MB (7.62 + 7.07) | 12.48 MB (2.79 + 9.69) | -2.21 MB | 2.31x -> 1.97x | 2.23x -> 1.90x |
+
+- The 802 blob rows and 104 directory filters of the head (4.23 MB of key
+  and value bytes, about 4.4 MB with Postgres overhead) became 4 segments
+  of 2.62 MB (2.59 MB of data, about 32 KB of key index), 2.89 KB a key.
+  The import indexes only its head, so every row was whole and live; the
+  `derived` table keeps only rows that are not pure functions (claims,
+  importer maps, manifests).
+- Block size and level, measured on the same rows (zstd output, key order):
+  64 KiB at level 9 3.02 MB (the other families' setting; a first build of
+  this change took B to 12.34 MB on Postgres, 12.77 MB on SQLite, 2.01x of
+  6.35 MB), 256 KiB at 17 2.90 MB, 512 KiB at 17 2.82 MB (chosen), 1 MiB at
+  17 2.62 MB. The walk's order, which puts a directory beside its
+  subdirectories, gained a little more (2.59 MB of data in segments).
+- The default mode, `build`, keeps every row and adds the segments: B grows
+  by 2.6 MB of blobs until `retire`.
+
+**Search latency** (20 literal queries, limit 100, on B's head over HTTP;
+a fresh server with passes and retention off each run, round 1 cold,
+rounds 2 to 4 warm; four runs each, milliseconds; Postgres):
+
+| | Round 1 p50 / p99 | Warm p50 / p99 |
+|---|---|---|
+| Before (search rows as rows) | 10.0-11.2 / 91.4-109.2 | 7.5-8.2 / 22.9-26.7 |
+| After (rows retired, read from segments) | 8.0-9.6 / 84.4-92.9 | 6.5-7.3 / 21.7-25.2 |
+
+A cold server reads each touched data blob whole (at most 1 MiB, four on
+B) instead of one batched row read per directory, and decompresses 512 KiB
+blocks; on a filesystem blob store that costs nothing measurable, and the
+warm path is served from the block cache (`--derive-cache-bytes`
+unchanged). On an object store each data blob read is a request (50 to 150
+ms): ranged reads are the follow-up before large object-store deployments
+retire this family.
 
 ## Changeset compression
 

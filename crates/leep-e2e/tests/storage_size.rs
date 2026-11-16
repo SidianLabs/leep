@@ -24,9 +24,12 @@
 //! Then a server in `--derived-segments retire` (its waits cut to zero)
 //! seals the `skiplist` and `history-tree-v4` rows (family `changeset-v1`,
 //! ADR 0104) and the `generation`, `last_merge-v1`, `root_tree` and
-//! `log-filter-v1` rows (family `changeset-v2`, ADR 0105) into derived
-//! segments and deletes them: it checks the segment bytes per changeset and
-//! their share of what the rows took.
+//! `log-filter-v1` rows (family `changeset-v2`, ADR 0105) and the code
+//! search rows and keyframes (family `content-v1`, ADR 0106; every head of
+//! this history is inside the retention window, so every row is live) into
+//! derived segments and deletes them: it checks the segment bytes per
+//! changeset (per search row for `content-v1`) and their share of what the
+//! rows took.
 //!
 //! The budgets keep 25% or more over the worst value measured when they were
 //! set (docs/PERFORMANCE.md, "Storage size guard"). If a change trips one on
@@ -80,6 +83,10 @@ struct Budgets {
     segment_share: f64,
     segment2_per_changeset: f64,
     segment2_share: f64,
+    /// The same for family `content-v1` (ADR 0106), per key (a blob or a
+    /// tree node with its search rows).
+    content_per_key: f64,
+    content_share: f64,
 }
 
 // Measured when set (ADR 0101, two runs each): blobs 469-474 bytes a land on
@@ -110,6 +117,8 @@ const SQLITE: Budgets = Budgets {
     segment_share: SEGMENT_SHARE,
     segment2_per_changeset: SEGMENT2_PER_CHANGESET,
     segment2_share: SEGMENT2_SHARE,
+    content_per_key: CONTENT_PER_KEY,
+    content_share: CONTENT_SHARE,
 };
 
 const POSTGRES: Budgets = Budgets {
@@ -125,6 +134,8 @@ const POSTGRES: Budgets = Budgets {
     segment_share: SEGMENT_SHARE,
     segment2_per_changeset: SEGMENT2_PER_CHANGESET,
     segment2_share: SEGMENT2_SHARE,
+    content_per_key: CONTENT_PER_KEY,
+    content_share: CONTENT_SHARE,
 };
 
 /// Key and value bytes of the code search blob rows, retired kind included,
@@ -162,7 +173,17 @@ const SEGMENT_SHARE: f64 = 0.14;
 const SEGMENT2_PER_CHANGESET: f64 = 92.0;
 const SEGMENT2_SHARE: f64 = 0.40;
 
+/// The same for family `content-v1` (the code search rows and keyframes,
+/// ADR 0106), per key. Measured when set (six runs, both backends): 394-470
+/// bytes a key (148-175 keys, one segment), 0.148-0.185 of the 380-483 KB
+/// of rows: whole rows, patches and keyframes of one history repeat each
+/// other within a 512 KiB block. The budgets keep 25% over the worst run.
+const CONTENT_PER_KEY: f64 = 590.0;
+const CONTENT_SHARE: f64 = 0.24;
+
 const V1_KINDS: &str = "'skiplist', 'history-tree-v4'";
+const CONTENT_KINDS: &str = "'blob-trigrams-v2', 'blob-trigrams-keyframe-v2', \
+                             'tree-trigrams-v2', 'tree-trigrams-keyframe-v2'";
 const V2_KINDS: &str = "'generation', 'last_merge-v1', 'root_tree', 'log-filter-v1'";
 
 /// One-file lands after the measurement, each waiting for the warmer: all
@@ -874,8 +895,9 @@ fn storage_stays_within_its_budgets() {
     // cut, seals the kinds of both families and deletes their rows.
     let (rows1, row_bytes1) = segmented_kinds(&stores, V1_KINDS);
     let (rows2, row_bytes2) = segmented_kinds(&stores, V2_KINDS);
-    let (rows, row_bytes) = (rows1 + rows2, row_bytes1 + row_bytes2);
-    let all_kinds = format!("{V1_KINDS}, {V2_KINDS}");
+    let (rows3, row_bytes3) = segmented_kinds(&stores, CONTENT_KINDS);
+    let (rows, row_bytes) = (rows1 + rows2 + rows3, row_bytes1 + row_bytes2 + row_bytes3);
+    let all_kinds = format!("{V1_KINDS}, {V2_KINDS}, {CONTENT_KINDS}");
     let db_before_retire = sizes(&stores).db;
     let mut flags = FLAGS.to_vec();
     flags.extend([
@@ -905,6 +927,9 @@ fn storage_stays_within_its_budgets() {
     let families = derived_segment_bytes(&stores);
     let (_, keys, seg_bytes, segments) = families[0];
     let (_, keys2, seg_bytes2, segments2) = families[1];
+    let (_, keys3, seg_bytes3, segments3) = families[2];
+    let per_key3 = seg_bytes3 as f64 / keys3.max(1) as f64;
+    let share3 = seg_bytes3 as f64 / row_bytes3.max(1) as f64;
     let per_changeset = seg_bytes as f64 / keys.max(1) as f64;
     let share = seg_bytes as f64 / row_bytes1.max(1) as f64;
     let per_changeset2 = seg_bytes2 as f64 / keys2.max(1) as f64;
@@ -915,11 +940,26 @@ fn storage_stays_within_its_budgets() {
          bytes for {keys} changesets ({per_changeset:.1} a changeset, {share:.3} of the \
          rows); changeset-v2: {rows2} rows of {row_bytes2} bytes became {segments2} \
          segment(s) of {seg_bytes2} bytes for {keys2} changesets ({per_changeset2:.1} a \
-         changeset, {share2:.3} of the rows); database {db_before_retire} -> \
+         changeset, {share2:.3} of the rows); content-v1: {rows3} rows of {row_bytes3} \
+         bytes became {segments3} segment(s) of {seg_bytes3} bytes for {keys3} keys \
+         ({per_key3:.1} a key, {share3:.3} of the rows); database {db_before_retire} -> \
          {db_after_retire} in use"
     );
     println!("{report}");
-    assert!(keys > 0 && keys2 > 0, "nothing was sealed: {report}");
+    assert!(
+        keys > 0 && keys2 > 0 && keys3 > 0,
+        "nothing was sealed: {report}"
+    );
+    assert!(
+        per_key3 <= budgets.content_per_key,
+        "content-v1 segment bytes per key over {}: {report}",
+        budgets.content_per_key
+    );
+    assert!(
+        share3 <= budgets.content_share,
+        "content-v1 segments over {} of their rows: {report}",
+        budgets.content_share
+    );
     assert!(
         per_changeset <= budgets.segment_per_changeset,
         "changeset-v1 segment bytes per changeset over {}: {report}",

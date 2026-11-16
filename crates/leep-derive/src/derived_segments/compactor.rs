@@ -10,6 +10,13 @@
 //! hold, and the columns a key is expected to have before it is sealed
 //! without waiting. What a process carries between passes (a backfill, a
 //! retirement, the segments it accounts for) is kept per family.
+//!
+//! Family `content-v1` (ADR 0106) differs by its table entry and a few
+//! policies: keys are ordered by a walk of the heads' trees, only rows
+//! search retention keeps are sealed (keyframes always), a merge leaves out
+//! what retention no longer keeps and a third-dead segment is rewritten,
+//! segments are capped at 1 MiB and merged in two tiers by bytes, and rows
+//! are compared by the set or filter they stand for.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -21,12 +28,13 @@ use leep_core::{ChangesetId, Error, Hash, Result};
 use tokio::time::Instant;
 
 use super::codec::{
-    self, Block, Family, Loc, Manifest, SealRow, SegmentData, SegmentRef, FAMILIES,
+    self, Block, Equality, Family, Keys, Loc, Manifest, SealRow, SegmentData, SegmentRef, FAMILIES,
 };
 use super::view::{load_indexes, Live, ManifestRead};
 use super::{lease_key, read_manifest, swap_manifest, MANIFEST_KIND};
 use crate::derived::{decode_u64, DerivedKind, Generation};
 use crate::gc_lease::{self, GcLease};
+use crate::search::retention::ContentLive;
 use crate::Repo;
 
 /// What a server does with derived segments (`--derived-segments`).
@@ -149,6 +157,19 @@ pub struct CompactOptions {
     /// upgrading (ADR 0105). The default names `changeset-v1` alone, as
     /// ADR 0104's `retire` did.
     pub retire_families: Vec<String>,
+    /// Family `content-v1` (ADR 0106): how long search row retention keeps
+    /// a row after the last head that held its blob or tree (its
+    /// `--search-retention`); `None` when retention is off, so every row is
+    /// live. Only live rows are sealed, and a merge leaves the others out.
+    pub content_keep: Option<Duration>,
+    /// The clock skew retention allows in the ref log's times.
+    pub content_skew: Duration,
+    /// Most bytes of a `content-v1` data blob: a cold search reads a whole
+    /// data blob for one row, so its segments are smaller than the others'.
+    pub content_max_bytes: usize,
+    /// For tests only: the time (Unix seconds) retention's window is judged
+    /// at, instead of the clock.
+    pub content_now: Option<i64>,
     /// For crash tests only.
     pub pause: Option<PauseHook>,
 }
@@ -173,6 +194,10 @@ impl Default for CompactOptions {
             max_retire_time: Duration::from_secs(60),
             list_every: Duration::from_secs(600),
             retire_families: vec![codec::FAMILY_CHANGESET_NAME.to_string()],
+            content_keep: Some(crate::search::retention::DEFAULT_KEEP),
+            content_skew: Duration::from_secs(300),
+            content_max_bytes: 1 << 20,
+            content_now: None,
             pause: None,
         }
     }
@@ -200,6 +225,10 @@ impl CompactOptions {
             max_retire_time: Duration::from_secs(3600),
             list_every: Duration::ZERO,
             retire_families: FAMILIES.iter().map(|f| f.name.to_string()).collect(),
+            content_keep: Some(crate::search::retention::DEFAULT_KEEP),
+            content_skew: Duration::from_secs(300),
+            content_max_bytes: 32 << 10,
+            content_now: None,
             pause: None,
         }
     }
@@ -315,6 +344,8 @@ struct FamilyState {
     /// Rows a retirement that hit its bound has still to compare, by
     /// holding segment: the following passes go on without listing again.
     retire_left: Option<RetireWork>,
+    /// `content-v1`: what retention keeps live, and when it was walked.
+    content: Option<(Arc<ContentLive>, Instant)>,
     /// The family's live segments (with their column masks) the carried work
     /// above accounts for: those live at its listing, and those this
     /// process published since. A live segment outside it (another server's pass,
@@ -506,20 +537,32 @@ async fn feature_recorded(features: Option<&Features>, name: &'static str) -> Re
     }
 }
 
-/// The name of pause point `at` of `fam`, as the pause hook is given it.
+/// The name of pause point `at` of `fam`, as the pause hook is given it:
+/// as it is for `changeset-v1`, after `<family>:` for the others.
 fn point(fam: &Family, at: &'static str) -> &'static str {
-    if fam.id == codec::FAMILY_CHANGESET {
-        return at;
-    }
-    match at {
-        "seal-stored" => "changeset-v2:seal-stored",
-        "seal-swapped" => "changeset-v2:seal-swapped",
-        "merge-stored" => "changeset-v2:merge-stored",
-        "retire-deleted" => "changeset-v2:retire-deleted",
-        "feature-recorded" => "changeset-v2:feature-recorded",
-        other => other,
+    match (fam.id, at) {
+        (codec::FAMILY_CHANGESET, _) => at,
+        (codec::FAMILY_CHANGESET_V2, "seal-stored") => "changeset-v2:seal-stored",
+        (codec::FAMILY_CHANGESET_V2, "seal-swapped") => "changeset-v2:seal-swapped",
+        (codec::FAMILY_CHANGESET_V2, "merge-stored") => "changeset-v2:merge-stored",
+        (codec::FAMILY_CHANGESET_V2, "retire-deleted") => "changeset-v2:retire-deleted",
+        (codec::FAMILY_CHANGESET_V2, "feature-recorded") => "changeset-v2:feature-recorded",
+        (codec::FAMILY_CONTENT, "seal-stored") => "content-v1:seal-stored",
+        (codec::FAMILY_CONTENT, "seal-swapped") => "content-v1:seal-swapped",
+        (codec::FAMILY_CONTENT, "merge-stored") => "content-v1:merge-stored",
+        (codec::FAMILY_CONTENT, "retire-deleted") => "content-v1:retire-deleted",
+        (codec::FAMILY_CONTENT, "feature-recorded") => "content-v1:feature-recorded",
+        _ => at,
     }
 }
+
+/// How long a pass of `content-v1` trusts the live set it walked while the
+/// ref log has not moved: heads leave the retention window as time passes.
+const CONTENT_LIVE_AGE: Duration = Duration::from_secs(3600);
+
+/// The order of a `content-v1` key no current head holds (a keyframe of an
+/// old version, a row sealed while live): after every walked one.
+const UNWALKED: u64 = 1 << 40;
 
 pub(crate) struct Pass<'a> {
     repo: &'a Repo,
@@ -551,6 +594,11 @@ pub(crate) struct Pass<'a> {
     /// Live segments found condemned by blob GC in this pass: no more of
     /// their rows are retired in it.
     condemned: HashSet<Hash>,
+    /// `content-v1`: what retention keeps live, once this pass needed it,
+    /// and whether the ref log has not moved since it was walked (a merge
+    /// leaves keys out only then).
+    live: Option<Arc<ContentLive>>,
+    live_current: bool,
     report: PassReport,
 }
 
@@ -620,6 +668,8 @@ impl<'a> Pass<'a> {
             budget: PassBudget::default(),
             unreadable: HashSet::new(),
             condemned: HashSet::new(),
+            live: None,
+            live_current: false,
             report,
         };
         if !p.report.newer_manifest {
@@ -874,6 +924,93 @@ impl<'a> Pass<'a> {
         self.load_segments().await
     }
 
+    /// Most bytes of one of the family's data blobs.
+    fn max_bytes(&self) -> usize {
+        match self.fam.keys {
+            Keys::Changesets => self.opts.max_bytes,
+            Keys::Content => self.opts.content_max_bytes,
+        }
+    }
+
+    /// The tier `s` merges in; `None`: never merged by tier. `content-v1`
+    /// has two tiers by bytes (ADR 0106): segments under a quarter of the
+    /// cap merge with their neighbours, larger ones are only rewritten once
+    /// a third of them is dead, so a row is rewritten about twice.
+    fn tier(&self, s: &SegmentRef) -> Option<u32> {
+        match self.fam.keys {
+            Keys::Changesets => Some(self.opts.tier(s.rows)),
+            Keys::Content => {
+                ((s.data_len as usize).saturating_mul(4) < self.max_bytes()).then_some(0)
+            }
+        }
+    }
+
+    /// `content-v1`: what retention keeps live, walked again when the ref
+    /// log moved (and the last walk is older than `list_every`) or the last
+    /// walk is older than [`CONTENT_LIVE_AGE`].
+    async fn content_live(&mut self, state: &mut FamilyState) -> Result<Arc<ContentLive>> {
+        if let Some(l) = &self.live {
+            return Ok(l.clone());
+        }
+        let seq = self.repo.newest_ref_seq().await?;
+        if let Some((l, at)) = &state.content {
+            let same = l.seq == seq;
+            if (same && at.elapsed() < CONTENT_LIVE_AGE) || at.elapsed() < self.opts.list_every {
+                self.live_current = same;
+                self.live = Some(l.clone());
+                return Ok(l.clone());
+            }
+        }
+        let now = self.opts.content_now.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64)
+        });
+        let l = Arc::new(
+            self.repo
+                .content_live(self.opts.content_keep, self.opts.content_skew, now)
+                .await?,
+        );
+        self.live_current = l.seq == seq;
+        state.content = Some((l.clone(), Instant::now()));
+        self.live = Some(l.clone());
+        Ok(l)
+    }
+
+    /// The columns of `key` a seal may take and a merge keeps: every column
+    /// of a changeset family; in `content-v1` the keyframes always (a live
+    /// patch may stand on the keyframe of a version no head holds), and a
+    /// blob or tree row only while retention keeps it live.
+    fn keep_mask(&self, key: &Hash) -> u64 {
+        match (self.fam.keys, &self.live) {
+            (Keys::Changesets, _) => u64::MAX,
+            (Keys::Content, Some(l)) if l.live(key) => u64::MAX,
+            (Keys::Content, Some(_)) => self.fam.keyframe_mask(),
+            (Keys::Content, None) => u64::MAX,
+        }
+    }
+
+    /// The sort keys of `ids` in a segment of the family: the generations of
+    /// stored changesets (`None` for one that is not, left out), or for
+    /// `content-v1` the place in the heads' walk (after it for a key it does
+    /// not reach).
+    async fn order_keys(
+        &mut self,
+        ids: &[Hash],
+        state: &mut FamilyState,
+    ) -> Result<Vec<Option<u64>>> {
+        match self.fam.keys {
+            Keys::Changesets => generations(self.repo, ids, self.opts.batch).await,
+            Keys::Content => {
+                let live = self.content_live(state).await?;
+                Ok(ids
+                    .iter()
+                    .map(|k| Some(live.order(k).map_or(UNWALKED, u64::from)))
+                    .collect())
+            }
+        }
+    }
+
     /// The newest live segment holding `key`'s value of `col`, as its
     /// position in the live list.
     fn holder(&self, key: &Hash, col: u8) -> u32 {
@@ -1068,7 +1205,7 @@ impl<'a> Pass<'a> {
         let mut unsealed_rows = 0u64;
         let mut lone_now: HashSet<Hash> = HashSet::new();
         let mut cands: Vec<(Hash, u64)> = Vec::new();
-        let expected = self.fam.mask();
+        let expected = self.fam.expected;
         for (k, r) in &rows {
             let mut open = 0u64;
             let mut present = r.have;
@@ -1078,6 +1215,8 @@ impl<'a> Pass<'a> {
                     open |= bit(col);
                 }
             }
+            // `content-v1` seals only what retention keeps (ADR 0106).
+            open &= self.keep_mask(k);
             if open == 0 {
                 continue;
             }
@@ -1128,6 +1267,9 @@ impl<'a> Pass<'a> {
             if !self.report.listed {
                 return Ok(());
             }
+            if self.fam.keys == Keys::Content {
+                self.content_live(state).await?;
+            }
             let pending = self.seal_candidates(state);
             if pending.is_empty() {
                 return Ok(());
@@ -1151,7 +1293,7 @@ impl<'a> Pass<'a> {
             }
             let part = bf.pending.split_off(bf.pending.len().saturating_sub(chunk));
             let ids: Vec<Hash> = part.iter().map(|(k, _)| *k).collect();
-            let gens = generations(self.repo, &ids, self.opts.batch).await?;
+            let gens = self.order_keys(&ids, state).await?;
             for ((k, m), g) in part.into_iter().zip(gens) {
                 match g {
                     Some(g) => bf.order.push((g, k, m)),
@@ -1193,17 +1335,40 @@ impl<'a> Pass<'a> {
 
     /// Read the rows of one page and seal them, in segments that fit
     /// `max_bytes`. A row gone meanwhile is left out; one whose value does
-    /// not decode is remembered and not listed again for a while.
+    /// not decode is remembered and not listed again for a while. A page of
+    /// `content-v1` (rows of up to 64 KiB) is read a batch of keys at a time
+    /// and sealed once its rows reach about the cap, so a pass holds about
+    /// one segment's rows at once.
     async fn seal_page(
         &mut self,
         page: &[(u64, Hash, u64)],
         state: &mut FamilyState,
     ) -> Result<()> {
-        let mut seal: Vec<SealRow> = Vec::with_capacity(page.len());
+        let (step, cut) = match self.fam.keys {
+            Keys::Changesets => (page.len().max(1), usize::MAX),
+            Keys::Content => (self.opts.batch.max(1), self.max_bytes() / 3 * 4),
+        };
+        let mut seal: Vec<SealRow> = Vec::new();
+        let mut raw = 0usize;
+        for part in page.chunks(step) {
+            for row in self.read_seal_rows(part).await? {
+                raw += row.values.iter().map(|(_, v)| v.len()).sum::<usize>();
+                seal.push(row);
+                if raw >= cut {
+                    self.seal_rows(std::mem::take(&mut seal), state).await?;
+                    raw = 0;
+                }
+            }
+        }
+        self.seal_rows(seal, state).await
+    }
+
+    /// The rows of `part` (keys with the columns to seal), as stored now.
+    async fn read_seal_rows(&self, part: &[(u64, Hash, u64)]) -> Result<Vec<SealRow>> {
         let mut values: HashMap<Hash, Vec<(u8, Bytes)>> = HashMap::new();
         for c in self.fam.columns {
             let (col, kind) = (c.id, c.kind);
-            let keys: Vec<Hash> = page
+            let keys: Vec<Hash> = part
                 .iter()
                 .filter(|(_, _, m)| m & bit(col) != 0)
                 .map(|(_, k, _)| *k)
@@ -1217,20 +1382,25 @@ impl<'a> Pass<'a> {
                 }
             }
         }
-        for (g, k, _) in page {
-            if let Some(v) = values.remove(k) {
-                seal.push(SealRow {
+        Ok(part
+            .iter()
+            .filter_map(|(g, k, _)| {
+                values.remove(k).map(|v| SealRow {
                     key: *k,
                     order: *g,
                     values: v,
-                });
-            }
-        }
+                })
+            })
+            .collect())
+    }
+
+    /// Seal `seal` in segments that fit the family's cap.
+    async fn seal_rows(&mut self, seal: Vec<SealRow>, state: &mut FamilyState) -> Result<()> {
         if seal.is_empty() {
             return Ok(());
         }
         let mut out = Vec::new();
-        encode_capped(self.fam.id, self.opts.max_bytes, &seal, &mut out)?;
+        encode_capped(self.fam.id, self.max_bytes(), &seal, &mut out)?;
         for (enc, bad) in out {
             for b in &bad {
                 tracing::warn!(
@@ -1278,50 +1448,78 @@ impl<'a> Pass<'a> {
     /// Merge runs of [`CompactOptions::fanout`] adjacent live segments of
     /// one tier while their keys and bytes fit the caps. Adjacent, so a key
     /// in several segments still answers from the newest. Keys of
-    /// changesets no longer stored (the changeset sweep) are left out.
+    /// changesets no longer stored (the changeset sweep) are left out. In
+    /// `content-v1`, rows retention no longer keeps are left out too (only
+    /// while the walk that found them is current), and a segment of which a
+    /// third is such rows is rewritten alone (ADR 0106).
     async fn merge(&mut self, state: &mut FamilyState) -> Result<()> {
         let f = self.opts.fanout.max(2);
-        // Each round merges (the live list shrinks) or skips a segment (the
-        // skip set grows), so it ends; the bound is defense in depth.
+        let omit = if self.fam.keys == Keys::Content && !self.man.live.is_empty() {
+            self.content_live(state).await?;
+            self.live_current
+        } else {
+            false
+        };
+        let cap = self.max_bytes();
+        let mut rewritten: HashSet<Hash> = HashSet::new();
+        // Each round merges (the live list shrinks), rewrites a segment once
+        // (the rewritten set grows) or skips one (the skip set grows), so it
+        // ends; the bound is defense in depth.
         for _ in 0..4 * self.man.live.len() + 16 {
             let live = self.man.live.clone();
-            // The first run of `f` adjacent loaded segments of one tier;
-            // of it, the longest prefix (two or more) within the caps.
-            let fits = |run: &[SegmentRef]| -> usize {
-                let (mut rows, mut bytes, mut k) = (0usize, 0usize, 0);
-                for s in run {
-                    rows += s.rows as usize;
-                    bytes += s.data_len as usize;
-                    if rows > self.opts.max_rows || bytes > self.opts.max_bytes {
-                        break;
-                    }
-                    k += 1;
-                }
-                k
-            };
-            let found = (0..live.len().saturating_sub(f - 1)).find_map(|i| {
-                let run = &live[i..i + f];
-                let t = self.opts.tier(run[0].rows);
-                // A segment holding a column this binary does not know is
-                // never merged: the merge could not carry the column (ADR
-                // 0105). A newer binary merges it.
-                if !run.iter().all(|s| {
-                    self.opts.tier(s.rows) == t
-                        && self
-                            .segs
-                            .get(&s.index)
-                            .is_some_and(|l| !l.idx.has_unknown_columns())
+            let found = {
+                let mergeable = |s: &SegmentRef| {
+                    // A segment holding a column this binary does not know
+                    // is never merged: the merge could not carry the column
+                    // (ADR 0105). A newer binary merges it.
+                    self.segs
+                        .get(&s.index)
+                        .is_some_and(|l| !l.idx.has_unknown_columns())
                         && !self.unreadable.contains(&s.index)
-                }) {
-                    return None;
-                }
-                let k = fits(run);
-                let ids: Vec<Hash> = run[..k].iter().map(|s| s.index).collect();
-                (k >= 2 && !state.oversize.contains(&ids)).then_some((i, k))
-            });
+                };
+                // The first run of `f` adjacent loaded segments of one
+                // tier; of it, the longest prefix (two or more) within the
+                // caps.
+                let fits = |run: &[SegmentRef]| -> usize {
+                    let (mut rows, mut bytes, mut k) = (0usize, 0usize, 0);
+                    for s in run {
+                        rows += s.rows as usize;
+                        bytes += s.data_len as usize;
+                        if rows > self.opts.max_rows || bytes > cap {
+                            break;
+                        }
+                        k += 1;
+                    }
+                    k
+                };
+                (0..live.len().saturating_sub(f - 1))
+                    .find_map(|i| {
+                        let run = &live[i..i + f];
+                        let t = self.tier(&run[0])?;
+                        if !run.iter().all(|s| self.tier(s) == Some(t) && mergeable(s)) {
+                            return None;
+                        }
+                        let k = fits(run);
+                        let ids: Vec<Hash> = run[..k].iter().map(|s| s.index).collect();
+                        (k >= 2 && !state.oversize.contains(&ids)).then_some((i, k))
+                    })
+                    .or_else(|| {
+                        if !omit {
+                            return None;
+                        }
+                        live.iter()
+                            .position(|s| {
+                                mergeable(s) && !rewritten.contains(&s.index) && self.mostly_dead(s)
+                            })
+                            .map(|i| (i, 1))
+                    })
+            };
             let Some((at, k)) = found else {
                 return Ok(());
             };
+            if k == 1 {
+                rewritten.insert(live[at].index);
+            }
             let run: Vec<SegmentRef> = live[at..at + k].to_vec();
             let mut unreadable = None;
             // Oldest first, so a newer segment's value replaces an older's.
@@ -1345,12 +1543,15 @@ impl<'a> Pass<'a> {
                 self.mark_unreadable(index, state);
                 continue;
             }
+            if omit {
+                values.retain(|(key, col), _| self.keep_mask(key) & bit(*col) != 0);
+            }
             let mut keys: Vec<Hash> = values.keys().map(|(k, _)| *k).collect();
             keys.sort_unstable();
             keys.dedup();
-            let gens = generations(self.repo, &keys, self.opts.batch).await?;
+            let orders = self.order_keys(&keys, state).await?;
             let mut rows = Vec::with_capacity(keys.len());
-            for (key, g) in keys.iter().zip(gens) {
+            for (key, g) in keys.iter().zip(orders) {
                 let Some(g) = g else { continue };
                 let v: Vec<(u8, Bytes)> = self
                     .fam
@@ -1366,7 +1567,7 @@ impl<'a> Pass<'a> {
             }
             let (enc, bad) = codec::encode(self.fam.id, &rows, codec::nonce())?;
             self.report.bad_values += bad.len() as u64;
-            if enc.seg.data_len as usize > self.opts.max_bytes {
+            if enc.seg.data_len as usize > cap {
                 state.oversize.insert(run.iter().map(|s| s.index).collect());
                 continue;
             }
@@ -1392,6 +1593,27 @@ impl<'a> Pass<'a> {
         }
         tracing::warn!("derived segment merges stopped at their round bound");
         Ok(())
+    }
+
+    /// `content-v1`: whether a third or more of `s`'s values are rows
+    /// retention no longer keeps (keyframes always count as kept).
+    fn mostly_dead(&self, s: &SegmentRef) -> bool {
+        let Some(l) = self.segs.get(&s.index) else {
+            return false;
+        };
+        let (mut total, mut dead) = (0usize, 0usize);
+        for c in self.fam.columns {
+            if !s.has(c.id) {
+                continue;
+            }
+            for k in l.idx.keys_with(c.id) {
+                total += 1;
+                if self.keep_mask(k) & bit(c.id) == 0 {
+                    dead += 1;
+                }
+            }
+        }
+        total > 0 && dead * 3 >= total
     }
 
     /// Delete rows a live segment, seen live for at least
@@ -1562,31 +1784,48 @@ impl<'a> Pass<'a> {
         let started = std::time::Instant::now();
         let ks: Vec<Hash> = chunk.iter().map(|(k, _)| *k).collect();
         let got = self.repo.row_meta().get_derived_many(kind, &ks).await?;
-        let mut del = Vec::with_capacity(ks.len());
-        let mut unequal = 0;
+        let mut pairs = Vec::with_capacity(ks.len());
         for ((k, loc), row) in chunk.iter().zip(got) {
             let Some(row) = row else { continue };
             let Some(value) = self.value_at(live, *loc, col).await? else {
                 self.mark_unreadable(live.r.index, state);
                 break;
             };
-            if (column.equal)(&row, &value) {
-                del.push((*k, row));
-            } else {
-                unequal += 1;
-                self.report.mismatched += 1;
-                state.mismatched.insert((*k, col), live.r.index);
-                metrics::counter!(
-                    "leep_derived_segment_mismatch_total",
-                    "kind" => kind, "family" => family
-                )
-                .increment(1);
-                tracing::warn!(
-                    key = %k,
-                    kind,
-                    "a {kind} row differs from its derived segment's value; the \
-                     row stays and wins (run `leep-server verify --derived {kind}`)"
-                );
+            pairs.push((*k, row, value));
+        }
+        // A patch (`content-v1`) is compared by the set or filter it stands
+        // for, its keyframe read as any read would (a row, or a live
+        // segment's value).
+        let keyframes = self.keyframes_of(&column.equal, &pairs).await?;
+        let mut del = Vec::with_capacity(pairs.len());
+        let mut unequal = 0;
+        for (k, row, value) in pairs {
+            match column
+                .equal
+                .same(&row, &value, &|h| keyframes.get(h).cloned())
+            {
+                Some(true) => del.push((k, row)),
+                // A keyframe is not stored: neither is known to stand for
+                // anything, so the row stays, and is compared again after
+                // the next listing. A patch is never retired without its
+                // keyframe.
+                None => {}
+                Some(false) => {
+                    unequal += 1;
+                    self.report.mismatched += 1;
+                    state.mismatched.insert((k, col), live.r.index);
+                    metrics::counter!(
+                        "leep_derived_segment_mismatch_total",
+                        "kind" => kind, "family" => family
+                    )
+                    .increment(1);
+                    tracing::warn!(
+                        key = %k,
+                        kind,
+                        "a {kind} row differs from its derived segment's value; the \
+                         row stays and wins (run `leep-server verify --derived {kind}`)"
+                    );
+                }
             }
         }
         if del.is_empty() {
@@ -1628,6 +1867,36 @@ impl<'a> Pass<'a> {
             tokio::time::sleep(rest).await;
         }
         Ok(n + unequal)
+    }
+}
+
+impl Pass<'_> {
+    /// The keyframes the patches among `pairs` (rows and segment values)
+    /// stand on, read through the view: a row, or a live segment's value.
+    async fn keyframes_of(
+        &self,
+        equal: &Equality,
+        pairs: &[(Hash, Bytes, Bytes)],
+    ) -> Result<HashMap<Hash, Bytes>> {
+        let Some(kind) = equal.keyframe_kind() else {
+            return Ok(HashMap::new());
+        };
+        let mut bases: Vec<Hash> = pairs
+            .iter()
+            .flat_map(|(_, r, v)| [equal.base(r), equal.base(v)])
+            .flatten()
+            .collect();
+        bases.sort_unstable();
+        bases.dedup();
+        if bases.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let got = self.repo.meta().get_derived_many(kind, &bases).await?;
+        Ok(bases
+            .into_iter()
+            .zip(got)
+            .filter_map(|(h, v)| Some((h, v?)))
+            .collect())
     }
 }
 

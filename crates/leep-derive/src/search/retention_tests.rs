@@ -602,14 +602,55 @@ pub(crate) async fn retention_fault_sweep(seed: u64) -> u64 {
         .rate(&[Op::DeleteChangesets], 250, Fault::FailAfter)
         .rate(&[Op::DeleteChangesets], 100, Fault::Fail)
         .rate(Op::BLOB, 40, Fault::Fail);
-    let faulty = Repo::new(
-        Arc::new(FaultyBlobStore::new(blobs.clone(), plan.clone())),
-        Arc::new(FaultyMetaStore::new(racing.clone(), plan.clone())),
-    );
+    let faulty_blobs: Arc<dyn leep_core::BlobStore> =
+        Arc::new(FaultyBlobStore::new(blobs.clone(), plan.clone()));
+    let faulty_meta: Arc<dyn MetaStore> =
+        Arc::new(FaultyMetaStore::new(racing.clone(), plan.clone()));
     let mut rng = leep_testkit::Rng::new(seed ^ 0x0102);
     let mut state = RetentionState::default();
     let mut failures = 0;
+    // Derived segment passes beside it (ADR 0106), through faults of their
+    // own and killed at random points: they seal the live search rows and
+    // retire them, under their own lease; retention touches only rows.
+    use crate::derived_segments::{compact_pass, CompactOptions, CompactState, Features, Mode};
+    let cplan = FaultPlan::new(seed ^ 0x5EA1);
+    cplan
+        .rate(Op::META, 40, Fault::Fail)
+        .rate(Op::WRITES, 30, Fault::FailAfter)
+        .rate(Op::BLOB, 40, Fault::Fail);
+    let compactor = Repo::new(
+        Arc::new(FaultyBlobStore::new(blobs.clone(), cplan.clone())),
+        Arc::new(FaultyMetaStore::new(meta.clone(), cplan.clone())),
+    );
+    let copts = CompactOptions {
+        content_keep: Some(std::time::Duration::ZERO),
+        content_skew: std::time::Duration::ZERO,
+        content_now: Some(later()),
+        ..CompactOptions::small(Mode::Retire)
+    };
+    let features = Features {
+        record: Arc::new(|_| Box::pin(async { Ok(()) })),
+        recorded: Arc::new(|_| Box::pin(async { Ok(true) })),
+    };
+    let mut cstate = CompactState::default();
     loop {
+        if rng.below(2) == 0 {
+            let kill = if rng.below(3) == 0 {
+                rng.below(60)
+            } else {
+                usize::MAX
+            };
+            let _ = leep_testkit::cancel_after_polls(
+                compact_pass(&compactor, &copts, &mut cstate, Some(&features)),
+                kill,
+            )
+            .await;
+        }
+        // A process whose view of the derived segments is fresh: a pass
+        // retires a row only once its segment was live far longer than a
+        // reader's manifest may be old (ADR 0104), which these passes,
+        // retiring at once, stand in for.
+        let faulty = Repo::new(faulty_blobs.clone(), faulty_meta.clone());
         match faulty
             .retire_search_rows(&at_once(), later(), &mut state, &ok)
             .await
@@ -626,12 +667,40 @@ pub(crate) async fn retention_fault_sweep(seed: u64) -> u64 {
         assert!(failures < 500, "seed {seed}: no pass completes");
     }
     let now_head = meta.get_ref("main").await.unwrap().unwrap();
-    let reader = Repo::new(blobs, meta.clone());
-    let stored = blob_rows(&reader).await;
+    let reader = Repo::new(blobs.clone(), meta.clone());
+    // A row, or a live segment's value: retention never deletes a sealed
+    // value, and a pass retires a row only once a segment holds it.
+    let sealed = |r: Repo| async move {
+        r.segments().refresh(&**r.row_meta()).await.unwrap();
+        r.segments()
+            .family(crate::derived_segments::FAMILY_CONTENT)
+            .keys_with(crate::derived_segments::COL_BLOB_TRIGRAMS)
+    };
+    let mut stored = blob_rows(&reader).await;
+    stored.extend(sealed(Repo::new(blobs.clone(), meta.clone())).await);
     for b in blobs_of(&reader, now_head).await {
         assert!(
             stored.contains(&b),
             "seed {seed}: the head's blob {b} lost its row after {failures} failures"
+        );
+    }
+    // Fault-free passes settle, and the head's rows stay readable.
+    let clean_passes = Repo::new(blobs.clone(), meta.clone());
+    for _ in 0..20 {
+        let p = compact_pass(&clean_passes, &copts, &mut cstate, Some(&features))
+            .await
+            .unwrap()
+            .unwrap();
+        if p.sealed_segments + p.merges + p.retired_rows + p.dropped == 0 {
+            break;
+        }
+    }
+    let mut stored = blob_rows(&reader).await;
+    stored.extend(sealed(Repo::new(blobs.clone(), meta.clone())).await);
+    for b in blobs_of(&reader, now_head).await {
+        assert!(
+            stored.contains(&b),
+            "seed {seed}: the head's blob {b} lost its row"
         );
     }
     assert_closed(&reader, reader.root_tree(now_head).await.unwrap(), "sweep").await;

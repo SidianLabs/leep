@@ -338,6 +338,14 @@ fn blob_keyframe_of(keyframe: Option<&[u8]>) -> Result<&[u8]> {
 }
 
 impl BlobPatch<'_> {
+    /// Whether both lists decode, without its keyframe: what a derived
+    /// segment checks before it holds the row (ADR 0106).
+    pub fn check(&self) -> Result<()> {
+        get_deltas(self.adds, 1 << 24)?;
+        get_deltas(self.removes, 1 << 24)?;
+        Ok(())
+    }
+
     /// The keyframe's set (its encoded values) with this patch applied.
     /// Every removed code must be in it and every added one not, so a set
     /// has one patch on a given keyframe.
@@ -674,6 +682,13 @@ impl<'a> TreeRow<'a> {
 }
 
 impl PatchRow<'_> {
+    /// Whether both lists decode, without its keyframe (ADR 0106).
+    pub fn check(&self) -> Result<()> {
+        get_deltas(self.removes, BLOOM_BITS as u32)?;
+        get_deltas(self.adds, BLOOM_BITS as u32)?;
+        Ok(())
+    }
+
     /// Apply to the keyframe's filter. Every removed position must be set
     /// in it and every added one clear, so a patch has one encoding.
     pub fn apply(&self, f: &mut Bloom) -> Result<()> {

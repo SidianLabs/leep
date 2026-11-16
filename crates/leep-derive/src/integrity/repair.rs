@@ -315,7 +315,7 @@ impl Rederive<'_> {
     /// differs is rewritten whole. A keyframe must be the whole row.
     async fn blob_trigrams(&mut self, kind: &'static str) -> Result<()> {
         let meta = self.real.meta().clone();
-        let mut scan = RowScan::new(kind, true, 0);
+        let mut scan = RowScan::of(self.real, kind, true, 0).await?;
         while let Some(page) = scan.next(&*meta).await? {
             let keyframes = if kind == BLOB_TRIGRAMS {
                 self.real
@@ -379,7 +379,7 @@ impl Rederive<'_> {
     /// differs is rewritten whole.
     async fn tree_trigrams(&mut self, kind: &'static str) -> Result<()> {
         let meta = self.real.meta().clone();
-        let mut scan = RowScan::new(kind, true, 0);
+        let mut scan = RowScan::of(self.real, kind, true, 0).await?;
         let mut memo = TreeRowMemo::new();
         while let Some(page) = scan.next(&*meta).await? {
             for (key, value) in page {

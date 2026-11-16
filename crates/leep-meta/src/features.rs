@@ -33,12 +33,21 @@ pub const DERIVED_SEGMENTS: &str = "derived-segments";
 /// family's live segments as orphans, so it must refuse the store.
 pub const DERIVED_SEGMENTS_2: &str = "derived-segments-2";
 
+/// Rows of the derived segment family `content-v1` (ADR 0106: the code
+/// search rows and their keyframes) are being or have been deleted once a
+/// segment holds their values. A binary of ADR 0105 or before reads no
+/// `content-v1` segment (it would derive every search row again on its
+/// first probe) and its `gc` refuses the family's manifest row, so it must
+/// refuse the store.
+pub const DERIVED_SEGMENTS_3: &str = "derived-segments-3";
+
 /// Every feature this binary can read.
 pub const KNOWN: &[&str] = &[
     CHANGESET_ZSTD_DICT,
     GC_MARK_SEGMENTS,
     DERIVED_SEGMENTS,
     DERIVED_SEGMENTS_2,
+    DERIVED_SEGMENTS_3,
 ];
 
 /// Record `name` in the store at `url` (idempotent). `mem://` stores are
@@ -166,6 +175,28 @@ mod tests {
         assert!(has_store_feature(&url, mode, DERIVED_SEGMENTS_2)
             .await
             .unwrap());
+    }
+
+    /// Mixed fleets (ADR 0106): a binary of ADR 0105 (which knows
+    /// `derived-segments-2` but not `content-v1`) refuses a store once
+    /// `derived-segments-3` is recorded, naming it, and still opens one with
+    /// both earlier features (mode `build` of `content-v1` records nothing).
+    #[test]
+    fn an_adr_0105_binary_refuses_a_store_with_content_retired() {
+        const ADR_0105_KNOWN: &[&str] = &[
+            CHANGESET_ZSTD_DICT,
+            GC_MARK_SEGMENTS,
+            DERIVED_SEGMENTS,
+            DERIVED_SEGMENTS_2,
+        ];
+        let before = [DERIVED_SEGMENTS.to_string(), DERIVED_SEGMENTS_2.to_string()];
+        check_against(ADR_0105_KNOWN, &before).unwrap();
+        let mut after = before.to_vec();
+        after.push(DERIVED_SEGMENTS_3.to_string());
+        let err = check_against(ADR_0105_KNOWN, &after).unwrap_err();
+        assert!(err.to_string().contains("(derived-segments-3)"), "{err}");
+        assert!(check_against(ADR_0105_KNOWN, &[DERIVED_SEGMENTS_3.to_string()]).is_err());
+        check(&after).unwrap();
     }
 
     /// `gc --retire-mark-rows` records its feature by URL; the store still

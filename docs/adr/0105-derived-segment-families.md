@@ -1,5 +1,5 @@
 # 0105. Derived segment families: generations, last merges, root trees and log filters as segments
-Status: Accepted
+Status: Accepted; Stage B is [0106](0106-search-rows-as-derived-segments.md)
 Date: 2026-11-15
 
 Amends [0104](0104-derived-segments.md) (one family; its extension
@@ -244,7 +244,7 @@ concern.
 are labelled by `family`; reads, errors, mismatches and retired rows gain a
 `family` label. Sums are unaffected.
 
-## Stage B (planned, not in this change)
+## Stage B (planned here, decided in [ADR 0106](0106-search-rows-as-derived-segments.md))
 A hash-keyed family `content-v1` for `blob-trigrams-v2`,
 `tree-trigrams-v2` and their keyframes, in the same container: ordinals by
 a head-tree walk, set equality (`same_blob_set_with`, `same_filter`)

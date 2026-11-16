@@ -1,7 +1,8 @@
 //! The read path of derived segments (ADR 0104, section "Read path"; ADR
-//! 0105): a [`MetaStore`] that answers reads of the kinds a segment family
-//! holds (`skiplist`, `history-tree-v4`, `generation`, `last_merge-v1`,
-//! `root_tree`, `log-filter-v1`) that the database misses from the live
+//! 0105, 0106): a [`MetaStore`] that answers reads of the kinds a segment
+//! family holds (`skiplist`, `history-tree-v4`, `generation`,
+//! `last_merge-v1`, `root_tree`, `log-filter-v1`, and the code search rows
+//! and keyframes) that the database misses from the live
 //! segments, installed by `Repo::new` so every read site gets it unchanged.
 //!
 //! Order of a read: the database, exactly the statement issued before;
@@ -655,18 +656,21 @@ impl SegmentedMeta {
 
     /// Fill the misses in `rows` (values of `keys` of column `col` of
     /// `family`) from the live segments. A segment that cannot be read makes
-    /// the view read the manifests again, once, and look again.
+    /// the view read the manifests again, once, and look again. `single`:
+    /// the miss is a single-row read's (`get_derived`), which refreshes with
+    /// single-row reads; a batched read's (even of one key) refreshes with
+    /// one batched read of every family's manifest.
     async fn fill(
         &self,
         family: u8,
         col: u8,
         keys: &[Hash],
         rows: &mut [Option<Bytes>],
+        single: bool,
     ) -> Result<()> {
         if rows.iter().all(Option::is_some) {
             return Ok(());
         }
-        let single = keys.len() == 1;
         let view = self.view.family(family);
         // A miss is judged against a manifest at most `REFRESH` old.
         if view.stale() {
@@ -736,7 +740,7 @@ impl MetaStore for SegmentedMeta {
         let mut row = self.inner.get_derived(kind, key).await?;
         if row.is_none() {
             let mut rows = [None];
-            self.fill(family, col, &[*key], &mut rows).await?;
+            self.fill(family, col, &[*key], &mut rows, true).await?;
             row = rows[0].take();
         }
         Ok(row)
@@ -754,7 +758,7 @@ impl MetaStore for SegmentedMeta {
                 keys.len()
             )));
         }
-        self.fill(family, col, keys, &mut rows).await?;
+        self.fill(family, col, keys, &mut rows, false).await?;
         Ok(rows)
     }
 
@@ -771,7 +775,7 @@ impl MetaStore for SegmentedMeta {
                 if rows.len() != keys.len() {
                     return Err(Error::Storage("get_derived_kinds answered short".into()));
                 }
-                self.fill(family, col, keys, rows).await?;
+                self.fill(family, col, keys, rows, false).await?;
             }
         }
         Ok(got)
