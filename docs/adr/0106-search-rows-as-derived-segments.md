@@ -292,9 +292,23 @@ sealed keys from the indexes without building a set of them.
   drawn up to ten times its 18 s mean, past the watchdog's 120 s, and seed
   1 draws such a time for the first CLI agent about five minutes in; a
   harness flaw, reached or not depending on how many iterations the agent
-  ran by then. The harness now counts a thinking agent as alive. The
-  segment count is bounded by the merge rule above; a 50-minute soak is
-  reported below.
+  ran by then (it reproduces on 784bed6 too). The harness now counts a
+  thinking agent as alive.
+- A 50-minute soak at the final merge rule (same settings, 18,039 lands):
+  the `content-v1` live segments grew with the family's bytes, never past
+  the rule's bound: 95 at 2.4 minutes, 408 at 12 (37.2 MB of data, 91 KB a
+  segment against the small limits' 128 KiB cap), 1,093 at 31, 1,654 at
+  44 (152 MB, 92 KB a segment; bound 2,324), 1,929 at 48. Every head is
+  inside the 14-day window, so nothing dies and the family only grows; at
+  the default 1 MiB cap the same bytes take an eighth of the segments.
+  The soak's final `verify --full --rehash` of that store ran for over an
+  hour (it rereads every search row a directory filter covers, one
+  statement each, as with rows, plus a segment lookup that misses the
+  32 MiB data cache across 2,000 segments).
+- RSS (20-minute soak, Postgres, the same harness against 784bed6's
+  server): 784bed6 324 / 429 / 539 / 602 MiB at 5, 10, 15 and 20 minutes;
+  this change 357 / 467 / 599 / 649 MiB (+47 MiB, about the segment
+  caches), after keeping the live walk's peak flat (section Cost).
 - Deviations from the design: blocks of 512 KiB at zstd level 17 instead
   of the other families' 64 KiB at 9 (measured, above); a merge leaves keys
   out only while its walk is current; keyframes are never left out (they

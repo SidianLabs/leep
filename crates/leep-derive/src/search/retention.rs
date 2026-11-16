@@ -219,6 +219,10 @@ struct Live {
     added: usize,
 }
 
+/// A tree node as the live walk keeps it: the files first found in it and
+/// its subdirectories.
+type WalkedNode = (Box<[Hash]>, Box<[Hash]>);
+
 /// What retention keeps live, as a derived segment pass of family
 /// `content-v1` needs it (ADR 0106): every blob and tree node below a head
 /// current now or within the window, each numbered by its first place in a
@@ -278,7 +282,7 @@ impl Repo {
         // once: the order is a locality key, so where a shared file lands
         // does not matter). Every list sized exactly; the files seen are
         // dropped before the order is built, so the peak is one of them.
-        let mut nodes: HashMap<Hash, (Box<[Hash]>, Box<[Hash]>)> = HashMap::new();
+        let mut nodes: HashMap<Hash, WalkedNode> = HashMap::new();
         let mut queued: HashSet<Hash> = HashSet::new();
         let mut seen_files: HashSet<Hash> = HashSet::new();
         let mut level: Vec<Hash> = roots
