@@ -279,6 +279,12 @@ struct FamilyState {
     /// Whether this process said once that `retire` holds the family back
     /// (its feature unrecorded and the family not named).
     held_back_warned: bool,
+    /// When the store last answered that the family's feature is not
+    /// recorded: a held-back family asks again only after
+    /// [`FEATURE_RECHECK`], not every pass (each ask opens a connection).
+    unrecorded_at: Option<Instant>,
+    /// Live segments whose blob condemnation this process has logged.
+    condemned_warned: HashSet<Hash>,
     /// Runs whose merge came out over the byte cap: not tried again.
     oversize: HashSet<Vec<Hash>>,
     /// Live segments this process read whole and found sound: later passes
@@ -488,6 +494,11 @@ pub async fn compact_pass(
     gc_lease::release(lease, result).await.map(Some)
 }
 
+/// How long a held-back family trusts the store's answer that its feature
+/// is not recorded. Another server recording it is seen this late, which
+/// only delays this one's retirement.
+pub(crate) const FEATURE_RECHECK: Duration = Duration::from_secs(60);
+
 async fn feature_recorded(features: Option<&Features>, name: &'static str) -> Result<bool> {
     match features {
         Some(f) => (f.recorded)(name).await,
@@ -537,6 +548,9 @@ pub(crate) struct Pass<'a> {
     /// retire uses them again in this pass, and the next pass probes them
     /// whole.
     unreadable: HashSet<Hash>,
+    /// Live segments found condemned by blob GC in this pass: no more of
+    /// their rows are retired in it.
+    condemned: HashSet<Hash>,
     report: PassReport,
 }
 
@@ -566,16 +580,19 @@ impl<'a> Pass<'a> {
             ManifestRead::Damaged => {
                 report.damaged_manifest = true;
                 // Replaced only where every row is certainly still stored:
-                // this process is in mode build and the store has never
-                // recorded the family's feature (another server may have
-                // retired).
-                if opts.mode == Mode::Retire || feature_recorded(features, fam.feature).await? {
+                // the store has never recorded the family's feature (another
+                // server may have retired), and this process would not
+                // retire the family itself. A `retire` server holding the
+                // family back deletes none of its rows, so it may replace it.
+                let would_retire =
+                    opts.mode == Mode::Retire && opts.retire_families.iter().any(|n| n == fam.name);
+                if would_retire || feature_recorded(features, fam.feature).await? {
                     return Err(Error::Other(format!(
                         "the {MANIFEST_KIND} row of family {} does not decode, and rows may \
                          have been retired (the store feature {} is recorded, or this server \
-                         runs retire), so it may name the only copy of deleted rows; it is \
-                         not replaced automatically (see LeepDerivedSegmentPassesFailing in \
-                         RUNBOOKS.md)",
+                         retires the family), so it may name the only copy of deleted rows; \
+                         it is not replaced automatically (see LeepDerivedSegmentPassesFailing \
+                         in RUNBOOKS.md)",
                         fam.name, fam.feature
                     )));
                 }
@@ -602,6 +619,7 @@ impl<'a> Pass<'a> {
             started: std::time::Instant::now(),
             budget: PassBudget::default(),
             unreadable: HashSet::new(),
+            condemned: HashSet::new(),
             report,
         };
         if !p.report.newer_manifest {
@@ -696,6 +714,7 @@ impl<'a> Pass<'a> {
             state.live_since.entry(*h).or_insert(now);
         }
         state.verified.retain(|h| live.contains(h));
+        state.condemned_warned.retain(|h| live.contains(h));
         state.mismatched.retain(|_, h| live.contains(h));
         let accounted = self
             .man
@@ -733,10 +752,17 @@ impl<'a> Pass<'a> {
         if state.feature_recorded || self.opts.retire_families.iter().any(|n| n == self.fam.name) {
             return Ok(true);
         }
+        if state
+            .unrecorded_at
+            .is_some_and(|t| t.elapsed() < FEATURE_RECHECK)
+        {
+            return Ok(false);
+        }
         if feature_recorded(self.features, self.fam.feature).await? {
             state.feature_recorded = true;
             return Ok(true);
         }
+        state.unrecorded_at = Some(Instant::now());
         if !state.held_back_warned {
             state.held_back_warned = true;
             tracing::warn!(
@@ -1372,9 +1398,10 @@ impl<'a> Pass<'a> {
     /// [`CompactOptions::retire_after`], holds the same value for. The
     /// feature is recorded first; the manifest is read again under the
     /// lease and must be the one this pass holds; each step checks the
-    /// lease, compares every row with its segment value, and deletes a row
-    /// only if it still holds the bytes compared (one statement), so a row
-    /// `repair` rewrote meanwhile stays.
+    /// lease, compares every row with its segment value, reads the
+    /// segment's blob condemnations again (after the feature is recorded),
+    /// and deletes a row only if it still holds the bytes compared (one
+    /// statement), so a row `repair` rewrote meanwhile stays.
     async fn retire(&mut self, state: &mut FamilyState) -> Result<()> {
         let now = Instant::now();
         let ripe: HashSet<Hash> = state
@@ -1410,23 +1437,9 @@ impl<'a> Pass<'a> {
             if !ripe.contains(&seg) || self.unreadable.contains(&seg) {
                 continue;
             }
-            // A blob GC of a binary that cannot read this family (it ran
-            // before the feature was recorded) may have condemned the
-            // segment as an orphan: its rows are not deleted while either
-            // blob carries a condemnation. They go after the next collect,
-            // or stay with the segment dropped and sealed again.
-            let marks = self
-                .repo
-                .row_meta()
-                .get_derived_many(crate::gc::BLOB_CONDEMNED, &[l.r.index, l.r.data])
-                .await?;
-            if marks.iter().any(Option::is_some) {
-                tracing::warn!(
-                    segment = %seg,
-                    family = self.fam.name,
-                    "a derived segment's blob is condemned by blob GC; its rows are not \
-                     retired"
-                );
+            // Spares comparing a condemned segment's rows; each step reads
+            // the condemnations again before it deletes.
+            if self.condemned(&l, state).await? {
                 continue;
             }
             let mut i = 0;
@@ -1441,7 +1454,7 @@ impl<'a> Pass<'a> {
                     self.report.more |= progress;
                     return Ok(());
                 }
-                if self.unreadable.contains(&seg) {
+                if self.unreadable.contains(&seg) || self.condemned.contains(&seg) {
                     break;
                 }
                 let col = cands[i].1;
@@ -1464,6 +1477,32 @@ impl<'a> Pass<'a> {
             self.forget_data();
         }
         Ok(())
+    }
+
+    /// Whether either blob of `l` carries a blob GC condemnation. A blob GC
+    /// of a binary that cannot read this family (one that started before
+    /// the family's feature was recorded) may have condemned the segment as
+    /// an orphan: its rows are not deleted while it does. They go after the
+    /// next collect, or stay with the segment dropped and sealed again.
+    /// Logged once per segment per process.
+    async fn condemned(&mut self, l: &Live, state: &mut FamilyState) -> Result<bool> {
+        let marks = self
+            .repo
+            .row_meta()
+            .get_derived_many(crate::gc::BLOB_CONDEMNED, &[l.r.index, l.r.data])
+            .await?;
+        if !marks.iter().any(Option::is_some) {
+            return Ok(false);
+        }
+        self.condemned.insert(l.r.index);
+        if state.condemned_warned.insert(l.r.index) {
+            tracing::warn!(
+                segment = %l.r.index,
+                family = self.fam.name,
+                "a derived segment's blob is condemned by blob GC; its rows are not retired"
+            );
+        }
+        Ok(true)
     }
 
     /// The rows to retire, from a listing: each row whose newest holding
@@ -1564,6 +1603,12 @@ impl<'a> Pass<'a> {
             (f.record)(self.fam.feature).await?;
             state.feature_recorded = true;
             self.pause("feature-recorded").await;
+        }
+        // Read after the feature is recorded: binaries that cannot read the
+        // family refuse the store from then on, so only a `gc` already
+        // under way could condemn later (ADR 0105, section 4).
+        if self.condemned(live, state).await? {
+            return Ok(unequal);
         }
         gc_lease::check(self.lease)?;
         let n = self

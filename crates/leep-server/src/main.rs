@@ -1384,10 +1384,10 @@ fn start_derived_segments(args: &Args, repo: &Repo) {
         pass.lone_wait = std::time::Duration::ZERO;
         pass.retire_after = std::time::Duration::ZERO;
     }
-    // Checked by the flag's parser.
+    // Checked by the flag's parser; an empty list would drop `changeset-v1`.
     pass.retire_families =
         CompactOptions::parse_retire_families(&args.derived_segments_retire_families)
-            .unwrap_or_default();
+            .expect("--derived-segments-retire-families was checked when parsed");
     if let Some(at) = args.debug_derived_segments_pause_at.clone() {
         pass.pause = Some(PauseHook(Arc::new(move |point| {
             let stop = point == at;

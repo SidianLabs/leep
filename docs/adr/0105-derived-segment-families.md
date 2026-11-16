@@ -133,8 +133,9 @@ the moved kinds from the root or collect `changeset-v2` segments as
 orphans. `build` records nothing: rolling back from it is free (an ADR 0104
 `gc` may collect `changeset-v2` segments as orphans; every row is still
 there and the next pass seals again). A damaged `changeset-v2` manifest is
-replaced automatically only in `build` on a store without
-`derived-segments-2`.
+replaced automatically only on a store without `derived-segments-2`, by a
+process that would not retire the family (`build`, or `retire` holding it
+back).
 
 **A door is passed only on purpose.** A fleet already running
 `--derived-segments retire` would otherwise pass the second door just by
@@ -145,7 +146,10 @@ of family names, or `all`; `changeset-v1` is always included, as ADR 0104's
 `retire` meant), or its feature is already recorded in the store (another
 server, or an earlier run, passed the door). Otherwise the family still
 seals and merges, and the server says once per process that it holds the
-family back. The flag takes Stage B's `content-v1` the same way.
+family back. While it holds a family back it asks the store whether the
+feature is recorded at most once a minute (each ask opens a connection),
+so another server passing the door is seen up to a minute late. The flag
+takes Stage B's `content-v1` the same way.
 
 | Situation | What happens |
 |---|---|
@@ -160,8 +164,13 @@ before the family's feature was recorded, could have condemned the family's
 live segments as orphans. A pass does not delete rows of a segment either of
 whose blobs carries a condemnation (`blob-condemned-v1`): they go after the
 next collect (if the segment survives it) or stay, the segment dropped and
-sealed again. The rest of the window is closed by the rule to set the flag
-only once every binary runs this release.
+sealed again. The condemnations are read before a segment's rows are
+compared and again before each delete statement. For a family's first
+delete that second read comes after the feature is recorded; from then on
+such binaries refuse the store, so only a `gc` already under way could
+condemn later. That window
+is closed by the rule to set the flag only once every binary runs this
+release. The warning is logged once per segment per process.
 
 ### 5. GC over every family (point 2)
 `gc_view` lists every `derived-segments-v1` row and unions the live and
@@ -270,7 +279,8 @@ dead). Its listing-based verify must see sealed keys in the same change.
   minutes. In mode `retire` only unsealed rows remain to list.
 - **A seal or merge** asks whether each key's changeset is stored (batched,
   one statement per 1,000 keys); a retirement asks for two
-  `blob-condemned-v1` rows per holding segment.
+  `blob-condemned-v1` rows per holding segment and again per delete
+  statement (1,000 rows).
 
 ## Consequences
 - Measured on corpus B (reconstructed: 2,231 changesets, Git 6.35 MB after
@@ -321,3 +331,11 @@ dead). Its listing-based verify must see sealed keys in the same change.
   parsed; the listing trigger scaled by a family's columns; condemned
   segments' rows not retired; `repair drop` with a damaged manifest needs
   every kind of the family.
+- Changed after a second review, before release: a `retire` server holding
+  a family back replaces that family's damaged manifest like `build` (it
+  deletes none of its rows); blob condemnations are read again before each
+  delete, so after the family's feature is recorded, and their warning is
+  logged once per segment; a held-back family asks for its feature at most
+  once a minute; the crash test no longer expects a row deleted when
+  killed at either family's `feature-recorded`, since the first family
+  rotates; the server's family list cannot silently fall back to empty.

@@ -3791,7 +3791,9 @@ family's kinds, and:
    statement, resting as long as each step took. A `log-filter-v1` row
    may be one of several right values (a merge over the side budget stores
    a superset), so mismatches of that kind after merges are not damage.
-   Rows of a segment whose blobs `gc` condemned are not deleted.
+   Rows of a segment whose blobs `gc` condemned are not deleted; the
+   condemnations are read again before each delete statement, after the
+   family's feature is recorded.
 
 A pass's time and row bounds are shared by both families (the one going
 first rotates), so one pass stays well under `repair`'s two-minute wait.
