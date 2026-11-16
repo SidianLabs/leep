@@ -1543,6 +1543,7 @@ fn run_segments_kill(backend: &str, meta_url: Option<String>, mode: &str, point:
             seal_rows: 1,
             idle_rows: 1,
             max_rows: 8,
+            content_max_rows: 8,
             ..CompactOptions::small(Mode::Build)
         };
         common_block_on(compact_pass(

@@ -167,6 +167,9 @@ pub struct CompactOptions {
     /// Most bytes of a `content-v1` data blob: a cold search reads a whole
     /// data blob for one row, so its segments are smaller than the others'.
     pub content_max_bytes: usize,
+    /// Most keys in a `content-v1` segment (16,384 by default, as the
+    /// others; more in the small limits, where its bytes cap binds).
+    pub content_max_rows: usize,
     /// For tests only: the time (Unix seconds) retention's window is judged
     /// at, instead of the clock.
     pub content_now: Option<i64>,
@@ -197,6 +200,7 @@ impl Default for CompactOptions {
             content_keep: Some(crate::search::retention::DEFAULT_KEEP),
             content_skew: Duration::from_secs(300),
             content_max_bytes: 1 << 20,
+            content_max_rows: 16_384,
             content_now: None,
             pause: None,
         }
@@ -227,7 +231,8 @@ impl CompactOptions {
             retire_families: FAMILIES.iter().map(|f| f.name.to_string()).collect(),
             content_keep: Some(crate::search::retention::DEFAULT_KEEP),
             content_skew: Duration::from_secs(300),
-            content_max_bytes: 32 << 10,
+            content_max_bytes: 128 << 10,
+            content_max_rows: 1_024,
             content_now: None,
             pause: None,
         }
@@ -932,16 +937,26 @@ impl<'a> Pass<'a> {
         }
     }
 
+    /// Most keys in one of the family's segments.
+    fn max_rows(&self) -> usize {
+        match self.fam.keys {
+            Keys::Changesets => self.opts.max_rows,
+            Keys::Content => self.opts.content_max_rows,
+        }
+    }
+
     /// The tier `s` merges in; `None`: never merged by tier. `content-v1`
-    /// has two tiers by bytes (ADR 0106): segments under a quarter of the
-    /// cap merge with their neighbours, larger ones are only rewritten once
-    /// a third of them is dead, so a row is rewritten about twice.
+    /// has two tiers (ADR 0106): segments under half of both caps (bytes
+    /// and keys) merge with their neighbours while the result fits, so
+    /// segments end between half the cap and the cap; full ones are only
+    /// rewritten once a third of them is dead. A segment stopped by the key
+    /// cap does not stay small.
     fn tier(&self, s: &SegmentRef) -> Option<u32> {
         match self.fam.keys {
             Keys::Changesets => Some(self.opts.tier(s.rows)),
-            Keys::Content => {
-                ((s.data_len as usize).saturating_mul(4) < self.max_bytes()).then_some(0)
-            }
+            Keys::Content => ((s.data_len as usize).saturating_mul(2) < self.max_bytes()
+                && (s.rows as usize).saturating_mul(2) < self.max_rows())
+            .then_some(0),
         }
     }
 
@@ -1308,7 +1323,7 @@ impl<'a> Pass<'a> {
             bf.order.sort_unstable();
             bf.sorted = true;
         }
-        let page_rows = self.opts.max_rows.max(1);
+        let page_rows = self.max_rows().max(1);
         let mut pages = 0;
         while bf.sorted && bf.next < bf.order.len() && pages < self.opts.max_seal_pages.max(1) {
             if progress && std::time::Instant::now() >= deadline {
@@ -1461,9 +1476,20 @@ impl<'a> Pass<'a> {
             false
         };
         let cap = self.max_bytes();
-        let mut rewritten: HashSet<Hash> = HashSet::new();
+        let max_rows = self.max_rows();
+        // Segments a third dead, found once a pass: each is rewritten alone.
+        let mut dead: VecDeque<Hash> = if omit {
+            self.man
+                .live
+                .iter()
+                .filter(|s| self.mostly_dead(s))
+                .map(|s| s.index)
+                .collect()
+        } else {
+            VecDeque::new()
+        };
         // Each round merges (the live list shrinks), rewrites a segment once
-        // (the rewritten set grows) or skips one (the skip set grows), so it
+        // (the dead list shrinks) or skips one (the skip set grows), so it
         // ends; the bound is defense in depth.
         for _ in 0..4 * self.man.live.len() + 16 {
             let live = self.man.live.clone();
@@ -1485,7 +1511,7 @@ impl<'a> Pass<'a> {
                     for s in run {
                         rows += s.rows as usize;
                         bytes += s.data_len as usize;
-                        if rows > self.opts.max_rows || bytes > cap {
+                        if rows > max_rows || bytes > cap {
                             break;
                         }
                         k += 1;
@@ -1504,22 +1530,18 @@ impl<'a> Pass<'a> {
                         (k >= 2 && !state.oversize.contains(&ids)).then_some((i, k))
                     })
                     .or_else(|| {
-                        if !omit {
-                            return None;
+                        while let Some(h) = dead.pop_front() {
+                            if let Some(i) = live.iter().position(|s| s.index == h && mergeable(s))
+                            {
+                                return Some((i, 1));
+                            }
                         }
-                        live.iter()
-                            .position(|s| {
-                                mergeable(s) && !rewritten.contains(&s.index) && self.mostly_dead(s)
-                            })
-                            .map(|i| (i, 1))
+                        None
                     })
             };
             let Some((at, k)) = found else {
                 return Ok(());
             };
-            if k == 1 {
-                rewritten.insert(live[at].index);
-            }
             let run: Vec<SegmentRef> = live[at..at + k].to_vec();
             let mut unreadable = None;
             // Oldest first, so a newer segment's value replaces an older's.

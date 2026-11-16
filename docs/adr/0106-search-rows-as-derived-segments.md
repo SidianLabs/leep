@@ -118,9 +118,12 @@ Accepted by the maintainer on 2026-11-15.
 - A seal reads a page a batch of keys at a time and closes a segment once
   its rows reach four thirds of the cap, so a pass holds about one
   segment's rows at once (a dense filter is 64 KiB).
-- Two tiers by bytes: segments under a quarter of the cap merge with their
-  neighbours by four; larger ones are only rewritten once a third dead. A
-  row is written about twice.
+- Two tiers: segments under half of both caps (1 MiB, and 16,384 keys)
+  merge with up to three neighbours while the result fits, so segments end
+  between half the cap and the cap; full ones are only rewritten once a
+  third dead. A row is written about twice. (A first version kept every
+  segment over a quarter of the byte cap apart: in a soak with small
+  limits, 1,978 such segments of 8 to 32 KiB accumulated.)
 - `--derive-cache-bytes` is not raised: the 32 MiB data cache and 16 MiB
   block cache are shared with the other families (measured below).
 
@@ -212,6 +215,13 @@ search paths read rows with `get_derived_many`, often of one key.
   rows (new lines, `crates/leep-e2e/tests/storage_size.rs`).
 - `budget_tests`: search on a new process 31 -> 32 metadata calls (the
   manifests, once a minute); search land 11 and create 13 unchanged.
+- Soak (8 minutes, 50 agents and 2 CLI agents, Postgres, `retire` naming
+  every family, the small limits): passes, 6.0 lands a second, land p99
+  42 ms; `content-v1` 294 live segments, 32,306 rows retired. With the
+  first tier rule the same soak failed twice the same way: 1,978
+  `content-v1` segments accumulated and a CLI agent made no progress for
+  120 s about five minutes in (no command finished, so which one stalled
+  was not recorded); with the rule above it did not recur.
 - Deviations from the design: blocks of 512 KiB at zstd level 17 instead
   of the other families' 64 KiB at 9 (measured, above); a merge leaves keys
   out only while its walk is current; keyframes are never left out (they
