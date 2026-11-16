@@ -36,7 +36,7 @@
 //! Nothing here is on the land path: the server runs passes in the index
 //! lane (`leep-server`, `search_retention`).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use leep_core::{ChangesetId, Error, FileKind, Hash, LeaseKey, Result, TreeEntry};
@@ -219,7 +219,136 @@ struct Live {
     added: usize,
 }
 
+/// A tree node as the live walk keeps it: the files first found in it and
+/// its subdirectories.
+type WalkedNode = (Box<[Hash]>, Box<[Hash]>);
+
+/// What retention keeps live, as a derived segment pass of family
+/// `content-v1` needs it (ADR 0106): every blob and tree node below a head
+/// current now or within the window, each numbered by its first place in a
+/// depth-first walk of those heads' trees (a directory, then its files, then
+/// its subdirectories), so a directory's filter and its files' rows sit in
+/// the same blocks of a segment.
+#[derive(Debug)]
+pub(crate) struct ContentLive {
+    /// The newest ref log entry read before the refs were listed: a pass
+    /// trusts this set only while it is still the newest.
+    pub seq: Option<u64>,
+    /// Retention is off: every row is kept, so every row is live (`order`
+    /// still numbers the current heads' content).
+    pub all: bool,
+    order: HashMap<Hash, u32>,
+}
+
+impl ContentLive {
+    /// Whether retention keeps `key`'s row.
+    pub fn live(&self, key: &Hash) -> bool {
+        self.all || self.order.contains_key(key)
+    }
+
+    /// `key`'s place in the walk, if a head holds it.
+    pub fn order(&self, key: &Hash) -> Option<u32> {
+        self.order.get(key).copied()
+    }
+}
+
 impl Repo {
+    /// [`ContentLive`] at `now` (Unix seconds): the heads of every ref, then
+    /// with `keep` (retention on) every head the ref log names since `keep`
+    /// (and `skew`) before `now`, newest first, as a retention pass finds
+    /// them. Trees are read a level at a time, without filling the shared
+    /// node cache, each distinct node once.
+    pub(crate) async fn content_live(
+        &self,
+        keep: Option<Duration>,
+        skew: Duration,
+        now: i64,
+    ) -> Result<ContentLive> {
+        let walker = self.without_node_caching();
+        let seq = self.newest_seq().await?;
+        let refs = self.meta().list_refs().await?;
+        let mut heads: Vec<ChangesetId> = refs.values().copied().collect();
+        if let Some(keep) = keep {
+            let cutoff = now
+                .saturating_sub(keep.as_secs().min(i64::MAX as u64) as i64)
+                .saturating_sub(skew.as_secs().min(i64::MAX as u64) as i64);
+            heads.extend(self.heads_since(cutoff).await?);
+        }
+        let mut seen = HashSet::new();
+        heads.retain(|h| seen.insert(*h));
+        let roots = walker.roots_of(&heads).await?;
+        // Each node's subdirectories, and the files first found in it (a
+        // file under many directories, or many versions of one, is kept
+        // once: the order is a locality key, so where a shared file lands
+        // does not matter). Every list sized exactly; the files seen are
+        // dropped before the order is built, so the peak is one of them.
+        let mut nodes: HashMap<Hash, WalkedNode> = HashMap::new();
+        let mut queued: HashSet<Hash> = HashSet::new();
+        let mut seen_files: HashSet<Hash> = HashSet::new();
+        let mut level: Vec<Hash> = roots
+            .iter()
+            .filter(|r| queued.insert(**r))
+            .copied()
+            .collect();
+        while !level.is_empty() {
+            let mut next = Vec::new();
+            for chunk in level.chunks(TREE_BATCH) {
+                for (tree, node) in chunk.iter().zip(walker.read_trees_shared(chunk).await?) {
+                    let (mut files, mut dirs) = (Vec::new(), Vec::new());
+                    for entry in node.entries.values() {
+                        match *entry {
+                            TreeEntry::Dir { tree } => dirs.push(tree),
+                            TreeEntry::File { content, .. } => {
+                                if seen_files.insert(content) {
+                                    files.push(content);
+                                }
+                            }
+                        }
+                    }
+                    next.extend(dirs.iter().filter(|d| queued.insert(**d)).copied());
+                    nodes.insert(*tree, (files.into_boxed_slice(), dirs.into_boxed_slice()));
+                }
+            }
+            level = next;
+        }
+        let total = nodes.len() + seen_files.len();
+        drop(seen_files);
+        drop(queued);
+        let mut order: HashMap<Hash, u32> = HashMap::with_capacity(total);
+        let mut stack: Vec<Hash> = Vec::new();
+        for root in roots {
+            stack.push(root);
+            while let Some(tree) = stack.pop() {
+                if order.contains_key(&tree) {
+                    continue;
+                }
+                let at = order.len() as u32;
+                order.insert(tree, at);
+                let Some((files, dirs)) = nodes.remove(&tree) else {
+                    continue;
+                };
+                for f in files.iter() {
+                    let at = order.len() as u32;
+                    order.entry(*f).or_insert(at);
+                }
+                stack.extend(dirs.iter().rev().filter(|d| !order.contains_key(d)));
+            }
+        }
+        drop(nodes);
+        order.shrink_to_fit();
+        Ok(ContentLive {
+            seq,
+            all: keep.is_none(),
+            order,
+        })
+    }
+
+    /// The newest ref log entry's `seq` (`None` for an empty log): a
+    /// [`ContentLive`] is current while this has not moved.
+    pub(crate) async fn newest_ref_seq(&self) -> Result<Option<u64>> {
+        self.newest_seq().await
+    }
+
     /// One retention pass over the blob trigram rows (see the module docs),
     /// at `now` (Unix seconds). `check` is asked before every delete, and an
     /// error from it stops the pass: the server passes its lease check.

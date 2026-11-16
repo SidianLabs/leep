@@ -76,8 +76,11 @@ const BUDGETS: &[Limit] = &[
     // trigram index on the way (ADR 0014): every blob read once. Plus, the
     // first time a blob row is missing, one count of the retired
     // `blob-trigrams-v1` rows, repeated at most every 10 minutes, which
-    // spares every later miss its fallback read (ADR 0102).
-    Limit::fixed("search", "meta calls", 31),
+    // spares every later miss its fallback read (ADR 0102). And the first
+    // miss of a search row reads every derived segment family's manifest
+    // in one batched read, at most once a minute (ADR 0106: the search rows
+    // may be sealed in family `content-v1`).
+    Limit::fixed("search", "meta calls", 32),
     Limit::fixed("search", "blob calls", 297),
     // The warmer's search derivation of one land that changed one file
     // three directories deep, its parent indexed: per directory on the path

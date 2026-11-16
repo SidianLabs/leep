@@ -11,7 +11,9 @@
 //!
 //! Families and their columns are one table, [`FAMILIES`]; each column has
 //! a codec: its encoding, its decoding, and the equality a row is compared
-//! by before it is deleted.
+//! by before it is deleted. Family `content-v1` (ADR 0106) is keyed by
+//! content hashes instead (blobs and tree nodes) and holds the code search
+//! rows verbatim, ordered by a walk of the heads' trees.
 
 use bytes::Bytes;
 use leep_core::{ChangesetId, Error, Hash, Result};
@@ -20,6 +22,8 @@ use crate::derived::history_pack;
 use crate::derived::{
     DerivedKind, FilterRow, Generation, HistoryTree, LastMerge, LogFilterIndex, RootTree, Skiplist,
 };
+use crate::search::trigram::{BlobRow, Bloom, StoredBlob, TreeRow};
+use crate::search::{BLOB_KEYFRAME_KIND, BLOB_KIND, KEYFRAME_KIND, TREE_KIND};
 
 /// Object kind whose preimage prefix starts every index blob, so no upload
 /// can take its address (ADR 0041).
@@ -35,6 +39,11 @@ pub const FAMILY_CHANGESET_NAME: &str = "changeset-v1";
 /// binary does not know is ignored, never read as damage.
 pub const FAMILY_CHANGESET_V2: u8 = 2;
 pub const FAMILY_CHANGESET_V2_NAME: &str = "changeset-v2";
+/// Family `content-v1` (ADR 0106): keys are blob and tree node hashes, the
+/// code search rows; ordered by a depth-first walk of the heads' trees,
+/// and holding only rows of what retention keeps live.
+pub const FAMILY_CONTENT: u8 = 3;
+pub const FAMILY_CONTENT_NAME: &str = "content-v1";
 
 /// Column numbers of `changeset-v1`, fixed forever: a later kind takes a
 /// new number and every stored segment stays valid.
@@ -46,6 +55,12 @@ pub const COL_GENERATION: u8 = 1;
 pub const COL_LAST_MERGE: u8 = 2;
 pub const COL_ROOT_TREE: u8 = 3;
 pub const COL_LOG_FILTER: u8 = 4;
+
+/// Column numbers of `content-v1`, fixed forever.
+pub const COL_BLOB_TRIGRAMS: u8 = 1;
+pub const COL_BLOB_KEYFRAME: u8 = 2;
+pub const COL_TREE_TRIGRAMS: u8 = 3;
+pub const COL_TREE_KEYFRAME: u8 = 4;
 
 /// Turns a changeset id a row names into its id reference.
 pub(crate) type Refer<'a> = &'a mut dyn FnMut(&Hash) -> u64;
@@ -66,7 +81,110 @@ pub struct Column {
     decode: DecodeFn,
     /// Whether a row and a segment value are the same, checked before the
     /// row is deleted.
-    pub equal: fn(&[u8], &[u8]) -> bool,
+    pub equal: Equality,
+}
+
+/// How a row and a segment value are compared before the row is deleted.
+#[derive(Clone, Copy)]
+pub enum Equality {
+    /// By their bytes (or a kind's own definition of the same value).
+    Bytes(fn(&[u8], &[u8]) -> bool),
+    /// By the trigram set they stand for, each patch applied to its
+    /// keyframe (`blob-trigrams-v2`, ADR 0102): a row may be rewritten as
+    /// another patch of the same set, so bytes would leave residue.
+    BlobSet,
+    /// By the filter they stand for (`tree-trigrams-v2`, ADR 0094).
+    Filter,
+}
+
+impl Equality {
+    /// Whether `b`, read back from a segment, is the value `a` that was
+    /// sealed: the kind's own equality, or for the content rows (held
+    /// verbatim) their bytes.
+    pub fn sealed_as(&self, a: &[u8], b: &[u8]) -> bool {
+        match self {
+            Equality::Bytes(f) => f(a, b),
+            Equality::BlobSet | Equality::Filter => a == b,
+        }
+    }
+
+    /// The keyframe kind a value of this equality may stand on.
+    pub fn keyframe_kind(&self) -> Option<&'static str> {
+        match self {
+            Equality::Bytes(_) => None,
+            Equality::BlobSet => Some(BLOB_KEYFRAME_KIND),
+            Equality::Filter => Some(KEYFRAME_KIND),
+        }
+    }
+
+    /// The keyframe `value` stands on, if it is a patch.
+    pub fn base(&self, value: &[u8]) -> Option<Hash> {
+        match self {
+            Equality::Bytes(_) => None,
+            Equality::BlobSet => StoredBlob::parse(value).ok()?.base(),
+            Equality::Filter => match TreeRow::parse(value) {
+                Ok(TreeRow::Patch(p)) => Some(p.base),
+                _ => None,
+            },
+        }
+    }
+
+    /// Whether `row` and `value` stand for the same thing, each patch
+    /// resolved by `keyframe`. `None`: one of them cannot be resolved (a
+    /// keyframe not stored), so neither is known equal; the row stays.
+    pub fn same(
+        &self,
+        row: &[u8],
+        value: &[u8],
+        keyframe: &dyn Fn(&Hash) -> Option<Bytes>,
+    ) -> Option<bool> {
+        let kf = |v: &[u8]| -> Option<Option<Bytes>> {
+            match self.base(v) {
+                None => Some(None),
+                Some(b) => keyframe(&b).map(Some),
+            }
+        };
+        match self {
+            Equality::Bytes(f) => Some(f(row, value)),
+            Equality::BlobSet => {
+                if row == value {
+                    return Some(true);
+                }
+                let (kr, kv) = (kf(row)?, kf(value)?);
+                match (
+                    BlobRow::of_stored(row, kr.as_deref()),
+                    BlobRow::of_stored(value, kv.as_deref()),
+                ) {
+                    (Ok(a), Ok(b)) => Some(a == b),
+                    _ => Some(false),
+                }
+            }
+            Equality::Filter => {
+                if row == value {
+                    return Some(true);
+                }
+                let (kr, kv) = (kf(row)?, kf(value)?);
+                match (
+                    Bloom::of_row(row, kr.as_deref()),
+                    Bloom::of_row(value, kv.as_deref()),
+                ) {
+                    (Ok(a), Ok(b)) => Some(a == b),
+                    _ => Some(false),
+                }
+            }
+        }
+    }
+}
+
+/// How a family numbers its keys, and which keys it holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Keys {
+    /// Changeset ids, ordered by generation; a key whose changeset is no
+    /// longer stored is left out.
+    Changesets,
+    /// Content hashes, ordered by a depth-first walk of the heads' trees;
+    /// patch and whole rows only of what retention keeps live (ADR 0106).
+    Content,
 }
 
 /// A family: its columns, and the store feature that guards its rows.
@@ -82,6 +200,16 @@ pub struct Family {
     /// `changeset-v1` cannot be: ADR 0104 binaries read an unknown column as
     /// damage and drop the segment.
     pub tolerant: bool,
+    pub keys: Keys,
+    /// Uncompressed bytes a block holds before it is closed, and the zstd
+    /// level of blocks: writer's choices (the block directory says where
+    /// each block lies, so any size reads).
+    pub block_bytes: usize,
+    pub zstd_level: i32,
+    /// Columns a key is expected to have before it is sealed without
+    /// waiting `lone_wait` for the others; none in `content-v1`, whose
+    /// columns are independent.
+    pub expected: u64,
 }
 
 impl Family {
@@ -103,6 +231,16 @@ impl Family {
     pub fn column_of(&self, kind: &str) -> Option<u8> {
         self.columns.iter().find(|c| c.kind == kind).map(|c| c.id)
     }
+
+    /// Bit `c` for every column holding keyframes (`content-v1`): never
+    /// left out of a merge, since a live patch may stand on the keyframe of
+    /// a blob or tree no head holds (ADR 0102).
+    pub fn keyframe_mask(&self) -> u64 {
+        if self.keys != Keys::Content {
+            return 0;
+        }
+        (1 << COL_BLOB_KEYFRAME) | (1 << COL_TREE_KEYFRAME)
+    }
 }
 
 fn bytes_equal(a: &[u8], b: &[u8]) -> bool {
@@ -120,18 +258,22 @@ pub static FAMILIES: &[Family] = &[
                 kind: Skiplist::NAME,
                 encode: encode_skiplist,
                 decode: decode_skiplist,
-                equal: bytes_equal,
+                equal: Equality::Bytes(bytes_equal),
             },
             Column {
                 id: COL_HISTORY_TREE,
                 kind: HistoryTree::NAME,
                 encode: encode_history,
                 decode: decode_history,
-                equal: history_pack::same_part,
+                equal: Equality::Bytes(history_pack::same_part),
             },
         ],
         feature: super::FEATURE,
         tolerant: false,
+        keys: Keys::Changesets,
+        block_bytes: BLOCK_BYTES,
+        zstd_level: ZSTD_LEVEL,
+        expected: (1 << COL_SKIPLIST) | (1 << COL_HISTORY_TREE),
     },
     Family {
         id: FAMILY_CHANGESET_V2,
@@ -142,21 +284,21 @@ pub static FAMILIES: &[Family] = &[
                 kind: Generation::NAME,
                 encode: encode_u64,
                 decode: decode_u64,
-                equal: bytes_equal,
+                equal: Equality::Bytes(bytes_equal),
             },
             Column {
                 id: COL_LAST_MERGE,
                 kind: LastMerge::NAME,
                 encode: encode_u64,
                 decode: decode_u64,
-                equal: bytes_equal,
+                equal: Equality::Bytes(bytes_equal),
             },
             Column {
                 id: COL_ROOT_TREE,
                 kind: RootTree::NAME,
                 encode: encode_hash,
                 decode: decode_hash,
-                equal: bytes_equal,
+                equal: Equality::Bytes(bytes_equal),
             },
             Column {
                 id: COL_LOG_FILTER,
@@ -166,11 +308,59 @@ pub static FAMILIES: &[Family] = &[
                 // A merge over the side budget stores a superset (ADR 0047),
                 // so two right rows of one changeset may differ: only the
                 // same bytes let a row go.
-                equal: bytes_equal,
+                equal: Equality::Bytes(bytes_equal),
             },
         ],
         feature: super::FEATURE_2,
         tolerant: true,
+        keys: Keys::Changesets,
+        block_bytes: BLOCK_BYTES,
+        zstd_level: ZSTD_LEVEL,
+        expected: (1 << COL_GENERATION)
+            | (1 << COL_LAST_MERGE)
+            | (1 << COL_ROOT_TREE)
+            | (1 << COL_LOG_FILTER),
+    },
+    Family {
+        id: FAMILY_CONTENT,
+        name: FAMILY_CONTENT_NAME,
+        columns: &[
+            Column {
+                id: COL_BLOB_TRIGRAMS,
+                kind: BLOB_KIND,
+                encode: encode_blob_row,
+                decode: decode_verbatim,
+                equal: Equality::BlobSet,
+            },
+            Column {
+                id: COL_BLOB_KEYFRAME,
+                kind: BLOB_KEYFRAME_KIND,
+                encode: encode_blob_keyframe,
+                decode: decode_verbatim,
+                // One encoding per set: every write of it is the same.
+                equal: Equality::Bytes(bytes_equal),
+            },
+            Column {
+                id: COL_TREE_TRIGRAMS,
+                kind: TREE_KIND,
+                encode: encode_tree_row,
+                decode: decode_verbatim,
+                equal: Equality::Filter,
+            },
+            Column {
+                id: COL_TREE_KEYFRAME,
+                kind: KEYFRAME_KIND,
+                encode: encode_tree_keyframe,
+                decode: decode_verbatim,
+                equal: Equality::Bytes(bytes_equal),
+            },
+        ],
+        feature: super::FEATURE_3,
+        tolerant: true,
+        keys: Keys::Content,
+        block_bytes: CONTENT_BLOCK_BYTES,
+        zstd_level: CONTENT_ZSTD_LEVEL,
+        expected: 0,
     },
 ];
 
@@ -198,6 +388,13 @@ pub(crate) const BLOCK_BYTES: usize = if cfg!(test) { 300 } else { 64 << 10 };
 /// zstd level of blocks: segments are written once in the background and
 /// read many times.
 const ZSTD_LEVEL: i32 = 9;
+/// Blocks of `content-v1` (ADR 0106): larger and compressed harder, since
+/// the search rows repeat across rows (a directory's filter holds every
+/// bit of its subdirectories', its neighbour in the walk) more than within
+/// one, and a dense filter alone is 64 KiB. Measured on corpus B's search
+/// rows: 64 KiB at level 9 3.02 MB, 512 KiB at level 17 2.82 MB.
+const CONTENT_BLOCK_BYTES: usize = if cfg!(test) { 1200 } else { 512 << 10 };
+const CONTENT_ZSTD_LEVEL: i32 = 17;
 /// Largest block a reader decompresses, so a damaged length cannot make it
 /// allocate without bound.
 const BLOCK_MAX: u64 = 16 << 20;
@@ -578,8 +775,8 @@ pub fn encode(family: u8, rows: &[SealRow], nonce: u64) -> Result<(Encoded, Vec<
     }
     // Column directories, filled as blocks are written.
     let mut dirs: Vec<(u8, Vec<u8>, Vec<BlockRef>)> = Vec::new();
-    let mut z =
-        zstd::bulk::Compressor::new(ZSTD_LEVEL).map_err(|e| Error::Other(format!("zstd: {e}")))?;
+    let mut z = zstd::bulk::Compressor::new(fam.zstd_level)
+        .map_err(|e| Error::Other(format!("zstd: {e}")))?;
     for (col, rows) in &cols {
         let mut present = vec![0u8; n.div_ceil(8)];
         let mut blocks = Vec::new();
@@ -607,7 +804,7 @@ pub fn encode(family: u8, rows: &[SealRow], nonce: u64) -> Result<(Encoded, Vec<
             present[o / 8] |= 1 << (o % 8);
             put_varint(&mut buf, row.len() as u64);
             buf.extend_from_slice(row);
-            if buf.len() >= BLOCK_BYTES {
+            if buf.len() >= fam.block_bytes {
                 flush(&mut buf, first, &mut data)?;
             }
         }
@@ -748,6 +945,52 @@ fn encode_log_filter(_: Hash, value: &[u8], _: Refer) -> std::result::Result<Vec
     Ok(value.to_vec())
 }
 
+/// `blob-trigrams-v2`: the row as it is. Sealed only if it parses as its
+/// kind: a whole row (or "not indexed") that decodes, or a patch whose
+/// header and lists parse (its fit to its keyframe is checked where it is
+/// read, as for a row).
+fn encode_blob_row(_: Hash, value: &[u8], _: Refer) -> std::result::Result<Vec<u8>, String> {
+    match StoredBlob::parse(value).map_err(|e| e.to_string())? {
+        StoredBlob::Whole(_) => {
+            BlobRow::decode(value).map_err(|e| e.to_string())?;
+        }
+        StoredBlob::Patch(p) => p.check().map_err(|e| e.to_string())?,
+    }
+    Ok(value.to_vec())
+}
+
+/// `blob-trigrams-keyframe-v2`: the row as it is, only a whole indexed set.
+fn encode_blob_keyframe(_: Hash, value: &[u8], _: Refer) -> std::result::Result<Vec<u8>, String> {
+    match BlobRow::decode(value).map_err(|e| e.to_string())? {
+        BlobRow::Trigrams(_) => Ok(value.to_vec()),
+        BlobRow::NotIndexed(_) => Err("a keyframe that is not a whole set".into()),
+    }
+}
+
+/// `tree-trigrams-v2`: the row as it is, if it parses as its kind (a whole
+/// filter that decodes, saturated, or a patch whose lists parse).
+fn encode_tree_row(_: Hash, value: &[u8], _: Refer) -> std::result::Result<Vec<u8>, String> {
+    match TreeRow::parse(value).map_err(|e| e.to_string())? {
+        TreeRow::Keyframe(k) => {
+            Bloom::decode(k).map_err(|e| e.to_string())?;
+        }
+        TreeRow::Saturated => {}
+        TreeRow::Patch(p) => p.check().map_err(|e| e.to_string())?,
+    }
+    Ok(value.to_vec())
+}
+
+/// `tree-trigrams-keyframe-v2`: the row as it is, only a whole filter.
+fn encode_tree_keyframe(_: Hash, value: &[u8], _: Refer) -> std::result::Result<Vec<u8>, String> {
+    match TreeRow::parse(value).map_err(|e| e.to_string())? {
+        TreeRow::Keyframe(k) => {
+            Bloom::decode(k).map_err(|e| e.to_string())?;
+            Ok(value.to_vec())
+        }
+        _ => Err("a keyframe that is not a whole filter".into()),
+    }
+}
+
 fn decode_skiplist<'b>(_: Hash, r: &mut Reader<'b>, id: Resolve<'_, 'b>) -> Result<Bytes> {
     let k = r.count(2)?;
     let mut ids = Vec::with_capacity(k);
@@ -797,6 +1040,12 @@ fn decode_hash<'b>(_: Hash, r: &mut Reader<'b>, _: Resolve<'_, 'b>) -> Result<By
 /// the kind's own reader checks the value where it is used, so a value
 /// that would not parse is never counted as segment damage.
 fn decode_log_filter<'b>(_: Hash, r: &mut Reader<'b>, _: Resolve<'_, 'b>) -> Result<Bytes> {
+    Ok(Bytes::copy_from_slice(r.take(r.left())?))
+}
+
+/// Code search rows (`content-v1`): the bytes as they are, for the same
+/// reason as [`decode_log_filter`]; search reads them as it reads rows.
+fn decode_verbatim<'b>(_: Hash, r: &mut Reader<'b>, _: Resolve<'_, 'b>) -> Result<Bytes> {
     Ok(Bytes::copy_from_slice(r.take(r.left())?))
 }
 

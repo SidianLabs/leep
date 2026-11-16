@@ -233,7 +233,7 @@ pub fn write(i: Inputs) -> Result<bool> {
         };
         let mut families = Vec::new();
         let mut families_pass = true;
-        for family in ["changeset-v1", "changeset-v2"] {
+        for family in ["changeset-v1", "changeset-v2", "content-v1"] {
             let live = tr
                 .scrapes
                 .last()

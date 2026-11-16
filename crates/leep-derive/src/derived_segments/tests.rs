@@ -948,7 +948,7 @@ async fn a_lost_segment_reads_as_missing_rows() {
 
 /// A view reads the manifests again only for a miss, at most every
 /// `REFRESH`: in mode build (every row there) never; a single-row read's
-/// miss reads each family's with a single-row read (two families), and a
+/// miss reads each family's with a single-row read (three families), and a
 /// batched read of several kinds carries them all in the same call.
 #[tokio::test(start_paused = true)]
 async fn the_manifest_is_read_only_for_misses() {
@@ -984,7 +984,7 @@ async fn the_manifest_is_read_only_for_misses() {
         .await
         .unwrap();
     assert!(got.is_some());
-    assert_eq!((counter.calls() - base, counter.manifest_reads()), (3, 2));
+    assert_eq!((counter.calls() - base, counter.manifest_reads()), (4, 3));
     v.meta()
         .get_derived_many(HistoryTree::NAME, &[ids[3].0, ids[4].0])
         .await
@@ -995,14 +995,14 @@ async fn the_manifest_is_read_only_for_misses() {
         .unwrap();
     // `generation` is sealed too (family changeset-v2): its miss finds the
     // manifest read above.
-    assert_eq!((counter.calls() - base, counter.manifest_reads()), (5, 2));
+    assert_eq!((counter.calls() - base, counter.manifest_reads()), (6, 3));
     tokio::time::advance(view::REFRESH).await;
     let keys = [ids[3].0];
     v.meta()
         .get_derived_kinds(&[(Skiplist::NAME, &keys), (Generation::NAME, &keys)])
         .await
         .unwrap();
-    assert_eq!((counter.calls() - base, counter.manifest_reads()), (6, 3));
+    assert_eq!((counter.calls() - base, counter.manifest_reads()), (7, 4));
 }
 
 /// Counts derived reads, and those that bring the manifest.
@@ -1137,7 +1137,10 @@ async fn gc_keeps_live_segments_and_collects_merged_ones() {
     drop(each);
     // Every family's segments: GC unions the manifests.
     let mut m = Manifest::new(FAMILY_CHANGESET);
-    for fam in FAMILIES {
+    for fam in FAMILIES
+        .iter()
+        .filter(|f| f.keys == super::Keys::Changesets)
+    {
         let (_, ManifestRead::Read(fm)) = read_manifest(&r, fam.id).await.unwrap() else {
             panic!("no manifest of {}", fam.name)
         };
@@ -1185,7 +1188,10 @@ async fn gc_keeps_live_segments_and_collects_merged_ones() {
         None,
     )
     .await;
-    for fam in FAMILIES {
+    for fam in FAMILIES
+        .iter()
+        .filter(|f| f.keys == super::Keys::Changesets)
+    {
         let (_, ManifestRead::Read(m)) = read_manifest(&r, fam.id).await.unwrap() else {
             panic!()
         };
@@ -1193,7 +1199,10 @@ async fn gc_keeps_live_segments_and_collects_merged_ones() {
     }
     // A damaged manifest of either family stops GC: it cannot tell live
     // segments from orphans.
-    for fam in FAMILIES {
+    for fam in FAMILIES
+        .iter()
+        .filter(|f| f.keys == super::Keys::Changesets)
+    {
         let (good, _) = read_manifest(&r, fam.id).await.unwrap();
         r.row_meta()
             .put_derived(
@@ -1212,7 +1221,7 @@ async fn gc_keeps_live_segments_and_collects_merged_ones() {
     assert!(gc::run(&r, &opts, &clock).await.is_ok());
     // So does a manifest row of a family this binary does not know: a
     // newer binary's live segments are not orphans.
-    let unknown = Hash::of_object("derived-segment-family", b"content-v1");
+    let unknown = Hash::of_object("derived-segment-family", b"content-v9");
     r.row_meta()
         .put_derived(MANIFEST_KIND, &unknown, Bytes::from_static(b"x"))
         .await
@@ -1940,7 +1949,7 @@ async fn a_lost_index_blob_is_noticed_while_the_view_holds_it() {
 
 /// Rows whose values do not decode, ahead of good ones in generation
 /// order: the backfill goes past them and ends, and they are not made
-/// candidates again by every listing (mode `retire` lists every pass).
+/// candidates again by later passes.
 #[tokio::test(start_paused = true)]
 async fn undecodable_rows_ahead_of_good_ones_do_not_keep_passes_busy() {
     let r = repo();
@@ -1979,7 +1988,7 @@ async fn undecodable_rows_ahead_of_good_ones_do_not_keep_passes_busy() {
     for _ in 0..3 {
         let p = v1(&pass(&r, &opts, &mut st, Some(&hook)).await);
         // Every good row is held; the bad ones are not candidates.
-        assert!(p.listed && !p.more && p.unsealed_rows == 0, "{p:?}");
+        assert!(!p.more && p.unsealed_rows == 0, "{p:?}");
         assert_eq!((p.sealed_keys, p.bad_values), (0, 0), "{p:?}");
     }
 }

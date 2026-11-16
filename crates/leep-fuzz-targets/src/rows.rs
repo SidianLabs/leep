@@ -218,7 +218,7 @@ pub fn skiplist_row(data: &[u8]) {
     assert_eq!(again, data);
 }
 
-/// Derived segments (ADR 0104, 0105): the manifest, and an index and data
+/// Derived segments (ADR 0104 to 0106): the manifest, and an index and data
 /// blob pair of any family parsed without their address checks so
 /// mutations reach the parsers. A pair that decodes re-encodes to a segment
 /// holding the same values (those that decode as their kind), equal by the
@@ -268,6 +268,6 @@ pub fn derived_segment(data: &[u8]) {
         let equal = fam.column(col).expect("a known column").equal;
         assert!(values
             .iter()
-            .any(|(k, c, w)| *k == key && *c == col && equal(w, &v)));
+            .any(|(k, c, w)| *k == key && *c == col && equal.sealed_as(w, &v)));
     }
 }

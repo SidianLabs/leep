@@ -1611,7 +1611,7 @@ rollout log.
 
 ## LeepDerivedSegmentPassesFailing
 
-**Meaning.** The derived segment compactor (ADR 0104, 0105; OPERATIONS.md,
+**Meaning.** The derived segment compactor (ADR 0104 to 0106; OPERATIONS.md,
 "Derived segments") failed more than three passes in an hour
 (`leep_derived_segment_passes_total{outcome="error"}`), or a pass in mode
 `retire` kept rows that differ from the value of the segment holding them
@@ -1626,7 +1626,9 @@ reads derive values again, which costs time on deep histories.
 **Diagnose.** The server log's `derived segments pass failed` warnings give
 the error and the family (`changeset-v1` holds `skiplist` and
 `history-tree-v4`; `changeset-v2` holds `generation`, `last_merge-v1`,
-`root_tree` and `log-filter-v1`); a failing family does not stop the other.
+`root_tree` and `log-filter-v1`; `content-v1` holds the code search rows
+`blob-trigrams-v2`, `tree-trigrams-v2` and their keyframes); a failing
+family does not stop the others.
 Then `leep-server verify --derived <the family's kinds>` (`--full` to
 recompute every value):
 
@@ -1634,12 +1636,14 @@ recompute every value):
   manifest is damaged (`bad_derived_manifest`). In mode `build`, or in
   `retire` while the family is held back (not named in
   `--derived-segments-retire-families`), the next pass replaces it unless
-  the family's store feature (`derived-segments`, `derived-segments-2`) is
+  the family's store feature (`derived-segments`, `derived-segments-2`,
+  `derived-segments-3`) is
   recorded; otherwise passes refuse to, and `gc` refuses to run.
 - `a derived-segments-v1 row of a derived segment family this leep-server
   does not know`: a newer `leep-server` wrote a family this one cannot read.
   `gc` refuses to run with it; run the newer `gc`.
 - Not a failure: `--derived-segments retire deletes no changeset-v2 row`
+  (or `content-v1`)
   (logged once at warn) means the family is held back until it is named in
   `--derived-segments-retire-families` (ADR 0105); name it once every
   binary runs this release and no older `gc` is running.
@@ -1652,7 +1656,10 @@ recompute every value):
   blob was lost or damaged (a disk, a restore whose blob copy finished
   before the segment was sealed, an older `gc` that collected it).
 - `derived_mismatch` on `skiplist` or `history-tree-v4`: a row or a segment
-  value is wrong. A mismatch counted by passes means the row differs from
+  value is wrong. For the search kinds a pass compares a row with its
+  segment value by the set or filter they stand for, so a mismatch there
+  is a wrong row or value too; a patch whose keyframe is missing is not
+  counted, only kept. A mismatch counted by passes means the row differs from
   the segment; `verify --full` says which of the two is wrong.
 - `conflict ... changed under this pass`: two passes overlapped (one lost its
   lease); harmless, the next pass goes on.

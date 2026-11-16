@@ -930,7 +930,7 @@ impl Verifier<'_> {
     /// keyframe must be the whole row, byte for byte.
     async fn scan_blob_trigrams(&mut self, kind: &'static str) -> Result<()> {
         let meta = self.repo.meta().clone();
-        let mut scan = RowScan::new(kind, self.opts.full, self.opts.sample);
+        let mut scan = RowScan::of(self.repo, kind, self.opts.full, self.opts.sample).await?;
         while let Some(page) = scan.next(&*meta).await? {
             let keyframes = if kind == BLOB_TRIGRAMS {
                 self.repo
@@ -997,7 +997,7 @@ impl Verifier<'_> {
     /// 0094). A keyframe must be whole.
     async fn scan_tree_trigrams(&mut self, kind: &'static str) -> Result<()> {
         let meta = self.repo.meta().clone();
-        let mut scan = RowScan::new(kind, self.opts.full, self.opts.sample);
+        let mut scan = RowScan::of(self.repo, kind, self.opts.full, self.opts.sample).await?;
         let mut memo = TreeRowMemo::new();
         while let Some(page) = scan.next(&*meta).await? {
             for (key, value) in page {

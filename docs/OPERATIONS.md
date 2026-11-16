@@ -162,7 +162,7 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_search_retention_live_blobs` | gauge | none | Blob entries the last pass found below every head current now or within `--search-retention` (a blob under several trees counts once per tree). |
 | `leep_derived_segment_passes_total` | counter | `outcome` = `ok`, `busy`, `error` | Passes of the derived segment compactor (ADR 0104). `busy`: another server held its lease. An error is logged and retried at the next interval. |
 | `leep_derived_segment_pass_seconds` | histogram | none | Time of each pass that ran. |
-| `leep_derived_segments_live` / `leep_derived_segment_bytes` | gauge | `family` = `changeset-v1`, `changeset-v2` | Live derived segments of each family after the last pass, and the bytes of their data blobs (ADR 0105). |
+| `leep_derived_segments_live` / `leep_derived_segment_bytes` | gauge | `family` = `changeset-v1`, `changeset-v2`, `content-v1` | Live derived segments of each family after the last pass, and the bytes of their data blobs (ADR 0105). |
 | `leep_derived_segment_unsealed_rows` | gauge | `family` | Rows of the family's kinds no live segment held when the last pass looked; seals start at 1,024 changesets (or 64 after 10 quiet minutes). |
 | `leep_derived_segment_index_bytes` | gauge | `family` | Bytes the family's live segment indexes hold in memory. |
 | `leep_derived_segment_reads_total` | counter | `outcome` = `hit`; `family` | Values a read found in a segment because the row was missing. |
@@ -3761,14 +3761,40 @@ follows applies to each family on its own (a family's backfill, retirement
 and failures never stop the other). On Leep's history plus 2,000 edits the
 second family takes its about 1.65 MB of rows (with Postgres overhead) down
 to a segment of about 0.16 MB (docs/PERFORMANCE.md, "Derived segments, family
-changeset-v2"). The storage target (at most twice Git) is met with
-`retire` and a `VACUUM FULL`: `build`, the default, keeps every row.
+changeset-v2").
+
+Since ADR 0106 a third family, `content-v1` (feature `derived-segments-3`),
+holds the code search rows (`blob-trigrams-v2`, `tree-trigrams-v2`) and
+their keyframes, keyed by blob and tree node. It seals a blob or directory
+row only while the search row retention keeps it (below a head current now
+or within the `--search-retention` of the server whose pass holds the
+lease; every row with `off`), and every keyframe. **Run every server with
+the same `--search-retention`**: whichever holds the lease decides what is
+live. Superseded rows are not sealed: retention deletes superseded blob
+rows as before, and superseded directory filters (`tree-trigrams-v2`),
+which retention never deletes, stay rows as before. A sealed row that
+becomes superseded stays in its segment until a merge leaves it out (a
+segment is rewritten once a third of it is); that also drops a directory
+filter sealed while it was live, which derives again if a search needs it.
+A row and its segment value are compared by the trigram set or filter they
+stand for, not their bytes. Its segments hold at most 1 MiB of data, in 512 KiB blocks. On
+Leep's history plus 2,000 edits the search rows' about 4.4 MB (with
+Postgres overhead) become about 2.6 MB of segments (docs/PERFORMANCE.md,
+"Derived segments, family content-v1").
+
+The storage target (at most twice Git) is met with `retire` naming every
+family (`--derived-segments-retire-families all`), `gc` and a `VACUUM
+FULL derived` (or `VACUUM` on SQLite): that is the operator step for the
+full savings. `build`, the default, keeps every row and adds the segments
+(about 2.6 MB of blobs on that history). Corpus B indexes only its head;
+a store whose every land the warmer indexed keeps more search rows
+(patches, keyframes, superseded filters): ADR 0106 measures both.
 
 | Flag / env | Default | What it does |
 |---|---|---|
 | `--derived-segments off\|build\|retire` / `LEEP_DERIVED_SEGMENTS` | `build` | `build`: seal and merge in the background, keep every row. `retire`: also delete rows a live segment holds the same value for (the one-way door below). `off`: no passes; segments already written are still read. |
 | `--derived-segments-interval D` / `LEEP_DERIVED_SEGMENTS_INTERVAL` | `5m` | How often a pass runs (the first 2 to 3 minutes after start). |
-| `--derived-segments-retire-families LIST` / `LEEP_DERIVED_SEGMENTS_RETIRE_FAMILIES` | empty (`changeset-v1`) | In `retire`, the families whose one-way door this server may pass: comma-separated names (`changeset-v2`) or `all`; `changeset-v1` always. A family not named deletes rows only once its store feature is already recorded (ADR 0105). |
+| `--derived-segments-retire-families LIST` / `LEEP_DERIVED_SEGMENTS_RETIRE_FAMILIES` | empty (`changeset-v1`) | In `retire`, the families whose one-way door this server may pass: comma-separated names (`changeset-v2`, `content-v1`) or `all`; `changeset-v1` always. A family not named deletes rows only once its store feature is already recorded (ADR 0105). |
 
 A pass holds the store-wide lease `maintenance` / `derived-segments`, so one
 server at a time runs it, in the index lane (it uses the index connections,
@@ -3848,7 +3874,13 @@ and seals again). The storage only comes back with `retire`:
 > `--derived-segments-retire-families` (or once its feature is recorded);
 > until then it seals and merges, and the server logs once that it holds
 > the family back. Name `changeset-v2` (or `all`) once every server,
-> importer and cron job runs this release. A store retired by an ADR 0104
+> importer and cron job runs this release. Likewise `derived-segments-3`
+> (ADR 0106), recorded before the first `content-v1` row (a search row or
+> keyframe) is deleted: binaries of ADR 0105 and before then refuse the
+> store. Name `content-v1` (or `all`) once every binary runs this release.
+> An ADR 0105 `gc` refuses to run while a `content-v1` manifest row exists
+> (it cannot tell that family's live segments from orphans), even in
+> `build`: roll back such a fleet's `gc` only together with the servers. A store retired by an ADR 0104
 > server and then run in `build` by this release records nothing new:
 > rolling back from `build` stays free. No `gc` of an older binary may be
 > running when a family is named: a pass skips the rows of a segment
@@ -3870,7 +3902,10 @@ that kind (its column is cleared in the manifest), then deletes the rows,
 so everything derives again. Both hold the derived-segments lease, waiting
 up to two minutes for a running pass. The same holds for the kinds of
 `changeset-v2` (`repair drop --kind generation` and so on clears their
-columns in that family's manifest). If a family's manifest does not decode,
+columns in that family's manifest) and the search kinds of `content-v1`:
+`repair drop --kind blob-trigrams-v2` (or `tree-trigrams-v2`) clears both
+of its columns, keyframes with patches, and `verify` and `repair rederive`
+of the search kinds visit the keys only a segment holds too. If a family's manifest does not decode,
 `repair drop` replaces it with an empty one, which stops every kind of the
 family answering, so it refuses unless all of the family's kinds are named (a pass seals at most four pages of
 16,384 changesets and deletes at most 65,536 rows or for at most a minute,

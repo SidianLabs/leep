@@ -1,4 +1,4 @@
-//! Derived segments (ADR 0104) against the real metadata backends, SQLite
+//! Derived segments (ADR 0104 to 0106) against the real metadata backends, SQLite
 //! and (when `LEEP_TEST_POSTGRES_URL` is set) Postgres, over a filesystem
 //! blob store: the `MetaStore` contracts through the segment view, and a
 //! store sealed, merged and retired by the compactor reading every value
@@ -16,6 +16,7 @@ use leep_derive::derived::{derive, HistoryTree};
 use leep_derive::derived_segments::{
     compact_pass, CompactOptions, CompactState, Features, Mode, PassReport,
 };
+use leep_derive::search::SearchQuery;
 use leep_derive::Repo;
 use leep_store::FsBlobStore;
 
@@ -112,6 +113,27 @@ async fn values(r: &Repo, ids: &[ChangesetId]) -> Vec<Option<Vec<u8>>> {
     out
 }
 
+fn body(i: u32) -> String {
+    format!("fn value_{i}() -> u32 {{ needle_{} }}\n", i % 5)
+}
+
+/// What searches of `id` find, through a new handle.
+async fn answers(r: &Repo, id: ChangesetId) -> Vec<String> {
+    let fresh = Repo::new(r.blobs().clone(), r.meta().clone());
+    let mut out = Vec::new();
+    for q in ["needle_3", "value_4", "fn value", "nowhere_xyz"] {
+        for m in fresh
+            .search(id, &SearchQuery::new(q))
+            .await
+            .unwrap()
+            .matches
+        {
+            out.push(format!("{q} {} {}", m.path, m.line));
+        }
+    }
+    out
+}
+
 async fn pass(r: &Repo, mode: Mode, state: &mut CompactState) -> PassReport {
     let hook = Features {
         record: Arc::new(|_| Box::pin(async { Ok(()) })),
@@ -136,14 +158,18 @@ async fn exercise(meta: Arc<dyn MetaStore>, dir: &std::path::Path) {
         let next = if i % 11 == 5 {
             let side = commit(&r, &[tip], &format!("s/{i}"), "s").await;
             ids.push(side);
-            commit(&r, &[tip, side], &format!("d{}/f", i % 3), &format!("{i}")).await
+            commit(&r, &[tip, side], &format!("d{}/f", i % 3), &body(i)).await
         } else {
-            commit(&r, &[tip], &format!("d{}/f", i % 3), &format!("{i}")).await
+            commit(&r, &[tip], &format!("d{}/f", i % 3), &body(i)).await
         };
         tip = next;
         ids.push(tip);
         if i % 3 == 2 {
             derive::<HistoryTree>(&r, tip).await.unwrap();
+            // A head, and its search rows (family content-v1, ADR 0106).
+            let was = r.meta().get_ref("main").await.unwrap();
+            assert!(r.meta().cas_ref("main", was, Some(tip)).await.unwrap());
+            r.derive_search(tip).await.unwrap();
             let p = pass(&r, Mode::Build, &mut state).await;
             sealed += p.sealed_segments;
             merges += p.merges;
@@ -153,6 +179,8 @@ async fn exercise(meta: Arc<dyn MetaStore>, dir: &std::path::Path) {
     assert!(sealed > 4 && merges > 0, "{sealed} sealed, {merges} merges");
     let want = values(&r, &ids).await;
     assert!(want.iter().all(Option::is_some));
+    let found = answers(&r, tip).await;
+    assert!(!found.is_empty());
     for _ in 0..10 {
         let p = pass(&r, Mode::Retire, &mut state).await;
         if p.sealed_segments + p.merges + p.retired_rows == 0 {
@@ -165,6 +193,17 @@ async fn exercise(meta: Arc<dyn MetaStore>, dir: &std::path::Path) {
         0
     );
     assert_eq!(values(&r, &ids).await, want);
+    // Every head is inside the retention window, so every search row was
+    // live, sealed and retired.
+    for kind in [
+        "blob-trigrams-v2",
+        "blob-trigrams-keyframe-v2",
+        "tree-trigrams-v2",
+        "tree-trigrams-keyframe-v2",
+    ] {
+        assert_eq!(r.row_meta().count_derived(kind).await.unwrap(), 0, "{kind}");
+    }
+    assert_eq!(answers(&r, tip).await, found);
     let opts = leep_derive::integrity::VerifyOptions {
         full: true,
         ..Default::default()

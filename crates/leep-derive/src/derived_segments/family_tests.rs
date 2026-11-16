@@ -90,7 +90,7 @@ async fn changeset_v2_rows_of_real_histories_round_trip() {
     );
     for (_, col) in want.keys() {
         let fam = codec::family(FAMILY_CHANGESET_V2).unwrap();
-        assert!((fam.column(*col).unwrap().equal)(b"x", b"x"));
+        assert!(fam.column(*col).unwrap().equal.sealed_as(b"x", b"x"));
     }
     for chunk in rows.chunks(5) {
         let (enc, bad) = codec::encode(FAMILY_CHANGESET_V2, chunk, 2).unwrap();
@@ -699,7 +699,11 @@ async fn retire_does_not_pass_a_new_familys_door_unless_named() {
     );
     assert_eq!(
         CompactOptions::parse_retire_families("all").unwrap(),
-        ["changeset-v1", "changeset-v2"]
+        ["changeset-v1", "changeset-v2", "content-v1"]
+    );
+    assert_eq!(
+        CompactOptions::parse_retire_families("content-v1").unwrap(),
+        ["changeset-v1", "content-v1"]
     );
     assert!(CompactOptions::parse_retire_families("content-v9").is_err());
     assert_eq!(CompactOptions::default().retire_families, ["changeset-v1"]);
@@ -1089,7 +1093,10 @@ async fn two_processes_alternating_passes_seal_each_key_once() {
         };
         super::tests::pass(repo, &opts, st, None).await;
     }
-    for fam in FAMILIES {
+    for fam in FAMILIES
+        .iter()
+        .filter(|f| f.keys == super::Keys::Changesets)
+    {
         for c in fam
             .columns
             .iter()

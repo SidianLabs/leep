@@ -1,7 +1,8 @@
 //! The read path of derived segments (ADR 0104, section "Read path"; ADR
-//! 0105): a [`MetaStore`] that answers reads of the kinds a segment family
-//! holds (`skiplist`, `history-tree-v4`, `generation`, `last_merge-v1`,
-//! `root_tree`, `log-filter-v1`) that the database misses from the live
+//! 0105, 0106): a [`MetaStore`] that answers reads of the kinds a segment
+//! family holds (`skiplist`, `history-tree-v4`, `generation`,
+//! `last_merge-v1`, `root_tree`, `log-filter-v1`, and the code search rows
+//! and keyframes) that the database misses from the live
 //! segments, installed by `Repo::new` so every read site gets it unchanged.
 //!
 //! Order of a read: the database, exactly the statement issued before;
@@ -169,6 +170,13 @@ impl Segments {
     /// transient read of one family's index blob must not freeze the other
     /// family's view); the first error is returned.
     pub async fn apply_all(&self, raws: Vec<Option<Bytes>>) -> Result<()> {
+        first_error(self.apply_each(raws).await?)
+    }
+
+    /// [`Segments::apply_all`], each family's outcome apart (in
+    /// [`FAMILIES`] order), so a reader of one family is not failed by
+    /// another's transient error.
+    pub async fn apply_each(&self, raws: Vec<Option<Bytes>>) -> Result<Vec<Result<()>>> {
         if raws.len() != self.views.len() {
             return Err(Error::Storage(format!(
                 "read {} {MANIFEST_KIND} rows for {} families",
@@ -176,22 +184,25 @@ impl Segments {
                 self.views.len()
             )));
         }
-        let mut first = None;
+        let mut out = Vec::with_capacity(raws.len());
         for (v, raw) in self.views.iter().zip(raws) {
-            if let Err(e) = v.apply(raw).await {
-                first.get_or_insert(e);
-            }
+            out.push(v.apply(raw).await);
         }
-        first.map_or(Ok(()), Err)
+        Ok(out)
     }
 
     /// Read every family's manifest from `rows` in one statement and use
     /// them.
     pub async fn refresh(&self, rows: &dyn MetaStore) -> Result<()> {
+        first_error(self.refresh_each(rows).await?)
+    }
+
+    /// [`Segments::refresh`], each family's outcome apart.
+    pub async fn refresh_each(&self, rows: &dyn MetaStore) -> Result<Vec<Result<()>>> {
         let raws = rows
             .get_derived_many(MANIFEST_KIND, &Self::manifest_keys())
             .await?;
-        self.apply_all(raws).await
+        self.apply_each(raws).await
     }
 
     /// [`Segments::refresh`] with one single-row read per family, for a miss
@@ -201,18 +212,45 @@ impl Segments {
     /// Each family is read and applied on its own; the first error is
     /// returned once all were tried.
     pub async fn refresh_singly(&self, rows: &dyn MetaStore) -> Result<()> {
-        let mut first = None;
+        first_error(self.refresh_singly_each(rows).await)
+    }
+
+    /// [`Segments::refresh_singly`], each family's outcome apart.
+    pub async fn refresh_singly_each(&self, rows: &dyn MetaStore) -> Vec<Result<()>> {
+        let mut out = Vec::with_capacity(self.views.len());
         for (v, k) in self.views.iter().zip(Self::manifest_keys()) {
-            let applied = match rows.get_derived(MANIFEST_KIND, &k).await {
+            out.push(match rows.get_derived(MANIFEST_KIND, &k).await {
                 Ok(raw) => v.apply(raw).await,
                 Err(e) => Err(e),
-            };
-            if let Err(e) = applied {
-                first.get_or_insert(e);
+            });
+        }
+        out
+    }
+
+    /// Of `each` (every family's outcome, in [`FAMILIES`] order), the first
+    /// error of a family in `wanted`; the others' errors are logged, so a
+    /// read of one family never fails for another family's segments.
+    pub(crate) fn errors_of(each: Vec<Result<()>>, wanted: &[u8]) -> Result<()> {
+        let mut first = None;
+        for (fam, r) in FAMILIES.iter().zip(each) {
+            if let Err(e) = r {
+                if wanted.contains(&fam.id) {
+                    first.get_or_insert(e);
+                } else {
+                    tracing::warn!(
+                        family = fam.name,
+                        error = %e,
+                        "derived segment manifest not applied; this family's reads try again"
+                    );
+                }
             }
         }
         first.map_or(Ok(()), Err)
     }
+}
+
+fn first_error(each: Vec<Result<()>>) -> Result<()> {
+    each.into_iter().find_map(|r| r.err()).map_or(Ok(()), Err)
 }
 
 /// One family's view of its live segments: their indexes in memory, and
@@ -499,8 +537,13 @@ impl SegmentView {
             .entry(live.r.data)
             .or_default()
             .clone();
+        // Removed however this future ends, cancelled included.
+        let _entry = Loading {
+            map: &self.loading,
+            key: live.r.data,
+        };
         let _one = gate.lock().await;
-        let out = async {
+        async {
             if let Some(d) = caches.datas.get(&live.r.data) {
                 return Ok(Some(d));
             }
@@ -534,9 +577,36 @@ impl SegmentView {
                 }
             }
         }
-        .await;
-        self.loading.lock().unwrap().remove(&live.r.data);
-        out
+        .await
+    }
+
+    /// Values of `col` the live segments hold, a key in several counted in
+    /// each: an upper bound, for estimates, without building a set.
+    pub fn sealed_upper(&self, col: u8) -> u64 {
+        self.segments()
+            .iter()
+            .filter(|l| l.r.has(col))
+            .map(|l| l.idx.keys_with(col).count() as u64)
+            .sum()
+    }
+
+    /// Keys a live segment holds a value of `col` for, each once (counted
+    /// in the newest segment holding it), without building a set.
+    pub fn sealed_distinct(&self, col: u8) -> u64 {
+        let segs: Vec<Arc<Live>> = self
+            .segments()
+            .into_iter()
+            .filter(|l| l.r.has(col))
+            .collect();
+        let mut n = 0;
+        for (i, l) in segs.iter().enumerate() {
+            n += l
+                .idx
+                .keys_with(col)
+                .filter(|k| !segs[..i].iter().any(|newer| newer.idx.has(k, col)))
+                .count() as u64;
+        }
+        n
     }
 
     /// Keys a live segment holds a value of `col` for, deduplicated.
@@ -553,6 +623,21 @@ impl SegmentView {
             }
         }
         out
+    }
+}
+
+/// A data blob load in flight, forgotten when the load ends or is dropped.
+struct Loading<'a> {
+    map: &'a Mutex<BTreeMap<Hash, Arc<tokio::sync::Mutex<()>>>>,
+    key: Hash,
+}
+
+impl Drop for Loading<'_> {
+    fn drop(&mut self) {
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
     }
 }
 
@@ -644,33 +729,39 @@ impl SegmentedMeta {
     }
 
     /// Read every family's manifest again now and use them: in one batched
-    /// read, or for a single-row read's miss in single reads.
-    async fn refresh(&self, single: bool) -> Result<()> {
-        if single {
-            self.view.refresh_singly(&*self.inner).await
+    /// read, or for a single-row read's miss in single reads. Only an error
+    /// of `family`'s (a failed read of the manifests, or its own segments)
+    /// is returned; another family's is logged.
+    async fn refresh(&self, single: bool, family: u8) -> Result<()> {
+        let each = if single {
+            self.view.refresh_singly_each(&*self.inner).await
         } else {
-            self.view.refresh(&*self.inner).await
-        }
+            self.view.refresh_each(&*self.inner).await?
+        };
+        Segments::errors_of(each, &[family])
     }
 
     /// Fill the misses in `rows` (values of `keys` of column `col` of
     /// `family`) from the live segments. A segment that cannot be read makes
-    /// the view read the manifests again, once, and look again.
+    /// the view read the manifests again, once, and look again. `single`:
+    /// the miss is a single-row read's (`get_derived`), which refreshes with
+    /// single-row reads; a batched read's (even of one key) refreshes with
+    /// one batched read of every family's manifest.
     async fn fill(
         &self,
         family: u8,
         col: u8,
         keys: &[Hash],
         rows: &mut [Option<Bytes>],
+        single: bool,
     ) -> Result<()> {
         if rows.iter().all(Option::is_some) {
             return Ok(());
         }
-        let single = keys.len() == 1;
         let view = self.view.family(family);
         // A miss is judged against a manifest at most `REFRESH` old.
         if view.stale() {
-            self.refresh(single).await?;
+            self.refresh(single, family).await?;
         }
         if view.state.read().unwrap().segs.is_empty() {
             return Ok(());
@@ -697,7 +788,7 @@ impl SegmentedMeta {
                 return Ok(());
             }
             retried = true;
-            self.refresh(single).await?;
+            self.refresh(single, family).await?;
         }
     }
 
@@ -718,7 +809,13 @@ impl SegmentedMeta {
             .pop()
             .filter(|v| v.len() == mk.len())
             .ok_or_else(|| Error::Storage("get_derived_kinds answered short".into()))?;
-        self.view.apply_all(manifests).await?;
+        // Only the families this read asks for may fail it.
+        let wanted: Vec<u8> = reads
+            .iter()
+            .filter(|(_, keys)| !keys.is_empty())
+            .filter_map(|(k, _)| codec::kind_column(k).map(|(f, _)| f))
+            .collect();
+        Segments::errors_of(self.view.apply_each(manifests).await?, &wanted)?;
         Ok(got)
     }
 }
@@ -736,7 +833,7 @@ impl MetaStore for SegmentedMeta {
         let mut row = self.inner.get_derived(kind, key).await?;
         if row.is_none() {
             let mut rows = [None];
-            self.fill(family, col, &[*key], &mut rows).await?;
+            self.fill(family, col, &[*key], &mut rows, true).await?;
             row = rows[0].take();
         }
         Ok(row)
@@ -754,7 +851,7 @@ impl MetaStore for SegmentedMeta {
                 keys.len()
             )));
         }
-        self.fill(family, col, keys, &mut rows).await?;
+        self.fill(family, col, keys, &mut rows, false).await?;
         Ok(rows)
     }
 
@@ -771,7 +868,7 @@ impl MetaStore for SegmentedMeta {
                 if rows.len() != keys.len() {
                     return Err(Error::Storage("get_derived_kinds answered short".into()));
                 }
-                self.fill(family, col, keys, rows).await?;
+                self.fill(family, col, keys, rows, false).await?;
             }
         }
         Ok(got)
@@ -783,7 +880,7 @@ impl MetaStore for SegmentedMeta {
             if have.iter().any(|h| !h) {
                 let view = self.view.family(family);
                 if view.stale() {
-                    self.refresh(false).await?;
+                    self.refresh(false, family).await?;
                 }
                 for (k, h) in keys.iter().zip(have.iter_mut()) {
                     *h = *h || view.holds(k, col);
@@ -798,12 +895,12 @@ impl MetaStore for SegmentedMeta {
         let Some((family, col)) = codec::kind_column(kind) else {
             return self.inner.count_derived(kind).await;
         };
-        self.refresh(false).await?;
-        let sealed = self.view.family(family).keys_with(col);
-        if sealed.is_empty() {
+        self.refresh(false, family).await?;
+        let view = self.view.family(family);
+        let mut n = view.sealed_distinct(col);
+        if n == 0 {
             return self.inner.count_derived(kind).await;
         }
-        let mut n = sealed.len() as u64;
         let mut after = None;
         loop {
             let page = self.inner.list_derived_keys(kind, after, 10_000).await?;
@@ -811,7 +908,7 @@ impl MetaStore for SegmentedMeta {
                 return Ok(n);
             };
             after = Some(last);
-            n += page.iter().filter(|k| !sealed.contains(k)).count() as u64;
+            n += page.iter().filter(|k| !view.holds(k, col)).count() as u64;
         }
     }
 
@@ -822,9 +919,9 @@ impl MetaStore for SegmentedMeta {
         if let Some((family, col)) = codec::kind_column(kind) {
             let view = self.view.family(family);
             if view.stale() {
-                self.refresh(false).await?;
+                self.refresh(false, family).await?;
             }
-            let sealed = view.keys_with(col).len() as u64;
+            let sealed = view.sealed_upper(col);
             if sealed > est.rows {
                 est.rows = sealed;
                 est.exact = false;

@@ -1327,14 +1327,65 @@ fn killed_auto_compaction_mid_pass_loses_nothing_postgres() {
 }
 
 // ---------------------------------------------------------------------------
-// Derived segments (ADR 0104, 0105)
+// Derived segments (ADR 0104 to 0106)
 
 /// The kinds of family `changeset-v2` (ADR 0105).
 const V2_KINDS: [&str; 4] = ["generation", "last_merge-v1", "root_tree", "log-filter-v1"];
 
+/// The search kinds of family `content-v1` (ADR 0106).
+const CONTENT_KINDS: [&str; 4] = [
+    "blob-trigrams-v2",
+    "blob-trigrams-keyframe-v2",
+    "tree-trigrams-v2",
+    "tree-trigrams-keyframe-v2",
+];
+
+/// The tree nodes and blobs below `id`'s tree, and the keyframes their
+/// stored search rows stand on: the keys of `content-v1` a head needs.
+fn content_keys(stores: &Stores, id: ChangesetId) -> (Vec<Hash>, Vec<Hash>) {
+    let repo = open_repo(stores);
+    common_block_on(async {
+        let mut keys = Vec::new();
+        let mut stack = vec![repo.root_tree(id).await.unwrap()];
+        while let Some(t) = stack.pop() {
+            keys.push(t);
+            for e in repo.read_tree(t).await.unwrap().entries.values() {
+                match *e {
+                    leep_core::TreeEntry::Dir { tree } => stack.push(tree),
+                    leep_core::TreeEntry::File { content, .. } => keys.push(content),
+                }
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        let mut bases = Vec::new();
+        for kind in ["blob-trigrams-v2", "tree-trigrams-v2"] {
+            for v in repo
+                .meta()
+                .get_derived_many(kind, &keys)
+                .await
+                .unwrap()
+                .into_iter()
+                .flatten()
+            {
+                // A patch: tag, then the keyframe's key.
+                if (kind == "blob-trigrams-v2" && v.first() == Some(&2))
+                    || (kind == "tree-trigrams-v2" && v.first() == Some(&4))
+                {
+                    bases.push(Hash(v[1..33].try_into().unwrap()));
+                }
+            }
+        }
+        bases.sort_unstable();
+        bases.dedup();
+        (keys, bases)
+    })
+}
+
 /// Every value of the kinds both segment families hold, of `ids`, as a new
 /// process reads it (rows, then segments), history parts by their content.
 fn segment_values(stores: &Stores, ids: &[ChangesetId]) -> Vec<Option<Vec<u8>>> {
+    let (content, bases) = content_keys(stores, *ids.last().unwrap());
     let repo = open_repo(stores);
     let keys: Vec<Hash> = ids.iter().map(|i| i.0).collect();
     common_block_on(async {
@@ -1368,34 +1419,90 @@ fn segment_values(stores: &Stores, ids: &[ChangesetId]) -> Vec<Option<Vec<u8>>> 
                     .map(|v| v.map(|b| b.to_vec())),
             );
         }
+        // The head's search rows and the keyframes they stand on.
+        for kind in CONTENT_KINDS {
+            let of = if kind.contains("keyframe") {
+                &bases
+            } else {
+                &content
+            };
+            out.extend(
+                repo.meta()
+                    .get_derived_many(kind, of)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|v| v.map(|b| b.to_vec())),
+            );
+        }
         out
     })
 }
 
-/// How many of `ids` live segments of both families hold (`skiplist` and
-/// `history-tree-v4`; `generation` and `root_tree`, which every changeset
-/// has), and the rows of the six kinds left.
+/// How many of `ids` live segments of both changeset families hold
+/// (`skiplist` and `history-tree-v4`; `generation` and `root_tree`, which
+/// every changeset has; the last id counts only once `content-v1` holds
+/// its head's search rows that have values and their keyframes), and the
+/// rows of the ten kinds left (of the search kinds, the head's and the
+/// keyframes).
 fn segment_coverage(stores: &Stores, ids: &[ChangesetId]) -> (usize, u64) {
     use leep_derive::derived_segments::{
-        self as ds, COL_GENERATION, COL_HISTORY_TREE, COL_ROOT_TREE, COL_SKIPLIST,
+        self as ds, COL_BLOB_KEYFRAME, COL_BLOB_TRIGRAMS, COL_GENERATION, COL_HISTORY_TREE,
+        COL_ROOT_TREE, COL_SKIPLIST, COL_TREE_KEYFRAME, COL_TREE_TRIGRAMS,
     };
+    let (content, bases) = content_keys(stores, *ids.last().unwrap());
     let repo = open_repo(stores);
     common_block_on(async {
         repo.segments().refresh(&**repo.row_meta()).await.unwrap();
         let v1 = repo.segments().family(ds::FAMILY_CHANGESET).clone();
         let v2 = repo.segments().family(ds::FAMILY_CHANGESET_V2).clone();
+        let c = repo.segments().family(ds::FAMILY_CONTENT).clone();
+        let blobs = repo
+            .meta()
+            .derived_present("blob-trigrams-v2", &content)
+            .await
+            .unwrap();
+        let trees = repo
+            .meta()
+            .derived_present("tree-trigrams-v2", &content)
+            .await
+            .unwrap();
+        let search_sealed = content
+            .iter()
+            .zip(blobs.iter().zip(&trees))
+            .all(|(k, (b, t))| {
+                (!b || c.holds(k, COL_BLOB_TRIGRAMS)) && (!t || c.holds(k, COL_TREE_TRIGRAMS))
+            })
+            && bases
+                .iter()
+                .all(|k| c.holds(k, COL_BLOB_KEYFRAME) || c.holds(k, COL_TREE_KEYFRAME));
         let held = ids
             .iter()
-            .filter(|id| {
+            .enumerate()
+            .filter(|(i, id)| {
                 v1.holds(&id.0, COL_SKIPLIST)
                     && v1.holds(&id.0, COL_HISTORY_TREE)
                     && v2.holds(&id.0, COL_GENERATION)
                     && v2.holds(&id.0, COL_ROOT_TREE)
+                    && (*i + 1 < ids.len() || search_sealed)
             })
             .count();
         let mut rows = 0;
         for kind in ["skiplist", "history-tree-v4"].into_iter().chain(V2_KINDS) {
             rows += repo.row_meta().count_derived(kind).await.unwrap();
+        }
+        // Search rows of the head's content and keyframes; the parent's own
+        // versions are rows retention no longer keeps, never sealed.
+        for kind in CONTENT_KINDS {
+            let keys = repo
+                .row_meta()
+                .list_derived_keys(kind, None, 1 << 20)
+                .await
+                .unwrap();
+            rows += keys
+                .iter()
+                .filter(|k| kind.contains("keyframe") || content.binary_search(k).is_ok())
+                .count() as u64;
         }
         (held, rows)
     })
@@ -1427,11 +1534,16 @@ fn run_segments_kill(backend: &str, meta_url: Option<String>, mode: &str, point:
         leep_derive::derived::LogFilterIndex,
     >(&repo, *made.last().unwrap()))
     .unwrap();
+    // The search rows of the head (family content-v1), patched on its
+    // parent's: whole rows, patches and keyframes of both kinds.
+    common_block_on(repo.derive_search(made[made.len() - 2])).unwrap();
+    common_block_on(repo.derive_search(*made.last().unwrap())).unwrap();
     if point.ends_with("merge-stored") {
         let opts = CompactOptions {
             seal_rows: 1,
             idle_rows: 1,
             max_rows: 8,
+            content_max_rows: 8,
             ..CompactOptions::small(Mode::Build)
         };
         common_block_on(compact_pass(
@@ -1503,6 +1615,8 @@ fn run_segments_kill(backend: &str, meta_url: Option<String>, mode: &str, point:
         // one family the other may not have deleted anything yet.
         let (family, feature) = if point.starts_with("changeset-v2:") {
             ("changeset-v2", "derived-segments-2")
+        } else if point.starts_with("content-v1:") {
+            ("content-v1", "derived-segments-3")
         } else {
             ("changeset-v1", "derived-segments")
         };
@@ -1546,10 +1660,10 @@ fn run_segments_kill(backend: &str, meta_url: Option<String>, mode: &str, point:
     );
 }
 
-/// Kill points of both families: before and after a seal's manifest
-/// swap, before a merge's swap, between recording the store feature and
-/// the first delete, and after a retirement's delete.
-const SEGMENT_KILLS: [(&str, &str); 10] = [
+/// Kill points of every family: before and after a seal's manifest swap,
+/// before a merge's swap, between recording the store feature and the
+/// first delete, and after a retirement's delete.
+const SEGMENT_KILLS: [(&str, &str); 15] = [
     ("build", "seal-stored"),
     ("build", "seal-swapped"),
     ("build", "merge-stored"),
@@ -1560,6 +1674,11 @@ const SEGMENT_KILLS: [(&str, &str); 10] = [
     ("build", "changeset-v2:merge-stored"),
     ("retire", "changeset-v2:feature-recorded"),
     ("retire", "changeset-v2:retire-deleted"),
+    ("build", "content-v1:seal-stored"),
+    ("build", "content-v1:seal-swapped"),
+    ("build", "content-v1:merge-stored"),
+    ("retire", "content-v1:feature-recorded"),
+    ("retire", "content-v1:retire-deleted"),
 ];
 
 #[test]

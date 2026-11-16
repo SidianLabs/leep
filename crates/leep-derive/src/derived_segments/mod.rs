@@ -9,9 +9,10 @@
 //! - [`compactor`]: the background pass that seals, merges and (in mode
 //!   `retire`) deletes rows a live segment holds, family by family.
 //!
-//! Families: `changeset-v1` (`skiplist`, `history-tree-v4`; ADR 0104) and
+//! Families: `changeset-v1` (`skiplist`, `history-tree-v4`; ADR 0104),
 //! `changeset-v2` (`generation`, `last_merge-v1`, `root_tree`,
-//! `log-filter-v1`; ADR 0105).
+//! `log-filter-v1`; ADR 0105) and `content-v1` (the code search rows and
+//! their keyframes, keyed by blob and tree node; ADR 0106).
 //!
 //! Invariants: kind names, keys and values do not change (a segment gives
 //! back the value a row read would); a segment only holds values read from
@@ -21,6 +22,8 @@ pub mod codec;
 pub mod compactor;
 pub mod view;
 
+#[cfg(test)]
+mod content_tests;
 #[cfg(test)]
 mod family_tests;
 #[cfg(test)]
@@ -33,8 +36,10 @@ use bytes::Bytes;
 use leep_core::{Error, Hash, LeaseKey, Result};
 
 pub use codec::{
-    Family, Manifest, SegmentRef, COL_GENERATION, COL_HISTORY_TREE, COL_LAST_MERGE, COL_LOG_FILTER,
-    COL_ROOT_TREE, COL_SKIPLIST, FAMILIES, FAMILY_CHANGESET, FAMILY_CHANGESET_V2,
+    Equality, Family, Keys, Manifest, SegmentRef, COL_BLOB_KEYFRAME, COL_BLOB_TRIGRAMS,
+    COL_GENERATION, COL_HISTORY_TREE, COL_LAST_MERGE, COL_LOG_FILTER, COL_ROOT_TREE, COL_SKIPLIST,
+    COL_TREE_KEYFRAME, COL_TREE_TRIGRAMS, FAMILIES, FAMILY_CHANGESET, FAMILY_CHANGESET_V2,
+    FAMILY_CONTENT,
 };
 pub use compactor::{
     compact_pass, CompactOptions, CompactState, FeatureHook, FeatureProbe, Features, Mode,
@@ -67,6 +72,12 @@ pub const FEATURE: &str = "derived-segments";
 /// from the root, and its `gc` would delete the new family's live
 /// segments as orphans.
 pub const FEATURE_2: &str = "derived-segments-2";
+
+/// Store feature recorded before the first `content-v1` row (the code
+/// search rows, ADR 0106) is deleted: a binary of ADR 0105 or before reads
+/// no `content-v1` segment, so it would derive those rows again on every
+/// search, and its `gc` refuses an unknown family's manifest row.
+pub const FEATURE_3: &str = "derived-segments-3";
 
 /// A row is deleted only once its segment has been live this long, as seen
 /// by the deleting process: every reader re-reads the manifest at least
@@ -270,11 +281,14 @@ pub(crate) async fn drop_columns(
         ManifestRead::Read(m) => m,
         ManifestRead::Damaged => {
             let fam = codec::family(family).expect("a family this binary knows");
+            // Kinds dropped only with another (keyframes with their
+            // patches) are not named: naming that one brings them.
             let missing: Vec<&str> = fam
                 .columns
                 .iter()
                 .filter(|c| !cols.contains(&c.id))
                 .map(|c| c.kind)
+                .filter(|k| crate::integrity::kinds::check_droppable(k).is_ok())
                 .collect();
             if !missing.is_empty() {
                 return Err(Error::Invalid(format!(

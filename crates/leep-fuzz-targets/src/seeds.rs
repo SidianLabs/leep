@@ -423,6 +423,77 @@ fn rows(out: &mut Out) {
             "manifest-changeset-v2",
             with_prefix(0, &m.encode()),
         );
+
+        // Family content-v1 (ADR 0106): code search rows verbatim, every
+        // column, a patch of each kind on its keyframe.
+        use leep_derive::search::trigram::{BlobRow, Bloom};
+        let set: Vec<u32> = (0..40).map(|i| i * 977 + 3).collect();
+        let whole = BlobRow::Trigrams(set.clone()).encode();
+        let blob_patch = leep_derive::search::trigram::blob_patch_on(
+            &[set.as_slice(), &[1 << 23]].concat(),
+            &Hash([1; 32]),
+            &set,
+        );
+        let mut f = Bloom::default();
+        for c in &set {
+            f.insert(*c);
+        }
+        let mut g = f.clone();
+        g.insert(5);
+        let rows = vec![
+            codec::SealRow {
+                key: Hash([1; 32]),
+                order: 0,
+                values: vec![
+                    (codec::COL_BLOB_TRIGRAMS, whole.clone().into()),
+                    (codec::COL_BLOB_KEYFRAME, whole.into()),
+                ],
+            },
+            codec::SealRow {
+                key: Hash([2; 32]),
+                order: 1,
+                values: vec![(codec::COL_BLOB_TRIGRAMS, blob_patch.into())],
+            },
+            codec::SealRow {
+                key: Hash([3; 32]),
+                order: 2,
+                values: vec![
+                    (codec::COL_TREE_TRIGRAMS, f.encode_row().into()),
+                    (codec::COL_TREE_KEYFRAME, f.encode_row().into()),
+                ],
+            },
+            codec::SealRow {
+                key: Hash([4; 32]),
+                order: 3,
+                values: vec![(
+                    codec::COL_TREE_TRIGRAMS,
+                    g.patch_on(&Hash([3; 32]), &f).into(),
+                )],
+            },
+            codec::SealRow {
+                key: Hash([5; 32]),
+                order: 4,
+                values: vec![(codec::COL_TREE_TRIGRAMS, vec![3u8].into())],
+            },
+        ];
+        let (enc, bad) = codec::encode(codec::FAMILY_CONTENT, &rows, 7).unwrap();
+        assert!(bad.is_empty(), "{bad:?}");
+        let mut pair = vec![1u8];
+        pair.extend_from_slice(&(enc.index.1.len() as u16).to_be_bytes());
+        pair.extend_from_slice(&enc.index.1);
+        pair.extend_from_slice(&enc.data.1);
+        out.add("derived_segment", "content-v1", pair);
+        let m = codec::Manifest {
+            family: codec::FAMILY_CONTENT,
+            seq: 5,
+            live: vec![enc.seg],
+            retired: vec![],
+        };
+        out.add(
+            "derived_segment",
+            "manifest-content-v1",
+            with_prefix(0, &m.encode()),
+        );
     }
 
     let mut skip = Vec::new();

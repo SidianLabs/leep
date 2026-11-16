@@ -205,6 +205,9 @@ pub struct Shared {
     pub ledger: Ledger,
     /// Milliseconds since start of each agent's last completed iteration.
     pub beats: Vec<AtomicU64>,
+    /// Per agent, the command or request it is in now and when it started
+    /// (ms since the start), so a stall names what it waits on.
+    pub doing: Vec<std::sync::Mutex<Option<(String, u64)>>>,
     pub iterations: AtomicU64,
     /// When the measured run began, in milliseconds since `start`; setup
     /// before it counts as negative time.
@@ -226,6 +229,7 @@ impl Shared {
             chaos: Mutex::new(Vec::new()),
             ledger: Ledger::default(),
             beats: (0..agents).map(|_| AtomicU64::new(0)).collect(),
+            doing: (0..agents).map(|_| std::sync::Mutex::new(None)).collect(),
             iterations: AtomicU64::new(0),
             run0_ms: AtomicU64::new(0),
             finishing: AtomicBool::new(false),
@@ -248,6 +252,35 @@ impl Shared {
 
     pub fn stopped(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
+    }
+
+    /// Note that `agent` started `what` (`None`: finished it).
+    pub fn doing(&self, agent: usize, what: Option<String>) {
+        if let Some(d) = self.doing.get(agent) {
+            let at = self.start.elapsed().as_millis() as u64;
+            *d.lock().unwrap_or_else(|e| e.into_inner()) = what.map(|w| (w, at));
+        }
+    }
+
+    /// What `agent` is in now, and for how long, for a stall's message.
+    pub fn doing_now(&self, agent: usize) -> String {
+        let now = self.start.elapsed().as_millis() as u64;
+        match self
+            .doing
+            .get(agent)
+            .and_then(|d| d.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        {
+            Some((what, at)) => format!("in `{what}` for {}s", now.saturating_sub(at) / 1000),
+            None => "between commands".to_string(),
+        }
+    }
+
+    /// `agent` is alive but idle by design (thinking between iterations):
+    /// not a stall, though not an iteration either.
+    pub fn alive(&self, agent: usize) {
+        if let Some(b) = self.beats.get(agent) {
+            b.store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
+        }
     }
 
     pub fn beat(&self, agent: usize) {

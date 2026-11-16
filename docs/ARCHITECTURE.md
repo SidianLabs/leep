@@ -116,7 +116,7 @@ Rules:
 | `Changeset` | `Hash::of_object("changeset-v1", postcard)` | `MetaStore::put_changeset` |
 | Ref | name → `ChangesetId` | `MetaStore`, CAS only |
 | Ref log entry | `seq` → (ref, old, new, time, actor, operation, message) | `MetaStore`, appended by `cas_ref_logged` (or `cas_ref_logged_chain`, one entry per step) in the CAS's own transaction |
-| Derived value | `(kind, key)` → bytes | `MetaStore::put_derived`; `cas_derived` for a row a holder may overwrite after losing its lease (the GC mark manifest, ADR 0103; the derived segment manifests, ADR 0104). `skiplist` and `history-tree-v4` (family `changeset-v1`, ADR 0104) and `generation`, `last_merge-v1`, `root_tree` and `log-filter-v1` values (family `changeset-v2`, ADR 0105) may instead be held by derived segments in the blob store |
+| Derived value | `(kind, key)` → bytes | `MetaStore::put_derived`; `cas_derived` for a row a holder may overwrite after losing its lease (the GC mark manifest, ADR 0103; the derived segment manifests, ADR 0104). `skiplist` and `history-tree-v4` (family `changeset-v1`, ADR 0104) and `generation`, `last_merge-v1`, `root_tree` and `log-filter-v1` values (family `changeset-v2`, ADR 0105) and the code search rows and keyframes (family `content-v1`, ADR 0106) may instead be held by derived segments in the blob store |
 
 `Changeset { parents, author, timestamp, message, changes, extra }`:
 - `changes: BTreeMap<RepoPath, FileChange>` is relative to `parents[0]`. A
@@ -237,15 +237,15 @@ way.
 | `cs-tombstone-v1` | per deleted changeset id: deletion time and root tree hash, written before the delete; dropped after `--tombstone-retention` (ADR 0059 section 11) | `gc --full --backup-fence`, and the sweep's tombstone pass |
 | `cs-reach-v1` | per changeset id, one byte: "a ref or ref log entry reaches it, and every parent has a row"; written parents first, plus a progress row at the zero key (ADR 0059 section 4) | the changeset sweep's incremental reachability mark |
 | `gc-mark-v1` | per changeset id, tree node hash or blob hash, one byte: "referenced by a stored changeset, and everything below has a row"; written by GC marks in post-order before ADR 0103, never since; deleted by `gc --retire-mark-rows` | incremental GC marks, until the manifest says the rows are retired |
-| `derived-segments-v1` | one row per family (`changeset-v1`, ADR 0104; `changeset-v2`, ADR 0105): the family's live derived segments in publish order, each an index blob and a data blob in the blob store with a column mask, and retired segments' blobs; replaced only by `cas_derived` under the `derived-segments` lease | the segment view every `Repo` reads the six segmented kinds through; the compactor; blob GC, which unions every family's manifest and never condemns a live segment |
+| `derived-segments-v1` | one row per family (`changeset-v1`, ADR 0104; `changeset-v2`, ADR 0105; `content-v1`, ADR 0106): the family's live derived segments in publish order, each an index blob and a data blob in the blob store with a column mask, and retired segments' blobs; replaced only by `cas_derived` under the `derived-segments` lease | the segment view every `Repo` reads the six segmented kinds through; the compactor; blob GC, which unions every family's manifest and never condemns a live segment |
 | `gc-mark-segments-v1` | one row: the ordered list of live GC mark segments (blobs of sorted 32-byte hashes behind the object prefix `leep:gc-mark-segment-v1\0`), whether the `gc-mark-v1` rows still count, and retired segments; every prefix of the list is closed (ADR 0103) | incremental GC marks, which skip covered changesets and stop at marked tree nodes |
-| `blob-trigrams-v2` | per blob hash: sorted trigram set of a UTF-8 text blob up to 1 MiB (delta varints), or a "not indexed" marker, stored whole (the retired `blob-trigrams-v1` encoding, which is read where a blob has no v2 row) or as a patch (codes added and removed) on the set in `blob-trigrams-keyframe-v2` of the keyframe its predecessor (the file at the same path in the directory's predecessor) is on, while `patch² <= 128 × whole`; a probe costs at most two rows. Rows of blobs no ref head has held for `--search-retention` (14 days) are deleted and derived again on demand (ADR 0014, ADR 0102) | code search |
+| `blob-trigrams-v2` | per blob hash: sorted trigram set of a UTF-8 text blob up to 1 MiB (delta varints), or a "not indexed" marker, stored whole (the retired `blob-trigrams-v1` encoding, which is read where a blob has no v2 row) or as a patch (codes added and removed) on the set in `blob-trigrams-keyframe-v2` of the keyframe its predecessor (the file at the same path in the directory's predecessor) is on, while `patch² <= 128 × whole`; a probe costs at most two rows. Rows of blobs no ref head has held for `--search-retention` (14 days) are deleted and derived again on demand (ADR 0014, ADR 0102). A row, or a value in a derived segment of family `content-v1` (ADR 0106) | code search |
 | `blob-trigrams-keyframe-v2` | per blob hash: that blob's whole set, the base of patches; written before any patch on it, in its one encoding, so it never changes, and never retired (ADR 0102) | as above |
 | `git-blob-v1` / `git-tree-v1` | per blob hash / tree node hash: the 20-byte sha1 git gives the blob, or the git tree of the node (a subtree with no files left out); pure functions of content (ADR 0090) | git ids of a store's objects, the coming git wire protocol |
 | `git-commit-v1` | per changeset: the 20-byte sha1 of its git commit under the store's commit style, from its root tree's and its parents' git ids. Imported changesets reproduce their original commit; others carry `Leep-Changeset:` under the `trailer` style, the mirror's rule (ADR 0049, 0090). Derived on demand; deleted with its changeset by the sweep | as above |
 | `git-oid-v1` | per `Hash::of_object("git-oid", sha)`: kind byte (1 blob, 2 tree, 3 commit) and the 32-byte Leep hash; written beside each forward row; a lookup checks the forward row, so one whose changeset was swept answers "unknown" (ADR 0090) | finding the Leep object a git id names |
 | `git-style-v1` | one row: the store's commit style (`plain`/`trailer`, optionally `+provenance`), written once by the first derivation or mirror start (ADR 0090) | every git commit id of a changeset made in Leep |
-| `tree-trigrams-v2` | per tree node hash: fixed-size bloom filter (2^19 bits) over every trigram below the directory, the OR of its children's filters, stored whole (dense or sparse), as a one-byte "saturated" marker past 2^17 bits set (admits every query; a saturated child makes its parent saturated), or as a patch (positions added and removed) on the whole filter in `tree-trigrams-keyframe-v2` of the keyframe its predecessor (the same path in the first parent's tree) is on, while `patch² <= 512 × whole`; reads cost at most two rows (ADR 0014, ADR 0094) | code search directory pruning |
+| `tree-trigrams-v2` | per tree node hash: fixed-size bloom filter (2^19 bits) over every trigram below the directory, the OR of its children's filters, stored whole (dense or sparse), as a one-byte "saturated" marker past 2^17 bits set (admits every query; a saturated child makes its parent saturated), or as a patch (positions added and removed) on the whole filter in `tree-trigrams-keyframe-v2` of the keyframe its predecessor (the same path in the first parent's tree) is on, while `patch² <= 512 × whole`; reads cost at most two rows (ADR 0014, ADR 0094). A row, or a value in a derived segment (ADR 0106) | code search directory pruning |
 | `tree-trigrams-keyframe-v2` | per tree node hash: that directory's whole filter, the base of patches; a function of content written before any patch on it, so it never changes, which the patches rely on since a `tree-trigrams-v2` row may be rewritten by a derivation from another predecessor (ADR 0094) | as above |
 
 **Derived segments** ([ADR 0104](adr/0104-derived-segments.md)). The
@@ -292,6 +292,23 @@ and stops at one it cannot read or of a family it does not know. The view
 refreshes every family's manifest together: in the read's batch, in one
 batched read, or (for a single-row read) one single-row read per family.
 `cs-reach-v1` stays a row (GC bookkeeping, not a pure function).
+
+Family `content-v1` ([ADR 0106](adr/0106-search-rows-as-derived-segments.md))
+holds the code search rows and their keyframes, verbatim, keyed by blob and
+tree node and numbered by a depth-first walk of the heads' trees (a
+directory, its files, its subdirectories), in blocks of 512 KiB and data
+blobs of at most 1 MiB. It seals a blob or directory row only while search
+row retention keeps it live (a head now or within the window; keyframes
+always; superseded directory filters, which retention never deletes, stay
+rows), leaves out at merge what retention no longer keeps (directory
+filters included), rewrites a segment once a third is dead, merges small
+segments so their number stays near twice the family's bytes over the
+cap, and compares a row with its sealed value by the set or filter they
+stand for, patches resolved against their keyframes (never equal when a
+keyframe is missing, unless byte-identical; a row that resolves is then
+sealed again). A view read fails only for its own family's errors. Retention keeps its own lease
+and touches rows only. `verify` and `repair rederive` scan the keys only a
+segment holds too (`RowScan::of`), since listings stay rows.
 
 **Unstored trees** ([ADR 0069](adr/0069-lazy-create-trees.md)). The
 `root_tree` row is always stored with its changeset, but the nodes of the
