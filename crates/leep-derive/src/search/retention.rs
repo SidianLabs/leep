@@ -273,9 +273,14 @@ impl Repo {
         let mut seen = HashSet::new();
         heads.retain(|h| seen.insert(*h));
         let roots = walker.roots_of(&heads).await?;
-        // Each node's files and subdirectories, in name order.
-        let mut nodes: HashMap<Hash, (Vec<Hash>, Vec<Hash>)> = HashMap::new();
+        // Each node's subdirectories, and the files first found in it (a
+        // file under many directories, or many versions of one, is kept
+        // once: the order is a locality key, so where a shared file lands
+        // does not matter). Every list sized exactly; the files seen are
+        // dropped before the order is built, so the peak is one of them.
+        let mut nodes: HashMap<Hash, (Box<[Hash]>, Box<[Hash]>)> = HashMap::new();
         let mut queued: HashSet<Hash> = HashSet::new();
+        let mut seen_files: HashSet<Hash> = HashSet::new();
         let mut level: Vec<Hash> = roots
             .iter()
             .filter(|r| queued.insert(**r))
@@ -289,16 +294,23 @@ impl Repo {
                     for entry in node.entries.values() {
                         match *entry {
                             TreeEntry::Dir { tree } => dirs.push(tree),
-                            TreeEntry::File { content, .. } => files.push(content),
+                            TreeEntry::File { content, .. } => {
+                                if seen_files.insert(content) {
+                                    files.push(content);
+                                }
+                            }
                         }
                     }
                     next.extend(dirs.iter().filter(|d| queued.insert(**d)).copied());
-                    nodes.insert(*tree, (files, dirs));
+                    nodes.insert(*tree, (files.into_boxed_slice(), dirs.into_boxed_slice()));
                 }
             }
             level = next;
         }
-        let mut order: HashMap<Hash, u32> = HashMap::with_capacity(nodes.len() * 8);
+        let total = nodes.len() + seen_files.len();
+        drop(seen_files);
+        drop(queued);
+        let mut order: HashMap<Hash, u32> = HashMap::with_capacity(total);
         let mut stack: Vec<Hash> = Vec::new();
         for root in roots {
             stack.push(root);
@@ -308,16 +320,18 @@ impl Repo {
                 }
                 let at = order.len() as u32;
                 order.insert(tree, at);
-                let Some((files, dirs)) = nodes.get(&tree) else {
+                let Some((files, dirs)) = nodes.remove(&tree) else {
                     continue;
                 };
-                for f in files {
+                for f in files.iter() {
                     let at = order.len() as u32;
                     order.entry(*f).or_insert(at);
                 }
                 stack.extend(dirs.iter().rev().filter(|d| !order.contains_key(d)));
             }
         }
+        drop(nodes);
+        order.shrink_to_fit();
         Ok(ContentLive {
             seq,
             all: keep.is_none(),

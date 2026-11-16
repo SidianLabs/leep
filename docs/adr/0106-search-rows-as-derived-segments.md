@@ -206,10 +206,17 @@ sealed keys from the indexes without building a set of them.
 ## Cost
 - A pass walks the live set when the ref log moved (one batched read per
   level of distinct trees of the window's heads) and holds it while it
-  seals or merges: about 50 bytes a live blob or tree. While walking it
-  also holds, transiently, every distinct tree node's list of files and
-  subdirectories (about 32 bytes an entry plus a map entry a node), and
-  sizes the order map for eight entries a node up front.
+  seals or merges: about 50 bytes a live blob or tree (the order map, sized
+  to its count). While walking it also holds, transiently, each distinct
+  tree node's subdirectories and the files first found in it (each distinct
+  file once), and the set of files seen, dropped before the order is built;
+  the previous set is released before a new walk, so one exists at a time.
+  The walk covers every head of the window, so on a busy store its peak
+  grows with the window's distinct content (bounded by the 14 days, and
+  redone at most every `list_every`, 10 minutes, when the ref log moved).
+  A first version kept every node's whole file list and two sets at once:
+  an RSS A/B soak against 784bed6 showed its peak growing 45 -> 101 MiB
+  across walks.
 - `budget_tests`: a search on a new process makes 32 metadata calls, not
   31 (the first miss of a search row reads the three manifests in one
   batched read, at most once a minute); search land stays 11 and create
@@ -224,8 +231,9 @@ sealed keys from the indexes without building a set of them.
   fingerprint filter would make them constant, which matters once a large
   store holds hundreds of `content-v1` segments.
 - The live walk is redone whole when the ref log moved; an incremental
-  walk (only new heads' changed subtrees) would make it proportional to
-  lands.
+  walk (only heads new since the last walk, their changed subtrees) or a
+  compact membership filter (as retention's Bloom filter) with a separate
+  locality order would make its cost and peak proportional to lands.
 - A cold process's first miss of a `content-v1` key waits for every live
   segment's index to load (8 at a time); with ranged reads of data blobs
   (needed before large object-store deployments retire this family) the

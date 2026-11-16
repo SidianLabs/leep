@@ -987,6 +987,8 @@ impl<'a> Pass<'a> {
                 return Ok(l.clone());
             }
         }
+        // The old set goes before the new one is built: one at a time.
+        state.content = None;
         let now = self.opts.content_now.unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
