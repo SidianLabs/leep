@@ -1651,7 +1651,8 @@ recompute every value):
   retired` (logged once per segment per process): a `gc` that cannot read
   the family (an older binary) condemned a live segment. Stop that `gc`'s
   schedule; the next collect deletes the segment and the next pass seals
-  the rows again, or keeps it.
+  the rows again, or finds it live and rescues it, and then its rows
+  retire.
 - `a derived segment's blobs cannot be read now; it is kept and skipped`:
   one segment's blob fails to read (an I/O error, a failing object store
   key). Readers leave just that segment out (its keys read as rows or

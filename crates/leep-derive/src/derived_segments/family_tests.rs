@@ -821,7 +821,8 @@ async fn a_held_back_family_asks_for_its_feature_once_a_minute() {
 
 /// Rows of a segment whose blob carries a blob GC condemnation are not
 /// retired, and the condemnations are read again after the family's
-/// feature is recorded: one written while it is recorded still holds.
+/// feature is recorded: one written while it is recorded still holds. Once
+/// a collect rescues the segment, its rows retire.
 #[tokio::test]
 async fn condemned_segments_rows_are_not_retired() {
     let r = repo();
@@ -870,11 +871,26 @@ async fn condemned_segments_rows_are_not_retired() {
         r.row_meta().count_derived(Generation::NAME).await.unwrap(),
         ids.len() as u64
     );
-    // Collected or cleared: the rows go.
-    r.row_meta()
-        .delete_derived_keys(&[crate::gc::BLOB_CONDEMNED], &blobs)
+    // A collect finds the segments live and rescues them (the condemnation
+    // rows stay, answered by rescue rows): the rows go.
+    let gc_opts = crate::gc::GcOptions {
+        grace: std::time::Duration::ZERO,
+        fence: std::time::Duration::ZERO,
+        unsafe_no_fence: true,
+        ..crate::gc::GcOptions::default()
+    };
+    crate::gc::collect(&r, &gc_opts, &crate::gc::SystemClock)
         .await
         .unwrap();
+    for h in &blobs {
+        assert!(r.blobs().contains(h).await.unwrap());
+        assert!(r
+            .row_meta()
+            .get_derived(crate::gc::BLOB_CONDEMNED, h)
+            .await
+            .unwrap()
+            .is_some());
+    }
     settle(&r, &all, &mut st, Some(&hook)).await;
     assert_eq!(
         r.row_meta().count_derived(Generation::NAME).await.unwrap(),

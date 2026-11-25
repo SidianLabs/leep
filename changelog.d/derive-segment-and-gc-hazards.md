@@ -17,3 +17,7 @@
   searches answered `indexing` on every retry. Merges also read the ref
   log again before storing a segment that leaves blob rows out, and keep
   everything if a ref moved since the walk.
+- **Fixed.** A derived segment that an older `gc` condemned and a collect
+  then rescued had its rows kept for good: the compactor took the
+  condemnation row alone for a standing condemnation. It now reads the
+  rescue and doom rows too, as the rest of blob GC does.

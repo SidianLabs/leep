@@ -2041,19 +2041,29 @@ impl<'a> Pass<'a> {
         Ok(())
     }
 
-    /// Whether either blob of `l` carries a blob GC condemnation. A blob GC
-    /// of a binary that cannot read this family (one that started before
-    /// the family's feature was recorded) may have condemned the segment as
-    /// an orphan: its rows are not deleted while it does. They go after the
-    /// next collect, or stay with the segment dropped and sealed again.
+    /// Whether either blob of `l` carries a blob GC condemnation that
+    /// stands (not rescued since, or a delete in flight). A blob GC of a
+    /// binary that cannot read this family (one that started before the
+    /// family's feature was recorded) may have condemned the segment as an
+    /// orphan: its rows are not deleted while it does. They go once a
+    /// collect rescues the segment (its condemnation row stays, answered by
+    /// a rescue row), or stay with the segment dropped and sealed again.
     /// Logged once per segment per process.
     async fn condemned(&mut self, l: &Live, state: &mut FamilyState) -> Result<bool> {
+        let hashes = [l.r.index, l.r.data];
         let marks = self
             .repo
             .row_meta()
-            .get_derived_many(crate::gc::BLOB_CONDEMNED, &[l.r.index, l.r.data])
+            .get_derived_many(crate::gc::BLOB_CONDEMNED, &hashes)
             .await?;
-        if !marks.iter().any(Option::is_some) {
+        let mut stands = false;
+        for (h, m) in hashes.iter().zip(&marks) {
+            if m.is_some() && self.repo.blob_condemned_now(h).await? {
+                stands = true;
+                break;
+            }
+        }
+        if !stands {
             return Ok(false);
         }
         self.condemned.insert(l.r.index);

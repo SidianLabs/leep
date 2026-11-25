@@ -484,6 +484,14 @@ impl Repo {
     }
 
     /// Reads from durable meta only; a stale answer here loses blobs.
+    /// Whether a blob GC condemnation of `hash` stands now: condemned and
+    /// not rescued since, or a delete of it may be in flight. A rescued
+    /// condemnation (an upload, or collect finding the blob live) is
+    /// clear, though its row stays.
+    pub(crate) async fn blob_condemned_now(&self, hash: &Hash) -> Result<bool> {
+        Ok(self.fence_state(hash).await?.blocked())
+    }
+
     async fn fence_state(&self, hash: &Hash) -> Result<BlobFence> {
         let Some(condemned) = self.condemned_row(hash).await? else {
             return Ok(BlobFence::default());

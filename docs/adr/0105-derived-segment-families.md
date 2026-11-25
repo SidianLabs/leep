@@ -162,9 +162,13 @@ takes Stage B's `content-v1` the same way.
 **Blob GC of a binary that cannot read a family.** Such a `gc`, started
 before the family's feature was recorded, could have condemned the family's
 live segments as orphans. A pass does not delete rows of a segment either of
-whose blobs carries a condemnation (`blob-condemned-v1`): they go after the
-next collect (if the segment survives it) or stay, the segment dropped and
-sealed again. The condemnations are read before a segment's rows are
+whose blobs carries a condemnation (`blob-condemned-v1`) that stands: they
+go after the next collect (if the segment survives it) or stay, the segment
+dropped and sealed again. A collect that finds the segment live rescues it
+and leaves the condemnation row, answered by a `blob-rescue-v1` row, so a
+pass reads the condemnation with its rescue and doom rows, as every other
+reader of the fence does (amended 2026-11-25: it took the row alone for a
+standing condemnation, so a rescued segment's rows were never retired). The condemnations are read before a segment's rows are
 compared and again before each delete statement. For a family's first
 delete that second read comes after the feature is recorded; from then on
 such binaries refuse the store, so only a `gc` already under way could
