@@ -554,6 +554,8 @@ pub struct PublishedObjectPack {
     report: RepackReport,
     from_loose: Vec<(Hash, LooseStamp)>,
     replaced: Vec<String>,
+    /// When `replaced` were retired (unix seconds, `packs/.retired`).
+    retired_at: i64,
     opts: RepackOptions,
     /// The lease, unless [`unlock`](Self::unlock) let it go.
     lease: Option<Lease>,
@@ -563,6 +565,7 @@ struct Published {
     report: RepackReport,
     from_loose: Vec<(Hash, LooseStamp)>,
     replaced: Vec<String>,
+    retired_at: i64,
 }
 
 impl ObjectBlobStore {
@@ -623,6 +626,7 @@ impl ObjectBlobStore {
                     report: p.report,
                     from_loose: p.from_loose,
                     replaced: p.replaced,
+                    retired_at: p.retired_at,
                     opts,
                     lease: Some(lease),
                 })
@@ -833,12 +837,13 @@ impl ObjectBlobStore {
         if written.records.is_empty() {
             // Every object of the merged packs was deleted: they retire
             // with no replacement.
-            self.retire(&replaced, "", "", lease).await?;
+            let retired_at = self.retire(&replaced, "", "", lease).await?;
             step(opts, RepackStep::Retired)?;
             return Ok(Published {
                 report,
                 from_loose: Vec::new(),
                 replaced,
+                retired_at,
             });
         }
 
@@ -847,6 +852,11 @@ impl ObjectBlobStore {
         // One id means the same bytes, so a repack that changed nothing finds
         // its pack published already and uploads nothing.
         let upload = view.pack(&id).is_none();
+        // Tombstones of an earlier copy of this pack (retired, or published
+        // still) do not hold for this one, which holds only what was live
+        // when it was read; they go once it is published, and the deletes
+        // since this run read its sources are added back (`late_deletes`).
+        let earlier = self.tombstones_of(&id).await?;
         if upload {
             upload_file(&*self.store, &pack_key(&id), &new_pack).await?;
             let size = self
@@ -879,6 +889,11 @@ impl ObjectBlobStore {
         report.index_bytes = index_len;
         report.pack_id = Some(id.clone());
 
+        if !earlier.is_empty() {
+            let keys = earlier.iter().map(|h| tombstone_key(&id, h)).collect();
+            delete_all(&*self.store, keys).await?;
+            bump_gen(&*self.store, &id).await?;
+        }
         // GC may have deleted objects after this run read them. Hide them in
         // the new pack too; a delete that starts from now on sees the pack.
         let late = self.late_deletes(&table, written.ids(), &sources).await?;
@@ -892,7 +907,7 @@ impl ObjectBlobStore {
         // retire durably (ADR 0080), so no server listing from now on
         // searches or merges them, and a sweep deletes them after the fence.
         let replaced: Vec<String> = replaced.into_iter().filter(|r| *r != id).collect();
-        self.retire(&replaced, &id, &id, lease).await?;
+        let retired_at = self.retire(&replaced, &id, &id, lease).await?;
         self.packs.unsupersede(&id);
         step(opts, RepackStep::Retired)?;
         if opts.mark {
@@ -920,6 +935,7 @@ impl ObjectBlobStore {
                 .map(|(id, stamp)| (*table.hash(id), stamp))
                 .collect(),
             replaced,
+            retired_at,
         })
     }
 
@@ -928,8 +944,14 @@ impl ObjectBlobStore {
     /// `packs/.gen`. A merge can reproduce a pack byte for byte, so its id
     /// may name a pack retired earlier and still listed; left retired, it
     /// would hide the only copy of what its sources held, and a sweep would
-    /// delete it. Only under the lease.
-    async fn retire(&self, ids: &[String], published: &str, by: &str, lease: &Lease) -> Result<()> {
+    /// delete it. Only under the lease. Returns the time it retired them.
+    async fn retire(
+        &self,
+        ids: &[String],
+        published: &str,
+        by: &str,
+        lease: &Lease,
+    ) -> Result<i64> {
         let now = now_secs();
         let changed = self
             .update_retired(lease, |r| {
@@ -946,7 +968,7 @@ impl ObjectBlobStore {
         if changed {
             bump_gen(&*self.store, by).await?;
         }
-        Ok(())
+        Ok(now)
     }
 
     /// Read-modify-write `packs/.retired` with a conditional PUT, so a
@@ -1188,15 +1210,20 @@ impl PublishedObjectPack {
             self.remove_loose(&id).await?;
         }
         self.lease().check().await?;
-        // Only packs still retired: a later repack may have published one
-        // again under the same id and taken it out of the record (see the
+        // Only packs still retired, and by this repack or earlier: a later
+        // repack may have published one again under the same id and taken
+        // it out of the record, or retired it again since (see the
         // filesystem store's `finish_blocking`).
         let retired = read_retired(&*objects).await?;
+        let (listed, _) = list_packs_dir(&*objects).await?;
         for id in &self.replaced {
-            if !retired.contains_key(id) {
-                self.report.old_packs_kept += 1;
+            if !retired.get(id).is_some_and(|&at| at <= self.retired_at) {
+                if listed.binary_search(id).is_ok() {
+                    self.report.old_packs_kept += 1;
+                }
                 continue;
             }
+            self.lease().check().await?;
             // The index first: without it the pack is unpublished garbage.
             delete_all(&*objects, vec![idx_key(id)]).await?;
             delete_all(&*objects, vec![pack_key(id)]).await?;

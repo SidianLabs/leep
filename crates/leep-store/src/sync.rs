@@ -409,6 +409,16 @@ pub async fn sync_packs(
     dst: &dyn PackFiles,
     mode: PackSyncMode,
 ) -> Result<PackSyncReport> {
+    sync_packs_with(src, dst, mode, RESCUE_MAX_BYTES).await
+}
+
+/// [`sync_packs`] with rescue packs of at most `rescue_max` stored bytes.
+async fn sync_packs_with(
+    src: &dyn PackFiles,
+    dst: &dyn PackFiles,
+    mode: PackSyncMode,
+    rescue_max: u64,
+) -> Result<PackSyncReport> {
     let mut report = PackSyncReport::default();
     let mut src_ids = src.pack_ids().await?;
     let mut seen: HashSet<String> = HashSet::new();
@@ -495,7 +505,7 @@ pub async fn sync_packs(
         PackSyncMode::Restore => report.tombstones_added = copy_tombstones(src, dst).await?,
         PackSyncMode::Pool => {
             let source: HashSet<&String> = src_ids.iter().collect();
-            prune_superseded(dst, &source, &mut report).await?;
+            prune_superseded(dst, &source, &mut report, rescue_max).await?;
         }
     }
     Ok(report)
@@ -525,9 +535,8 @@ async fn copy_tombstones(src: &dyn PackFiles, dst: &dyn PackFiles) -> Result<u64
     Ok(add.len() as u64)
 }
 
-/// The objects one rescue copies at most, by their stored size: they are
-/// held in memory while the rescue pack is written. A superseded pack whose
-/// own objects pass it stays whole, as before ADR 0107.
+/// The stored bytes one rescue pack takes at most: its objects are held in
+/// memory while it is written. More is rescued in several packs.
 const RESCUE_MAX_BYTES: u64 = 256 << 20;
 
 /// zstd level of the frames a rescue compresses again (objects that were
@@ -553,6 +562,7 @@ async fn prune_superseded(
     dst: &dyn PackFiles,
     source: &HashSet<&String>,
     report: &mut PackSyncReport,
+    rescue_max: u64,
 ) -> Result<()> {
     let ids = dst.pack_ids().await?;
     if ids.iter().all(|id| source.contains(id)) {
@@ -599,28 +609,39 @@ async fn prune_superseded(
             continue;
         }
         let (id, index) = &packs[i];
-        let bytes: u64 = mine.iter().map(|&r| index.entry(r).stored_len).sum();
-        // Nothing here is held twice (an earlier rescue pack), too much to
-        // hold in memory, or a pool tombstone to keep exactly (written
-        // before issue #155): it stays.
+        // Nothing here is held twice (an earlier rescue pack), or a pool
+        // tombstone to keep exactly (written before issue #155): it stays.
         let tombstoned = dead.get(id).is_some_and(|d| !d.is_empty());
-        if mine.len() == index.len() || bytes > RESCUE_MAX_BYTES || tombstoned {
+        if mine.len() == index.len() || tombstoned {
             i += 1;
             continue;
         }
-        let mut take: Vec<(usize, Vec<u32>)> = vec![(i, mine)];
-        // Earlier rescue packs (nothing in them held elsewhere), smallest
-        // first, while each is at most twice what the new pack holds so
-        // far: they stay few (about one per doubling) and each object is
+        // In packs of at most `rescue_max` stored bytes each (they are held
+        // in memory while written), however much only this pack holds.
+        let mut chunks: Vec<Vec<(usize, Vec<u32>)>> = Vec::new();
+        let (mut cur, mut cur_bytes) = (Vec::new(), 0u64);
+        for r in mine {
+            let n = index.entry(r).stored_len;
+            if !cur.is_empty() && cur_bytes + n > rescue_max {
+                chunks.push(vec![(i, std::mem::take(&mut cur))]);
+                cur_bytes = 0;
+            }
+            cur.push(r);
+            cur_bytes += n;
+        }
+        let mut last = vec![(i, cur)];
+        // Earlier rescue packs (nothing in them held elsewhere) join the
+        // last, smallest first, while each is at most twice what it holds
+        // so far: they stay few (about one per doubling) and each object is
         // rewritten about once per doubling.
         let mut small: Vec<(u64, usize)> = (0..packs.len())
             .filter(|&j| j != i && !source.contains(&packs[j].0))
             .map(|j| (packs[j].1.pack_len(), j))
             .collect();
         small.sort();
-        let mut total = bytes;
+        let mut total = cur_bytes;
         for (len, j) in small {
-            if len > 2 * total || total + len > RESCUE_MAX_BYTES {
+            if len > 2 * total || total + len > rescue_max {
                 break;
             }
             let theirs = own(j, &packs);
@@ -630,43 +651,50 @@ async fn prune_superseded(
                 continue;
             }
             total += len;
-            take.push((j, theirs));
+            last.push((j, theirs));
         }
-        let mut objects: Vec<(Hash, Vec<u8>, u64, i64)> = Vec::new();
+        chunks.push(last);
+        let mut new_packs: Vec<(String, PackIndex)> = Vec::new();
         let mut readable = true;
-        for (j, ranks) in &take {
-            let (id, index) = &packs[*j];
-            match rescue_objects(dst, id, index, ranks).await? {
-                Some(o) => objects.extend(o),
-                None => {
-                    readable = false;
-                    break;
+        'chunks: for chunk in &chunks {
+            let mut objects: Vec<(Hash, Vec<u8>, u64, i64)> = Vec::new();
+            for (j, ranks) in chunk {
+                let (id, index) = &packs[*j];
+                match rescue_objects(dst, id, index, ranks).await? {
+                    Some(o) => objects.extend(o),
+                    None => {
+                        readable = false;
+                        break 'chunks;
+                    }
                 }
             }
+            report.rescued_objects += objects.len() as u64;
+            new_packs.push(write_whole_pack(dst, objects).await?);
+            report.rescue_packs += 1;
         }
         if !readable {
             // A damaged pack keeps whatever it holds; `verify` reports it.
+            // Rescue packs written already only hold copies of its objects,
+            // so the next run prunes them.
             i += 1;
             continue;
         }
-        let n = objects.len() as u64;
-        let (new_id, new_index) = write_whole_pack(dst, objects).await?;
-        report.rescued_objects += n;
-        report.rescue_packs += 1;
-        let mut gone: Vec<usize> = take.iter().map(|(j, _)| *j).collect();
+        let mut gone: Vec<usize> = chunks.iter().flatten().map(|(j, _)| *j).collect();
         gone.sort_unstable();
-        let existing = packs.iter().any(|(id, _)| *id == new_id);
+        gone.dedup();
         for j in gone.into_iter().rev() {
             let id = packs.remove(j).0;
-            if id == new_id {
+            if new_packs.iter().any(|(n, _)| *n == id) {
                 continue;
             }
             dst.delete(&format!("{id}.idx")).await?;
             dst.delete(&format!("{id}.pack")).await?;
             report.pruned += 1;
         }
-        if !existing {
-            packs.push((new_id, new_index));
+        for (new_id, new_index) in new_packs {
+            if !packs.iter().any(|(id, _)| *id == new_id) {
+                packs.push((new_id, new_index));
+            }
         }
         // Indexes moved: look again from the start. Each rescue removes a
         // pack with copies held elsewhere and adds one with none, so this
@@ -1078,6 +1106,36 @@ mod tests {
             assert_eq!(r.vanished, before.len() as u64, "{r:?}");
             assert_eq!(r.copied, after.len() as u64, "{r:?}");
             assert_eq!(dp.pack_ids().await.unwrap(), after);
+        }
+
+        /// What only a superseded pool pack holds is rescued however much
+        /// it is, in several packs of at most the cap each.
+        #[tokio::test]
+        async fn a_large_rescue_is_written_in_several_packs() {
+            let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let (src, hashes) = source(a.path()).await;
+            let (sp, dp) = (FsPackFiles::new(a.path()), FsPackFiles::new(b.path()));
+            sync_packs(&sp, &dp, PackSyncMode::Pool).await.unwrap();
+            for h in &hashes[5..15] {
+                src.delete(h).await.unwrap();
+            }
+            repack(&src, RepackMode::Full).await;
+            // Each object is about 20 stored bytes: a few to a pack.
+            let r = sync_packs_with(&sp, &dp, PackSyncMode::Pool, 64)
+                .await
+                .unwrap();
+            assert_eq!(r.rescued_objects, 11, "{r:?}");
+            assert!(r.rescue_packs >= 3, "{r:?}");
+            assert_eq!(r.pruned, 2, "{r:?}");
+            let pool = FsBlobStore::new(b.path());
+            for h in &hashes {
+                assert!(pool.get(h).await.unwrap().is_some(), "the pool keeps {h}");
+            }
+            // Nothing more to do.
+            let r = sync_packs_with(&sp, &dp, PackSyncMode::Pool, 64)
+                .await
+                .unwrap();
+            assert_eq!((r.rescued_objects, r.pruned), (0, 0), "{r:?}");
         }
 
         async fn all(store: &dyn BlobStore) -> Vec<Hash> {

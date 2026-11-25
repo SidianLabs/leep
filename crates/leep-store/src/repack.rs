@@ -286,6 +286,8 @@ pub struct PublishedPack {
     /// (see [`stamp_of`]).
     from_loose: Vec<(Hash, i64)>,
     replaced: Vec<String>,
+    /// When `replaced` were retired (unix seconds, `packs/retired`).
+    retired_at: i64,
     opts: RepackOptions,
     /// The repack lock, unless [`unlock`](Self::unlock) let it go.
     lock: Option<File>,
@@ -385,9 +387,12 @@ impl PublishedPack {
         // input lost exactly what this repack added to it), and
         // `retire_for` then took it out of the record: it is the live copy
         // now, and deleting it by name would lose everything it holds.
+        // Retired again since (published again, then replaced by a later
+        // repack) waits for that retirement's own fence, which the sweep
+        // keeps.
         let retired = crate::retire::read_retired(&dir)?;
         for id in &self.replaced {
-            if !retired.contains_key(id) {
+            if !retired.get(id).is_some_and(|&at| at <= self.retired_at) {
                 if dir.join(format!("{id}.idx")).exists() {
                     self.report.old_packs_kept += 1;
                 }
@@ -511,6 +516,42 @@ pub(crate) fn rewrite_tombstones(dir: &Path) -> Result<()> {
         return sync_dir(dir);
     }
     let body: String = keep.iter().map(|(id, h)| tombstone_line(id, h)).collect();
+    let tmp = write_durably(dir, "tombstones", body.as_bytes())?;
+    std::fs::rename(&tmp, &path).map_err(storage_err)?;
+    sync_dir(dir)
+}
+
+/// The tombstoned hashes of pack `id`.
+fn tombstones_of(dir: &Path, id: &str) -> Result<HashSet<Hash>> {
+    let text = match std::fs::read(dir.join(TOMBSTONES)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(e) => return Err(storage_err(e)),
+    };
+    Ok(parse_tombstones(&text).remove(id).unwrap_or_default())
+}
+
+/// Remove the tombstones of `hashes` in pack `id`, under the tombstone
+/// lock, keeping every other line (those appended meanwhile included).
+fn drop_tombstones(dir: &Path, id: &str, hashes: &HashSet<Hash>) -> Result<()> {
+    let _lock = lock_tombstones(dir)?;
+    let path = dir.join(TOMBSTONES);
+    let text = match std::fs::read(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(storage_err(e)),
+    };
+    let mut keep: Vec<(String, Hash)> = parse_tombstones(&text)
+        .into_iter()
+        .flat_map(|(p, hs)| hs.into_iter().map(move |h| (p.clone(), h)))
+        .filter(|(p, h)| p != id || !hashes.contains(h))
+        .collect();
+    keep.sort();
+    if keep.is_empty() {
+        remove_if_present(&path)?;
+        return sync_dir(dir);
+    }
+    let body: String = keep.iter().map(|(p, h)| tombstone_line(p, h)).collect();
     let tmp = write_durably(dir, "tombstones", body.as_bytes())?;
     std::fs::rename(&tmp, &path).map_err(storage_err)?;
     sync_dir(dir)
@@ -987,7 +1028,8 @@ impl FsBlobStore {
             remove_if_present(&tmp_pack.take())?;
             // Every object of the merged packs was deleted: nothing of
             // theirs is live, so they retire with no replacement.
-            crate::retire::append_retired(&dir, &replaced, now_secs())?;
+            let retired_at = now_secs();
+            crate::retire::append_retired(&dir, &replaced, retired_at)?;
             step(&opts, RepackStep::Retired)?;
             self.packs.supersede(&replaced);
             return Ok(PublishedPack {
@@ -995,6 +1037,7 @@ impl FsBlobStore {
                 report,
                 from_loose,
                 replaced,
+                retired_at,
                 opts,
                 lock: Some(lock),
             });
@@ -1013,6 +1056,13 @@ impl FsBlobStore {
         tmp_pack.take();
         sync_dir(&dir)?;
         step(&opts, RepackStep::PackRenamed)?;
+        // A merge can write a pack that was published before, byte for byte
+        // (the id is the index's hash). Tombstones written for that earlier
+        // copy do not hold for this one, which holds only what was live when
+        // it was read: an object deleted then and uploaded again is live
+        // here. They are dropped once it is published; deletes since this
+        // run read its sources are added back below (`late_deletes`).
+        let earlier: HashSet<Hash> = tombstones_of(&dir, &id)?;
         let (tmp_idx, file) = create_exclusive(&dir, ".idx").map_err(storage_err)?;
         let mut tmp_idx = TempFile(Some(tmp_idx));
         {
@@ -1039,6 +1089,9 @@ impl FsBlobStore {
         report.index_bytes = index_len;
         report.pack_id = Some(id.clone());
 
+        if !earlier.is_empty() {
+            drop_tombstones(&dir, &id, &earlier)?;
+        }
         // GC may have deleted objects after this run read them. Hide them in
         // the new pack too; a delete that starts from now on sees the pack.
         let late = self.late_deletes(&table, written.ids(), &sources)?;
@@ -1051,7 +1104,8 @@ impl FsBlobStore {
         // they retire: durably, so no process scanning from now on, this
         // one after a restart included, searches or merges them again.
         let replaced: Vec<String> = replaced.into_iter().filter(|r| *r != id).collect();
-        crate::retire::retire_for(&dir, &replaced, &id, now_secs())?;
+        let retired_at = now_secs();
+        crate::retire::retire_for(&dir, &replaced, &id, retired_at)?;
         self.packs.unsupersede(&id);
         step(&opts, RepackStep::Retired)?;
         if opts.mark {
@@ -1072,6 +1126,7 @@ impl FsBlobStore {
             report,
             from_loose,
             replaced,
+            retired_at,
             opts,
             lock: Some(lock),
         })

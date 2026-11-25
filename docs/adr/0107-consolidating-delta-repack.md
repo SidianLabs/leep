@@ -196,10 +196,10 @@ only such a pack holds (decoded from its stream, through any delta chain,
 and checked against their hashes) into a new pool pack of whole frames,
 publishes it, then deletes the old pack. Earlier such packs join the new
 one while they are at most twice what it takes in, so they stay few. A
-pool pack is rewritten only when that removes copies other packs hold, at
-most 256 MiB of its objects at a time (held in memory); a larger one, or
-one with pool tombstones (written before issue #155), stays whole as
-before. An interrupted run leaves both packs, and the next run deletes the
+pool pack is rewritten only when that removes copies other packs hold, in
+rescue packs of at most 256 MiB each (each is held in memory while it is
+written); one with pool tombstones (written before issue #155) stays whole
+as before. An interrupted run leaves both packs, and the next run deletes the
 older. And since a consolidation can replace the source's packs at any
 time, a backup whose pack copy outlasts the fence finds packs it listed
 gone: it then lists the source's packs again (up to four listings) and
@@ -245,6 +245,15 @@ objects GC deleted inside the fence does exactly that: the pack an earlier
 run's cleanup still means to delete is published again, and `retire_for`
 (ADR 0080) takes it out of the record. Before, only the sweep honoured
 that; the cleanup deleted by name, which would have removed the live copy.
+It also deletes only packs whose recorded retirement is no later than its
+own: one published again and then retired again by a later repack waits
+for that later fence, which the sweep keeps. And a publish drops the
+tombstones its pack's id carried before (its earlier copy's, which
+`PackSet::tombstone` writes for retired packs too) before it adds the
+deletes since its own read: the new copy holds only what was live when it
+was read, so an object deleted then and uploaded again is live in it, and
+an old line would hide it there once the pack that held the upload is
+swept.
 Old and new servers share a store; whichever holds `repack.lock`
 decides, and an old server's merges only delay the gain. Object stores are
 unchanged: they run a full repack on a schedule (ADR 0100 section 4), which

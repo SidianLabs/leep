@@ -24,6 +24,10 @@
   under the same id (a consolidation of a pack whose added objects GC
   deleted inside the fence reproduces the pack before them), and the
   cleanup used to delete it by name.
+- **Fixed.** A pack published again under an earlier id drops the
+  tombstones of its earlier copy, which could hide an object deleted and
+  uploaded again; and a cleanup leaves a pack retired again by a later
+  repack to that repack's fence.
 - **Fixed.** A backup whose pack copy outlasts a repack's fence lists the
   source's packs again and copies the ones that replaced the packs that
   vanished, instead of copying their objects loose into the pool.
@@ -31,7 +35,8 @@
   replaced while dropping an object GC had deleted, so pools grew by the
   store's pack bytes at each such repack. The objects only the old pool
   pack holds are now copied into a small pool pack of their own and the
-  old pack is deleted; nothing a snapshot may need is dropped.
+  old pack is deleted, in packs of at most 256 MiB each; nothing a
+  snapshot may need is dropped.
 - **Changed.** A delta run compresses the whole frames of the land and
   import packs it takes at its own level instead of copying their level-1
   frames.
