@@ -267,6 +267,63 @@ pub(crate) async fn gc_view(repo: &Repo) -> Result<GcView> {
     Ok(view)
 }
 
+/// The live segment blobs the manifests stored in `meta` name, for a
+/// backup: copied right after its metadata snapshot, before blob GC can
+/// collect one a later merge retired, and checked by its closure check.
+#[derive(Debug, Default)]
+pub struct NamedSegments {
+    /// Per derived segment family whose manifest decodes: its name, its
+    /// store feature (once recorded, a live segment may hold the only copy
+    /// of its rows) and its live segments' blobs.
+    pub derived: Vec<(&'static str, &'static str, Vec<Hash>)>,
+    /// Live GC mark segments (ADR 0103): losing one costs a full mark walk.
+    pub gc_marks: Vec<Hash>,
+}
+
+impl NamedSegments {
+    pub fn len(&self) -> usize {
+        self.derived.iter().map(|(_, _, h)| h.len()).sum::<usize>() + self.gc_marks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Every blob named, derived segments first.
+    pub fn all(&self) -> Vec<Hash> {
+        let mut out: Vec<Hash> = self
+            .derived
+            .iter()
+            .flat_map(|(_, _, h)| h.iter().copied())
+            .collect();
+        out.extend(self.gc_marks.iter().copied());
+        out
+    }
+}
+
+/// [`NamedSegments`] of the manifests in `meta`. A manifest that does not
+/// decode, or a newer binary's, names nothing here.
+pub async fn named_segments(meta: &dyn leep_core::MetaStore) -> Result<NamedSegments> {
+    let mut out = NamedSegments::default();
+    for fam in FAMILIES {
+        let raw = meta.get_derived(MANIFEST_KIND, &fam.manifest_key()).await?;
+        if let ManifestRead::Read(m) = ManifestRead::of(fam.id, raw.as_deref()) {
+            out.derived
+                .push((fam.name, fam.feature, m.live_blobs().collect()));
+        }
+    }
+    let raw = meta
+        .get_derived(
+            crate::gc_segments::GC_MARK_SEGMENTS,
+            &crate::gc_segments::MANIFEST_KEY,
+        )
+        .await?;
+    if let Some(m) = raw.and_then(|v| crate::gc_segments::Manifest::decode(&v).ok()) {
+        out.gc_marks = m.live.iter().map(|s| s.hash).collect();
+    }
+    Ok(out)
+}
+
 /// Take [`lease_key`]'s lease for an operator command, waiting out a
 /// compactor pass (they are short) for up to about two minutes.
 pub(crate) async fn acquire_for(repo: &Repo, job: &str) -> Result<Option<GcLease>> {

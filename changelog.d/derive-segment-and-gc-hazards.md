@@ -25,3 +25,11 @@
   stops all blob GC until an operator drops every kind of the family: `gc`
   keeps every blob that starts like a derived segment, collects the rest,
   and reports the family. A row written by a newer binary still stops it.
+- **Fixed.** `leep-server backup` copies the live derived and GC mark
+  segments its metadata snapshot names right after the snapshot, before
+  the listing copy: a merge could retire one and `gc` collect it while a
+  long copy was on its way, leaving a restore without the only copy of
+  retired rows. The backup's check (and `backup verify`) counts a live
+  derived segment missing from the copy as a problem once its family's
+  store feature is recorded. The manifest's blob section gains
+  `segments_named`, `segments_copied` and `segments_vanished`.

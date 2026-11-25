@@ -37,7 +37,7 @@ use leep_derive::Repo;
 use leep_meta::snapshot::{self, SnapshotInfo};
 use leep_meta::SchemaMode;
 use leep_store::sync::{
-    sync_blobs, sync_packs, PackSyncMode, PackSyncReport, SyncOptions, SyncReport,
+    copy_named, sync_blobs, sync_packs, PackSyncMode, PackSyncReport, SyncOptions, SyncReport,
 };
 use leep_store::PackFiles;
 use serde::{Deserialize, Serialize};
@@ -133,6 +133,16 @@ pub struct BlobSection {
     pub tombstones_copied: u64,
     #[serde(default)]
     pub corrupt_packs: Vec<String>,
+    /// Live derived and GC mark segment blobs the metadata snapshot names,
+    /// copied right after it, before the listing copy: GC may collect a
+    /// segment a later merge retired before a long listing reaches it.
+    #[serde(default)]
+    pub segments_named: u64,
+    #[serde(default)]
+    pub segments_copied: u64,
+    /// Named segments already gone from the source when copied.
+    #[serde(default)]
+    pub segments_vanished: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -163,6 +173,9 @@ pub trait Hooks: Send + Sync {
     /// The metadata snapshot is written; blobs are not copied yet. Anything
     /// that happens here is what happens "between the two halves" of a backup.
     async fn after_meta_snapshot(&self, _info: &SnapshotInfo) {}
+    /// The live segments the snapshot names are copied; the listing copy
+    /// has not started.
+    async fn after_segments_copied(&self) {}
 }
 
 pub struct NoHooks;
@@ -338,7 +351,74 @@ pub async fn closure_check(
         max_problems,
         ..VerifyOptions::default()
     };
-    integrity::verify(&repo, &opts, progress).await
+    let mut report = integrity::verify(&repo, &opts, progress).await?;
+    check_named_segments(&opened.url, &repo, max_problems, &mut report).await?;
+    Ok(report)
+}
+
+/// The live segments the snapshot's manifests name are in the copy. A
+/// missing derived segment of a family whose store feature is recorded is
+/// a problem: rows may have been retired, so it may hold the only copy of
+/// them, and a restore would derive them all again (from the root for
+/// the changeset families). Otherwise, and for GC mark segments, a note.
+async fn check_named_segments(
+    url: &str,
+    repo: &Repo,
+    max_problems: usize,
+    report: &mut integrity::VerifyReport,
+) -> Result<()> {
+    let named = leep_derive::derived_segments::named_segments(&**repo.row_meta()).await?;
+    for (family, feature, hashes) in &named.derived {
+        let mut missing = Vec::new();
+        for h in hashes {
+            if !repo.blobs().contains(h).await? {
+                missing.push(*h);
+            }
+        }
+        if missing.is_empty() {
+            continue;
+        }
+        if leep_meta::features::has_store_feature(url, SchemaMode::RequireCurrent, feature).await? {
+            for h in missing {
+                report.problems_total += 1;
+                if report.problems.len() < max_problems {
+                    report.problems.push(
+                        Problem::new(
+                            "derived",
+                            "missing_derived_segment",
+                            format!(
+                                "a live segment blob of derived segment family {family} is not \
+                                 in the copy; the store feature {feature} is recorded, so it \
+                                 may hold the only copy of retired rows, which a restore would \
+                                 derive again"
+                            ),
+                        )
+                        .kind(leep_derive::derived_segments::MANIFEST_KIND)
+                        .key(&h),
+                    );
+                }
+            }
+        } else {
+            report.notes.push(format!(
+                "{} live segment blob(s) of derived segment family {family} are not in the \
+                 copy; every row is still stored, so they seal again",
+                missing.len()
+            ));
+        }
+    }
+    let mut gone = 0;
+    for h in &named.gc_marks {
+        if !repo.blobs().contains(h).await? {
+            gone += 1;
+        }
+    }
+    if gone > 0 {
+        report.notes.push(format!(
+            "{gone} live GC mark segment(s) are not in the copy; the first gc after a restore \
+             walks every changeset"
+        ));
+    }
+    Ok(())
 }
 
 fn check_section(r: Option<&integrity::VerifyReport>, rehash: bool) -> CheckSection {
@@ -380,6 +460,7 @@ fn blob_section(location: &str, r: &SyncReport, p: Option<&PackSyncReport>) -> B
         vanished: r.vanished,
         only_in_backup: r.only_in_destination,
         corrupt: r.corrupt.iter().map(|h| h.to_hex()).collect(),
+        ..BlobSection::default()
     }
 }
 
@@ -480,6 +561,36 @@ pub async fn backup(
     hooks.after_meta_snapshot(&info).await;
 
     // 2. Blobs second: everything the snapshot references is already stored.
+    // The live segments its manifests name first: they are referenced by a
+    // row, not a changeset, and blob GC may collect one a later merge
+    // retired while a long listing copy is still on its way to it.
+    let segments = match &opts.dest_blobs {
+        Some(dest) => {
+            let opened = snapshot::open_snapshot(&meta_path).await?;
+            let meta =
+                leep_meta::open_meta_store_with(&opened.url, SchemaMode::RequireCurrent).await?;
+            let named = leep_derive::derived_segments::named_segments(&*meta).await?;
+            let r =
+                copy_named(&*opts.source_blobs, &**dest, &named.all(), opts.concurrency).await?;
+            progress.info(&format!(
+                "backup: segments the snapshot names: {}, {} already in the backup, {} copied, {} \
+                 already gone",
+                named.len(),
+                r.present,
+                r.copied,
+                r.vanished
+            ));
+            for h in &r.corrupt {
+                progress.info(&format!(
+                    "backup: WARNING: segment blob {h} in the source does not hash to its name; \
+                     not copied"
+                ));
+            }
+            Some((named.len() as u64, r))
+        }
+        None => None,
+    };
+    hooks.after_segments_copied().await;
     let blobs = match &opts.dest_blobs {
         Some(dest) => {
             let packs = copy_packs(
@@ -506,7 +617,13 @@ pub async fn backup(
                     "backup: WARNING: blob {h} in the source does not hash to its name; not copied"
                 ));
             }
-            blob_section(&opts.dest_blobs_location, &r, packs.as_ref())
+            let mut section = blob_section(&opts.dest_blobs_location, &r, packs.as_ref());
+            if let Some((named, r)) = &segments {
+                section.segments_named = *named;
+                section.segments_copied = r.copied;
+                section.segments_vanished = r.vanished;
+            }
+            section
         }
         None => BlobSection::default(),
     };

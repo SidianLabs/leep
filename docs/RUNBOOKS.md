@@ -1663,8 +1663,11 @@ recompute every value):
   three passes in a row over an hour. Fix the store, or let the pass drop
   it.
 - `bad_derived_segment`, or a note that a segment is not stored: a segment
-  blob was lost or damaged (a disk, a restore whose blob copy finished
-  before the segment was sealed, an older `gc` that collected it).
+  blob was lost or damaged (a disk, an older `gc` that collected it, or a
+  restore of a backup an older `leep-server` took: its listing copy could
+  reach a segment only after a merge retired it and `gc` collected it;
+  backups now copy the snapshot's segments first, and their check fails on
+  a missing one once the family's store feature is recorded).
 - `derived_mismatch` on `skiplist` or `history-tree-v4`: a row or a segment
   value is wrong. For the search kinds a pass compares a row with its
   segment value by the set or filter they stand for, so a mismatch there

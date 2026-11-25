@@ -182,6 +182,47 @@ async fn copy_one(
     Ok(Outcome::Copied(n, dirs))
 }
 
+/// Copy the blobs `hashes` that `dst` lacks, before any listing: blobs a
+/// snapshot names that garbage collection may delete while a long listing
+/// copy is still on its way to them (a backup's live segments, which a
+/// merge can retire and GC collect within the copy). Counts like
+/// [`sync_blobs`]; one not stored in `src` is `vanished`.
+pub async fn copy_named(
+    src: &dyn BlobStore,
+    dst: &dyn BlobStore,
+    hashes: &[Hash],
+    concurrency: usize,
+) -> Result<SyncReport> {
+    let mut report = SyncReport::default();
+    let mut results = stream::iter(hashes.iter().map(|h| async move {
+        if dst.contains(h).await? {
+            return Ok(None);
+        }
+        let m = BlobMeta {
+            hash: *h,
+            size: 0,
+            modified: None,
+        };
+        copy_one(src, dst, m, false).await.map(Some)
+    }))
+    .buffer_unordered(concurrency.max(1));
+    while let Some(r) = results.next().await {
+        report.listed += 1;
+        match r? {
+            None => report.present += 1,
+            Some(Outcome::Copied(n, _)) => {
+                report.copied += 1;
+                report.bytes_copied += n;
+            }
+            Some(Outcome::Vanished) => report.vanished += 1,
+            Some(Outcome::Corrupt(h)) => report.corrupt.push(h),
+        }
+    }
+    drop(results);
+    dst.flush(&[]).await?;
+    Ok(report)
+}
+
 /// Copy the tree nodes below the copied nodes that `dst` still lacks,
 /// reading them from `src` exactly.
 ///

@@ -3105,7 +3105,7 @@ history, trees and blobs first, derived rows after.
 | `bad_rebased_origin`, `bad_gc_row` | Bookkeeping rows that are malformed or name changesets that do not exist (a rebased-origin row may name a swept original, but must agree with its copy's `leep.rebased_from`) | Restore from a backup. A bad GC row can be deleted with SQL while no `gc` runs; `repair` refuses to touch them |
 | `bad_gc_segment` | A GC mark segment the manifest names does not decode, or holds a different number of marks (ADR 0103). One that is not stored is only a note (normal after restoring a backup taken while `gc` ran) | Nothing is lost: the next `gc` trusts only the segments before it, walks the rest and stops naming it. Run `gc` (or `gc --full`) |
 | `bad_derived_manifest` | The `derived-segments-v1` row does not decode (ADR 0104). No derived segment is read (rows still are), and `gc` keeps every blob that starts like a derived segment (it cannot tell live segments from orphans) while collecting the rest | In mode `build` every row is still stored: the next derived segments pass replaces the row. After `retire`, a pass refuses to; run `repair drop --kind skiplist --kind history-tree-v4` (it replaces the manifest with an empty one and drops the rows), then `repair rederive --kind history-tree-v4 --missing` or let reads derive them |
-| `bad_derived_segment` | A live derived segment's index or data does not decode (ADR 0104). One that is not stored is only a note (normal after restoring a backup whose blob copy finished before the segment was sealed) | Nothing wrong is read: its keys read as rows or derive again, and the next pass drops it from the manifest and seals the rows again. After `retire`, `repair rederive --kind skiplist --kind history-tree-v4 --missing` writes the rows at once |
+| `bad_derived_segment` | A live derived segment's index or data does not decode (ADR 0104). One that is not stored is only a note (a lost blob, an older `gc` that collected it, or a backup taken by an older `leep-server`, whose listing copy could reach a segment after `gc` had collected it, a merge having retired it since the metadata snapshot) | Nothing wrong is read: its keys read as rows or derive again, and the next pass drops it from the manifest and seals the rows again. After `retire`, `repair rederive --kind skiplist --kind history-tree-v4 --missing` writes the rows at once |
 | `reflog_divergence` | A ref's newest ref log entry does not say where the ref is now | Someone changed the `refs` table or the log directly, or a restore mixed two points in time. Decide which is right: if the ref is right, the log is merely incomplete and nothing breaks; if the log is right, `leep undo`-style recovery is `POST /v1/refs/{name}` to the logged value. `repair` never edits either |
 | `reflog_chain_break` | An entry's `new` does not equal the next entry's `old`: an entry was removed or edited | The log is the record of what happened; restore it from a backup if you need it complete. Refs are unaffected |
 
@@ -3249,7 +3249,8 @@ What a run does, in order, and why the order matters:
 
 1. **Metadata first**, in one read transaction (`REPEATABLE READ` on Postgres),
    written to `meta.db`. Its instant is the backup's recovery point.
-2. **Blobs second**: every blob the pool lacks is copied. Blobs are immutable and
+2. **Blobs second**: first the live derived and GC mark segments the snapshot's
+   manifests name (below), then every blob the pool lacks. Blobs are immutable and
    named by their content, so "already there" is proof it is right and the
    second backup copies only what is new (a store with nothing new costs two
    directory or bucket listings).
@@ -3261,8 +3262,15 @@ Metadata before blobs is the whole consistency argument. A blob that a stored
 changeset needs is never deleted (ADR 0012), so everything the snapshot needs
 is in the blob store when step 2 looks, no matter what lands or what GC deletes
 meanwhile; copying blobs first would miss blobs of changesets landed between
-the two. So there is **no need to stop servers or pause GC**, and no `gc
-collect` schedule has to avoid the backup window. If a backup's check ever
+the two. Segment blobs (ADR 0103, 0104) are the exception: a metadata row names
+them, not a changeset, and a compactor merge can retire a segment the snapshot
+names, after which `gc` may collect it while a long listing copy is still on
+its way to it. So the backup copies those first, right after the snapshot, and
+the check counts a live derived segment missing from the copy as a problem once
+its family's store feature is recorded (it may hold the only copy of retired
+rows); otherwise, and for GC mark segments, it is a note. So there is **no need
+to stop servers or pause GC**, and no `gc collect` schedule has to avoid the
+backup window. If a backup's check ever
 finds a missing blob (a GC bug, `gc --unsafe-no-fence` run under live servers, a
 store that was already damaged) the backup is sealed as failed, prints the
 problems, exits 1 and `restore` refuses it.

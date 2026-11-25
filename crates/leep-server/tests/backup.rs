@@ -1003,3 +1003,140 @@ async fn a_tree_stored_while_the_blobs_are_listed_is_copied_whole() {
         text
     );
 }
+
+/// Deletes every live derived segment blob from the source, as a compactor
+/// merge retiring them and a `gc` collecting them during a long blob copy
+/// would; before the segments are copied, or after.
+struct CollectSegments {
+    blobs: Arc<dyn BlobStore>,
+    segments: Vec<Hash>,
+    before_copy: bool,
+}
+
+impl CollectSegments {
+    async fn collect(&self) {
+        for h in &self.segments {
+            self.blobs.delete(h).await.unwrap();
+        }
+    }
+}
+
+#[async_trait]
+impl Hooks for CollectSegments {
+    async fn after_meta_snapshot(&self, _: &SnapshotInfo) {
+        if self.before_copy {
+            self.collect().await;
+        }
+    }
+    async fn after_segments_copied(&self) {
+        if !self.before_copy {
+            self.collect().await;
+        }
+    }
+}
+
+/// The live segments a snapshot names are copied right after it, so `gc`
+/// collecting them during the listing copy cannot leave the backup without
+/// them; and a backup that misses one, once its family's store feature is
+/// recorded, fails its check (the segment may hold the only copy of retired
+/// rows).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_segments_are_copied_before_gc_can_collect_them() {
+    use leep_derive::derived_segments::{
+        compact_pass, named_segments, CompactOptions, CompactState, Features, Mode,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let site = Arc::new(Site::new(root.path(), "src").await);
+    let (mut tip, _, _) = site.populate().await;
+    for i in 0..12 {
+        let next = site
+            .commit(&[tip], &[("src/n.rs", &format!("fn n{i}() {{}}\n"))], "n")
+            .await;
+        site.advance("main", next).await;
+        tip = next;
+    }
+    leep_derive::derived::derive::<leep_derive::derived::HistoryTree>(&site.repo, tip)
+        .await
+        .unwrap();
+    let url = site.meta_url.clone();
+    let features = Features {
+        record: Arc::new(move |name| {
+            let url = url.clone();
+            Box::pin(async move {
+                leep_meta::features::add_store_feature(&url, SchemaMode::RequireCurrent, name).await
+            })
+        }),
+        recorded: Arc::new(|_| Box::pin(async { Ok(false) })),
+    };
+    let mut st = CompactState::default();
+    for _ in 0..8 {
+        compact_pass(
+            &site.repo,
+            &CompactOptions::small(Mode::Retire),
+            &mut st,
+            Some(&features),
+        )
+        .await
+        .unwrap();
+    }
+    let named = named_segments(&**site.repo.row_meta()).await.unwrap();
+    let segments: Vec<Hash> = named
+        .derived
+        .iter()
+        .flat_map(|(_, _, h)| h.iter().copied())
+        .collect();
+    assert!(!segments.is_empty());
+    let source = leep_store::open_blob_store(&site.blobs_url).unwrap();
+    let mut saved = Vec::new();
+    for h in &segments {
+        saved.push((*h, source.get(h).await.unwrap().unwrap()));
+    }
+
+    // Collected after the segments were copied: the backup holds them.
+    let out = root.path().join("backup");
+    let outcome = backup::backup(
+        opts(&site, &out),
+        &CollectSegments {
+            blobs: source.clone(),
+            segments: segments.clone(),
+            before_copy: false,
+        },
+        quiet(),
+    )
+    .await
+    .unwrap();
+    assert!(outcome.ok(), "{:?}", outcome.problems);
+    assert_eq!(outcome.manifest.blobs.segments_named, named.len() as u64);
+    assert_eq!(outcome.manifest.blobs.segments_copied, named.len() as u64);
+    let pool =
+        leep_store::open_blob_store(&format!("file://{}", out.join("blobs").display())).unwrap();
+    for h in &segments {
+        assert!(pool.contains(h).await.unwrap(), "{h}");
+    }
+
+    // Collected before they could be copied: the check fails.
+    for (h, b) in &saved {
+        source.put_with_hash(*h, b.clone()).await.unwrap();
+    }
+    let out = root.path().join("backup2");
+    let outcome = backup::backup(
+        opts(&site, &out),
+        &CollectSegments {
+            blobs: source.clone(),
+            segments: segments.clone(),
+            before_copy: true,
+        },
+        quiet(),
+    )
+    .await
+    .unwrap();
+    assert!(!outcome.ok());
+    assert!(
+        outcome
+            .problems
+            .iter()
+            .any(|p| p.code == "missing_derived_segment"),
+        "{:?}",
+        outcome.problems
+    );
+}
