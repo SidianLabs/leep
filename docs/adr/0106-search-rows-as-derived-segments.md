@@ -153,9 +153,14 @@ Accepted by the maintainer on 2026-11-15.
   512 KiB at level 17 2.82 MB, 1 MiB at level 17 2.62 MB (4.2 MB of rows,
   0.8 s of one core at level 17). A block and the zstd level are the
   writer's choice: the block directory says where each lies.
-- A seal reads a page a batch of keys at a time and closes a segment once
-  its rows reach four thirds of the cap, so a pass holds about one
-  segment's rows at once (a dense filter is 64 KiB). Encoding runs on the
+- A seal reads a page as many keys at a time as keep a read near 4 MiB of
+  rows (16 at first, halved after a read over it, doubled after one under a
+  quarter of it, at most the 1,000 of a batch; amended 2026-11-25: it read
+  1,000 keys of four columns whatever their size, up to 256 MB of dense
+  filters), and closes a segment once its rows reach four thirds of the
+  cap, so a pass holds about one segment's rows at once (a dense filter is
+  64 KiB). A retirement reads and deletes its rows in steps of the same
+  size. Encoding runs on the
   blocking pool, off the async workers.
 - Merges: the first run of two or more adjacent small segments (under half
   of both caps, 1 MiB and 16,384 keys), up to four, as far as they fit;

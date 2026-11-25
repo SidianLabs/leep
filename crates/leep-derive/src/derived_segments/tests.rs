@@ -2093,3 +2093,31 @@ async fn a_retirement_step_stops_at_an_unreadable_value() {
     let p = v1(&pass(&r, &retire, &mut st, Some(&hook)).await);
     assert_eq!(p.dropped, 1, "{p:?}");
 }
+
+/// A listing keeps in memory only the keys a seal or a retirement needs:
+/// once every row is sealed in mode `build` (rows stay), none.
+#[tokio::test]
+async fn a_listing_keeps_only_keys_with_work() {
+    let r = repo();
+    let ids = build(&r, None).await;
+    let o = CompactOptions::small(Mode::Build);
+    let mut st = CompactState::default();
+    settle(&r, &o, &mut st, None).await;
+    assert_eq!(
+        r.row_meta().count_derived(Skiplist::NAME).await.unwrap(),
+        ids.len() as u64
+    );
+    let p = pass(&r, &o, &mut st, None).await;
+    assert!(p.listed, "{p:?}");
+    assert_eq!(p.listed_keys, 0, "{p:?}");
+    // A new changeset's rows are kept until sealed.
+    commit(
+        &r,
+        &[*ids.last().unwrap()],
+        &[("late", Some("late"))],
+        "late",
+    )
+    .await;
+    let p = pass(&r, &o, &mut st, None).await;
+    assert!(p.listed_keys > 0, "{p:?}");
+}

@@ -127,7 +127,9 @@ A pass runs every `--derived-segments-interval` (5 minutes) in the index
 lane (ADR 0073) under the store-wide lease `maintenance/derived-segments`,
 one server at a time. It loads the live segments' indexes itself, never
 through the shared read view (whose state a reader's transient error or a
-late read may have moved), lists the keys of both kinds (bounded pages;
+late read may have moved), lists the keys of both kinds (bounded pages,
+each joined against the segments' sorted keys in its range, keeping in
+memory only the keys a seal or a retirement needs, not every key listed;
 in mode `build` only once their estimated count grew by 1,024 since the
 last listing or 10 minutes passed, so a quiet store is not listed every
 pass), and:

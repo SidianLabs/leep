@@ -33,3 +33,10 @@
   derived segment missing from the copy as a problem once its family's
   store feature is recorded. The manifest's blob section gains
   `segments_named`, `segments_copied` and `segments_vanished`.
+- **Fixed.** Derived segment passes no longer hold every row key of a
+  family in memory at each listing (about 150 MB for 1.2 million
+  changesets): a listing keeps only the keys a seal or a retirement needs.
+  `content-v1` no longer remembers every dead row's key between listings,
+  and seals and retirements read as many keys at once as keep a read near
+  4 MiB, not 1,000 keys of up to 64 KiB each. Pass reports gain
+  `listed_keys`.

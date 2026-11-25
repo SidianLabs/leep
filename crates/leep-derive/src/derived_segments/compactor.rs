@@ -287,6 +287,20 @@ impl CompactOptions {
     }
 }
 
+/// About the most row bytes a `content-v1` seal or retirement reads at once
+/// (a dense directory filter is 64 KiB, and a key has up to four columns):
+/// the keys read at once adapt to it.
+pub(crate) const READ_BYTES: usize = 4 << 20;
+
+/// Keys a `content-v1` seal or retirement reads at first, before it knows
+/// how large the family's rows are.
+const CONTENT_FIRST_STEP: usize = 16;
+
+/// Most keys a family's state remembers to skip (`unstored`, `bad`)
+/// between listings: past it they are forgotten at the next listing, which
+/// only costs looking at them again.
+pub(crate) const SKIPPED_CAP: usize = 65_536;
+
 /// Passes in a row a live segment must fail to read in before it is dropped
 /// (and [`CompactOptions::drop_failing_after`] must have passed).
 pub const FAILING_PASSES: u32 = 3;
@@ -366,7 +380,7 @@ struct FamilyState {
     reseal: HashSet<(Hash, u8)>,
     /// Keys with rows whose changeset is not stored (the changeset sweep
     /// was killed between rows and changeset): skipped until the next
-    /// listing after `list_every`.
+    /// listing after `list_every`, and at most [`SKIPPED_CAP`] of them.
     unstored: HashSet<Hash>,
     /// Rows whose value does not decode, by key and column: not sealed,
     /// and skipped like `unstored` (cleared with it), so they do not make
@@ -470,6 +484,9 @@ pub struct PassReport {
     pub newer_manifest: bool,
     /// Whether the rows were listed (in mode `build` only when they grew).
     pub listed: bool,
+    /// Keys a listing kept in memory: those with a row to seal, or (mode
+    /// `retire`) one a ripe segment holds; never every key listed.
+    pub listed_keys: u64,
     /// Whether the pass made progress and stopped with work left (a
     /// backfill's candidates beyond its pages or time, rows beyond its
     /// retire bound): the next pass should run soon.
@@ -495,6 +512,7 @@ impl PassReport {
         self.damaged_manifest |= r.damaged_manifest;
         self.newer_manifest |= r.newer_manifest;
         self.listed |= r.listed;
+        self.listed_keys += r.listed_keys;
         self.more |= r.more;
     }
 
@@ -645,6 +663,9 @@ pub(crate) struct Pass<'a> {
     /// leaves keys out only then).
     live: Option<Arc<ContentLive>>,
     live_current: bool,
+    /// Keys read at once when sealing or retiring `content-v1` rows, kept
+    /// near [`READ_BYTES`] a read.
+    read_step: usize,
     report: PassReport,
 }
 
@@ -717,6 +738,10 @@ impl<'a> Pass<'a> {
             condemned: HashSet::new(),
             live: None,
             live_current: false,
+            read_step: match fam.keys {
+                Keys::Changesets => opts.batch.max(1),
+                Keys::Content => CONTENT_FIRST_STEP.min(opts.batch.max(1)),
+            },
             report,
         };
         if !p.report.newer_manifest {
@@ -1346,6 +1371,7 @@ impl<'a> Pass<'a> {
         if state
             .unstored_cleared
             .is_none_or(|at| at.elapsed() >= self.opts.list_every)
+            || state.unstored.len() + state.bad.len() > SKIPPED_CAP
         {
             state.unstored.clear();
             state.bad.clear();
@@ -1353,6 +1379,33 @@ impl<'a> Pass<'a> {
         }
         state.listed = Some((Instant::now(), estimate));
         self.report.listed = true;
+        if self.fam.keys == Keys::Content && !self.man.live.is_empty() {
+            // Liveness decides which listed keys are kept, below.
+            self.content_live(state).await?;
+        }
+        // Segments whose rows a retirement would delete now.
+        let now = Instant::now();
+        let ripe: HashSet<u32> = if self.opts.mode == Mode::Retire {
+            self.man
+                .live
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| {
+                    state
+                        .live_since
+                        .get(&s.index)
+                        .is_some_and(|t| now.duration_since(*t) >= self.opts.retire_after)
+                })
+                .map(|(i, _)| i as u32)
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        // Only keys a seal or a retirement needs are kept: a row no live
+        // segment holds (or one to seal again) that the family keeps, or
+        // one a ripe segment holds in mode retire. In mode build every
+        // sealed row stays, so keeping them all would hold every key of the
+        // family in memory at each listing.
         let mut rows: HashMap<Hash, RowKey> = HashMap::new();
         for c in self.fam.columns {
             let (col, kind) = (c.id, c.kind);
@@ -1367,23 +1420,61 @@ impl<'a> Pass<'a> {
                     break;
                 };
                 after = Some(last);
-                for k in page {
-                    if !state.unstored.contains(&k) && !state.bad.contains(&(k, col)) {
-                        rows.entry(k)
-                            .or_insert(RowKey {
-                                have: 0,
-                                holder: [NONE; SLOTS],
-                            })
-                            .have |= bit(col);
+                let held = self.page_holders(&page, col);
+                for (k, at) in page.into_iter().zip(held) {
+                    if state.unstored.contains(&k) || state.bad.contains(&(k, col)) {
+                        continue;
                     }
+                    let open = at == NONE || state.reseal.contains(&(k, col));
+                    let wanted = (open && self.keep_mask(&k) & bit(col) != 0)
+                        || (at != NONE && ripe.contains(&at));
+                    if !wanted {
+                        continue;
+                    }
+                    let r = rows.entry(k).or_insert(RowKey {
+                        have: 0,
+                        holder: [NONE; SLOTS],
+                    });
+                    r.have |= bit(col);
+                    r.holder[slot(col)] = at;
                 }
             }
         }
         // Work still carried accounts for every live segment (`run` checked),
         // so it stays valid; from here on so does what this listing finds.
         state.known = self.man.live.iter().map(|s| (s.index, s.columns)).collect();
+        self.report.listed_keys = rows.len() as u64;
         self.rows = Some(rows);
         Ok(())
+    }
+
+    /// The newest live segment holding each of `page`'s keys (ascending, as
+    /// listed) for `col`, as its position in the live list: each segment's
+    /// keys in the page's range are walked once, so a whole listing costs
+    /// about the sealed keys plus a few searches per page and segment.
+    fn page_holders(&self, page: &[Hash], col: u8) -> Vec<u32> {
+        let mut out = vec![NONE; page.len()];
+        let (Some(lo), Some(hi)) = (page.first(), page.last()) else {
+            return out;
+        };
+        for (i, s) in self.man.live.iter().enumerate().rev() {
+            if !s.has(col) {
+                continue;
+            }
+            let Some(l) = self.segs.get(&s.index) else {
+                continue;
+            };
+            let keys = l.idx.keys();
+            let start = keys.partition_point(|k| k < lo);
+            for k in keys[start..].iter().take_while(|k| *k <= hi) {
+                if let Ok(j) = page.binary_search(k) {
+                    if out[j] == NONE && l.idx.has(k, col) {
+                        out[j] = i as u32;
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// The keys to seal from a fresh listing, once there are enough of
@@ -1421,10 +1512,9 @@ impl<'a> Pass<'a> {
                     open |= bit(col);
                 }
             }
-            // `content-v1` seals only what retention keeps (ADR 0106); a key
-            // with nothing it keeps is skipped like an unstored one until the
-            // next listing after `list_every`, so mode retire does not
-            // handle the never-sealed rows again every pass.
+            // `content-v1` seals only what retention keeps (ADR 0106); the
+            // listing already left out keys with nothing it keeps, so they
+            // cost no memory between listings.
             let kept = open & self.keep_mask(k);
             if open != 0 && kept == 0 {
                 dead_now.push(*k);
@@ -1463,7 +1553,6 @@ impl<'a> Pass<'a> {
             let dead: HashSet<&Hash> = dead_now.iter().collect();
             state.reseal.retain(|(k, _)| !dead.contains(k));
         }
-        state.unstored.extend(dead_now);
         state.lone_since.retain(|k, _| lone_now.contains(k));
         self.report.unsealed_rows = unsealed_rows;
         if keyed > state.last_unsealed || state.last_growth.is_none() {
@@ -1563,22 +1652,34 @@ impl<'a> Pass<'a> {
     /// Read the rows of one page and seal them, in segments that fit
     /// `max_bytes`. A row gone meanwhile is left out; one whose value does
     /// not decode is remembered and not listed again for a while. A page of
-    /// `content-v1` (rows of up to 64 KiB) is read a batch of keys at a time
-    /// and sealed once its rows reach about the cap, so a pass holds about
-    /// one segment's rows at once.
+    /// `content-v1` (rows of up to 64 KiB, four columns) is read a few keys
+    /// at a time, as many as keep a read near [`READ_BYTES`], and sealed
+    /// once its rows reach about the cap, so a pass holds about one
+    /// segment's rows at once.
     async fn seal_page(
         &mut self,
         page: &[(u64, Hash, u64)],
         state: &mut FamilyState,
     ) -> Result<()> {
-        let (step, cut) = match self.fam.keys {
+        let (mut step, cut) = match self.fam.keys {
             Keys::Changesets => (page.len().max(1), usize::MAX),
-            Keys::Content => (self.opts.batch.max(1), self.max_bytes() / 3 * 4),
+            Keys::Content => (self.read_step, self.max_bytes() / 3 * 4),
         };
         let mut seal: Vec<SealRow> = Vec::new();
         let mut raw = 0usize;
-        for part in page.chunks(step) {
-            for row in self.read_seal_rows(part).await? {
+        let mut at = 0;
+        while at < page.len() {
+            let part = &page[at..(at + step).min(page.len())];
+            at += part.len();
+            let rows = self.read_seal_rows(part).await?;
+            if self.fam.keys == Keys::Content {
+                let read: usize = rows
+                    .iter()
+                    .flat_map(|r| r.values.iter().map(|(_, v)| v.len()))
+                    .sum();
+                step = self.adapt_step(read);
+            }
+            for row in rows {
                 raw += row.values.iter().map(|(_, v)| v.len()).sum::<usize>();
                 seal.push(row);
                 if raw >= cut {
@@ -1588,6 +1689,20 @@ impl<'a> Pass<'a> {
             }
         }
         self.seal_rows(seal, state).await
+    }
+
+    /// The keys to read at once next, after a read of `read` bytes: halved
+    /// past [`READ_BYTES`], doubled (up to the batch) under a quarter of it.
+    /// Changeset rows are small; this only steers `content-v1`.
+    fn adapt_step(&mut self, read: usize) -> usize {
+        let batch = self.opts.batch.max(1);
+        if read > READ_BYTES {
+            self.read_step = (self.read_step / 2).max(1);
+        } else if read < READ_BYTES / 4 {
+            self.read_step = (self.read_step * 2).min(batch);
+        }
+        self.read_step = self.read_step.min(batch);
+        self.read_step
     }
 
     /// The rows of `part` (keys with the columns to seal), as stored now.
@@ -2017,7 +2132,7 @@ impl<'a> Pass<'a> {
                 }
                 let col = cands[i].1;
                 let mut j = i;
-                while j < cands.len() && j - i < self.opts.batch.max(1) && cands[j].1 == col {
+                while j < cands.len() && j - i < self.read_step && cands[j].1 == col {
                     j += 1;
                 }
                 let chunk: Vec<(Hash, Loc)> = cands[i..j]
@@ -2135,6 +2250,10 @@ impl<'a> Pass<'a> {
         let started = std::time::Instant::now();
         let ks: Vec<Hash> = chunk.iter().map(|(k, _)| *k).collect();
         let got = self.repo.row_meta().get_derived_many(kind, &ks).await?;
+        if self.fam.keys == Keys::Content {
+            let read: usize = got.iter().flatten().map(|v| v.len()).sum();
+            self.adapt_step(read);
+        }
         let mut pairs = Vec::with_capacity(ks.len());
         for ((k, loc), row) in chunk.iter().zip(got) {
             let Some(row) = row else { continue };
