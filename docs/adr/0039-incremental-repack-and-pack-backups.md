@@ -165,7 +165,10 @@ for a `file://`/path or `s3://` URL, and returns `None` for `mem://`.
   an object the source deleted before its next full repack, so a pool
   keeps somewhat more packs than the source. No prune that knows which
   sealed snapshots still need an object exists; ADR 0026 has the
-  retention advice (start a new pool).
+  retention advice (start a new pool). *Amended by ADR 0107 section 6a:*
+  such a pack is pruned too once the objects only it holds are copied
+  into a pool pack of their own, so the pool grows by those objects
+  rather than by a whole pack per repack.
 
 `BackupOptions` and `RestoreOptions` gain `source_packs`/`dest_packs`
 (`target_packs`). The manifest's blob section gains `packs_listed`,
