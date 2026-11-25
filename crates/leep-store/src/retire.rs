@@ -46,6 +46,9 @@ pub struct SweepReport {
     pub retired_bytes_removed: u64,
     /// Retired packs still inside their fence, left for a later sweep.
     pub retired_waiting: u64,
+    /// Loose copies a killed repack cleanup left moved aside, put back
+    /// (filesystem stores, the first sweep of a process).
+    pub asides_restored: u64,
 }
 
 pub(crate) fn retired_line(id: &str, at: i64) -> String {
@@ -283,7 +286,16 @@ impl FsBlobStore {
             Err(Error::Conflict(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let r = sweep_locked(&dir, fence)?;
+        let mut r = sweep_locked(&dir, fence)?;
+        // Under the lock, so no cleanup is in its window: a copy aside is a
+        // leftover. Only the first sweep of a process walks the shards for
+        // them: a kill leaves them, and a restarted server sweeps first; a
+        // cleanup that fails in process puts its copy back itself.
+        use std::sync::atomic::Ordering;
+        if !self.asides_restored.load(Ordering::Acquire) {
+            r.asides_restored = crate::repack::restore_asides(self.root())?;
+            self.asides_restored.store(true, Ordering::Release);
+        }
         if r.garbage_removed + r.retired_removed > 0 {
             self.packs.rescan(crate::packset::ScanReason::Repack)?;
         }

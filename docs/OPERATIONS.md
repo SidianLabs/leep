@@ -2964,8 +2964,8 @@ Backups copy packs as files into the backup pool (ADR 0039; see "Backup and
 restore"), so restoring a packed store gives a packed store.
 
 Do not delete anything under `packs/` by hand, and do not delete
-`.repack-*` files in the shard directories: each is a whole object that the
-next repack puts back. `.tmp-*` files under `packs/` belong to a running
+`.repack-*` files in the shard directories: each is a whole object that a
+restarted server's first sweep (or the next repack) puts back. `.tmp-*` files under `packs/` belong to a running
 repack or pack write, or are leftovers the next sweep deletes.
 `packs/retired` is the record that keeps retired packs unread; deleting it
 makes them searched and merged again until a repack retires them anew.
@@ -3573,8 +3573,9 @@ nothing removes them; delete those older than the request timeout if the
 space matters:
 `find /var/lib/leep/blobs -path '*/packs' -prune -o -name '.tmp-*' -mmin +60 -delete`.
 A killed repack leaves `.tmp-*` files in `packs/` and `.repack-*` files in the
-shard directories; leave them, the next repack deletes the first and puts the
-second (whole objects) back.
+shard directories; leave them, the next sweep deletes the first, and a
+server's first sweep after it starts (or the next repack) puts the second
+(whole objects) back.
 
 ## Soak tests
 

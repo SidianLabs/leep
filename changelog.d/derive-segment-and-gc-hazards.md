@@ -45,3 +45,11 @@
   rows behind for good. A collect now prunes those of blobs it deleted
   more than 30 days ago (`fence rows of long-deleted blobs pruned` in its
   report).
+- **Fixed.** A repack cleanup killed with a loose copy moved aside left a
+  rescued object (deleted from its pack by GC, uploaded again) unreadable
+  until an operator ran `leep-server repack`. A server's first sweep now
+  puts such copies back, and a cleanup that fails puts its copy back
+  itself.
+- **Fixed.** A pack merge kept the write time of the first copy of an
+  object several packs held, not the latest, so an upload's refresh could
+  look old to GC's grace and rescue checks.

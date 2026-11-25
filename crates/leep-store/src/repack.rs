@@ -15,7 +15,7 @@
 //! lock.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -355,17 +355,30 @@ impl PublishedPack {
                 Err(e) if e.kind() == ErrorKind::NotFound => continue,
                 Err(e) => return Err(storage_err(e)),
             }
-            step(&self.opts, RepackStep::LooseMovedAside(n))?;
-            let rewritten = stamp_of(mtime(&aside)?) != *packed_mtime;
-            // Collect writes its tombstone before it unlinks the loose file,
-            // and the upload that rescues the blob comes after the unlink.
-            let view = store.packs.fresh_tombstones()?;
-            let dead = new_id.as_ref().is_none_or(|id| {
-                !view
-                    .packs
-                    .iter()
-                    .any(|(p, dead)| &p.id == id && !dead.contains(hash))
-            });
+            // Until resolved, a failure puts the copy back: it may be the
+            // only live one (a kill leaves it to the next sweep).
+            let judged = (|| {
+                step(&self.opts, RepackStep::LooseMovedAside(n))?;
+                let rewritten = stamp_of(mtime(&aside)?) != *packed_mtime;
+                // Collect writes its tombstone before it unlinks the loose
+                // file, and the upload that rescues the blob comes after the
+                // unlink.
+                let view = store.packs.fresh_tombstones()?;
+                let dead = new_id.as_ref().is_none_or(|id| {
+                    !view
+                        .packs
+                        .iter()
+                        .any(|(p, dead)| &p.id == id && !dead.contains(hash))
+                });
+                Ok::<_, Error>((rewritten, dead))
+            })();
+            let (rewritten, dead) = match judged {
+                Ok(j) => j,
+                Err(e) => {
+                    let _ = put_back(&aside, &path);
+                    return Err(e);
+                }
+            };
             if rewritten || dead {
                 put_back(&aside, &path)?;
                 put_back_dirs.insert(path.parent().expect("blob path has a parent").to_path_buf());
@@ -592,6 +605,51 @@ struct LooseObject {
     mtime: Option<SystemTime>,
 }
 
+/// Put back every loose copy a repack cleanup moved aside and did not
+/// resolve (a kill in its window), with the repack lock held: such a copy
+/// may be the only live one of an object GC deleted from the pack and a
+/// client uploaded again, and nothing reads it there. Returns how many
+/// were put back (a copy whose address is stored again is only removed).
+pub(crate) fn restore_asides(root: &Path) -> Result<u64> {
+    let mut leftovers = LeftoverCounts {
+        restore: true,
+        ..LeftoverCounts::default()
+    };
+    for shard in 0..=255u8 {
+        let prefix = format!("{shard:02x}");
+        let dir = root.join(&prefix);
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => return Err(storage_err(e)),
+        };
+        let mut any = false;
+        for entry in rd {
+            let entry = entry.map_err(storage_err)?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(rest) = name.strip_prefix(ASIDE_PREFIX) else {
+                continue;
+            };
+            if format!("{prefix}{rest}").parse::<Hash>().is_err() {
+                continue;
+            }
+            let path = dir.join(rest);
+            if path.exists() {
+                leftovers.removed += 1;
+            } else {
+                leftovers.restored += 1;
+            }
+            put_back(&entry.path(), &path)?;
+            any = true;
+        }
+        if any {
+            sync_dir(&dir)?;
+        }
+    }
+    Ok(leftovers.restored)
+}
+
 /// Every loose object, in hash order.
 fn loose_objects(root: &Path, leftovers: &mut LeftoverCounts) -> Result<Vec<LooseObject>> {
     let mut out = Vec::new();
@@ -662,6 +720,9 @@ struct Sources {
     /// that an incremental repack names, so their first versions end at the
     /// repack's level too.
     recompress: Vec<bool>,
+    /// By id, the latest write time of an object several merged packs hold
+    /// when it is not the chosen copy's (rare: duplicates only).
+    later: HashMap<u32, i64>,
 }
 
 impl Sources {
@@ -728,7 +789,7 @@ fn read_source(store: &FsBlobStore, src: &Sources, id: u32, hash: &Hash) -> Resu
         let data = store.packs.decode(p, &e)?;
         return Ok(Read::Ok {
             data,
-            modified: e.modified,
+            modified: src.later.get(&id).copied().unwrap_or(e.modified),
             from_loose: None,
         });
     }
@@ -740,11 +801,14 @@ fn read_source(store: &FsBlobStore, src: &Sources, id: u32, hash: &Hash) -> Resu
 }
 
 /// Live hashes of `packs` in ascending order, each once, with the first
-/// pack (in the order given) that has it and its rank there. A heap merge
-/// of the sorted indexes, so it holds nothing per object.
+/// pack (in the order given) that has it and its rank there, and, when
+/// another pack holds a copy written later, that later write time: the
+/// merged copy keeps the latest, so an upload's refresh (GC's grace and
+/// "rescued by upload" checks, ADR 0012) survives a merge. A heap merge of
+/// the sorted indexes, so it holds nothing per object.
 fn merge_packs<'a>(
     packs: &'a [(usize, &'a Pack, &'a HashSet<Hash>)],
-) -> impl Iterator<Item = (Hash, usize, u32)> + 'a {
+) -> impl Iterator<Item = (Hash, usize, u32, Option<i64>)> + 'a {
     let mut heap: BinaryHeap<Reverse<(Hash, usize, u32)>> = BinaryHeap::new();
     let next_live = |k: usize, mut rank: u32| -> Option<(Hash, usize, u32)> {
         let (_, p, dead) = packs[k];
@@ -760,15 +824,20 @@ fn merge_packs<'a>(
     for k in 0..packs.len() {
         heap.extend(next_live(k, 0).map(Reverse));
     }
-    let mut last: Option<Hash> = None;
-    std::iter::from_fn(move || loop {
+    std::iter::from_fn(move || {
         let Reverse((h, k, rank)) = heap.pop()?;
         heap.extend(next_live(k, rank + 1).map(Reverse));
-        if last == Some(h) {
-            continue;
+        let first = packs[k].1.index.entry(rank).modified;
+        let mut latest = first;
+        while let Some(Reverse((h2, k2, r2))) = heap.peek().copied() {
+            if h2 != h {
+                break;
+            }
+            heap.pop();
+            heap.extend(next_live(k2, r2 + 1).map(Reverse));
+            latest = latest.max(packs[k2].1.index.entry(r2).modified);
         }
-        last = Some(h);
-        return Some((h, packs[k].0, rank));
+        Some((h, packs[k].0, rank, (latest > first).then_some(latest)))
     })
 }
 
@@ -913,6 +982,7 @@ impl FsBlobStore {
             packed: Vec::with_capacity(most),
             packs: view.packs.iter().map(|(p, _)| p.clone()).collect(),
             recompress,
+            later: HashMap::new(),
         };
         {
             let mut packed = merge_packs(&merging).peekable();
@@ -933,9 +1003,12 @@ impl FsBlobStore {
                 let mut src_packed = u64::MAX;
                 let mut src_loose = NOT_LOOSE;
                 if take_packed {
-                    let (h, k, rank) = packed.next().unwrap();
+                    let (h, k, rank, later) = packed.next().unwrap();
                     hash = Some(h);
                     src_packed = (k as u64) << 32 | u64::from(rank);
+                    if let Some(t) = later {
+                        sources.later.insert(hashes.len() as u32, t);
+                    }
                 }
                 if take_loose {
                     let o = loose.next().unwrap();
