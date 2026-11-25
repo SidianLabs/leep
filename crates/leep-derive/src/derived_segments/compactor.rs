@@ -1132,10 +1132,10 @@ impl<'a> Pass<'a> {
         Ok(l)
     }
 
-    /// The columns of `key` a seal may take and a merge keeps: every column
-    /// of a changeset family; in `content-v1` the keyframes always (a live
-    /// patch may stand on the keyframe of a version no head holds), and a
-    /// blob or tree row only while retention keeps it live.
+    /// The columns of `key` a seal may take: every column of a changeset
+    /// family; in `content-v1` the keyframes always (a live patch may stand
+    /// on the keyframe of a version no head holds), and a blob or tree row
+    /// only while retention keeps it live.
     fn keep_mask(&self, key: &Hash) -> u64 {
         match (self.fam.keys, &self.live) {
             (Keys::Changesets, _) => u64::MAX,
@@ -1143,6 +1143,23 @@ impl<'a> Pass<'a> {
             (Keys::Content, Some(_)) => self.fam.keyframe_mask(),
             (Keys::Content, None) => u64::MAX,
         }
+    }
+
+    /// The columns of `key` a merge keeps: [`Pass::keep_mask`], and in
+    /// `content-v1` every directory filter too, live or not
+    /// ([`Family::merge_kept_mask`]).
+    fn merge_keep_mask(&self, key: &Hash) -> u64 {
+        self.keep_mask(key) | self.fam.merge_kept_mask()
+    }
+
+    /// Whether the ref log has not moved since the walk this pass judges
+    /// liveness by: a merge leaves keys out only then, read again right
+    /// before each swap that would.
+    async fn walk_still_current(&self) -> Result<bool> {
+        let Some(l) = &self.live else {
+            return Ok(false);
+        };
+        Ok(self.repo.newest_ref_seq().await? == l.seq)
     }
 
     /// The sort keys of `ids` in a segment of the family: the generations of
@@ -1678,7 +1695,7 @@ impl<'a> Pass<'a> {
     /// third is such rows is rewritten alone (ADR 0106).
     async fn merge(&mut self, state: &mut FamilyState) -> Result<()> {
         let f = self.opts.fanout.max(2);
-        let omit = if self.fam.keys == Keys::Content && !self.man.live.is_empty() {
+        let mut omit = if self.fam.keys == Keys::Content && !self.man.live.is_empty() {
             self.content_live(state).await?;
             self.live_current
         } else {
@@ -1783,9 +1800,11 @@ impl<'a> Pass<'a> {
                 self.mark_unreadable(index, state);
                 continue;
             }
+            let before = values.len();
             if omit {
-                values.retain(|(key, col), _| self.keep_mask(key) & bit(*col) != 0);
+                values.retain(|(key, col), _| self.merge_keep_mask(key) & bit(*col) != 0);
             }
+            let omitted = values.len() != before;
             let mut keys: Vec<Hash> = values.keys().map(|(k, _)| *k).collect();
             keys.sort_unstable();
             keys.dedup();
@@ -1813,6 +1832,17 @@ impl<'a> Pass<'a> {
             self.report.bad_values += bad.len() as u64;
             if enc.seg.data_len as usize > cap {
                 state.oversize.insert(run.iter().map(|s| s.index).collect());
+                continue;
+            }
+            // Keys are left out only while the walk that judged them is
+            // current: a ref that moved meanwhile (a revert, a branch at an
+            // old revision) may hold them again. Then nothing more is left
+            // out in this pass, and this run is merged again keeping
+            // everything.
+            if omitted && !self.walk_still_current().await? {
+                omit = false;
+                self.live_current = false;
+                dead.clear();
                 continue;
             }
             if enc.seg.rows > 0 {
@@ -1914,7 +1944,7 @@ impl<'a> Pass<'a> {
             }
             for k in l.idx.keys_with(c.id) {
                 total += 1;
-                if by_liveness && self.keep_mask(k) & bit(c.id) == 0 {
+                if by_liveness && self.merge_keep_mask(k) & bit(c.id) == 0 {
                     dead += 1;
                 }
             }

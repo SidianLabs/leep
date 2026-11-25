@@ -300,8 +300,10 @@ directory, its files, its subdirectories), in blocks of 512 KiB and data
 blobs of at most 1 MiB. It seals a blob or directory row only while search
 row retention keeps it live (a head now or within the window; keyframes
 always; superseded directory filters, which retention never deletes, stay
-rows), leaves out at merge what retention no longer keeps (directory
-filters included), rewrites a segment once a third is dead, merges small
+rows), leaves out at merge the blob rows retention no longer keeps (never
+a directory filter, so a stored filter still means its subtree's are; the
+ref log is read again before each such merge is stored), rewrites a
+segment once a third is dead, merges small
 segments so their number stays near twice the family's bytes over the
 cap, and compares a row with its sealed value by the set or filter they
 stand for, patches resolved against their keyframes (never equal when a

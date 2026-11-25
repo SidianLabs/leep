@@ -3836,10 +3836,11 @@ lease; every row with `off`), and every keyframe. **Run every server with
 the same `--search-retention`**: whichever holds the lease decides what is
 live. Superseded rows are not sealed: retention deletes superseded blob
 rows as before, and superseded directory filters (`tree-trigrams-v2`),
-which retention never deletes, stay rows as before. A sealed row that
-becomes superseded stays in its segment until a merge leaves it out (a
-segment is rewritten once a third of it is); that also drops a directory
-filter sealed while it was live, which derives again if a search needs it.
+which retention never deletes, stay rows as before. A sealed blob row
+that becomes superseded stays in its segment until a merge leaves it out (a
+segment is rewritten once a third of it is). A directory filter is never
+left out, as rows never lose one: a stored filter means its whole subtree's
+are, which the warmer and bounded searches rely on.
 A row and its segment value are compared by the trigram set or filter they
 stand for, not their bytes. Its segments hold at most 1 MiB of data, in 512 KiB blocks. On
 Leep's history plus 2,000 edits the search rows' about 4.4 MB (with

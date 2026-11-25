@@ -10,3 +10,10 @@
   (`get_exact` after a `get` miss): a segment another process packed a
   moment ago is no longer dropped by a pass (mode `build`) or hidden from
   a reader for a minute.
+- **Fixed.** `content-v1` merges no longer leave out directory filters
+  (amends ADR 0106). Dropping a dead filter could leave a stored ancestor
+  over a subdirectory with no filter, so a ref created at an old revision
+  was taken for indexed and, under `--indexing lease` or `off`, its
+  searches answered `indexing` on every retry. Merges also read the ref
+  log again before storing a segment that leaves blob rows out, and keep
+  everything if a ref moved since the walk.

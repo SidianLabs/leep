@@ -382,8 +382,9 @@ async fn sealed_and_retired_search_answers_as_rows_did() {
     assert_eq!(rows(&r).await, after);
 }
 
-/// As the heads move on, merges leave out what retention no longer keeps,
-/// and no live segment is left a third dead; keyframes stay.
+/// As the heads move on, merges leave out the blob rows retention no
+/// longer keeps, and no live segment is left a third dead; keyframes and
+/// directory filters stay (a stored filter means its subtree's are).
 #[tokio::test]
 async fn merges_leave_dead_keys_out_and_rewrite_mostly_dead_segments() {
     let r = repo();
@@ -396,7 +397,8 @@ async fn merges_leave_dead_keys_out_and_rewrite_mostly_dead_segments() {
     settle(&r, &o, &mut st, None).await;
     let first = sealed(&r, COL_BLOB_TRIGRAMS).await;
     let keyframes = sealed(&r, COL_BLOB_KEYFRAME).await;
-    assert!(!first.is_empty() && !keyframes.is_empty());
+    let trees = sealed(&r, COL_TREE_TRIGRAMS).await;
+    assert!(!first.is_empty() && !keyframes.is_empty() && !trees.is_empty());
     // Many more lands: the first segments' versions of the two files and
     // the directories above them go dead.
     let mut files = Files::new();
@@ -442,7 +444,7 @@ async fn merges_leave_dead_keys_out_and_rewrite_mostly_dead_segments() {
         ] {
             for k in idx.keys_with(col) {
                 total += 1;
-                if [COL_BLOB_TRIGRAMS, COL_TREE_TRIGRAMS].contains(&col) && !l.live(k) {
+                if col == COL_BLOB_TRIGRAMS && !l.live(k) {
                     dead += 1;
                 }
             }
@@ -459,6 +461,8 @@ async fn merges_leave_dead_keys_out_and_rewrite_mostly_dead_segments() {
         "a dead key was left out"
     );
     assert!(keyframes.is_subset(&sealed(&r, COL_BLOB_KEYFRAME).await));
+    assert!(trees.iter().any(|k| !l.live(k)), "a directory filter died");
+    assert!(trees.is_subset(&sealed(&r, COL_TREE_TRIGRAMS).await));
     assert_eq!(answers(&r, prev).await, want);
 }
 
