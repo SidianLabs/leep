@@ -493,7 +493,9 @@ struct Args {
     #[arg(long, env = "LEEP_AUTO_REPACK_CONSOLIDATE_RATIO", default_value_t = 8, value_parser = clap::value_parser!(u64).range(1..))]
     auto_repack_consolidate_ratio: u64,
     /// A consolidation also runs once it would save 1/64 of those bytes (at
-    /// least 64 KiB) and has for this long; `off` leaves only the ratio.
+    /// least 64 KiB) and the packs holding that saving are this old (their
+    /// files' and records' times, so restarts keep the clock), or this
+    /// process has seen it this long; `off` leaves only the ratio.
     #[arg(long, env = "LEEP_AUTO_REPACK_CONSOLIDATE_AGE", default_value = "24h", value_parser = parse_duration_or_off)]
     auto_repack_consolidate_age: DurationOrOff,
     /// Delta packs larger than this are never rewritten by a consolidation

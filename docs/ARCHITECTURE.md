@@ -1367,13 +1367,17 @@ lands still write whole level-1 frames and never wait for the task.
 delta's base is in its own pack, ADR 0039), so a delta run stores the
 first new version at each path whole when its previous version is in an
 older pack. When no delta run is due, and after each delta run, the task
-judges its delta packs no larger than `--auto-repack-consolidate-max-bytes` (2 GiB): a walk of the
+judges its delta packs no larger than `--auto-repack-consolidate-max-bytes` (2 GiB), smallest first up to 2 GiB in all (half the ceiling on bytes waiting for cleanup): a walk of the
 history since the largest of them (`pack_order_where`, wanted: frames
 stored whole in the other packs; passed through: those packs, loose
 objects, whole packs) lists those frames with their previous versions,
-and the saving is measured by compressing a sample of them. Past an eighth
-of the packs' bytes, or a 64th held for a day (tombstoned bytes count
-too), an incremental repack merges exactly those packs, giving each listed
+and the saving is measured by compressing a sample of them; the walk runs
+again only once a 64th of the packs' bytes was written whole since the
+last, and a failed one backs off (a minute, doubling, up to 6 hours). Past
+an eighth of the packs' bytes, or a 64th once the packs holding it are a
+day old (by their files and records, so restarts keep the clock;
+tombstoned bytes count too), an incremental repack merges exactly those
+packs (`fold_only`: none written since the walk), giving each listed
 whole frame the walk's base (`write_order_redelta`) and copying every
 delta frame; the chain cap holds where chains join. The largest pack's own
 history is walked once per pack and process, which finds frames older

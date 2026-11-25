@@ -1468,7 +1468,7 @@ async fn delta_world(
     }
     let opts = RepackOptions {
         mode: INCREMENTAL,
-        leave: older.clone(),
+        fold_only: Some(Vec::new()),
         ..RepackOptions::default()
     };
     store
@@ -1514,6 +1514,7 @@ fn consolidation(packs: Vec<String>) -> RepackOptions {
     RepackOptions {
         mode: INCREMENTAL,
         packs,
+        fold_only: Some(Vec::new()),
         loose_subset: Some(Arc::new(Default::default())),
         mark: true,
         ..RepackOptions::default()
@@ -1641,4 +1642,90 @@ async fn a_consolidation_killed_at_any_step_leaves_a_readable_store() {
         assert_eq!(pack_ids(dir.path()).len(), 1, "{what}");
         check_blob_store_contract(&FsBlobStore::new(dir.path())).await;
     }
+}
+
+/// Packs written after a repack was planned (land packs written while its
+/// walk ran) are not taken in by the geometric rule: a consolidation (ADR
+/// 0107) merges exactly the two delta packs it names, and a delta run only
+/// the packs it listed, so the land pack stays whole for the delta run that
+/// compresses it. Without `fold_only` the same repack folds it in.
+#[tokio::test]
+async fn packs_written_after_the_plan_are_not_merged() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsBlobStore::new(dir.path()).with_pack_writes(crate::PackWrites {
+        min_objects: 4,
+        ..crate::PackWrites::default()
+    });
+    let (mut w, ids) = delta_world(&store, 30, 60, false).await;
+    let land: Vec<(Hash, Bytes)> = (0..8)
+        .map(|i| Bytes::from(format!("a land after the plan, object {i}\n")))
+        .map(|d| (Hash::of_blob(&d), d))
+        .collect();
+    store.put_many(land.clone()).await.unwrap();
+    w.live.extend(land.iter().cloned());
+    let land_pack: Vec<String> = pack_ids(dir.path())
+        .into_iter()
+        .filter(|id| !ids.contains(id))
+        .collect();
+    assert_eq!(land_pack.len(), 1);
+    let land_set = land_pack.iter().cloned().collect();
+    assert!(store.pack_details(&land_set).unwrap()[0].whole());
+
+    // As the old `leave` did, from the listing before the land pack.
+    let copy = tempfile::tempdir().unwrap();
+    copy_store(dir.path(), copy.path());
+    let unplanned = RepackOptions {
+        fold_only: None,
+        ..consolidation(ids.clone())
+    };
+    let r = FsBlobStore::new(copy.path())
+        .repack_publish(w.hints.clone(), unplanned)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert_eq!(r.packs_merged, 3, "the race this guards against: {r:?}");
+
+    let r = store
+        .repack_publish(w.hints.clone(), consolidation(ids.clone()))
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert_eq!((r.packs_merged, r.objects), (2, 60), "{r:?}");
+    let after = pack_ids(dir.path());
+    assert_eq!(after.len(), 2, "{after:?}");
+    assert!(after.contains(&land_pack[0]), "the land pack is left");
+    assert!(store.pack_details(&land_set).unwrap()[0].whole());
+    check_world(dir.path(), &w, "consolidated beside a land pack").await;
+
+    // A delta run that listed only the consolidated pack folds that one
+    // in, not the land pack written after its listing.
+    let consolidated: Vec<String> = after.into_iter().filter(|id| *id != land_pack[0]).collect();
+    let more = Bytes::from_static(b"one more loose object\n");
+    w.live.insert(store.put(more.clone()).await.unwrap(), more);
+    let delta_run = RepackOptions {
+        mode: RepackMode::Incremental {
+            factor: 2,
+            max_packs: 1,
+        },
+        fold_only: Some(consolidated.clone()),
+        mark: true,
+        ..RepackOptions::default()
+    };
+    let r = store
+        .repack_publish(Vec::<(Hash, Option<Hash>)>::new(), delta_run)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert_eq!(r.packs_merged, 1, "{r:?}");
+    let after = pack_ids(dir.path());
+    assert!(after.contains(&land_pack[0]), "{after:?}");
+    assert!(!after.contains(&consolidated[0]), "{after:?}");
+    check_world(dir.path(), &w, "after the delta run").await;
+    check_blob_store_contract(&FsBlobStore::new(dir.path())).await;
 }

@@ -120,9 +120,13 @@ pub struct RepackOptions {
     /// objects in this set (a batch of the automatic delta repack, ADR
     /// 0100); `None` packs every loose object.
     pub loose_subset: Option<Arc<HashSet<Hash>>>,
-    /// Packs an [`RepackMode::Incremental`] repack must not fold in by its
-    /// geometric rule: whole packs a later batch compresses.
-    pub leave: Vec<String>,
+    /// For an [`RepackMode::Incremental`] repack: the only packs its
+    /// geometric rule may fold in besides `packs`; `None`, any searchable
+    /// pack. A caller that plans from a listing names the packs it knew
+    /// then, so a pack written since (a land pack written while it walked)
+    /// is never taken in unplanned, and `Some` of nothing merges exactly
+    /// `packs` (a consolidation, ADR 0107). Checked under the repack lock.
+    pub fold_only: Option<Vec<String>>,
     /// Record the new pack as already compressed by a delta repack (ADR
     /// 0100, `packs/considered`), so a pack with no delta record that it
     /// wrote is not taken for a whole pack again.
@@ -144,7 +148,7 @@ impl Default for RepackOptions {
             hook: None,
             packs: Vec::new(),
             loose_subset: None,
-            leave: Vec::new(),
+            fold_only: None,
             mark: false,
             full_interval: None,
         }
@@ -804,8 +808,10 @@ impl FsBlobStore {
                     .collect();
                 let extra: Vec<(String, u64)> =
                     sizes.extract_if(.., |(id, _)| named.contains(id)).collect();
-                let leave: HashSet<&String> = opts.leave.iter().collect();
-                sizes.retain(|(id, _)| !leave.contains(id));
+                if let Some(only) = &opts.fold_only {
+                    let only: HashSet<&String> = only.iter().collect();
+                    sizes.retain(|(id, _)| only.contains(id));
+                }
                 let new = loose.len() as u64 + extra.iter().map(|p| p.1).sum::<u64>();
                 plan_merge(&sizes, new, factor, max_packs)
                     .into_iter()
@@ -1212,6 +1218,18 @@ impl FsBlobStore {
             .flat_map(|(p, dead)| dead.iter().filter_map(|h| p.index.find(h)))
             .map(|e| e.stored_len)
             .sum())
+    }
+
+    /// When pack `id` was written (its `.pack` file's modification time,
+    /// unix seconds), or `None` if it is gone: a time that survives
+    /// restarts, for the consolidation's age rule (ADR 0107). A pack is
+    /// never written again in place, so this is when it was made.
+    pub fn pack_written(&self, id: &str) -> Result<Option<i64>> {
+        match std::fs::metadata(self.packs.dir().join(format!("{id}.pack"))) {
+            Ok(m) => Ok(m.modified().ok().and_then(unix_secs)),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(storage_err(e)),
+        }
     }
 
     /// Objects of the new pack whose source GC deleted while it was written:

@@ -581,7 +581,6 @@ async fn a_consolidation_passes_the_pending_cap_only_alone() {
         fence: Duration::from_secs(3600),
         pending_share: 0.0,
         min_pending_bytes: 1,
-        max_pending_bytes: 1,
         ..opts(consolidating(u64::MAX))
     };
     let mut bg = task(&store, &meta, o);
@@ -608,12 +607,7 @@ async fn a_consolidation_passes_the_pending_cap_only_alone() {
             factor: 2,
             max_packs: 8,
         },
-        leave: store
-            .pack_sizes()
-            .unwrap()
-            .into_iter()
-            .map(|p| p.id)
-            .collect(),
+        fold_only: Some(Vec::new()),
         mark: true,
         ..leep_store::RepackOptions::default()
     };
@@ -639,7 +633,6 @@ async fn a_consolidation_passes_the_pending_cap_only_alone() {
             fence: Duration::from_secs(3600),
             pending_share: 0.0,
             min_pending_bytes: 1,
-            max_pending_bytes: 1,
             small_merge_bytes: 0,
             ..opts(consolidating(u64::MAX))
         },
@@ -733,6 +726,8 @@ async fn packs_over_the_limit_are_left_alone() {
     sizes.sort_by_key(|p| p.bytes);
     assert!(sizes.len() >= 2, "{sizes:?}");
     let largest = sizes.last().unwrap().clone();
+    let copy = tempfile::tempdir().unwrap();
+    copy_dir(dir.path(), copy.path());
     let limited = |max_bytes| AutoRepackOptions {
         consolidate: Some(ConsolidateOptions {
             ratio: u64::MAX,
@@ -759,6 +754,256 @@ async fn packs_over_the_limit_are_left_alone() {
     assert_eq!(r.packs_merged as usize, sizes.len(), "{r:?}");
     bg.finish_all().await.unwrap();
     assert_main_readable(Arc::new(FsBlobStore::new(dir.path())), &meta, "limit").await;
+
+    // The same through the budget: one consolidation rewrites at most half
+    // the ceiling on bytes waiting for cleanup, the largest packs left out,
+    // so the exemption from the cap never lets more through.
+    let store = fs_store(copy.path());
+    let sizes = store.pack_sizes().unwrap();
+    let rest = sizes.iter().map(|p| p.bytes).sum::<u64>() - largest.bytes;
+    let o = BackgroundRepackOptions {
+        max_pending_bytes: 2 * rest,
+        ..opts(limited(u64::MAX))
+    };
+    let mut bg = task(&store, &meta, o);
+    let tick = bg.tick().await.unwrap();
+    if let ConsolidateOutcome::Ran { report, .. } = &tick.consolidate {
+        assert_eq!(report.packs_merged as usize, sizes.len() - 1, "{report:?}");
+        assert!(bg.pending_bytes() <= rest, "{report:?}");
+    }
+    bg.finish_all().await.unwrap();
+    assert!(store
+        .pack_sizes()
+        .unwrap()
+        .iter()
+        .any(|p| p.id == largest.id));
+    assert_main_readable(Arc::new(FsBlobStore::new(copy.path())), &meta, "budget").await;
+}
+
+/// A store whose one delta pack holds frames whole next to their bases,
+/// as merges that copy frames (and servers before ADR 0107) left them: the
+/// first check walks that pack's own history and rewrites it alone, with
+/// no manual `repack --full`; afterwards nothing more is gained.
+#[tokio::test]
+async fn a_single_pack_left_by_older_merges_is_consolidated() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, meta, _) = heads_world(dir.path(), 3).await;
+    // A merge that copies frames, as the tiered merges and older servers
+    // did: one pack, its heads whole beside their bases.
+    let ids: Vec<String> = store
+        .pack_sizes()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert!(ids.len() >= 3, "{ids:?}");
+    let merge = leep_store::RepackOptions {
+        mode: leep_store::RepackMode::Planned { loose: false },
+        packs: ids,
+        mark: true,
+        threads: 1,
+        ..leep_store::RepackOptions::default()
+    };
+    store
+        .repack_publish(Vec::<(Hash, Option<Hash>)>::new(), merge)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert_eq!(store.pack_sizes().unwrap().len(), 1);
+    let before = whole_frames(&store);
+    let copy = tempfile::tempdir().unwrap();
+    copy_dir(dir.path(), copy.path());
+
+    let mut bg = task(&store, &meta, opts(consolidating(u64::MAX)));
+    let tick = bg.tick().await.unwrap();
+    assert_eq!(tick.auto, AutoOutcome::Nothing);
+    let (r, gain, walked) = consolidated(tick.consolidate);
+    assert_eq!(r.packs_merged, 1, "{r:?}");
+    assert!(gain > 0 && walked > 0, "{gain} {walked}");
+    bg.finish_all().await.unwrap();
+    let after = whole_frames(&store);
+    let full = full_repack(&copy, &meta).await;
+    assert!(
+        after < before && after <= full.whole,
+        "{after} whole (was {before}, a full repack {})",
+        full.whole
+    );
+    assert_main_readable(Arc::new(FsBlobStore::new(dir.path())), &meta, "single").await;
+    for restart in 0..2 {
+        let mut bg = task(&store, &meta, opts(consolidating(u64::MAX)));
+        let tick = bg.tick().await.unwrap();
+        assert!(
+            matches!(
+                tick.consolidate,
+                ConsolidateOutcome::Nothing | ConsolidateOutcome::Below { gain: 0, .. }
+            ),
+            "restart {restart}: {:?}",
+            tick.consolidate
+        );
+    }
+    check_blob_store_contract(&FsBlobStore::new(dir.path())).await;
+}
+
+/// The age rule holds across restarts: a gain below the ratio rule runs
+/// once the packs holding it have waited the age (the largest pack's file
+/// time), even in a process that has just started, as after an upgrade
+/// that restarts the server more often than the age.
+#[tokio::test]
+async fn the_age_rule_survives_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, meta, _) = heads_world(dir.path(), 3).await;
+    let ids: Vec<String> = store
+        .pack_sizes()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    let merge = leep_store::RepackOptions {
+        mode: leep_store::RepackMode::Planned { loose: false },
+        packs: ids,
+        mark: true,
+        threads: 1,
+        ..leep_store::RepackOptions::default()
+    };
+    store
+        .repack_publish(Vec::<(Hash, Option<Hash>)>::new(), merge)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    let day = Duration::from_secs(24 * 3600);
+    // The ratio rule never fires (the gain is not all of the bytes); the
+    // age rule's floor is any gain.
+    let aged = || AutoRepackOptions {
+        consolidate: Some(ConsolidateOptions {
+            ratio: 1,
+            age: Some(day),
+            min_gain: 1,
+            ..ConsolidateOptions::default()
+        }),
+        ..eager()
+    };
+    let mut bg = task(&store, &meta, opts(aged()));
+    let tick = bg.tick().await.unwrap();
+    assert!(
+        matches!(tick.consolidate, ConsolidateOutcome::Below { gain, .. } if gain > 0),
+        "{:?}",
+        tick.consolidate
+    );
+    // As if the pack were written two days ago: a new process runs it.
+    let id = &store.pack_sizes().unwrap()[0].id;
+    let file = std::fs::File::options()
+        .write(true)
+        .open(dir.path().join("packs").join(format!("{id}.pack")))
+        .unwrap();
+    file.set_modified(std::time::SystemTime::now() - 2 * day)
+        .unwrap();
+    drop(file);
+    let mut bg = task(&store, &meta, opts(aged()));
+    let (r, _, _) = consolidated(bg.tick().await.unwrap().consolidate);
+    assert_eq!(r.packs_merged, 1, "{r:?}");
+    bg.finish_all().await.unwrap();
+    // The pack it wrote is new: no age-rule rewrite again at once.
+    let mut bg = task(&store, &meta, opts(aged()));
+    let tick = bg.tick().await.unwrap();
+    assert!(
+        !matches!(tick.consolidate, ConsolidateOutcome::Ran { .. }),
+        "{:?}",
+        tick.consolidate
+    );
+    assert_main_readable(Arc::new(FsBlobStore::new(dir.path())), &meta, "aged").await;
+}
+
+/// A consolidation whose walk fails is not tried again at every check:
+/// it waits a minute (or the check interval), twice that after a second
+/// failure in a row, and runs once the walk works again.
+#[tokio::test(start_paused = true)]
+async fn a_failed_consolidation_backs_off_then_runs() {
+    use leep_testkit::{Fault, FaultPlan, FaultyMetaStore, Op};
+    let dir = tempfile::tempdir().unwrap();
+    let (store, meta, _) = heads_world(dir.path(), 2).await;
+    let plan = FaultPlan::new(7);
+    plan.rate(&[Op::ListRefs], 1000, Fault::Fail);
+    let faulty: Arc<dyn MetaStore> = Arc::new(FaultyMetaStore::new(meta.clone(), plan.clone()));
+    let bg = BackgroundRepack::new(PackStore::Fs(store.clone()), opts(consolidating(u64::MAX)));
+    let walk = bg.walk_repo(faulty);
+    let mut bg = bg.with_repo(walk);
+
+    let tick = bg.tick().await.unwrap();
+    assert!(
+        matches!(tick.consolidate, ConsolidateOutcome::Failed(_)),
+        "{:?}",
+        tick.consolidate
+    );
+    let walks = plan.calls(Op::ListRefs);
+    // Within the first minute: no walk.
+    tokio::time::advance(Duration::from_secs(59)).await;
+    assert_eq!(
+        bg.tick().await.unwrap().consolidate,
+        ConsolidateOutcome::NotChecked
+    );
+    assert_eq!(plan.calls(Op::ListRefs), walks);
+    // Then one, which fails again: the next wait is two minutes.
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(matches!(
+        bg.tick().await.unwrap().consolidate,
+        ConsolidateOutcome::Failed(_)
+    ));
+    tokio::time::advance(Duration::from_secs(100)).await;
+    assert_eq!(
+        bg.tick().await.unwrap().consolidate,
+        ConsolidateOutcome::NotChecked
+    );
+    // Fixed: the walk after the wait runs the consolidation.
+    plan.clear();
+    tokio::time::advance(Duration::from_secs(21)).await;
+    consolidated(bg.tick().await.unwrap().consolidate);
+    bg.finish_all().await.unwrap();
+    assert_main_readable(Arc::new(FsBlobStore::new(dir.path())), &meta, "retried").await;
+}
+
+/// After each delta run the consolidation judges the packs again, but walks
+/// only once the whole bytes written since its last walk reach an eighth of
+/// the ratio rule's floor: otherwise each run would walk all the history
+/// since the largest pack again, quadratic in what is written.
+#[tokio::test]
+async fn delta_runs_do_not_walk_again_until_enough_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = fs_store(dir.path());
+    let meta = Arc::new(MemoryMetaStore::new());
+    let repo = Repo::new(Arc::new(store.clone()), meta.clone());
+    import(&repo, &meta, 60).await;
+    // The ratio rule's floor is all of the packs' bytes, never reached;
+    // the age rule's is any gain, so every check judges the packs.
+    let judging = AutoRepackOptions {
+        consolidate: Some(ConsolidateOptions {
+            ratio: 1,
+            age: Some(Duration::from_secs(365 * 24 * 3600)),
+            min_gain: 1,
+            ..ConsolidateOptions::default()
+        }),
+        ..eager()
+    };
+    let mut bg = task(&store, &meta, opts(judging));
+    ran(bg.tick().await.unwrap().auto);
+    bg.finish_all().await.unwrap();
+    let (mut walks, mut skipped) = (0, 0);
+    for v in 60..68 {
+        land_one(&repo, &meta, v).await;
+        let tick = bg.tick().await.unwrap();
+        ran(tick.auto);
+        bg.finish_all().await.unwrap();
+        match tick.consolidate {
+            ConsolidateOutcome::Below { walked: 0, .. } => skipped += 1,
+            ConsolidateOutcome::Below { .. } => walks += 1,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(skipped > 0 && walks > 0, "{walks} walks, {skipped} skipped");
+    assert_main_readable(Arc::new(FsBlobStore::new(dir.path())), &meta, "skips").await;
 }
 
 /// Below every threshold nothing runs and nothing is written; a check

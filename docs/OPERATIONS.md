@@ -147,7 +147,7 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_repack_background_cleanup_seconds` | histogram | none | Time of each cleanup a fence after a merge (deleting the merged packs). |
 | `leep_repack_retired_removed_total` | counter | none | Retired packs deleted by the sweep at server start and at each background interval once their fence passed (ADR 0080). Grows after restarts that left merged packs waiting; the merges' own cleanups are under `leep_repack_background_cleanup_seconds`. |
 | `leep_repack_auto_runs_total` | counter | `outcome` = `ran`, `error` | Automatic delta repacks published (ADR 0100). An error is logged and retried at the next check. |
-| `leep_repack_auto_skipped_total` | counter | `reason` = `threshold`, `pending`, `interval`, `busy`, `consolidation` | Checks that did not run: below every threshold, cleanups waiting on too many bytes, a consolidation that is due waits for those cleanups (ADR 0107; at most a fence), an object store's full repack ran within its interval, or another repack held the store. |
+| `leep_repack_auto_skipped_total` | counter | `reason` = `threshold`, `pending`, `interval`, `busy`, `consolidation` | Checks that did not run: below every threshold, cleanups waiting on too many bytes, a consolidation that is due waits for those cleanups (ADR 0107; at most two fences), an object store's full repack ran within its interval, or another repack held the store. |
 | `leep_repack_auto_seconds` | histogram | none | Time of each automatic delta repack: walk, write and publish. |
 | `leep_repack_auto_input_bytes_total` / `leep_repack_auto_delta_bytes_total` | counter | none | Bytes that waited (loose files and whole packs) and pack bytes written for them. Their ratio is the compression the runs achieve. |
 | `leep_repack_auto_objects_total` | counter | none | Objects the automatic runs wrote. |
@@ -2776,23 +2776,30 @@ pack). Once nothing waits for a delta run, the task judges its delta
 packs: if merging them all into one, and compressing each of those frames
 against its previous version, now in the same pack, would save an eighth
 of their bytes (`--auto-repack-consolidate-ratio`), or a 64th (at least
-64 KiB) for a day (`--auto-repack-consolidate-age`), it does so. Objects
+64 KiB) once the packs holding that saving are a day old
+(`--auto-repack-consolidate-age`; counted from the packs' own write times,
+so restarts do not reset it), it does so. Objects
 GC deleted from those packs count toward the saving and are dropped. The
 history walk stops at the largest delta pack, so it costs the history
-written since; the largest pack's own history is walked once per server
-start, which finds frames older merges or servers left whole next to their
-bases. The saving is measured on a sample before each run, so new files
+written since, and runs again only once enough new whole frames were
+written (a 64th of the packs' bytes at the default ratio); the largest
+pack's own history is walked once per server start, which finds frames
+older merges or servers left whole next to their bases. A consolidation
+that fails is logged ("consolidation of delta packs failed") and tried
+again after a minute, doubling per failure in a row up to 6 hours. The saving is measured on a sample before each run, so new files
 (no previous version) never cause a rewrite. On the land-driven corpus the
 packs end at the size `repack --full` gives (PERFORMANCE.md,
 "Consolidating delta repack"). A consolidation holds the packs it replaced
 for the fence, like a merge; it may pass the cap on bytes waiting for
 cleanup when only small merges wait, and otherwise delta runs wait for it
-(at most a fence) so a busy server still gets it. It is checked when
+(at most two fences) so a busy server still gets it. It is checked when
 nothing is due for a delta run and right after each delta run.
 
 **The largest packs.** A delta pack larger than
 `--auto-repack-consolidate-max-bytes` (2 GiB) is never rewritten in the
-background: the server logs "a delta pack is larger than
+background, nor are the largest packs once the delta packs, counted
+smallest first, pass 2 GiB in all (half the 4 GiB ceiling on bytes waiting
+for cleanup): the server logs "a delta pack is larger than
 --auto-repack-consolidate-max-bytes" once per pack and process, leaves it
 as it is, and its walks stop at it. Frames whose previous version is in
 such a pack stay whole until a `leep-server repack --full`. Raise the limit
@@ -2819,7 +2826,7 @@ those.
 | `--auto-repack-object-store-interval D` / `LEEP_AUTO_REPACK_OBJECT_STORE_INTERVAL` | `24h` | Object stores: the shortest time between two automatic full repacks, kept in the bucket (`packs/.last-full`), so restarts and replicas share it. |
 | `--auto-repack-consolidate on\|off` / `LEEP_AUTO_REPACK_CONSOLIDATE` | `on` | Consolidate the delta packs (ADR 0107; filesystem stores). Off leaves the first new version at each path per run whole until a `repack --full`. |
 | `--auto-repack-consolidate-ratio N` / `LEEP_AUTO_REPACK_CONSOLIDATE_RATIO` | `8` | Consolidate once it would save `1/N` of the bytes of the packs it rewrites. |
-| `--auto-repack-consolidate-age D` / `LEEP_AUTO_REPACK_CONSOLIDATE_AGE` | `24h` | Also consolidate once it would have saved a 64th of those bytes (at least 64 KiB) for this long; `off` leaves only the ratio. |
+| `--auto-repack-consolidate-age D` / `LEEP_AUTO_REPACK_CONSOLIDATE_AGE` | `24h` | Also consolidate once it would save a 64th of those bytes (at least 64 KiB) and the packs holding that saving are this old (the largest pack's file time and the other packs' oldest records), or this process has seen it this long; `off` leaves only the ratio. |
 | `--auto-repack-consolidate-max-bytes B` / `LEEP_AUTO_REPACK_CONSOLIDATE_MAX_BYTES` | `2G` | Never rewrite a delta pack larger than this in the background; logged once, left to `repack --full`. |
 
 What operators no longer need: the nightly or hourly incremental `repack`
@@ -3326,9 +3333,17 @@ both stores:
   the packed source, and an unchanged store copies nothing. A pool pack that
   the source merged away is deleted once other pool packs hold every object
   it held (`packs_pruned` in the manifest). Objects GC deleted at the source
-  stay in the pool's packs, as they do loose: an older snapshot may need
-  them once the changeset sweep runs (issue #155), so a pool keeps somewhat
-  more packs than the source. `restore` copies the packs back
+  stay in the pool, as they do loose: an older snapshot may need them once
+  the changeset sweep runs (issue #155), and the pool cannot tell which
+  snapshots its operator still keeps. When a repack at the source (a
+  consolidation, ADR 0107, or `repack --full`) dropped such objects, the
+  backup copies the ones only the old pool pack holds, decoded and checked,
+  into a small pool pack of their own (logged as "kept in N new pool
+  pack(s)"), then deletes the old pack, so the pool grows by the deleted
+  objects, not by a copy of the packs per repack. Pool packs that carry
+  tombstones (written before issue #155) are left as they are. A pack
+  the source replaced while the backup ran is found by listing the
+  source's packs again, so its objects are not copied loose. `restore` copies the packs back
   first, so a packed store restores packed. Pools from before this change
   (all loose) restore as they always did; later backups add packs beside
   their loose objects.

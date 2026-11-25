@@ -48,8 +48,9 @@ At each check of the automatic repack, on a filesystem store, when no delta
 run is due (nothing waits, or less than every threshold) or right after a
 delta run that leaves no further batch (a busy store may never be below
 every threshold), the background task judges its **delta packs** (every pack that is not a whole pack
-waiting for a delta run) no larger than `--auto-repack-consolidate-max-bytes`.
-Let `L` be the largest of them. A consolidation is an incremental repack
+waiting for a delta run) no larger than `--auto-repack-consolidate-max-bytes`,
+smallest first, up to half the ceiling on bytes waiting for cleanup
+(section 5). Let `L` be the largest of them. A consolidation is an incremental repack
 that names exactly those packs (`RepackOptions::packs`; every other pack in
 `leave`, no loose object), at the delta run's level, given the hints of a
 walk:
@@ -59,7 +60,12 @@ walk:
   packs.
 
 So the walk covers the history written since `L` and stops at changesets
-whose root tree is in `L`; it never walks all of history. `L` is merged, so
+whose root tree is in `L`; it never walks all of history. The repack takes
+exactly the packs it names, checked under the repack lock
+(`RepackOptions::fold_only`): a land pack written while the walk ran is not
+folded in, where it would be copied whole, with no hints, into a pack
+recorded as considered. A delta run names the delta packs of its own
+listing the same way, for the same race. `L` is merged, so
 the bases the walk names there are in the table. `write_order_redelta`
 gives each whole frame the walk's base, and every delta frame is copied
 (ADR 0100 section 2). The writer's chain cap holds where chains join: a
@@ -85,8 +91,11 @@ the 2,000,000-changeset walk limit) and compresses the heads earlier merges
 left next to their bases, if the rules below say so. That replaces ADR
 0100's "run `repack --full` once after upgrading" for delta packs within
 the limit. The cost is one walk of that history per server start, on the
-nice-19 thread, after the delta runs; a store whose whole frames cannot
-reach the rules' floor (section 4) is not walked at all.
+server's async runtime, like a delta run's walk (it reads metadata and
+blobs), after the delta runs; measuring the sample and the rewrite run on
+the background repack's thread at the lowest CPU priority. A store whose
+whole frames cannot reach the rules' floor (section 4) is not walked at
+all.
 
 ### 4. When it runs
 The gain is what the consolidation would save:
@@ -105,14 +114,31 @@ The gain is what the consolidation would save:
   changeset sweep removed), which only `repack --full` dropped before.
 
 It runs when the gain reaches `1 / --auto-repack-consolidate-ratio` (8) of
-the bytes of the packs it rewrites, or when it has stayed at least `1/64`
-of them (and 64 KiB) for `--auto-repack-consolidate-age` (24 h; `off`
-leaves only the ratio). A cheap filter skips the walk when the whole bytes
-of the packs (each pack's `PackDetail::whole_bytes`, read once per pack)
-plus the tombstoned bytes cannot reach the lower of the two floors, and the
-task remembers the gain the walk found for a set of packs and does not
-walk again until the set changes. New files never trigger a rewrite: a
-first version has no base, so the walk finds no gain in it.
+the bytes of the packs it rewrites, or when it is at least `1/64` of them
+(and 64 KiB) and has waited `--auto-repack-consolidate-age` (24 h; `off`
+leaves only the ratio). Waited means either that this process has seen the
+gain above that floor for the age, or that the packs holding it are that
+old: `L`'s file was written, and the oldest record of the other packs
+(`PackDetail::oldest`, kept through merges) was written, at least the age
+ago. The second survives restarts, so a server restarted more often than
+the age (by upgrades, say) still applies the rule; a consolidation writes
+a new `L`, so the rule rewrites the packs at most about once per age.
+
+A cheap filter skips the walk when the whole bytes of the packs (each
+pack's `PackDetail::whole_bytes`, read once per pack) plus the tombstoned
+bytes cannot reach the lower of the two floors. The task also remembers
+what the last walk found outside `L`, and walks again only once the whole
+bytes of packs that walk did not judge reach an eighth of the ratio floor
+(a 64th of the packs' bytes at the default ratio) or `L` changes: each walk
+covers all the history since `L`, so walking after every delta run would
+be quadratic in the bytes written between consolidations, and this way the
+walks between two consolidations cost a bounded multiple of one. Until
+then the remembered figure stands for the gain, which errs low by at most
+those bytes. A consolidation that fails (a walk that meets an error, say)
+is not tried again for a minute, or the check interval if longer, doubling
+with each failure in a row up to 6 hours, so a walk that keeps failing is
+not repeated over all of history every minute. New files never trigger a
+rewrite: a first version has no base, so the walk finds no gain in it.
 
 All the delta packs within the limit are rewritten, not only the recent
 ones: the design's second option, merging the packs other than `L` when
@@ -130,16 +156,19 @@ than stopped: they copy frames, and a head one of them brings next to its
 base is found by the next walk, or by the walk of a new largest pack
 (section 3).
 
-### 5. The size limit
+### 5. The size limits
 Delta packs larger than `--auto-repack-consolidate-max-bytes` (2 GiB) are
-never rewritten in the background: each is logged once per process ("a
-delta pack is larger than ...") and left to `leep-server repack --full`.
-The walks stop at their history, and bases in them are not in the table,
-so frames whose base is there stay whole. 2 GiB because a consolidation
-holds the packs it replaced for the fence: at 2 GiB that stays within half
-the 4 GiB ceiling on bytes waiting for cleanup (ADR 0100 section 5), so
-delta runs and merges keep room beside it, and the rewrite (mostly copied
-frames, every object decoded and checked) takes minutes on one
+never rewritten in the background, and one consolidation takes the delta
+packs smallest first up to half the ceiling on bytes waiting for cleanup
+(`max_pending_bytes`, 4 GiB, ADR 0100 section 5), so the largest packs
+past that sum are left out too. Each pack left out is logged once per
+process ("a delta pack is larger than ...") and left to `leep-server
+repack --full`. The walks stop at their history, and bases in them are not
+in the table, so frames whose base is there stay whole. A consolidation
+holds the packs it replaced for the fence, so its cleanup stays within
+half that ceiling, the exemption of section 6 included, and delta runs and
+merges keep room beside it; and the rewrite (mostly copied frames, every
+object decoded and checked) of at most 2 GiB takes minutes on one
 low-priority core, not hours.
 
 ### 6. Disk during the fence
@@ -150,8 +179,40 @@ mostly one pack could never consolidate otherwise, and land packs keep
 merging under load. When larger cleanups wait and its packs would take the
 bytes waiting past the cap, it is held ("pending"), and delta runs wait for
 it (`leep_repack_auto_skipped_total{reason="consolidation"}`) so no new
-large cleanup starts: it runs within a fence, and loose objects wait that
-much longer. Lands never wait.
+large cleanup starts: it usually runs within a fence. Delta runs wait two
+fences at most from when it was first held, then run again whether or not
+it has (other cleanups may keep it held), so loose objects never wait long
+behind it. Lands never wait.
+
+### 6a. Backup pools
+A backup pool (ADR 0026, ADR 0039 section 6) keeps every object any
+snapshot may need and deletes a pool pack the source merged away only once
+other pool packs hold all its objects. A consolidation drops the objects GC
+deleted, so the pool pack it supersedes always held one no other pack does,
+and was kept whole: each consolidation followed by a backup added a full
+copy of the rewritten packs (six rounds took a pool to six times the
+source's pack bytes). So `sync_packs` into a pool now copies the objects
+only such a pack holds (decoded from its stream, through any delta chain,
+and checked against their hashes) into a new pool pack of whole frames,
+publishes it, then deletes the old pack. Earlier such packs join the new
+one while they are at most twice what it takes in, so they stay few. A
+pool pack is rewritten only when that removes copies other packs hold, at
+most 256 MiB of its objects at a time (held in memory); a larger one, or
+one with pool tombstones (written before issue #155), stays whole as
+before. An interrupted run leaves both packs, and the next run deletes the
+older. And since a consolidation can replace the source's packs at any
+time, a backup whose pack copy outlasts the fence finds packs it listed
+gone: it then lists the source's packs again (up to four listings) and
+copies those that replaced them, instead of leaving their objects to the
+loose copy.
+
+Objects the source deleted are kept, not dropped: the pool does not know
+which snapshots its operator keeps (retention is by deleting snapshot
+directories, ADR 0026), and a retained snapshot's closure may name an
+object the changeset sweep removed. Proving otherwise would mean walking
+every snapshot's metadata at each backup. The pool therefore grows by the
+deleted objects themselves, as a loose pool always did, and is reclaimed by
+starting a new pool.
 
 ### 7. Whole frames of land and import packs are compressed again
 A delta run (and `leep-server repack`) no longer copies a whole frame from
@@ -175,8 +236,16 @@ derived kind or API field, and hash types are untouched; a consolidated
 pack is an ordinary pack, recorded in `packs/considered` like any delta
 run's. Every object is decoded and checked against its address before it
 is written, as in every repack. Crash safety is the publish sequence of
-every repack (pack, rename, index, rename, retire, fence, delete): no new
-step. Old and new servers share a store; whichever holds `repack.lock`
+every repack (pack, rename, index, rename, retire, fence, delete), with
+one rule made explicit: a cleanup deletes only the packs it replaced that
+`packs/retired` still lists, read under the repack lock (filesystem and
+object stores alike). A merge can reproduce a pack byte for byte, under
+the same id, and a consolidation that rewrites one pack whose added
+objects GC deleted inside the fence does exactly that: the pack an earlier
+run's cleanup still means to delete is published again, and `retire_for`
+(ADR 0080) takes it out of the record. Before, only the sweep honoured
+that; the cleanup deleted by name, which would have removed the live copy.
+Old and new servers share a store; whichever holds `repack.lock`
 decides, and an old server's merges only delay the gain. Object stores are
 unchanged: they run a full repack on a schedule (ADR 0100 section 4), which
 already compresses every head. Lands never wait for any of it.
