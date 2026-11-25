@@ -691,12 +691,12 @@ fn run_crash_rounds_prepared(
 
 /// Kills aimed at a step the server logs: after each round's seeded wait,
 /// the kill waits (up to [`AIM_WAIT`]) for a new `start` line in the
-/// server's log and comes at once. A kill landed inside the step when no
-/// `end` line follows the last `start`.
+/// server's log and comes at once. A kill landed inside the step when none
+/// of the `end` lines (it finished, or stopped) follows the last `start`.
 struct Aim {
     rust_log: &'static str,
     start: &'static str,
-    end: &'static str,
+    end: &'static [&'static str],
 }
 
 const AIM_WAIT: Duration = Duration::from_secs(15);
@@ -725,7 +725,7 @@ fn aimed_kill(server: &mut Server, aim: &Aim) -> bool {
     let text = log_from(&path, from);
     let hit = text
         .rfind(aim.start)
-        .is_some_and(|i| !text[i..].contains(aim.end));
+        .is_some_and(|i| !aim.end.iter().any(|e| text[i..].contains(e)));
     if !hit {
         let tail: Vec<&str> = text.lines().rev().take(6).collect();
         progress!("missed the aimed step; the log ended with {tail:#?}");
@@ -1206,7 +1206,12 @@ const CONSOLIDATE: &[&str] = &[
 const CONSOLIDATING: Aim = Aim {
     rust_log: "warn,leep_server::background_repack=debug",
     start: "starting a consolidation of delta packs",
-    end: "consolidated delta packs",
+    // Published, or stopped: another repack held the store, or it failed.
+    end: &[
+        "consolidated delta packs",
+        "consolidation of delta packs skipped",
+        "consolidation of delta packs failed",
+    ],
 };
 
 fn consolidation_rounds(backend: &str, meta_url: Option<String>) {

@@ -2792,7 +2792,8 @@ packs end at the size `repack --full` gives (PERFORMANCE.md,
 "Consolidating delta repack"). A consolidation holds the packs it replaced
 for the fence, like a merge; it may pass the cap on bytes waiting for
 cleanup when only small merges wait, and otherwise delta runs wait for it
-(at most two fences) so a busy server still gets it. It is checked when
+(at most two fences, then one delta run goes and the wait starts again)
+so a busy server still gets it. It is checked when
 nothing is due for a delta run and right after each delta run.
 
 **The largest packs.** A delta pack larger than

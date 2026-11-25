@@ -538,9 +538,10 @@ struct AutoState {
 
 /// What a consolidation walk found, for the checks after it.
 struct Judged {
-    /// The largest pack it stopped at, and every pack it judged.
+    /// The largest pack it stopped at, and the whole bytes of the other
+    /// packs then.
     largest: String,
-    ids: HashSet<String>,
+    whole_outside: u64,
     /// What the frames whole outside the largest pack would save.
     outside: u64,
 }
@@ -912,7 +913,8 @@ impl BackgroundRepack {
         }
         // Delta runs wait for a held consolidation for two fences at most:
         // by then the cleanups that held it are done unless more keep
-        // coming, and loose objects must not wait for ever.
+        // coming, and loose objects must not wait for ever. Each delta run
+        // that goes through re-arms the hold.
         let hold = self.opts.fence.saturating_mul(2);
         let holding = |held: Option<Instant>| held.is_some_and(|t| now < t + hold);
         if consolidating && holding(self.auto.consolidation_held) && !self.auto.more {
@@ -1072,6 +1074,11 @@ impl BackgroundRepack {
         let report = pending.report().clone();
         self.auto.corrupt.extend(report.corrupt.iter().copied());
         self.auto.waiting_since = None;
+        // A delta run went through, so a hold of the consolidation starts
+        // again from its next check: delta runs wait up to two fences for
+        // it again, long enough for this run's own cleanup, instead of
+        // never waiting again once a first hold ran out.
+        self.auto.consolidation_held = None;
         // A batch that packed nothing (everything vanished meanwhile) does
         // not run again at once: the next check comes after the interval.
         let more = more && report.objects > 0;
@@ -1189,7 +1196,7 @@ impl BackgroundRepack {
     /// pack and stops at changesets whose root tree is in it, so its cost is
     /// that of the recent history; that pack is merged, so the frames the
     /// walk lists find their bases in it. The walk runs again only once the
-    /// whole bytes outside the largest pack have grown by an eighth of the
+    /// whole bytes outside the largest pack have changed by an eighth of the
     /// ratio rule's floor, so the walks after delta runs stay linear in what
     /// is written. The largest pack's own whole frames are judged once per
     /// pack and process, by a walk through its history too: that finds the
@@ -1288,11 +1295,9 @@ impl BackgroundRepack {
         // quadratic in the bytes written between consolidations.
         let cached = match (&self.auto.judged, known_inside) {
             (Some(j), Some(_)) if j.largest == largest_id => {
-                let new: u64 = cand
-                    .iter()
-                    .filter(|p| p.id != largest_id && !j.ids.contains(&p.id))
-                    .map(|p| whole_of(&p.id))
-                    .sum();
+                // By bytes, not pack ids: a delta run that folds judged packs
+                // into a new one moves their frames, it does not add any.
+                let new = w_rest.abs_diff(j.whole_outside);
                 (new.saturating_mul(8) < ratio_floor).then_some(j.outside)
             }
             _ => None,
@@ -1330,7 +1335,7 @@ impl BackgroundRepack {
                 }
                 self.auto.judged = Some(Judged {
                     largest: largest_id.clone(),
-                    ids: all.clone(),
+                    whole_outside: w_rest,
                     outside: w.outside,
                 });
                 walked_cs += w.order.changesets;
@@ -1353,6 +1358,8 @@ impl BackgroundRepack {
                 // holding it have waited that long, which a restart does
                 // not reset: the largest pack was written (its file's
                 // time) and the oldest record of the others is that old.
+                // Coarse (any old pack among the others counts), but never
+                // more than once per age: `L` must be that old too.
                 now >= since + a || {
                     let fs = fs.clone();
                     let id = largest_id.clone();

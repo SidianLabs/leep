@@ -990,20 +990,116 @@ async fn delta_runs_do_not_walk_again_until_enough_is_written() {
     let mut bg = task(&store, &meta, opts(judging));
     ran(bg.tick().await.unwrap().auto);
     bg.finish_all().await.unwrap();
-    let (mut walks, mut skipped) = (0, 0);
+    let (mut walks, mut skipped, mut skipped_folds) = (0, 0, 0);
     for v in 60..68 {
         land_one(&repo, &meta, v).await;
         let tick = bg.tick().await.unwrap();
-        ran(tick.auto);
+        let run = ran(tick.auto);
         bg.finish_all().await.unwrap();
         match tick.consolidate {
-            ConsolidateOutcome::Below { walked: 0, .. } => skipped += 1,
+            ConsolidateOutcome::Below { walked: 0, .. } => {
+                skipped += 1;
+                // A fold moved judged frames into a new pack: no new bytes.
+                skipped_folds += u32::from(run.packs_merged > 0);
+            }
             ConsolidateOutcome::Below { .. } => walks += 1,
             other => panic!("{other:?}"),
         }
     }
     assert!(skipped > 0 && walks > 0, "{walks} walks, {skipped} skipped");
+    assert!(
+        skipped_folds > 0,
+        "{walks} walks, {skipped} skipped, none after a fold"
+    );
     assert_main_readable(Arc::new(FsBlobStore::new(dir.path())), &meta, "skips").await;
+}
+
+/// A consolidation held by cleanups past two fences lets one delta run go,
+/// and that run re-arms the hold: the next delta runs wait for the
+/// consolidation again, which runs once the cleanups' fences pass. Before,
+/// the first hold's timer ran out for good, and a store with a delta run at
+/// every check kept one of its own cleanups waiting and never consolidated.
+#[tokio::test(start_paused = true)]
+async fn a_held_consolidation_holds_delta_runs_again_after_one_goes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, meta, repo) = heads_world(dir.path(), 2).await;
+    let total: u64 = store.pack_sizes().unwrap().iter().map(|p| p.bytes).sum();
+    let fence = Duration::from_secs(100);
+    let o = BackgroundRepackOptions {
+        fence,
+        // Merges of every two whole packs, none of them small.
+        trigger_packs: 1,
+        fanout: 2,
+        small_merge_bytes: 0,
+        // A cap that a delta run's cleanup stays under, but not with the
+        // consolidation's packs beside it.
+        pending_share: 0.0,
+        min_pending_bytes: total,
+        ..opts(consolidating(u64::MAX))
+    };
+    let mut bg = task(&store, &meta, o);
+    let step = Duration::from_secs(30);
+    let mut v = 40;
+    let land = |v: &mut usize| {
+        *v += 1;
+        let (repo, meta) = (repo.clone(), meta.clone());
+        let n = *v;
+        async move { land_one(&repo, &meta, n).await }
+    };
+    land(&mut v).await;
+    let tick = bg.tick().await.unwrap();
+    ran(tick.auto);
+    assert_eq!(tick.consolidate, ConsolidateOutcome::Held("pending"));
+    assert!(
+        bg.pending_bytes() < total,
+        "{} of {total}",
+        bg.pending_bytes()
+    );
+    // Land packs keep coming and their merges keep a cleanup waiting:
+    // delta runs wait, for two fences at most.
+    let mut forced = false;
+    for b in 0..10u32 {
+        tokio::time::advance(step).await;
+        for k in 0..2u32 {
+            let items: Vec<(Hash, Bytes)> = (0..5u32)
+                .map(|i| Bytes::from(format!("land batch {b}.{k} object {i}\n")))
+                .map(|d| (Hash::of_blob(&d), d))
+                .collect();
+            store.put_many(items).await.unwrap();
+        }
+        let tick = bg.tick().await.unwrap();
+        assert!(
+            !matches!(tick.consolidate, ConsolidateOutcome::Ran { .. }),
+            "{:?}",
+            tick.consolidate
+        );
+        match tick.auto {
+            AutoOutcome::Held("consolidation") => {}
+            AutoOutcome::Ran(_) => {
+                forced = true;
+                break;
+            }
+            other => panic!("batch {b}: {other:?}"),
+        }
+    }
+    assert!(forced, "a delta run went after two fences");
+    // The land packs stop; loose objects keep coming at every check. The
+    // hold is armed again, so delta runs wait and the consolidation runs
+    // once the waiting cleanups are done.
+    let mut consolidated = false;
+    for _ in 0..8 {
+        tokio::time::advance(step).await;
+        land(&mut v).await;
+        let tick = bg.tick().await.unwrap();
+        if matches!(tick.consolidate, ConsolidateOutcome::Ran { .. }) {
+            consolidated = true;
+            break;
+        }
+        assert_eq!(tick.auto, AutoOutcome::Held("consolidation"));
+    }
+    assert!(consolidated, "the consolidation ran");
+    bg.finish_all().await.unwrap();
+    assert_main_readable(Arc::new(FsBlobStore::new(dir.path())), &meta, "re-armed").await;
 }
 
 /// Below every threshold nothing runs and nothing is written; a check

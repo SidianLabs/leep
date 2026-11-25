@@ -6,7 +6,9 @@
   packs holding it are a day old (by a clock restarts do not reset), measured
   on a sample first; objects GC deleted from those packs count and are
   dropped. One consolidation rewrites at most 2 GiB of packs, walks again
-  only after enough new whole frames, and backs off after a failure. On the land-driven corpus (Postgres) all storage falls
+  only after enough new whole frames, and backs off after a failure.
+  Delta runs wait for a consolidation held by cleanups for at most two
+  fences; each one that goes makes the next wait again. On the land-driven corpus (Postgres) all storage falls
   from 26.92 to 15.61 MB, 4.24 to 2.46 times Git, the history objects to
   the size `repack --full` gives, and wide edits cost under a quarter of
   the blob bytes per land they did.

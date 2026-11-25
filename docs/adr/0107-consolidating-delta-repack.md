@@ -123,13 +123,20 @@ old: `L`'s file was written, and the oldest record of the other packs
 ago. The second survives restarts, so a server restarted more often than
 the age (by upgrades, say) still applies the rule; a consolidation writes
 a new `L`, so the rule rewrites the packs at most about once per age.
+That clock is coarse: the oldest record of any of the other packs counts,
+not of the frames that hold the gain, so an old small pack beside a fresh
+gain can make the gain look older than it is. The bound still holds, since
+`L` itself must be that old; a per-frame clock would need the write time
+of every frame the walk lists, which the remembered figure does not keep.
 
 A cheap filter skips the walk when the whole bytes of the packs (each
 pack's `PackDetail::whole_bytes`, read once per pack) plus the tombstoned
 bytes cannot reach the lower of the two floors. The task also remembers
 what the last walk found outside `L`, and walks again only once the whole
-bytes of packs that walk did not judge reach an eighth of the ratio floor
-(a 64th of the packs' bytes at the default ratio) or `L` changes: each walk
+bytes outside `L` have changed since that walk by an eighth of the ratio floor
+(a 64th of the packs' bytes at the default ratio) or `L` changes. By
+bytes, not by pack ids: a delta run's geometric fold moves judged frames
+into a pack with a new id without adding any. Each walk
 covers all the history since `L`, so walking after every delta run would
 be quadratic in the bytes written between consolidations, and this way the
 walks between two consolidations cost a bounded multiple of one. Until
@@ -180,9 +187,14 @@ merging under load. When larger cleanups wait and its packs would take the
 bytes waiting past the cap, it is held ("pending"), and delta runs wait for
 it (`leep_repack_auto_skipped_total{reason="consolidation"}`) so no new
 large cleanup starts: it usually runs within a fence. Delta runs wait two
-fences at most from when it was first held, then run again whether or not
+fences at most from when it was first held, then one runs whether or not
 it has (other cleanups may keep it held), so loose objects never wait long
-behind it. Lands never wait.
+behind it. That run re-arms the hold: the consolidation, held again by the
+run's own cleanup, makes the next delta runs wait again, up to two more
+fences, which that cleanup's fence fits in. Without the re-arm, a store
+whose delta runs come more often than once a fence would keep one cleanup
+of its own waiting at every check and never consolidate. Lands never
+wait.
 
 ### 6a. Backup pools
 A backup pool (ADR 0026, ADR 0039 section 6) keeps every object any
