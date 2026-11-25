@@ -53,3 +53,11 @@
 - **Fixed.** A pack merge kept the write time of the first copy of an
   object several packs held, not the latest, so an upload's refresh could
   look old to GC's grace and rescue checks.
+- **Fixed.** Smaller derived segment fixes: two servers taking turns on
+  the compactor lease no longer drop each other's carried backfill (a
+  segment the other sealed only takes its keys out of it); tiers count
+  from the smallest (idle) seal, so idle seals no longer make tier 0
+  rewrite the same rows about 20 times; `repair drop` checks its lease
+  before each delete step; and `verify` and `repair rederive` no longer
+  stop a kind's scan early when a page of sealed keys all read as
+  missing.

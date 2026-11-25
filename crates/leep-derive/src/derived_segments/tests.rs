@@ -1912,11 +1912,12 @@ async fn a_backfill_reads_generations_over_several_passes() {
     assert!(gens.windows(2).all(|w| w[0].1 <= w[1].0), "{gens:?}");
 }
 
-/// Work carried across passes is forgotten when a live segment appears
-/// that it does not account for (another server's pass): the next pass
-/// lists again and seals nothing twice.
+/// Work carried across passes survives a live segment it does not account
+/// for (another server's seal): its keys are taken out of the carried
+/// candidates, the next pass goes on without listing, and nothing is
+/// sealed twice.
 #[tokio::test]
-async fn a_carried_backfill_is_dropped_when_another_server_seals() {
+async fn a_carried_backfill_survives_another_servers_seal() {
     let r = repo();
     let ids = build(&r, None).await;
     let opts = CompactOptions {
@@ -1933,7 +1934,7 @@ async fn a_carried_backfill_is_dropped_when_another_server_seals() {
     let p = v1(&pass(&r, &opts, &mut theirs, None).await);
     assert!(p.listed && p.sealed_keys == 8, "{p:?}");
     let p = v1(&pass(&r, &opts, &mut mine, None).await);
-    assert!(p.listed, "{p:?}");
+    assert!(!p.listed, "{p:?}");
     let mut sealed = 16 + p.sealed_keys;
     for _ in 0..20 {
         let p = v1(&pass(&r, &opts, &mut mine, None).await);

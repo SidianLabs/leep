@@ -273,12 +273,16 @@ impl CompactOptions {
     }
 
     /// The tier of a segment of `rows` keys: `floor(log_fanout(rows /
-    /// seal_rows))`, so a seal is tier 0 and a merge of a tier's segments
-    /// lands about one tier up.
+    /// base))`, `base` the smallest seal (an idle one), so a merge of a
+    /// tier's segments lands about one tier up. Counted from the full seal
+    /// instead, idle seals and their merges all sat in tier 0 and a
+    /// growing segment there was rewritten with every three new seals,
+    /// about 20 times before it left the tier.
     fn tier(&self, rows: u32) -> u32 {
         let f = self.fanout.max(2) as u64;
+        let base = self.idle_rows.min(self.seal_rows).max(1) as u64;
         let mut t = 0;
-        let mut cap = (self.seal_rows.max(1) as u64).saturating_mul(f);
+        let mut cap = base.saturating_mul(f);
         while (rows as u64) >= cap && t < 16 {
             t += 1;
             cap = cap.saturating_mul(f);
@@ -859,7 +863,56 @@ impl<'a> Pass<'a> {
             .live
             .iter()
             .all(|s| state.known.get(&s.index) == Some(&s.columns));
-        if self.report.dropped > 0 || !accounted {
+        // Another server's pass only added segments (its seals): the carried
+        // work stays valid once their keys are taken out of it, so two
+        // servers taking turns do not each list every row again.
+        let only_added = !accounted
+            && self.report.dropped == 0
+            && state.known.iter().all(|(h, cols)| {
+                self.man
+                    .live
+                    .iter()
+                    .any(|s| s.index == *h && s.columns == *cols)
+            })
+            && self
+                .man
+                .live
+                .iter()
+                .filter(|s| !state.known.contains_key(&s.index))
+                .all(|s| self.segs.contains_key(&s.index));
+        if only_added {
+            let added: Vec<Arc<Live>> = self
+                .man
+                .live
+                .iter()
+                .filter(|s| !state.known.contains_key(&s.index))
+                .filter_map(|s| self.segs.get(&s.index).cloned())
+                .collect();
+            if let Some(bf) = state.backfill.as_mut() {
+                let held = |k: &Hash, m: u64| -> u64 {
+                    let mut m = m;
+                    for l in &added {
+                        for c in self.fam.columns {
+                            if m & bit(c.id) != 0 && l.r.has(c.id) && l.idx.has(k, c.id) {
+                                m &= !bit(c.id);
+                            }
+                        }
+                    }
+                    m
+                };
+                for (k, m) in bf.pending.iter_mut() {
+                    *m = held(k, *m);
+                }
+                bf.pending.retain(|(_, m)| *m != 0);
+                let next = bf.next.min(bf.order.len());
+                for (_, k, m) in bf.order[next..].iter_mut() {
+                    *m = held(k, *m);
+                }
+            }
+            for l in &added {
+                state.known.insert(l.r.index, l.r.columns);
+            }
+        } else if self.report.dropped > 0 || !accounted {
             if state.backfill.is_some() || state.retire_left.is_some() {
                 // List again now, not after `list_every`.
                 state.listed = None;
@@ -1974,6 +2027,9 @@ impl<'a> Pass<'a> {
             self.write().await?;
             if enc.seg.rows > 0 {
                 state.known.insert(enc.seg.index, enc.seg.columns);
+            }
+            for s in &run {
+                state.known.remove(&s.index);
             }
             state.live_since.insert(enc.seg.index, Instant::now());
             state.verified.insert(enc.seg.index);

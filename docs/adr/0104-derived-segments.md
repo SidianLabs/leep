@@ -162,8 +162,11 @@ pass), and:
    if it made progress (generations read, a page consumed, rows deleted or
    found unequal), so nothing can keep passes 5 s apart for ever.
 2. **Merges** runs of four adjacent live segments of one tier (`floor(log4(keys
-   / 1,024))`), the longest prefix of the run that fits the caps (two or
-   more), so a row is rewritten about three times at most. Adjacent, so a key
+   / 64))`, 64 the smallest seal, an idle one), the longest prefix of the run
+   that fits the caps (two or more), so a row is rewritten about four times
+   at most (amended 2026-11-25: tiers counted from 1,024 put idle seals and
+   their merges all in tier 0, where a growing segment was rewritten with
+   every three new seals, about 20 times). Adjacent, so a key
    in several segments still answers from the newest. Keys of changesets no
    longer stored (the changeset sweep, ADR 0059) are left out. The replaced
    segments are retired: still stored, collected by blob GC.
@@ -352,7 +355,7 @@ the operating system only on `VACUUM FULL derived` (or `pg_repack`) and
 - A cold read of a sealed key reads its segment's data blob once per process
   (at most 4 MiB: milliseconds on a filesystem, 50 to 150 ms on an object
   store), and a new manifest makes each process read the new index blobs.
-- Write amplification: a row is sealed once and merged about three times.
+- Write amplification: a row is sealed once and merged about four times.
 - Retired segments wait for the operator's `gc`: up to about twice the
   live segment bytes in the meantime.
 - In mode `build` a pass lists every key of both kinds whenever they grew

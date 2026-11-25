@@ -224,13 +224,16 @@ impl RowScan {
 
     /// `page` (rows after the cursor, at most `limit`) with the sealed keys
     /// up to its last key (or to the end, for a short page) that it lacks,
-    /// their values read through `meta`, in key order and cut to `limit`.
+    /// their values read through `meta`, in key order and cut to `limit`;
+    /// and the last sealed key looked at, so a page whose sealed keys all
+    /// read as missing (a segment unreadable, or left out since the scan
+    /// began) moves the cursor past them instead of ending the scan.
     async fn with_sealed(
         &self,
         meta: &dyn MetaStore,
         page: Vec<(Hash, Bytes)>,
         limit: usize,
-    ) -> Result<Vec<(Hash, Bytes)>> {
+    ) -> Result<(Vec<(Hash, Bytes)>, Option<Hash>)> {
         let upper = (page.len() >= limit)
             .then(|| page.last().map(|(k, _)| *k))
             .flatten();
@@ -243,9 +246,9 @@ impl RowScan {
             .take(limit)
             .copied()
             .collect();
-        if extra.is_empty() {
-            return Ok(page);
-        }
+        let Some(&looked) = extra.last() else {
+            return Ok((page, None));
+        };
         let values = meta.get_derived_many(self.kind, &extra).await?;
         let mut all = page;
         all.extend(
@@ -256,7 +259,7 @@ impl RowScan {
         );
         all.sort_unstable_by_key(|(k, _)| *k);
         all.truncate(limit);
-        Ok(all)
+        Ok((all, Some(looked)))
     }
 
     fn window_start(&self) -> Option<Hash> {
@@ -279,11 +282,17 @@ impl RowScan {
                 PAGE.min(self.per_window - self.taken)
             };
             let mut page = meta.list_derived(self.kind, self.cursor, limit).await?;
+            let mut looked = None;
             if !self.sealed.is_empty() {
-                page = self.with_sealed(meta, page, limit).await?;
+                (page, looked) = self.with_sealed(meta, page, limit).await?;
             }
             if page.is_empty() {
-                self.advance_window();
+                match looked {
+                    // Sealed keys were left, all read as missing: go on
+                    // after them.
+                    Some(k) => self.cursor = Some(k),
+                    None => self.advance_window(),
+                }
                 continue;
             }
             self.cursor = page.last().map(|(k, _)| *k);
