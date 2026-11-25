@@ -1197,8 +1197,9 @@ async fn gc_keeps_live_segments_and_collects_merged_ones() {
         };
         assert!(m.retired.is_empty(), "{:?}", m.retired);
     }
-    // A damaged manifest of either family stops GC: it cannot tell live
-    // segments from orphans.
+    // A damaged manifest of either family does not stop GC: it cannot tell
+    // that family's live segments from orphans, so it keeps every blob that
+    // starts like a segment, and collects the rest.
     for fam in FAMILIES
         .iter()
         .filter(|f| f.keys == super::Keys::Changesets)
@@ -1212,11 +1213,30 @@ async fn gc_keeps_live_segments_and_collects_merged_ones() {
             )
             .await
             .unwrap();
-        assert!(gc::run(&r, &opts, &clock).await.is_err(), "{}", fam.name);
+        let mut unnamed = leep_core::hash::OBJECT_DOMAIN.to_vec();
+        unnamed.extend_from_slice(codec::INDEX_KIND.as_bytes());
+        unnamed.extend_from_slice(b"\0 a segment no readable manifest names");
+        let unnamed = r.blobs().put(Bytes::from(unnamed)).await.unwrap();
+        let orphan = r
+            .blobs()
+            .put(Bytes::from(format!("an orphan {}", fam.name)))
+            .await
+            .unwrap();
+        let rep = gc::run(&r, &opts, &clock).await.unwrap();
+        assert_eq!(rep.condemn.damaged_derived_manifests, vec![fam.name]);
+        assert!(rep.condemn.kept_derived_unknown >= 1, "{rep:?}");
+        assert!(r.blobs().contains(&unnamed).await.unwrap());
+        assert!(!r.blobs().contains(&orphan).await.unwrap(), "{rep:?}");
+        for b in m.live_blobs() {
+            assert!(r.blobs().contains(&b).await.unwrap());
+        }
         r.row_meta()
             .put_derived(MANIFEST_KIND, &manifest_key(fam.id), good.unwrap())
             .await
             .unwrap();
+        // Fixed: the unnamed one is an orphan again.
+        gc::run(&r, &opts, &clock).await.unwrap();
+        assert!(!r.blobs().contains(&unnamed).await.unwrap());
     }
     assert!(gc::run(&r, &opts, &clock).await.is_ok());
     // So does a manifest row of a family this binary does not know: a

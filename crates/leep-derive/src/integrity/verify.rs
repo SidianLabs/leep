@@ -1707,8 +1707,8 @@ impl Verifier<'_> {
                         "bad_derived_manifest",
                         format!(
                             "{kind} row of family {name} does not decode: none of its derived \
-                             segments is read, and garbage collection refuses to run until it \
-                             is replaced"
+                             segments is read, and garbage collection keeps every derived \
+                             segment blob until it is replaced"
                         ),
                     )
                     .kind(kind)

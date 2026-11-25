@@ -1557,7 +1557,8 @@ misses and occupancy as Prometheus metrics (see [OPERATIONS.md](OPERATIONS.md)).
   refuse a fence the servers' timeouts do not cover. Derived segments (ADR
   0104) are read from their manifest in condemn and again in collect: a
   live segment's blobs are never condemned, retired ones are collected like
-  orphans and reported apart, and a manifest that does not decode stops GC.
+  orphans and reported apart, and while a manifest does not decode GC keeps
+  every blob that starts like a segment and collects the rest.
   [ADR 0059](adr/0059-unreachable-changeset-gc.md) deletes changesets no
   root reaches (refs, every ref log entry, landed-copy scan windows,
   attestations, mirror maps, a grace period) by the same condemn, fence and

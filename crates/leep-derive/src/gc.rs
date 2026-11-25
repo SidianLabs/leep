@@ -612,6 +612,11 @@ pub struct CondemnReport {
     /// Blobs of retired derived segments newly condemned. Not counted in
     /// `condemned`.
     pub derived_segments_condemned: u64,
+    /// Unreferenced blobs kept because they start like a derived segment
+    /// while a family's manifest does not decode (live or retired unknown).
+    pub kept_derived_unknown: u64,
+    /// Families whose derived segment manifest does not decode.
+    pub damaged_derived_manifests: Vec<&'static str>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -644,6 +649,9 @@ pub struct CollectReport {
     /// Blobs of retired derived segments deleted, or that would be in a dry
     /// run. Not counted in `deleted`.
     pub derived_segments_deleted: u64,
+    /// Condemned blobs kept because they start like a derived segment while
+    /// a family's manifest does not decode (rescued like referenced ones).
+    pub kept_derived_unknown: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1240,6 +1248,7 @@ async fn condemn_leased(
     // retired ones are collected like orphans and reported apart.
     let derived = crate::derived_segments::gc_view(repo).await?;
     report.derived_segments = derived.segments;
+    report.damaged_derived_manifests = derived.damaged.clone();
     marked.record.recheck(repo).await?;
     let grace = secs(opts.grace);
     let cutoff = started_at.saturating_sub(grace);
@@ -1286,6 +1295,10 @@ async fn condemn_leased(
             let state = repo.fence_state(&blob.hash).await?;
             if state.is_condemned() {
                 report.already_condemned += u64::from(!segment);
+                continue;
+            }
+            if derived.keeps_unknown(repo, &blob.hash).await? {
+                report.kept_derived_unknown += 1;
                 continue;
             }
             if !opts.dry_run {
@@ -1367,6 +1380,7 @@ async fn collect_leased(
     // an earlier condemn saw as an orphan is rescued here.
     let derived = crate::derived_segments::gc_view(repo).await?;
     let mut dseg = CollectReport::default();
+    let mut kept_unknown = 0u64;
     // What the mark trusted must still be the record before anything is
     // deleted; `which` checks again after each row read.
     marked.record.recheck(repo).await?;
@@ -1439,6 +1453,11 @@ async fn collect_leased(
                 }
                 continue;
             }
+            let is_marked = is_marked || {
+                let keep = derived.keeps_unknown(repo, &blob.hash).await?;
+                kept_unknown += u64::from(keep);
+                keep
+            };
             if is_marked {
                 // Stored by a request that checked before the condemnation.
                 // Clearing the condemnation lets clients reuse the blob.
@@ -1492,6 +1511,7 @@ async fn collect_leased(
     report.mark_segments = marked.record.live_count();
     report.derived_segments = derived.segments;
     report.derived_segments_deleted = dseg.deleted;
+    report.kept_derived_unknown = kept_unknown;
     if !opts.dry_run {
         marked
             .record

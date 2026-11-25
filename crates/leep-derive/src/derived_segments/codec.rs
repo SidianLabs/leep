@@ -502,6 +502,11 @@ fn prefix(kind: &str) -> Vec<u8> {
     p
 }
 
+/// Whether `data` starts like an index or data blob of a segment.
+pub fn has_segment_prefix(data: &[u8]) -> bool {
+    data.starts_with(&prefix(INDEX_KIND)) || data.starts_with(&prefix(DATA_KIND))
+}
+
 /// Whether `data` stored at `hash` is an index or data blob of a segment.
 pub fn is_segment_blob(hash: &Hash, data: &[u8]) -> bool {
     (data.starts_with(&prefix(INDEX_KIND)) || data.starts_with(&prefix(DATA_KIND)))

@@ -1356,6 +1356,14 @@ async fn run_gc(
             "retired derived segment blobs condemned: {}",
             r.derived_segments_condemned
         );
+        if !r.damaged_derived_manifests.is_empty() {
+            outln!(
+                "derived segment manifests that do not decode: {} (every derived segment blob \
+                 kept: {})",
+                r.damaged_derived_manifests.join(", "),
+                r.kept_derived_unknown
+            );
+        }
     }
     if let Some(r) = collect {
         let verb = if dry { "would delete" } else { "deleted" };
@@ -1373,6 +1381,13 @@ async fn run_gc(
             "collect: retired derived segment blobs deleted: {}",
             r.derived_segments_deleted
         );
+        if r.kept_derived_unknown > 0 {
+            outln!(
+                "collect: kept as possibly live derived segments (a manifest does not \
+                 decode): {}",
+                r.kept_derived_unknown
+            );
+        }
     }
     Ok(())
 }

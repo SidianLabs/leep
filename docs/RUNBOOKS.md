@@ -1638,7 +1638,9 @@ recompute every value):
   `--derived-segments-retire-families`), the next pass replaces it unless
   the family's store feature (`derived-segments`, `derived-segments-2`,
   `derived-segments-3`) is
-  recorded; otherwise passes refuse to, and `gc` refuses to run.
+  recorded; otherwise passes refuse to. Meanwhile `gc` keeps every derived
+  segment blob (its report lists the family and `kept`) and collects the
+  rest.
 - `a derived-segments-v1 row of a derived segment family this leep-server
   does not know`: a newer `leep-server` wrote a family this one cannot read.
   `gc` refuses to run with it; run the newer `gc`.
@@ -2248,9 +2250,11 @@ unreferenced blobs and only GC reclaims them.
      same with `derived-segments` or `derived-segments-2`: a server runs
      `--derived-segments retire` (ADR 0104, 0105; an ADR 0104 binary refuses
      a store with `derived-segments-2`);
-   - `the derived-segments-v1 row does not decode, so garbage collection
-     cannot tell live derived segments from orphans`: see
-     [LeepDerivedSegmentPassesFailing](#leepderivedsegmentpassesfailing).
+   - `a derived-segments-v1 row ... was written by a newer one` or `... of
+     family ... was written by a newer leep-server`: run the newer `gc`.
+     (A row that does not decode no longer stops `gc`: it keeps every
+     derived segment blob and says so; see
+     [LeepDerivedSegmentPassesFailing](#leepderivedsegmentpassesfailing).)
 3. Is it simply slow or killed? Condemn and collect walk only changesets stored since
    the last run (`changesets walked` in the report; ADR 0033), but still list every
    changeset and blob, so they take longer as the store grows, and the first run

@@ -252,8 +252,9 @@ them; `leep_derived_segment_index_bytes` reports what they hold.
   older `gc` condemned them); retired ones are collected like orphans,
   through condemn, fence and collect, and reported apart (`derived
   segments`, `retired derived segment blobs condemned` and `deleted`). A
-  manifest that does not decode stops GC, which could not tell live
-  segments from orphans.
+  manifest that does not decode makes GC keep every blob that starts like
+  a segment, since it cannot tell live segments from orphans, and collect
+  everything else (amended 2026-11-25: it stopped all blob GC).
 - **The changeset sweep** still deletes rows; a swept changeset's entries
   stay in segments until a merge leaves them out. They are pure functions
   of the id, so they are right if the changeset is stored again.

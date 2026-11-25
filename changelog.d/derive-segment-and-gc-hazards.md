@@ -21,3 +21,7 @@
   then rescued had its rows kept for good: the compactor took the
   condemnation row alone for a standing condemnation. It now reads the
   rescue and doom rows too, as the rest of blob GC does.
+- **Changed.** A `derived-segments-v1` row that does not decode no longer
+  stops all blob GC until an operator drops every kind of the family: `gc`
+  keeps every blob that starts like a derived segment, collects the rest,
+  and reports the family. A row written by a newer binary still stops it.

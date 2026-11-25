@@ -168,14 +168,34 @@ fn next_seq(prev: u64) -> u64 {
 
 /// What blob GC must know: the blobs of live segments (never condemned)
 /// and of retired ones (collected like orphans, reported apart), over
-/// every family. A manifest that does not decode, one a newer binary
-/// wrote, or a manifest row of a family this binary does not know is an
-/// error: GC cannot tell live segments from orphans then, and after
-/// `retire` they hold the only copy of their rows.
+/// every family. A manifest one a newer binary wrote, or a manifest row of
+/// a family this binary does not know, is an error: GC cannot tell that
+/// family's segments from orphans, nor know their blob layout. A manifest
+/// that does not decode only makes GC keep every blob that starts like a
+/// segment (live or retired is then unknown, and after `retire` a live one
+/// holds the only copy of its rows); everything else is still collected.
 pub(crate) struct GcView {
     pub live: HashSet<Hash>,
     pub retired: HashSet<Hash>,
     pub segments: u64,
+    /// Families whose manifest does not decode.
+    pub damaged: Vec<&'static str>,
+}
+
+impl GcView {
+    /// Whether GC must keep `hash`, about to be condemned or deleted, as
+    /// possibly a live segment of a family whose manifest does not decode:
+    /// only then, and only a stored blob that starts like a segment.
+    pub(crate) async fn keeps_unknown(&self, repo: &Repo, hash: &Hash) -> Result<bool> {
+        if self.damaged.is_empty() {
+            return Ok(false);
+        }
+        Ok(repo
+            .blobs()
+            .get(hash)
+            .await?
+            .is_some_and(|b| codec::has_segment_prefix(&b)))
+    }
 }
 
 pub(crate) async fn gc_view(repo: &Repo) -> Result<GcView> {
@@ -183,6 +203,7 @@ pub(crate) async fn gc_view(repo: &Repo) -> Result<GcView> {
         live: HashSet::new(),
         retired: HashSet::new(),
         segments: 0,
+        damaged: Vec::new(),
     };
     // Every manifest row there is (one per family), so one a newer binary
     // wrote for a family this one does not know stops GC instead of leaving
@@ -220,12 +241,15 @@ pub(crate) async fn gc_view(repo: &Repo) -> Result<GcView> {
                 view.segments += m.live.len() as u64;
             }
             ManifestRead::Damaged => {
-                return Err(Error::Other(format!(
+                tracing::error!(
+                    family = fam.name,
                     "the {MANIFEST_KIND} row of family {} does not decode, so garbage \
-                     collection cannot tell live derived segments from orphans; see \
+                     collection cannot tell its live derived segments from orphans: it keeps \
+                     every derived segment blob until the row is fixed; see \
                      LeepDerivedSegmentPassesFailing in RUNBOOKS.md",
                     fam.name
-                )))
+                );
+                view.damaged.push(fam.name);
             }
             ManifestRead::Newer => {
                 return Err(Error::Other(format!(

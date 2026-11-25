@@ -178,9 +178,13 @@ release. The warning is logged once per segment per process.
 
 ### 5. GC over every family (point 2)
 `gc_view` lists every `derived-segments-v1` row and unions the live and
-retired blobs of every family. A row that does not decode, one a newer
-binary wrote, or one whose key is not a known family's stops GC: it cannot
-tell that family's live segments from orphans. A blob live in one family is
+retired blobs of every family. A row a newer binary wrote, or one whose
+key is not a known family's, stops GC: it cannot tell that family's live
+segments from orphans. A row that does not decode (amended 2026-11-25: it
+stopped GC too, store-wide, until an operator dropped every kind of the
+family) makes GC keeps every blob that starts like a derived segment (index or data
+prefix), live or retired, until the row is fixed, and collects everything
+else; condemn reports the family and the blobs kept. A blob live in one family is
 never collected as another's retired.
 
 ### 6. The compactor by table (points 3 and 4)
