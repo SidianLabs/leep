@@ -1188,7 +1188,15 @@ impl PublishedObjectPack {
             self.remove_loose(&id).await?;
         }
         self.lease().check().await?;
+        // Only packs still retired: a later repack may have published one
+        // again under the same id and taken it out of the record (see the
+        // filesystem store's `finish_blocking`).
+        let retired = read_retired(&*objects).await?;
         for id in &self.replaced {
+            if !retired.contains_key(id) {
+                self.report.old_packs_kept += 1;
+                continue;
+            }
             // The index first: without it the pack is unpublished garbage.
             delete_all(&*objects, vec![idx_key(id)]).await?;
             delete_all(&*objects, vec![pack_key(id)]).await?;

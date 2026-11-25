@@ -261,6 +261,9 @@ pub struct RepackReport {
     /// new pack by GC and uploaded again.
     pub loose_kept: u64,
     pub old_packs_removed: u64,
+    /// Replaced packs a later repack published again under the same id
+    /// (no longer retired), so the cleanup left them in place.
+    pub old_packs_kept: u64,
     /// Packs earlier repacks retired, deleted by the sweep this run began
     /// with because their fence had passed (ADR 0080).
     pub retired_removed: u64,
@@ -373,7 +376,19 @@ impl PublishedPack {
             sync_dir(d)?;
         }
         let dir = store.packs.dir().to_path_buf();
+        // Only packs still retired. A later merge can publish a replaced
+        // pack again, byte for byte under the same id (a consolidation whose
+        // input lost exactly what this repack added to it), and
+        // `retire_for` then took it out of the record: it is the live copy
+        // now, and deleting it by name would lose everything it holds.
+        let retired = crate::retire::read_retired(&dir)?;
         for id in &self.replaced {
+            if !retired.contains_key(id) {
+                if dir.join(format!("{id}.idx")).exists() {
+                    self.report.old_packs_kept += 1;
+                }
+                continue;
+            }
             // The index first: without it the pack is unpublished garbage.
             remove_if_present(&dir.join(format!("{id}.idx")))?;
             sync_dir(&dir)?;
