@@ -665,10 +665,11 @@ async fn one_familys_failing_index_does_not_fail_anothers_reads() {
         .await
         .unwrap();
     assert!(kinds[0].iter().all(Option::is_some));
-    // The search rows' own read reports it.
+    // The search rows' own read leaves the unreadable segments out: the
+    // key reads as missing (it derives again), not as an error.
     let f = fresh(&r);
     let root = f.root_tree(ids[5]).await.unwrap();
-    assert!(f.meta().get_derived(TREE_KIND, &root).await.is_err());
+    assert!(f.meta().get_derived(TREE_KIND, &root).await.is_ok());
 }
 
 /// Small segments are merged even when larger ones sit between them: a

@@ -883,7 +883,8 @@ async fn condemned_segments_rows_are_not_retired() {
 }
 
 /// A transient error reading one family's index blob does not keep the
-/// other family's manifest from being applied.
+/// other family's manifest from being applied, nor the family's other
+/// segments from being used.
 #[tokio::test]
 async fn one_familys_failing_index_does_not_freeze_the_other() {
     let blobs: Arc<dyn leep_core::BlobStore> = Arc::new(MemoryBlobStore::new());
@@ -911,10 +912,15 @@ async fn one_familys_failing_index_does_not_freeze_the_other() {
         } else {
             segs.refresh(&**reader.row_meta()).await
         };
-        assert!(got.is_err(), "single {single}");
+        got.unwrap();
         assert_eq!(
             segs.family(FAMILY_CHANGESET_V2).segments().len(),
             live(&r, FAMILY_CHANGESET_V2).await.len(),
+            "single {single}"
+        );
+        assert_eq!(
+            segs.family(FAMILY_CHANGESET).segments().len(),
+            v1.len() - 1,
             "single {single}"
         );
     }

@@ -325,7 +325,19 @@ the operating system only on `VACUUM FULL derived` (or `pg_repack`) and
   miss, as with ADR 0012's VM freeze.
 - A segment lost or damaged (address, prefix, version, structure): its keys
   read as rows or derive again, and the next pass drops it and seals again.
-  A transient read error never does: it fails the read or the pass.
+  Every "not stored" is exact (`get_exact`, ADR 0070), so a blob another
+  process packed a moment ago is never taken for lost.
+- A segment whose blob fails to read with any other error (an I/O error,
+  a failing object store key). Amended 2026-11-25: before, one such index
+  blob failed every miss of its family on every server, and every pass,
+  for as long as the error lasted. Now readers leave that segment alone
+  out of their view for a minute (its keys read as rows or derive again,
+  every other segment still answers) and try it again; a pass keeps it,
+  leaves it out of its merges and retirement, and drops it only once it
+  failed three passes in a row over at least an hour while the family's
+  other segments read (`--derived-segments` passes report it as
+  `failing`). When every live segment of the family fails, the store is
+  taken to be failing: the pass fails and drops nothing.
 - `repair drop` and `repair rederive` hold the same lease as passes.
 - The land path, `cas_ref`, the ref log and the changeset transaction are
   not touched.

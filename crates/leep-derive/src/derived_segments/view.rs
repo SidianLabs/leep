@@ -318,10 +318,12 @@ impl SegmentView {
     }
 
     /// Use the manifest `raw` (as just read): load the index of every live
-    /// segment not loaded yet. A segment whose index is not stored or is
-    /// damaged is left out (its keys read as missing, so they derive
-    /// again); any other read error is returned and the view keeps what it
-    /// had, so a transient error never turns into a mass of derivations.
+    /// segment not loaded yet. A segment whose index is not stored, is
+    /// damaged or cannot be read now is left out (its keys read as rows or
+    /// derive again), the last for [`REFRESH`], then tried again: one
+    /// segment whose blob fails to read must not fail every read of the
+    /// family, which would also keep the view stale and refetch every
+    /// index on each miss.
     pub async fn apply(&self, raw: Option<Bytes>) -> Result<()> {
         let _held = self.apply.lock().await;
         {
@@ -391,7 +393,7 @@ impl SegmentView {
             .filter(|r| !have.contains_key(&r.index) && !broken.contains_key(&r.index))
             .copied()
             .collect();
-        let loaded = load_indexes(&*self.blobs, self.family, &wanted).await?;
+        let loaded = load_indexes(&*self.blobs, self.family, &wanted).await;
         let mut segs = Vec::with_capacity(live.len());
         for r in live.iter().rev() {
             if let Some(l) = have.get(&r.index) {
@@ -407,11 +409,29 @@ impl SegmentView {
                 continue;
             }
             match loaded.get(&r.index) {
-                Some(Some(idx)) => segs.push(Arc::new(Live {
+                Some(Ok(Some(idx))) => segs.push(Arc::new(Live {
                     r: *r,
                     idx: idx.clone(),
                 })),
-                Some(None) => {
+                Some(Ok(None)) => {
+                    broken.insert(r.index, tokio::time::Instant::now());
+                }
+                Some(Err(e)) => {
+                    // Left out like a lost one, but only for `REFRESH`: its
+                    // keys read as rows or derive again meanwhile, and every
+                    // other segment of the family still answers.
+                    metrics::counter!(
+                        "leep_derived_segment_errors_total",
+                        "what" => "index-read", "family" => family
+                    )
+                    .increment(1);
+                    tracing::warn!(
+                        segment = %r.index,
+                        family,
+                        error = %e,
+                        "derived segment index cannot be read now; its keys read as rows or \
+                         derive again, and it is tried again in a minute"
+                    );
                     broken.insert(r.index, tokio::time::Instant::now());
                 }
                 None => {}
@@ -547,7 +567,7 @@ impl SegmentView {
             if let Some(d) = caches.datas.get(&live.r.data) {
                 return Ok(Some(d));
             }
-            let bytes = match self.blobs.get(&live.r.data).await {
+            let bytes = match get_segment_blob(&*self.blobs, &live.r.data).await {
                 Ok(Some(b)) => b,
                 Ok(None) => {
                     metrics::counter!(
@@ -663,20 +683,48 @@ fn block_key(data: &Hash, col: usize, block: usize) -> Hash {
 /// Index blobs read at once by a manifest change.
 const INDEX_FETCHES: usize = 8;
 
-/// [`load_index`] of each of `wanted`, [`INDEX_FETCHES`] at a time.
+/// What loading one segment's index found.
+pub(crate) type IndexLoad = Result<Option<Arc<SegmentIndex>>>;
+
+/// [`load_index`] of each of `wanted`, [`INDEX_FETCHES`] at a time, each
+/// outcome apart: one index that cannot be read now must not keep the
+/// others from being used.
 pub(crate) async fn load_indexes(
     blobs: &dyn BlobStore,
     family: u8,
     wanted: &[SegmentRef],
-) -> Result<BTreeMap<Hash, Option<Arc<SegmentIndex>>>> {
-    use futures_util::stream::{self, StreamExt, TryStreamExt};
+) -> BTreeMap<Hash, IndexLoad> {
+    use futures_util::stream::{self, StreamExt};
     stream::iter(wanted.iter().copied())
         .map(|r| async move {
-            Ok::<_, Error>((r.index, load_index(blobs, family, &r).await?.map(Arc::new)))
+            (
+                r.index,
+                load_index(blobs, family, &r).await.map(|i| i.map(Arc::new)),
+            )
         })
         .buffer_unordered(INDEX_FETCHES)
-        .try_collect()
+        .collect()
         .await
+}
+
+/// A segment blob, with a miss that is exact: `get`, and after a miss
+/// `get_exact`, so a blob another process packed a moment ago (segments are
+/// written loose and packed minutes later) is not taken for lost while a
+/// cached pack view hides it (ADR 0070). Costs nothing more on a hit.
+pub(crate) async fn get_segment_blob(blobs: &dyn BlobStore, hash: &Hash) -> Result<Option<Bytes>> {
+    match blobs.get(hash).await? {
+        Some(b) => Ok(Some(b)),
+        None => blobs.get_exact(hash).await,
+    }
+}
+
+/// Whether a segment blob is stored, with an exact "no" (see
+/// [`get_segment_blob`]).
+pub(crate) async fn segment_blob_stored(blobs: &dyn BlobStore, hash: &Hash) -> Result<bool> {
+    if blobs.contains(hash).await? {
+        return Ok(true);
+    }
+    Ok(blobs.get_exact(hash).await?.is_some())
 }
 
 /// Read and decode `r`'s index blob, named by `family`'s manifest. `None`
@@ -687,7 +735,7 @@ pub(crate) async fn load_index(
     family: u8,
     r: &SegmentRef,
 ) -> Result<Option<SegmentIndex>> {
-    let what = match blobs.get(&r.index).await {
+    let what = match get_segment_blob(blobs, &r.index).await {
         Ok(Some(bytes)) => match codec::decode_index(&r.index, &bytes) {
             Ok(idx)
                 if idx.family == family && idx.data == r.data && idx.len() == r.rows as usize =>

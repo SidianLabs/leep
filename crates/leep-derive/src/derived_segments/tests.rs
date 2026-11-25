@@ -1539,9 +1539,10 @@ async fn a_newer_manifest_is_left_alone() {
     assert!(values(&r, &ids).await.iter().all(Option::is_some));
 }
 
-/// A pass probes segments itself: a transient read error fails the pass
-/// and drops nothing, whatever a reader marked broken; on a store with the
-/// feature recorded, a lost segment is dropped only when two passes agree.
+/// A pass probes segments itself: a transient read error drops nothing
+/// (before `drop_failing_after`), whatever a reader marked broken; on a
+/// store with the feature recorded, a lost segment is dropped only when two
+/// passes agree.
 #[tokio::test]
 async fn transient_errors_drop_nothing_and_losses_need_two_passes() {
     let blobs: Arc<dyn leep_core::BlobStore> = Arc::new(MemoryBlobStore::new());
@@ -1566,16 +1567,19 @@ async fn transient_errors_drop_nothing_and_losses_need_two_passes() {
         .get_derived(Skiplist::NAME, &ids[1].0)
         .await
         .ok();
-    // A new process's pass fails on the transient error, dropping nothing.
+    // A new process's pass keeps the segment through a transient error
+    // (others read), or fails when every segment fails; it drops nothing.
     let mut fresh_state = CompactState::default();
-    assert!(compact_pass(
-        &r,
-        &CompactOptions::small(Mode::Retire),
-        &mut fresh_state,
-        Some(&f)
-    )
-    .await
-    .is_err());
+    let slow = CompactOptions {
+        drop_failing_after: Duration::from_secs(3600),
+        ..CompactOptions::small(Mode::Retire)
+    };
+    for _ in 0..4 {
+        if let Ok(Some(p)) = compact_pass(&r, &slow, &mut fresh_state, Some(&f)).await {
+            assert_eq!(v1(&p).dropped, 0);
+            assert_eq!(v1(&p).failing, 1);
+        }
+    }
     assert_eq!(read_manifest(&r, FAMILY_CHANGESET).await.unwrap().0, before);
     flaky.failing.lock().unwrap().clear();
     // Lost for real: the first pass suspects it, the second drops it.

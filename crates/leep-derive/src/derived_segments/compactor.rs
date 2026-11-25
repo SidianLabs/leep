@@ -30,7 +30,7 @@ use tokio::time::Instant;
 use super::codec::{
     self, Block, Equality, Family, Keys, Loc, Manifest, SealRow, SegmentData, SegmentRef, FAMILIES,
 };
-use super::view::{load_indexes, Live, ManifestRead};
+use super::view::{get_segment_blob, load_indexes, segment_blob_stored, Live, ManifestRead};
 use super::{lease_key, read_manifest, swap_manifest, MANIFEST_KIND};
 use crate::derived::{decode_u64, DerivedKind, Generation};
 use crate::gc_lease::{self, GcLease};
@@ -173,6 +173,13 @@ pub struct CompactOptions {
     /// For tests only: the time (Unix seconds) retention's window is judged
     /// at, instead of the clock.
     pub content_now: Option<i64>,
+    /// A live segment whose blobs fail to read (not "not stored", not
+    /// damage: an I/O error, a failing object store key) while the
+    /// family's other segments read is dropped once it failed
+    /// [`FAILING_PASSES`] passes in a row over at least this long: its keys
+    /// then seal again from rows or derive again, instead of the family
+    /// keeping a segment no pass can read.
+    pub drop_failing_after: Duration,
     /// For crash tests only.
     pub pause: Option<PauseHook>,
 }
@@ -202,6 +209,7 @@ impl Default for CompactOptions {
             content_max_bytes: 1 << 20,
             content_max_rows: 16_384,
             content_now: None,
+            drop_failing_after: Duration::from_secs(3600),
             pause: None,
         }
     }
@@ -234,6 +242,7 @@ impl CompactOptions {
             content_max_bytes: 128 << 10,
             content_max_rows: 1_024,
             content_now: None,
+            drop_failing_after: Duration::ZERO,
             pause: None,
         }
     }
@@ -276,6 +285,19 @@ impl CompactOptions {
         }
         t
     }
+}
+
+/// Passes in a row a live segment must fail to read in before it is dropped
+/// (and [`CompactOptions::drop_failing_after`] must have passed).
+pub const FAILING_PASSES: u32 = 3;
+
+/// What a probe of a live segment's blobs found.
+enum Probe {
+    Sound,
+    /// Not stored, or damaged: definite.
+    Lost,
+    /// A read failed with any other error, for now.
+    Failing(Error),
 }
 
 /// What a process remembers between passes, per family: carried work
@@ -328,6 +350,10 @@ struct FamilyState {
     /// with the feature recorded, a segment is dropped only when two passes
     /// in a row agree.
     suspect: HashSet<Hash>,
+    /// Live segments whose blobs failed to read (an error that is neither
+    /// "not stored" nor damage) in every pass since the first, with when
+    /// that was and in how many passes.
+    failing: HashMap<Hash, (Instant, u32)>,
     /// Rows found unequal to their holding segment's value, with that
     /// segment: not read and reported again while it holds them.
     mismatched: HashMap<(Hash, u8), Hash>,
@@ -426,6 +452,10 @@ pub struct PassReport {
     /// Live segments that could not be read and were dropped from the
     /// manifest (their rows seal again, or derive again).
     pub dropped: u64,
+    /// Live segments whose blobs failed to read in this pass with an error
+    /// that is neither "not stored" nor damage: kept, and left out of the
+    /// pass's merges and retirement.
+    pub failing: u64,
     /// Rows deleted (mode `retire`).
     pub retired_rows: u64,
     /// Rows found unequal to their segment's value, kept.
@@ -456,6 +486,7 @@ impl PassReport {
         self.merges += r.merges;
         self.merged_away += r.merged_away;
         self.dropped += r.dropped;
+        self.failing += r.failing;
         self.retired_rows += r.retired_rows;
         self.mismatched += r.mismatched;
         self.bad_values += r.bad_values;
@@ -587,6 +618,9 @@ pub(crate) struct Pass<'a> {
     man: Manifest,
     /// Live segments whose index this pass loaded itself, by index hash.
     segs: HashMap<Hash, Arc<Live>>,
+    /// Live segments whose index blob failed to read in this pass, with
+    /// the error (neither "not stored" nor damage).
+    index_errors: HashMap<Hash, Error>,
     /// Data blobs and blocks this pass read (one segment at a time where it
     /// reads many).
     data: HashMap<Hash, Arc<SegmentData>>,
@@ -672,6 +706,7 @@ impl<'a> Pass<'a> {
             raw,
             man,
             segs: HashMap::new(),
+            index_errors: HashMap::new(),
             data: HashMap::new(),
             blocks: HashMap::new(),
             rows: None,
@@ -692,7 +727,8 @@ impl<'a> Pass<'a> {
 
     /// Load the live segments' indexes itself, not through the shared read
     /// view (whose state a reader's transient error or a late read may
-    /// have moved). A transient read error fails the pass.
+    /// have moved). An index that fails to read is remembered for
+    /// [`Pass::check_live`]; the others are used.
     async fn load_segments(&mut self) -> Result<()> {
         // Decoded indexes the view already holds are reused: an index is
         // immutable and checked by address when loaded, so only the view's
@@ -729,9 +765,20 @@ impl<'a> Pass<'a> {
             .filter(|s| !self.segs.contains_key(&s.index))
             .copied()
             .collect();
-        for (h, idx) in load_indexes(&**self.repo.blobs(), self.fam.id, &missing).await? {
-            if let (Some(idx), Some(r)) = (idx, self.man.live.iter().find(|s| s.index == h)) {
-                self.segs.insert(h, Arc::new(Live { r: *r, idx }));
+        for (h, idx) in load_indexes(&**self.repo.blobs(), self.fam.id, &missing).await {
+            match idx {
+                Ok(Some(idx)) => {
+                    if let Some(r) = self.man.live.iter().find(|s| s.index == h) {
+                        self.index_errors.remove(&h);
+                        self.segs.insert(h, Arc::new(Live { r: *r, idx }));
+                    }
+                }
+                Ok(None) => {
+                    self.index_errors.remove(&h);
+                }
+                Err(e) => {
+                    self.index_errors.insert(h, e);
+                }
             }
         }
         // Column masks come from the manifest.
@@ -844,49 +891,123 @@ impl<'a> Pass<'a> {
         Ok(false)
     }
 
-    /// Whether `s`'s blobs read, probed by this pass itself: `Ok(false)`
-    /// only for definite loss or damage (not stored, address or structure
-    /// wrong, a read the store reports corrupt); any other error fails the
-    /// pass. A segment read whole once in this process is later only checked
-    /// for presence, as is an index taken from the read view.
-    async fn probe(&mut self, s: &SegmentRef, state: &mut FamilyState) -> Result<bool> {
+    /// Whether `s`'s blobs read, probed by this pass itself: `Lost` only
+    /// for definite loss or damage (not stored, address or structure wrong,
+    /// a read the store reports corrupt), `Failing` for any other read
+    /// error. A segment read whole once in this process is later only
+    /// checked for presence, as is an index taken from the read view. Every
+    /// "not stored" is exact (a blob packed a moment ago by another process
+    /// is not taken for lost).
+    async fn probe(&mut self, s: &SegmentRef, state: &mut FamilyState) -> Probe {
+        let blobs = self.repo.blobs().clone();
         let Some(live) = self.segs.get(&s.index).cloned() else {
-            // `load_indexes` gives `None` only for definite loss or damage.
-            return Ok(false);
+            return match self.index_errors.remove(&s.index) {
+                Some(e) => Probe::Failing(e),
+                // `load_indexes` gives `None` only for definite loss or damage.
+                None => Probe::Lost,
+            };
         };
-        if self.reused.contains(&s.index) && !self.repo.blobs().contains(&s.index).await? {
-            return Ok(false);
+        let present = |h: Hash| {
+            let blobs = blobs.clone();
+            async move {
+                match segment_blob_stored(&*blobs, &h).await {
+                    Ok(true) => Probe::Sound,
+                    Ok(false) => Probe::Lost,
+                    Err(e) => Probe::Failing(e),
+                }
+            }
+        };
+        if self.reused.contains(&s.index) {
+            match present(s.index).await {
+                Probe::Sound => {}
+                other => return other,
+            }
         }
         if state.verified.contains(&s.index) {
-            return self.repo.blobs().contains(&s.data).await;
+            return present(s.data).await;
         }
-        let bytes = match self.repo.blobs().get(&s.data).await {
+        let bytes = match get_segment_blob(&*blobs, &s.data).await {
             Ok(Some(b)) => b,
-            Ok(None) => return Ok(false),
-            Err(e) if crate::gc_segments::segment_reads_corrupt(&e) => return Ok(false),
-            Err(e) => return Err(e),
+            Ok(None) => return Probe::Lost,
+            Err(e) if crate::gc_segments::segment_reads_corrupt(&e) => return Probe::Lost,
+            Err(e) => return Probe::Failing(e),
         };
         let sound = codec::decode_data(&live.idx, &s.data, bytes)
             .and_then(|d| codec::read_all(&live.idx, &d).map(|_| d));
         match sound {
             Ok(_) => {
                 state.verified.insert(s.index);
-                Ok(true)
+                Probe::Sound
             }
-            Err(_) => Ok(false),
+            Err(_) => Probe::Lost,
         }
     }
 
     /// Drop live segments that cannot be read (their keys then read as rows
     /// or derive again, and seal again), forget retired blobs no longer
     /// stored, and replace a manifest that did not decode. On a store with
-    /// the feature recorded a segment is dropped only when this pass and the
-    /// last both found it unreadable.
+    /// the feature recorded a lost segment is dropped only when this pass
+    /// and the last both found it unreadable. A segment whose blobs fail to
+    /// read is kept and left out of this pass's work, and dropped once it
+    /// failed [`FAILING_PASSES`] passes in a row over at least
+    /// [`CompactOptions::drop_failing_after`]; when every live segment
+    /// fails, the store is taken to be failing and the pass fails, dropping
+    /// nothing.
     async fn check_live(&mut self, state: &mut FamilyState) -> Result<()> {
         let mut bad = Vec::new();
+        let mut failing = Vec::new();
+        let mut first_error = None;
         for s in self.man.live.clone() {
-            if !self.probe(&s, state).await? {
-                bad.push(s);
+            match self.probe(&s, state).await {
+                Probe::Sound => {}
+                Probe::Lost => bad.push(s),
+                Probe::Failing(e) => {
+                    failing.push(s);
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        let now = Instant::now();
+        state
+            .failing
+            .retain(|h, _| failing.iter().any(|s| s.index == *h));
+        if let Some(e) = first_error {
+            if failing.len() == self.man.live.len() {
+                return Err(e);
+            }
+            self.report.failing = failing.len() as u64;
+            for s in &failing {
+                let entry = state.failing.entry(s.index).or_insert((now, 0));
+                entry.1 += 1;
+                self.unreadable.insert(s.index);
+                state.verified.remove(&s.index);
+                metrics::counter!(
+                    "leep_derived_segment_errors_total",
+                    "what" => "failing", "family" => self.fam.name
+                )
+                .increment(1);
+                let (since, passes) = *entry;
+                if passes >= FAILING_PASSES
+                    && now.duration_since(since) >= self.opts.drop_failing_after
+                {
+                    tracing::error!(
+                        segment = %s.index,
+                        family = self.fam.name,
+                        passes,
+                        error = %e,
+                        "a derived segment's blobs failed to read in every pass for a while; \
+                         dropping it, its keys seal again from rows or derive again"
+                    );
+                    bad.push(*s);
+                } else {
+                    tracing::warn!(
+                        segment = %s.index,
+                        family = self.fam.name,
+                        passes,
+                        error = %e,
+                        "a derived segment's blobs cannot be read now; it is kept and skipped"
+                    );
+                }
             }
         }
         let careful = !bad.is_empty()
@@ -895,7 +1016,11 @@ impl<'a> Pass<'a> {
         let mut gone = Vec::new();
         let mut suspect = HashSet::new();
         for s in bad {
-            if careful && !state.suspect.contains(&s.index) {
+            let failed = state
+                .failing
+                .get(&s.index)
+                .is_some_and(|(_, n)| *n >= FAILING_PASSES);
+            if careful && !failed && !state.suspect.contains(&s.index) {
                 tracing::warn!(
                     segment = %s.index,
                     family = self.fam.name,
@@ -909,7 +1034,9 @@ impl<'a> Pass<'a> {
         state.suspect = suspect;
         let mut retired = Vec::with_capacity(self.man.retired.len());
         for h in &self.man.retired {
-            if self.repo.blobs().contains(h).await? {
+            // Forgotten only once surely gone: a retired blob that fails to
+            // read stays listed (GC collects it as retired).
+            if self.repo.blobs().contains(h).await.unwrap_or(true) {
                 retired.push(*h);
             }
         }
@@ -1112,11 +1239,16 @@ impl<'a> Pass<'a> {
         if let Some(d) = self.data.get(&live.r.data) {
             return Ok(Some(d.clone()));
         }
-        let bytes = match self.repo.blobs().get(&live.r.data).await {
+        let bytes = match get_segment_blob(&**self.repo.blobs(), &live.r.data).await {
             Ok(Some(b)) => b,
             Ok(None) => return Ok(None),
             Err(e) if crate::gc_segments::segment_reads_corrupt(&e) => return Ok(None),
-            Err(e) => return Err(e),
+            Err(e) => {
+                // Left out of the rest of the pass like a lost one; the next
+                // pass's probe decides about it.
+                tracing::warn!(segment = %live.r.index, error = %e, "a derived segment's data cannot be read now");
+                return Ok(None);
+            }
         };
         match codec::decode_data(&live.idx, &live.r.data, bytes) {
             Ok(d) => {

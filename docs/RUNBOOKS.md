@@ -1652,6 +1652,13 @@ recompute every value):
   the family (an older binary) condemned a live segment. Stop that `gc`'s
   schedule; the next collect deletes the segment and the next pass seals
   the rows again, or keeps it.
+- `a derived segment's blobs cannot be read now; it is kept and skipped`:
+  one segment's blob fails to read (an I/O error, a failing object store
+  key). Readers leave just that segment out (its keys read as rows or
+  derive again) and try it again every minute; passes skip it, and drop it
+  (`failed to read in every pass for a while; dropping it`) once it failed
+  three passes in a row over an hour. Fix the store, or let the pass drop
+  it.
 - `bad_derived_segment`, or a note that a segment is not stored: a segment
   blob was lost or damaged (a disk, a restore whose blob copy finished
   before the segment was sealed, an older `gc` that collected it).
