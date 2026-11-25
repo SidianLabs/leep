@@ -1381,6 +1381,10 @@ async fn run_gc(
             "collect: retired derived segment blobs deleted: {}",
             r.derived_segments_deleted
         );
+        outln!(
+            "collect: fence rows of long-deleted blobs pruned: {}",
+            r.fence_rows_pruned
+        );
         if r.kept_derived_unknown > 0 {
             outln!(
                 "collect: kept as possibly live derived segments (a manifest does not \

@@ -40,3 +40,8 @@
   and seals and retirements read as many keys at once as keep a read near
   4 MiB, not 1,000 keys of up to 64 KiB each. Pass reports gain
   `listed_keys`.
+- **Fixed.** Blob GC's fence rows (`blob-condemned-v1`, `blob-rescue-v1`,
+  `blob-doom-v1`) were never deleted, so every blob GC ever deleted left
+  rows behind for good. A collect now prunes those of blobs it deleted
+  more than 30 days ago (`fence rows of long-deleted blobs pruned` in its
+  report).

@@ -176,6 +176,15 @@ steps back.
   blob answer 409 until `gc collect` runs again.
 - Collect reads one meta row per blob (to find condemnations): O(blobs) point
   reads, in addition to the changeset scan.
+- Pruning (amended 2026-11-25). The rows were never deleted, so every blob
+  ever deleted kept at least a condemnation and a doom row for good, and
+  segment churn (ADR 0103, 0104) made that steady. Each collect now deletes
+  the condemnation, rescue and doom rows of a blob whose doom is `deleted`
+  for the condemnation that stands, once that condemnation is 30 days old:
+  the condemnation first, so a reader in between finds none, as it does
+  after. Collect holds the `gc` lease, so no condemn races it; a rescue an
+  upload writes meanwhile may stay behind, inert without its condemnation.
+  An upload of the same bytes later is simply new.
 
 ## Consequences
 - ADR 0008's residual race is closed under the stated assumptions; its other
