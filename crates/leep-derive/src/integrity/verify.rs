@@ -1549,6 +1549,7 @@ impl Verifier<'_> {
             gc::BLOB_CONDEMNED,
             gc::BLOB_RESCUE,
             gc::BLOB_DOOM,
+            gc::BLOB_DOOM_SEEN,
             gc::GC_MARK,
             crate::changeset_gc::CS_CONDEMNED,
             crate::changeset_gc::CS_RESCUE,

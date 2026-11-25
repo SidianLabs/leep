@@ -71,6 +71,14 @@ pub const BLOB_RESCUE: &str = "blob-rescue-v1";
 /// always sees the other.
 pub const BLOB_DOOM: &str = "blob-doom-v1";
 
+/// Derived-data kind recording when a collect first saw a blob's doom say
+/// `deleted` (value: the condemnation time that doom answers, then the
+/// collect's start time, both 8-byte big-endian). Fence rows are pruned
+/// only [`FENCE_ROW_RETENTION`] after it, so their age counts from the
+/// delete, not the condemnation (ADR 0012). Read by no request path; an
+/// older binary ignores it.
+pub const BLOB_DOOM_SEEN: &str = "blob-doom-seen-v1";
+
 /// How long an upload waits for an in-progress delete of the same blob before
 /// giving up with a retryable conflict.
 pub(crate) const DOOM_WAIT: Duration = Duration::from_secs(30);
@@ -173,6 +181,11 @@ pub(crate) fn decode_doom_of(kind: &str, v: &[u8]) -> Result<(i64, Doom)> {
 /// byte. Public only so the fuzz harness can reach the private decoders.
 #[doc(hidden)]
 pub fn decode_row(kind: &str, v: &[u8]) -> Result<(i64, Option<u8>)> {
+    if kind == BLOB_DOOM_SEEN {
+        return decode_seen(v)
+            .map(|(_, at)| (at, None))
+            .ok_or_else(|| Error::Other(format!("corrupt {kind} row")));
+    }
     if kind == BLOB_DOOM || kind == crate::changeset_gc::CS_DOOM {
         let (t, d) = decode_doom_of(kind, v)?;
         Ok((t, Some(d as u8)))
@@ -644,9 +657,9 @@ pub struct CollectReport {
     pub mark_segments: u64,
     /// Retired mark segments deleted, or that would be in a dry run.
     pub segments_deleted: u64,
-    /// Blobs whose fence rows (condemnation, rescue, doom) this run
-    /// deleted: deleted blobs condemned more than [`FENCE_ROW_RETENTION`]
-    /// ago.
+    /// Blobs whose fence rows (condemnation, rescue, doom, doom-seen) this
+    /// run deleted: blobs a collect first saw deleted more than
+    /// [`FENCE_ROW_RETENTION`] ago.
     pub fence_rows_pruned: u64,
     /// Live derived segments (ADR 0104).
     pub derived_segments: u64,
@@ -1385,6 +1398,7 @@ async fn collect_leased(
     let derived = crate::derived_segments::gc_view(repo).await?;
     let mut dseg = CollectReport::default();
     let mut kept_unknown = 0u64;
+    let mut deleted_now: HashSet<Hash> = HashSet::new();
     // What the mark trusted must still be the record before anything is
     // deleted; `which` checks again after each row read.
     marked.record.recheck(repo).await?;
@@ -1506,6 +1520,7 @@ async fn collect_leased(
                 .await?;
             report.deleted += 1;
             report.deleted_bytes += blob.size;
+            deleted_now.insert(blob.hash);
             if segment {
                 retired_stored.remove(&blob.hash);
             }
@@ -1521,28 +1536,50 @@ async fn collect_leased(
             .record
             .prune_retired(repo, lease, |h| retired_stored.contains(h))
             .await?;
-        report.fence_rows_pruned = prune_fence_rows(repo, lease, started_at).await?;
+        report.fence_rows_pruned = prune_fence_rows(repo, lease, started_at, &deleted_now).await?;
     }
     Ok(report)
 }
 
-/// How long the fence rows of a deleted blob stay after its condemnation.
-/// Long past any fence, upload or backup in flight: an upload of the same
-/// bytes afterwards finds no condemnation and stores them as new.
+/// How long the fence rows of a deleted blob stay after a collect first saw
+/// it deleted. Long past any fence, upload or backup in flight: an upload of
+/// the same bytes afterwards finds no condemnation and stores them as new.
 pub const FENCE_ROW_RETENTION: Duration = Duration::from_secs(30 * 86_400);
 
-/// Delete the fence rows (condemnation, rescue, doom) of blobs whose doom
-/// says a collect deleted them for their current condemnation, more than
-/// [`FENCE_ROW_RETENTION`] before `now`. Every blob ever deleted left at
-/// least two rows for good; segment churn (ADR 0103, 0104) makes that
-/// steady. The condemnation goes first, so a reader in between finds no
-/// condemnation, which is what it finds after. Collect holds the `gc` lease,
-/// so no condemn writes a new condemnation meanwhile; a rescue an upload
-/// writes meanwhile may stay behind, harmless without its condemnation.
+/// A [`BLOB_DOOM_SEEN`] value.
+fn seen_value(epoch: i64, at: i64) -> Bytes {
+    let mut v = epoch.to_be_bytes().to_vec();
+    v.extend_from_slice(&at.to_be_bytes());
+    Bytes::from(v)
+}
+
+fn decode_seen(v: &[u8]) -> Option<(i64, i64)> {
+    let (e, t) = v.split_at_checked(8)?;
+    Some((
+        i64::from_be_bytes(e.try_into().ok()?),
+        i64::from_be_bytes(t.try_into().ok()?),
+    ))
+}
+
+/// Delete the fence rows (condemnation, rescue, doom, and the seen row) of
+/// blobs whose doom says a collect deleted them for their current
+/// condemnation, once a collect first saw that doom at least
+/// [`FENCE_ROW_RETENTION`] before `now`. A doom seen for the first time is
+/// only recorded as seen at `now`; a blob this run (`deleted_now`) deleted
+/// is never pruned. Counting from the condemnation instead would prune the
+/// rows of a blob condemned long ago seconds after its delete, while an
+/// upload racing the delete still needs the condemnation to write the blob
+/// again. Every blob ever deleted left at least two rows for good; segment
+/// churn (ADR 0103, 0104) makes that steady. The condemnation goes first, so
+/// a reader in between finds no condemnation, which is what it finds after.
+/// Collect holds the `gc` lease, so no condemn writes a new condemnation
+/// meanwhile; a rescue an upload writes meanwhile may stay behind, inert
+/// without its condemnation.
 async fn prune_fence_rows(
     repo: &Repo,
     lease: &Option<crate::gc_lease::GcLease>,
     now: i64,
+    deleted_now: &HashSet<Hash>,
 ) -> Result<u64> {
     let before = now.saturating_sub(secs(FENCE_ROW_RETENTION));
     let mut pruned = 0;
@@ -1557,34 +1594,54 @@ async fn prune_fence_rows(
         };
         after = Some(*last);
         let short = page.len() < PRUNE_PAGE;
-        let old: Vec<(Hash, i64)> = page
+        let deleted: Vec<(Hash, i64)> = page
             .iter()
+            .filter(|(h, _)| !deleted_now.contains(h))
             .filter_map(|(h, v)| match decode_doom(v) {
-                Ok((epoch, Doom::Deleted)) if epoch < before => Some((*h, epoch)),
+                Ok((epoch, Doom::Deleted)) => Some((*h, epoch)),
                 _ => None,
             })
             .collect();
-        if !old.is_empty() {
-            let keys: Vec<Hash> = old.iter().map(|(h, _)| *h).collect();
+        if !deleted.is_empty() {
+            let keys: Vec<Hash> = deleted.iter().map(|(h, _)| *h).collect();
             let condemned = repo.meta().get_derived_many(BLOB_CONDEMNED, &keys).await?;
-            // Only where the doom answers the condemnation that stands: a
-            // later one (the blob uploaded and orphaned again) is live.
-            let done: Vec<Hash> = old
-                .iter()
-                .zip(condemned)
-                .filter(|((_, epoch), c)| {
-                    c.as_ref()
-                        .is_none_or(|v| decode_time(BLOB_CONDEMNED, v).ok() == Some(*epoch))
-                })
-                .map(|((h, _), _)| *h)
-                .collect();
+            let seen = repo.meta().get_derived_many(BLOB_DOOM_SEEN, &keys).await?;
+            let mut done = Vec::new();
+            let mut first_seen = Vec::new();
+            for (((h, epoch), c), seen) in deleted.iter().zip(condemned).zip(seen) {
+                // Only where the doom answers the condemnation that stands: a
+                // later one (the blob uploaded and orphaned again) is live.
+                let current = c
+                    .as_ref()
+                    .is_none_or(|v| decode_time(BLOB_CONDEMNED, v).ok() == Some(*epoch));
+                if !current {
+                    continue;
+                }
+                match seen.as_deref().and_then(decode_seen) {
+                    Some((e, at)) if e == *epoch => {
+                        if at <= before {
+                            done.push(*h);
+                        }
+                    }
+                    // Not seen yet for this condemnation: from now on.
+                    _ => first_seen.push(DerivedRow::new(
+                        BLOB_DOOM_SEEN,
+                        *h,
+                        seen_value(*epoch, now),
+                    )),
+                }
+            }
+            if !first_seen.is_empty() {
+                crate::gc_lease::check(lease)?;
+                repo.meta().put_derived_many(&first_seen).await?;
+            }
             if !done.is_empty() {
                 crate::gc_lease::check(lease)?;
                 repo.meta()
                     .delete_derived_keys(&[BLOB_CONDEMNED], &done)
                     .await?;
                 repo.meta()
-                    .delete_derived_keys(&[BLOB_RESCUE, BLOB_DOOM], &done)
+                    .delete_derived_keys(&[BLOB_RESCUE, BLOB_DOOM, BLOB_DOOM_SEEN], &done)
                     .await?;
                 pruned += done.len() as u64;
             }
@@ -2270,6 +2327,12 @@ mod tests {
         assert_eq!(doom_value(1, Doom::Abandoned)[8], 1);
         assert_eq!(doom_value(1, Doom::Deleted)[8], 2);
         assert_eq!(
+            &seen_value(1_700_000_000, 1_700_000_001)[..],
+            [0, 0, 0, 0, 0x65, 0x53, 0xf1, 0x00, 0, 0, 0, 0, 0x65, 0x53, 0xf1, 0x01]
+        );
+        assert_eq!(decode_seen(&seen_value(-5, 7)), Some((-5, 7)));
+        assert!(decode_seen(&[0; 15]).is_none());
+        assert_eq!(
             decode_doom(&doom_value(-5, Doom::Deleted)).unwrap(),
             (-5, Doom::Deleted)
         );
@@ -2312,38 +2375,74 @@ mod tests {
         assert_eq!(r.missing_blobs(&[orphan]).await.unwrap(), [orphan]);
     }
 
-    /// The fence rows of a deleted blob go once its condemnation is older
-    /// than the retention; an upload of the same bytes then finds no
-    /// condemnation. A later condemnation of the same hash keeps its rows.
+    /// The fence rows of a deleted blob go once a collect first saw it
+    /// deleted at least the retention ago, counted from the delete, not the
+    /// condemnation: a blob condemned long ago keeps its rows through the
+    /// collect that deletes it, so an upload racing that delete still finds
+    /// the condemnation and writes the blob again. A later condemnation of
+    /// the same hash keeps its rows; an upload after the prune is new.
     #[tokio::test]
-    async fn fence_rows_of_deleted_blobs_are_pruned_after_the_retention() {
+    async fn fence_rows_of_deleted_blobs_are_pruned_a_retention_after_the_delete() {
         let (r, blobs, orphan, t) = orphan_setup("pruned").await;
         let rows = |r: Repo, h: Hash| async move {
             let mut n = 0;
-            for kind in [BLOB_CONDEMNED, BLOB_RESCUE, BLOB_DOOM] {
+            for kind in [BLOB_CONDEMNED, BLOB_RESCUE, BLOB_DOOM, BLOB_DOOM_SEEN] {
                 n += usize::from(r.meta().get_derived(kind, &h).await.unwrap().is_some());
             }
             n
         };
-        let rep = gc_at(&r, 1, false, t).await;
-        assert_eq!(rep.collect.deleted, 1);
-        assert_eq!(rep.collect.fence_rows_pruned, 0);
-        assert_eq!(rows(r.clone(), orphan).await, 2);
         let retention = secs(FENCE_ROW_RETENTION);
-        // Within the retention: kept.
-        let early = collect(&r, &opts(1, false), &TestClock::at(t + retention - 1))
+        condemn(&r, &opts(1, false), &TestClock::at(t))
             .await
             .unwrap();
-        assert_eq!(early.fence_rows_pruned, 0);
-        // A second orphan condemned and deleted later, with the same doom
-        // epoch rule: only the old one goes.
+        let c = decode_time(
+            BLOB_CONDEMNED,
+            &r.meta()
+                .get_derived(BLOB_CONDEMNED, &orphan)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        // Deleted more than a retention after its condemnation: the same
+        // collect prunes nothing.
+        let del = t + retention + FENCE;
+        let rep = collect(&r, &opts(1, false), &TestClock::at(del))
+            .await
+            .unwrap();
+        assert_eq!((rep.deleted, rep.fence_rows_pruned), (1, 0));
+        assert!(!blobs.contains(&orphan).await.unwrap());
+        assert_eq!(rows(r.clone(), orphan).await, 2);
+        // An upload whose write raced the delete finds the condemnation and
+        // the doom, and writes the blob again.
+        r.rescue(orphan, Bytes::from("pruned"), c).await.unwrap();
+        assert!(blobs.contains(&orphan).await.unwrap());
+        blobs.delete(&orphan).await.unwrap();
+        // The next collect records the delete as seen; within the retention
+        // of that, nothing goes.
+        let seen = del + FENCE;
+        let rep = collect(&r, &opts(1, false), &TestClock::at(seen))
+            .await
+            .unwrap();
+        assert_eq!(rep.fence_rows_pruned, 0);
+        assert!(r
+            .meta()
+            .get_derived(BLOB_DOOM_SEEN, &orphan)
+            .await
+            .unwrap()
+            .is_some());
+        let rep = collect(&r, &opts(1, false), &TestClock::at(seen + retention - 1))
+            .await
+            .unwrap();
+        assert_eq!(rep.fence_rows_pruned, 0);
+        // A second orphan deleted later keeps its rows when the first goes.
         let late = blobs.put(Bytes::from("later")).await.unwrap();
         age_all(&blobs).await;
-        let done = gc_at(&r, 1, false, t + retention).await;
+        let done = gc_at(&r, 1, false, seen + retention).await;
         assert!(!blobs.contains(&late).await.unwrap());
         assert_eq!(done.collect.fence_rows_pruned, 1);
         assert_eq!(rows(r.clone(), orphan).await, 0);
-        assert_eq!(rows(r.clone(), late).await, 2);
+        assert!(rows(r.clone(), late).await >= 2);
         // Uploaded again: no condemnation stands in the way.
         assert_eq!(r.missing_blobs(&[orphan]).await.unwrap(), [orphan]);
         blobs.put(Bytes::from("pruned")).await.unwrap();
