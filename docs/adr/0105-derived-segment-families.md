@@ -184,7 +184,10 @@ segments from orphans. A row that does not decode (amended 2026-11-25: it
 stopped GC too, store-wide, until an operator dropped every kind of the
 family) makes GC keeps every blob that starts like a derived segment (index or data
 prefix), live or retired, until the row is fixed, and collects everything
-else; condemn reports the family and the blobs kept. A blob live in one family is
+else; condemn reports the family and the blobs kept. Telling a segment
+blob by its prefix reads each candidate blob (unreferenced, past grace)
+whole, since the blob store has no range read; that costs only while a
+manifest is damaged. A blob live in one family is
 never collected as another's retired.
 
 ### 6. The compactor by table (points 3 and 4)

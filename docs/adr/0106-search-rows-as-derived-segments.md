@@ -89,9 +89,12 @@ Accepted by the maintainer on 2026-11-15.
   `repair drop` cleared) is rewritten alone. A sealed blob row that becomes
   superseded therefore outlives its window until then. Keys are left out
   only while the walk that judged them is current: the newest ref log
-  entry is read again right before each merge that leaves something out
-  stores its segment, and if it moved, that merge is redone keeping
-  everything and nothing more is left out in the pass. The walk is redone
+  entry is read again after each merge that leaves something out is
+  encoded, before its segment is stored, and if it moved, that merge is
+  redone keeping everything and nothing more is left out in the pass. A
+  ref that moves in the short window between that read and the manifest
+  swap can still find blob rows left out; retention's backfill derives
+  them (below), and directory filters are never left out. The walk is redone
   when the ref log moved (at most every `list_every`, 10 minutes) or after
   an hour.
 - Directory filters are never left out, live or not, like keyframes

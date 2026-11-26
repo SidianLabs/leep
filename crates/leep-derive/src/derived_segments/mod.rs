@@ -185,7 +185,10 @@ pub(crate) struct GcView {
 impl GcView {
     /// Whether GC must keep `hash`, about to be condemned or deleted, as
     /// possibly a live segment of a family whose manifest does not decode:
-    /// only then, and only a stored blob that starts like a segment.
+    /// only then, and only a stored blob that starts like a segment. The
+    /// blob is read whole (`BlobStore` has no range read), once per
+    /// candidate: candidates are the unreferenced blobs past grace, and the
+    /// mode lasts only until the manifest is fixed.
     pub(crate) async fn keeps_unknown(&self, repo: &Repo, hash: &Hash) -> Result<bool> {
         if self.damaged.is_empty() {
             return Ok(false);

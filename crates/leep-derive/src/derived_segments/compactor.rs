@@ -1264,8 +1264,10 @@ impl<'a> Pass<'a> {
     }
 
     /// Whether the ref log has not moved since the walk this pass judges
-    /// liveness by: a merge leaves keys out only then, read again right
-    /// before each swap that would.
+    /// liveness by: a merge leaves keys out only then. Read once a merge
+    /// that leaves keys out is encoded, before its segment is stored, so
+    /// a ref moving between this read and the swap is not seen; only blob
+    /// rows are left out, and retention's backfill derives those again.
     async fn walk_still_current(&self) -> Result<bool> {
         let Some(l) = &self.live else {
             return Ok(false);
