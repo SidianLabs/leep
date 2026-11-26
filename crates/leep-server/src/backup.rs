@@ -20,7 +20,10 @@
 //! The pool only grows. Nothing the source deletes is deleted or hidden in
 //! it (the source's pack tombstones are not copied), because since the
 //! changeset sweep (ADR 0059) an older snapshot can name an object the
-//! source no longer has.
+//! source no longer has. A pool pack the source merged away goes once its
+//! objects are in other pool packs; those only it holds are first copied
+//! into a pool pack of their own (ADR 0107), so repacks that drop deleted
+//! objects do not keep whole old packs in the pool.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -414,6 +417,12 @@ async fn copy_packs(
         progress.info(&format!(
             "{what}: packs: {} in the source, {} already there, {} copied ({} bytes), {} merged away and pruned, {} tombstones copied",
             r.listed, r.present, r.copied, r.bytes_copied, r.pruned, r.tombstones_added
+        ));
+    }
+    if r.rescued_objects > 0 {
+        progress.info(&format!(
+            "{what}: packs: {} objects only merged-away packs held (deleted in the source) kept in {} new pool pack(s)",
+            r.rescued_objects, r.rescue_packs
         ));
     }
     for id in &r.corrupt {

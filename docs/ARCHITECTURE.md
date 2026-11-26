@@ -1362,6 +1362,28 @@ bytes are a quarter of the store, at most once a day by the time kept in
 half the live store (64 MiB to 4 GiB), merges under 64 MiB exempt; the
 fence is unchanged. The write path is unchanged:
 lands still write whole level-1 frames and never wait for the task.
+
+**Delta packs are consolidated** (ADR 0107). Packs stay self-contained (a
+delta's base is in its own pack, ADR 0039), so a delta run stores the
+first new version at each path whole when its previous version is in an
+older pack. When no delta run is due, and after each delta run, the task
+judges its delta packs no larger than `--auto-repack-consolidate-max-bytes` (2 GiB), smallest first up to 2 GiB in all (half the ceiling on bytes waiting for cleanup): a walk of the
+history since the largest of them (`pack_order_where`, wanted: frames
+stored whole in the other packs; passed through: those packs, loose
+objects, whole packs) lists those frames with their previous versions,
+and the saving is measured by compressing a sample of them; the walk runs
+again only once a 64th of the packs' bytes was written whole since the
+last, and a failed one backs off (a minute, doubling, up to 6 hours). Past
+an eighth of the packs' bytes, or a 64th once the packs holding it are a
+day old (by their files and records, so restarts keep the clock;
+tombstoned bytes count too), an incremental repack merges exactly those
+packs (`fold_only`: none written since the walk), giving each listed
+whole frame the walk's base (`write_order_redelta`) and copying every
+delta frame; the chain cap holds where chains join. The largest pack's own
+history is walked once per pack and process, which finds frames older
+merges left whole next to their bases, so upgraded stores need no manual
+`repack --full`. A delta run also compresses again the whole frames of the
+land and import packs it takes (level 1) instead of copying them.
 `cargo test -p leep-e2e --test storage_size` (ADR 0101) holds a default
 server's settled size per land and its ratio to Git under budgets in CI,
 and `leep-soak --max-blob-store-ratio` bounds `leep_blob_store_size_ratio`

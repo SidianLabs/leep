@@ -1265,8 +1265,9 @@ async fn an_incremental_repack_compresses_the_whole_packs_it_is_given() {
     assert_eq!(r.packs_merged, 5, "{r:?}");
     assert_eq!(r.objects, 39, "{r:?}");
     // Only the first version and the one after the deleted version (its
-    // base is gone) keep their whole frames.
-    assert_eq!(r.frames_reused, 2, "{r:?}");
+    // base is gone) stay whole, and not as copies of their level-1 frames
+    // (ADR 0107): every frame of a whole pack is compressed again.
+    assert_eq!(r.frames_reused, 0, "{r:?}");
     assert!(r.whole <= 3, "{r:?}");
     check_world(dir.path(), &w, "redelta").await;
     assert_eq!(pack_ids(dir.path()).len(), 1);
@@ -1434,4 +1435,297 @@ async fn reads_follow_chains_up_to_the_read_limit() {
     let store = FsBlobStore::new(dir.path());
     let err = store.get(&h).await.unwrap_err();
     assert!(err.to_string().contains("delta chain too long"), "{err}");
+}
+
+/// Two packs a delta repack wrote, as the automatic delta repack leaves
+/// them (ADR 0100): the first `first` versions as one chain, then the rest
+/// by a later run that left the older pack alone, so the first version it
+/// wrote is whole although its previous version is in the older pack.
+/// With `deletes`, GC then deletes a base in the older pack and that whole
+/// head, after the walk named them (`hints` still does). Returns the pack
+/// ids, older first.
+async fn delta_world(
+    store: &FsBlobStore,
+    first: usize,
+    total: usize,
+    deletes: bool,
+) -> (World, Vec<String>) {
+    let vs = versions(total);
+    let mut hashes = Vec::new();
+    let mut live = BTreeMap::new();
+    for v in &vs[..first] {
+        let h = store.put(v.clone()).await.unwrap();
+        hashes.push(h);
+        live.insert(h, v.clone());
+    }
+    repack_incremental(store, chain_hints(&hashes)).await;
+    let older = pack_ids(store.root());
+    assert_eq!(older.len(), 1);
+    for v in &vs[first..] {
+        let h = store.put(v.clone()).await.unwrap();
+        hashes.push(h);
+        live.insert(h, v.clone());
+    }
+    let opts = RepackOptions {
+        mode: INCREMENTAL,
+        fold_only: Some(Vec::new()),
+        ..RepackOptions::default()
+    };
+    store
+        .repack_publish(chain_hints(&hashes), opts)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    let mut ids = older.clone();
+    ids.extend(
+        pack_ids(store.root())
+            .into_iter()
+            .filter(|id| !older.contains(id)),
+    );
+    assert_eq!(ids.len(), 2);
+    let newer: std::collections::HashSet<String> = [ids[1].clone()].into();
+    let whole = store.whole_in(&newer).unwrap();
+    assert!(whole(&hashes[first]).is_some(), "the head is whole");
+    assert!(whole(&hashes[first + 1]).is_none(), "the next is a delta");
+    let details = store.pack_details(&newer).unwrap();
+    assert!(
+        details[0].deltas > 0 && details[0].whole_bytes > 0,
+        "{details:?}"
+    );
+    let mut gone = Vec::new();
+    if deletes {
+        gone = vec![hashes[first / 2], hashes[first]];
+        for h in &gone {
+            store.delete(h).await.unwrap();
+            live.remove(h);
+        }
+    }
+    let w = World {
+        live,
+        gone,
+        hints: chain_hints(&hashes),
+    };
+    (w, ids)
+}
+
+fn consolidation(packs: Vec<String>) -> RepackOptions {
+    RepackOptions {
+        mode: INCREMENTAL,
+        packs,
+        fold_only: Some(Vec::new()),
+        loose_subset: Some(Arc::new(Default::default())),
+        mark: true,
+        ..RepackOptions::default()
+    }
+}
+
+/// Merging the two packs with the walk's hints (a consolidation, ADR 0107)
+/// compresses the whole head against its base, now in the same pack, and
+/// copies every delta frame; the result is within 5% of a full repack.
+#[tokio::test]
+async fn a_consolidation_compresses_whole_heads_against_bases_in_the_other_pack() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsBlobStore::new(dir.path());
+    let (w, ids) = delta_world(&store, 30, 60, false).await;
+    let copy = tempfile::tempdir().unwrap();
+    copy_store(dir.path(), copy.path());
+    let r = store
+        .repack_publish(w.hints.clone(), consolidation(ids))
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert_eq!((r.packs_merged, r.objects), (2, 60), "{r:?}");
+    assert_eq!(r.whole, 1, "only the first version: {r:?}");
+    assert_eq!(r.frames_reused, 59, "every old frame but the head's: {r:?}");
+    check_world(dir.path(), &w, "consolidated").await;
+    let full = repack(&FsBlobStore::new(copy.path()), w.hints.clone()).await;
+    assert!(
+        r.pack_bytes as f64 <= full.pack_bytes as f64 * 1.05,
+        "{} bytes, a full repack {}",
+        r.pack_bytes,
+        full.pack_bytes
+    );
+    check_blob_store_contract(&FsBlobStore::new(dir.path())).await;
+}
+
+/// A head that becomes a delta joins its chain to the chain below it.
+/// Frames are copied while their base is under the cap; the one that would
+/// go past it is written whole, so no chain exceeds `MAX_CHAIN` and the
+/// deepest object reads.
+#[tokio::test]
+async fn joined_chains_stay_within_the_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsBlobStore::new(dir.path());
+    let (w, ids) = delta_world(&store, 40, 180, false).await;
+    let r = store
+        .repack_publish(w.hints.clone(), consolidation(ids))
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert!(r.frames_reused > 150, "{r:?}");
+    let idx = index_of(dir.path());
+    let depth_of = |e: IdxEntry| {
+        let (mut depth, mut cur) = (0, e);
+        while let Some(b) = cur.base {
+            cur = idx.entry(b);
+            depth += 1;
+        }
+        depth
+    };
+    let deepest = idx.iter().map(depth_of).max().unwrap();
+    assert_eq!(deepest, pack::MAX_CHAIN, "{r:?}");
+    let head = idx.find(&w.hints[40].0).unwrap();
+    assert_eq!(depth_of(head), 40, "the head is a delta on its base");
+    check_world(dir.path(), &w, "joined").await;
+}
+
+/// A consolidation after GC deleted a base and a whole head the walk had
+/// named, killed at each step: every live object reads and the deleted
+/// ones stay gone, and the next run cleans up, drops them and succeeds.
+#[tokio::test]
+async fn a_consolidation_killed_at_any_step_leaves_a_readable_store() {
+    let steps = [
+        RepackStep::Started,
+        RepackStep::Wrote(3),
+        RepackStep::Wrote(40),
+        RepackStep::PackSynced,
+        RepackStep::PackRenamed,
+        RepackStep::IndexSynced,
+        RepackStep::Published,
+        RepackStep::Retired,
+        RepackStep::OldPacksRemoved,
+        RepackStep::TombstonesRewritten,
+    ];
+    for kill_at in steps {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path());
+        let (w, ids) = delta_world(&store, 30, 60, true).await;
+        let opts = RepackOptions {
+            hook: Some(Arc::new(move |s| {
+                if s == kill_at {
+                    Err(Error::Storage(format!("killed at {s:?}")))
+                } else {
+                    Ok(())
+                }
+            })),
+            ..consolidation(ids)
+        };
+        let res = match store.repack_publish(w.hints.clone(), opts).await {
+            Ok(p) => p.finish().await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        assert!(res.is_err(), "{kill_at:?} was reached");
+        let what = format!("killed at {kill_at:?}");
+        check_world(dir.path(), &w, &what).await;
+        store
+            .retire_sweep(std::time::Duration::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        check_world(dir.path(), &w, &format!("{what}, swept")).await;
+        let left = pack_ids(dir.path());
+        let r = store
+            .repack_publish(w.hints.clone(), consolidation(left))
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        assert_eq!(r.objects, 58, "{what}: {r:?}");
+        check_world(dir.path(), &w, &format!("{what}, consolidated")).await;
+        assert_eq!(pack_ids(dir.path()).len(), 1, "{what}");
+        check_blob_store_contract(&FsBlobStore::new(dir.path())).await;
+    }
+}
+
+/// Packs written after a repack was planned (land packs written while its
+/// walk ran) are not taken in by the geometric rule: a consolidation (ADR
+/// 0107) merges exactly the two delta packs it names, and a delta run only
+/// the packs it listed, so the land pack stays whole for the delta run that
+/// compresses it. Without `fold_only` the same repack folds it in.
+#[tokio::test]
+async fn packs_written_after_the_plan_are_not_merged() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsBlobStore::new(dir.path()).with_pack_writes(crate::PackWrites {
+        min_objects: 4,
+        ..crate::PackWrites::default()
+    });
+    let (mut w, ids) = delta_world(&store, 30, 60, false).await;
+    let land: Vec<(Hash, Bytes)> = (0..8)
+        .map(|i| Bytes::from(format!("a land after the plan, object {i}\n")))
+        .map(|d| (Hash::of_blob(&d), d))
+        .collect();
+    store.put_many(land.clone()).await.unwrap();
+    w.live.extend(land.iter().cloned());
+    let land_pack: Vec<String> = pack_ids(dir.path())
+        .into_iter()
+        .filter(|id| !ids.contains(id))
+        .collect();
+    assert_eq!(land_pack.len(), 1);
+    let land_set = land_pack.iter().cloned().collect();
+    assert!(store.pack_details(&land_set).unwrap()[0].whole());
+
+    // As the old `leave` did, from the listing before the land pack.
+    let copy = tempfile::tempdir().unwrap();
+    copy_store(dir.path(), copy.path());
+    let unplanned = RepackOptions {
+        fold_only: None,
+        ..consolidation(ids.clone())
+    };
+    let r = FsBlobStore::new(copy.path())
+        .repack_publish(w.hints.clone(), unplanned)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert_eq!(r.packs_merged, 3, "the race this guards against: {r:?}");
+
+    let r = store
+        .repack_publish(w.hints.clone(), consolidation(ids.clone()))
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert_eq!((r.packs_merged, r.objects), (2, 60), "{r:?}");
+    let after = pack_ids(dir.path());
+    assert_eq!(after.len(), 2, "{after:?}");
+    assert!(after.contains(&land_pack[0]), "the land pack is left");
+    assert!(store.pack_details(&land_set).unwrap()[0].whole());
+    check_world(dir.path(), &w, "consolidated beside a land pack").await;
+
+    // A delta run that listed only the consolidated pack folds that one
+    // in, not the land pack written after its listing.
+    let consolidated: Vec<String> = after.into_iter().filter(|id| *id != land_pack[0]).collect();
+    let more = Bytes::from_static(b"one more loose object\n");
+    w.live.insert(store.put(more.clone()).await.unwrap(), more);
+    let delta_run = RepackOptions {
+        mode: RepackMode::Incremental {
+            factor: 2,
+            max_packs: 1,
+        },
+        fold_only: Some(consolidated.clone()),
+        mark: true,
+        ..RepackOptions::default()
+    };
+    let r = store
+        .repack_publish(Vec::<(Hash, Option<Hash>)>::new(), delta_run)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert_eq!(r.packs_merged, 1, "{r:?}");
+    let after = pack_ids(dir.path());
+    assert!(after.contains(&land_pack[0]), "{after:?}");
+    assert!(!after.contains(&consolidated[0]), "{after:?}");
+    check_world(dir.path(), &w, "after the delta run").await;
+    check_blob_store_contract(&FsBlobStore::new(dir.path())).await;
 }

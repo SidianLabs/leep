@@ -84,6 +84,18 @@ impl Server {
 
     /// Start with extra `leep-server` arguments (for example signing flags).
     pub fn start_with(port: u16, stores: &Stores, log_dir: &Path, extra: &[&str]) -> Server {
+        Self::start_logged(port, stores, log_dir, extra, "warn")
+    }
+
+    /// [`start_with`](Self::start_with), logging what `rust_log` (a
+    /// `RUST_LOG` filter) lets through, for a test that reads the log.
+    pub fn start_logged(
+        port: u16,
+        stores: &Stores,
+        log_dir: &Path,
+        extra: &[&str],
+        rust_log: &str,
+    ) -> Server {
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let log = log_dir.join(format!("server-{port}-{}.log", std::process::id()));
         // Appended, so a restarted server keeps the log of the one before it.
@@ -97,7 +109,7 @@ impl Server {
             .args(["--listen", &addr.to_string()])
             .args(["--meta", &stores.meta, "--blobs", &stores.blobs])
             .args(extra)
-            .env("RUST_LOG", "warn")
+            .env("RUST_LOG", rust_log)
             .stdin(Stdio::null())
             .stdout(out)
             .stderr(err)
@@ -136,6 +148,11 @@ impl Server {
 
     pub fn log_text(&self) -> String {
         fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// The log file, appended to by every server started on this port.
+    pub fn log_path(&self) -> &Path {
+        &self.log
     }
 
     /// Send SIGHUP, which makes the server reload its config files.

@@ -19,6 +19,9 @@ use crate::packfiles::{read_all, PackFiles};
 /// Listing page size.
 const PAGE: usize = 1000;
 
+/// Listings of the source's packs one [`sync_packs`] makes at most.
+const PACK_PASSES: usize = 4;
+
 /// Told about progress about every five seconds.
 pub type SyncProgress = Arc<dyn Fn(&SyncReport) + Send + Sync>;
 
@@ -345,7 +348,8 @@ pub enum PackSyncMode {
     /// snapshot may still name an object the source has since deleted (the
     /// changeset sweep, ADR 0059, issue #155). Pool packs a source repack
     /// merged away are pruned when other pool packs hold every object they
-    /// hold.
+    /// hold, or once the objects only they hold are copied into a pool pack
+    /// of their own (ADR 0107).
     Pool,
     /// Into a store being restored. The source's tombstones of the packs
     /// the destination holds are copied, so the target reads exactly as the
@@ -373,6 +377,11 @@ pub struct PackSyncReport {
     /// Destination packs the source no longer has, deleted because other
     /// destination packs hold every object they do.
     pub pruned: u64,
+    /// Objects only such packs held (objects the source deleted, which an
+    /// older snapshot may need), copied into new pool packs so those packs
+    /// could be pruned too; and how many such packs were written.
+    pub rescued_objects: u64,
+    pub rescue_packs: u64,
 }
 
 /// Copy the packs `src` has published that `dst` lacks, each as its two
@@ -390,80 +399,113 @@ pub struct PackSyncReport {
 /// Into a pool, a destination pack the source no longer has (a repack
 /// merged it into a bigger one) is deleted when the destination's other
 /// packs hold every object it holds, so a backup pool does not keep every
-/// intermediate pack. Objects are never lost that way; a pack that holds
-/// anything no other pack does stays.
+/// intermediate pack. When it holds objects no other pack does (a repack
+/// dropped them because the source deleted them), those are first written
+/// into a new pool pack, so it can go too: a pool does not keep a whole
+/// copy of the source's packs for every repack that dropped one object.
+/// Objects are never lost that way.
 pub async fn sync_packs(
     src: &dyn PackFiles,
     dst: &dyn PackFiles,
     mode: PackSyncMode,
 ) -> Result<PackSyncReport> {
+    sync_packs_with(src, dst, mode, RESCUE_MAX_BYTES).await
+}
+
+/// [`sync_packs`] with rescue packs of at most `rescue_max` stored bytes.
+async fn sync_packs_with(
+    src: &dyn PackFiles,
+    dst: &dyn PackFiles,
+    mode: PackSyncMode,
+    rescue_max: u64,
+) -> Result<PackSyncReport> {
     let mut report = PackSyncReport::default();
-    let src_ids = src.pack_ids().await?;
-    let dst_ids: HashSet<String> = dst.pack_ids().await?.into_iter().collect();
-    report.listed = src_ids.len() as u64;
-    for id in &src_ids {
-        if dst_ids.contains(id) {
-            report.present += 1;
-            continue;
+    let mut src_ids = src.pack_ids().await?;
+    let mut seen: HashSet<String> = HashSet::new();
+    // A pack that vanished was replaced by a repack after the listing (a
+    // consolidation can rewrite every delta pack at any time): list again
+    // and copy the packs that replaced it, rather than leave its objects
+    // to the loose copy. A few passes at most, each only after a vanish.
+    for _ in 0..PACK_PASSES {
+        let todo: Vec<String> = src_ids
+            .iter()
+            .filter(|id| seen.insert((*id).clone()))
+            .cloned()
+            .collect();
+        if todo.is_empty() {
+            break;
         }
-        let idx_name = format!("{id}.idx");
-        let pack_name = format!("{id}.pack");
-        let Some(idx) = read_all(src, &idx_name).await? else {
-            report.vanished += 1;
-            continue;
-        };
-        let index = match (pack::pack_id(&idx) == *id).then(|| PackIndex::decode(idx.clone())) {
-            Some(Ok(i)) => i,
-            _ => {
-                report.corrupt.push(id.clone());
+        report.listed += todo.len() as u64;
+        let dst_ids: HashSet<String> = dst.pack_ids().await?.into_iter().collect();
+        let vanished = report.vanished;
+        for id in &todo {
+            if dst_ids.contains(id) {
+                report.present += 1;
                 continue;
             }
-        };
-        let Some(data) = src.read(&pack_name).await? else {
-            report.vanished += 1;
-            continue;
-        };
-        let hasher = Arc::new(Mutex::new((blake3::Hasher::new(), 0u64)));
-        let h = hasher.clone();
-        let want = index.pack_len();
-        let data = data
-            .map(move |chunk| {
-                let chunk = chunk?;
-                let mut g = h.lock().unwrap();
-                g.0.update(&chunk);
-                g.1 += chunk.len() as u64;
-                if g.1 > want {
-                    return Err(Error::Storage("pack longer than its index says".into()));
+            let idx_name = format!("{id}.idx");
+            let pack_name = format!("{id}.pack");
+            let Some(idx) = read_all(src, &idx_name).await? else {
+                report.vanished += 1;
+                continue;
+            };
+            let index = match (pack::pack_id(&idx) == *id).then(|| PackIndex::decode(idx.clone())) {
+                Some(Ok(i)) => i,
+                _ => {
+                    report.corrupt.push(id.clone());
+                    continue;
                 }
-                Ok(chunk)
-            })
-            .boxed();
-        let n = match dst.write(&pack_name, data).await {
-            Ok(n) => n,
-            Err(_) if hasher.lock().unwrap().1 > want => {
+            };
+            let Some(data) = src.read(&pack_name).await? else {
+                report.vanished += 1;
+                continue;
+            };
+            let hasher = Arc::new(Mutex::new((blake3::Hasher::new(), 0u64)));
+            let h = hasher.clone();
+            let want = index.pack_len();
+            let data = data
+                .map(move |chunk| {
+                    let chunk = chunk?;
+                    let mut g = h.lock().unwrap();
+                    g.0.update(&chunk);
+                    g.1 += chunk.len() as u64;
+                    if g.1 > want {
+                        return Err(Error::Storage("pack longer than its index says".into()));
+                    }
+                    Ok(chunk)
+                })
+                .boxed();
+            let n = match dst.write(&pack_name, data).await {
+                Ok(n) => n,
+                Err(_) if hasher.lock().unwrap().1 > want => {
+                    report.corrupt.push(id.clone());
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let digest = *hasher.lock().unwrap().0.finalize().as_bytes();
+            if n != want || &digest != index.pack_hash() {
+                dst.delete(&pack_name).await?;
                 report.corrupt.push(id.clone());
                 continue;
             }
-            Err(e) => return Err(e),
-        };
-        let digest = *hasher.lock().unwrap().0.finalize().as_bytes();
-        if n != want || &digest != index.pack_hash() {
-            dst.delete(&pack_name).await?;
-            report.corrupt.push(id.clone());
-            continue;
+            let idx_len = idx.len() as u64;
+            dst.write(&idx_name, stream::once(async { Ok(idx.into()) }).boxed())
+                .await?;
+            report.copied += 1;
+            report.bytes_copied += n + idx_len;
         }
-        let idx_len = idx.len() as u64;
-        dst.write(&idx_name, stream::once(async { Ok(idx.into()) }).boxed())
-            .await?;
-        report.copied += 1;
-        report.bytes_copied += n + idx_len;
+        if report.vanished == vanished {
+            break;
+        }
+        src_ids = src.pack_ids().await?;
     }
 
     match mode {
         PackSyncMode::Restore => report.tombstones_added = copy_tombstones(src, dst).await?,
         PackSyncMode::Pool => {
             let source: HashSet<&String> = src_ids.iter().collect();
-            report.pruned = prune_superseded(dst, &source).await?;
+            prune_superseded(dst, &source, &mut report, rescue_max).await?;
         }
     }
     Ok(report)
@@ -493,15 +535,38 @@ async fn copy_tombstones(src: &dyn PackFiles, dst: &dyn PackFiles) -> Result<u64
     Ok(add.len() as u64)
 }
 
+/// The stored bytes one rescue pack takes at most: its objects are held in
+/// memory while it is written. More is rescued in several packs.
+const RESCUE_MAX_BYTES: u64 = 256 << 20;
+
+/// zstd level of the frames a rescue compresses again (objects that were
+/// deltas against a base it does not copy).
+const RESCUE_LEVEL: i32 = 9;
+
 /// Delete destination packs the source no longer has when every object they
 /// hold is in another destination pack, and readable there wherever it is
 /// readable in them. Index first, as a repack does. Tombstones never make
 /// an object prunable: a pool's tombstones (only written before issue #155
 /// was fixed) may hide what an older snapshot needs, and its bytes must stay.
-async fn prune_superseded(dst: &dyn PackFiles, source: &HashSet<&String>) -> Result<u64> {
+///
+/// A pack that also holds objects no other pack does (the source deleted
+/// them, and its repack dropped them; an older snapshot may need them, ADR
+/// 0026) is pruned once those are copied, decoded and checked against their
+/// hashes, into a new pool pack of whole frames, published before the old
+/// one is deleted. Earlier such packs that only hold objects of their own
+/// join it while they are no larger than what it takes in already, so they
+/// stay few without being rewritten at every backup. A pool pack is only
+/// ever rewritten when that removes copies other packs hold: never for
+/// nothing.
+async fn prune_superseded(
+    dst: &dyn PackFiles,
+    source: &HashSet<&String>,
+    report: &mut PackSyncReport,
+    rescue_max: u64,
+) -> Result<()> {
     let ids = dst.pack_ids().await?;
     if ids.iter().all(|id| source.contains(id)) {
-        return Ok(0);
+        return Ok(());
     }
     let dead = dst.tombstones().await?;
     let mut packs: Vec<(String, PackIndex)> = Vec::new();
@@ -522,21 +587,280 @@ async fn prune_superseded(dst: &dyn PackFiles, source: &HashSet<&String>) -> Res
             .enumerate()
             .any(|(j, (oid, o))| j != i && o.find(h).is_some() && (live(oid, h) || !live(id, h)))
     };
-    let mut pruned = 0;
+    // Ranks of the objects of pack `i` no other pack keeps.
+    let own = |i: usize, packs: &[(String, PackIndex)]| -> Vec<u32> {
+        let (id, index) = &packs[i];
+        (0..index.len() as u32)
+            .filter(|&r| !kept(i, id, &index.hash_at(r as usize), packs))
+            .collect()
+    };
     let mut i = 0;
     while i < packs.len() {
-        let (id, index) = &packs[i];
-        let covered = !source.contains(id) && index.hashes().all(|h| kept(i, id, &h, &packs));
-        if covered {
+        if source.contains(&packs[i].0) {
+            i += 1;
+            continue;
+        }
+        let mine = own(i, &packs);
+        if mine.is_empty() {
+            let id = packs.remove(i).0;
             dst.delete(&format!("{id}.idx")).await?;
             dst.delete(&format!("{id}.pack")).await?;
-            packs.remove(i);
-            pruned += 1;
-        } else {
+            report.pruned += 1;
+            continue;
+        }
+        let (id, index) = &packs[i];
+        // Nothing here is held twice (an earlier rescue pack), or a pool
+        // tombstone to keep exactly (written before issue #155): it stays.
+        let tombstoned = dead.get(id).is_some_and(|d| !d.is_empty());
+        if mine.len() == index.len() || tombstoned {
             i += 1;
+            continue;
+        }
+        // In packs of at most `rescue_max` stored bytes each (they are held
+        // in memory while written), however much only this pack holds.
+        let mut chunks: Vec<Vec<(usize, Vec<u32>)>> = Vec::new();
+        let (mut cur, mut cur_bytes) = (Vec::new(), 0u64);
+        for r in mine {
+            let n = index.entry(r).stored_len;
+            if !cur.is_empty() && cur_bytes + n > rescue_max {
+                chunks.push(vec![(i, std::mem::take(&mut cur))]);
+                cur_bytes = 0;
+            }
+            cur.push(r);
+            cur_bytes += n;
+        }
+        let mut last = vec![(i, cur)];
+        // Earlier rescue packs (nothing in them held elsewhere) join the
+        // last, smallest first, while each is at most twice what it holds
+        // so far: they stay few (about one per doubling) and each object is
+        // rewritten about once per doubling.
+        let mut small: Vec<(u64, usize)> = (0..packs.len())
+            .filter(|&j| j != i && !source.contains(&packs[j].0))
+            .map(|j| (packs[j].1.pack_len(), j))
+            .collect();
+        small.sort();
+        let mut total = cur_bytes;
+        for (len, j) in small {
+            if len > 2 * total || total + len > rescue_max {
+                break;
+            }
+            let theirs = own(j, &packs);
+            if theirs.len() != packs[j].1.len()
+                || dead.get(&packs[j].0).is_some_and(|d| !d.is_empty())
+            {
+                continue;
+            }
+            total += len;
+            last.push((j, theirs));
+        }
+        chunks.push(last);
+        let mut new_packs: Vec<(String, PackIndex)> = Vec::new();
+        let mut readable = true;
+        'chunks: for chunk in &chunks {
+            let mut objects: Vec<(Hash, Vec<u8>, u64, i64)> = Vec::new();
+            for (j, ranks) in chunk {
+                let (id, index) = &packs[*j];
+                match rescue_objects(dst, id, index, ranks).await? {
+                    Some(o) => objects.extend(o),
+                    None => {
+                        readable = false;
+                        break 'chunks;
+                    }
+                }
+            }
+            report.rescued_objects += objects.len() as u64;
+            new_packs.push(write_whole_pack(dst, objects).await?);
+            report.rescue_packs += 1;
+        }
+        if !readable {
+            // A damaged pack keeps whatever it holds; `verify` reports it.
+            // Rescue packs written already only hold copies of its objects,
+            // so the next run prunes them.
+            i += 1;
+            continue;
+        }
+        let mut gone: Vec<usize> = chunks.iter().flatten().map(|(j, _)| *j).collect();
+        gone.sort_unstable();
+        gone.dedup();
+        for j in gone.into_iter().rev() {
+            let id = packs.remove(j).0;
+            if new_packs.iter().any(|(n, _)| *n == id) {
+                continue;
+            }
+            dst.delete(&format!("{id}.idx")).await?;
+            dst.delete(&format!("{id}.pack")).await?;
+            report.pruned += 1;
+        }
+        for (new_id, new_index) in new_packs {
+            if !packs.iter().any(|(id, _)| *id == new_id) {
+                packs.push((new_id, new_index));
+            }
+        }
+        // Indexes moved: look again from the start. Each rescue removes a
+        // pack with copies held elsewhere and adds one with none, so this
+        // ends.
+        i = 0;
+    }
+    Ok(())
+}
+
+/// Read the objects at `ranks` of pack `id` (a stream of its file, so
+/// memory holds only them and the bases on their chains), decoded and
+/// checked against their hashes: each as its frame if the frame is whole,
+/// else compressed again whole. `None` if the pack is missing or damaged.
+async fn rescue_objects(
+    dst: &dyn PackFiles,
+    id: &str,
+    index: &PackIndex,
+    ranks: &[u32],
+) -> Result<Option<Vec<(Hash, Vec<u8>, u64, i64)>>> {
+    let want: HashSet<u32> = ranks.iter().copied().collect();
+    // Every frame on the chains of the wanted ones, and how many of the
+    // needed frames use each as their base.
+    let mut needed: HashSet<u32> = HashSet::new();
+    let mut uses: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for &r in ranks {
+        let mut cur = r;
+        let mut depth = 0;
+        while needed.insert(cur) {
+            let Some(b) = index.entry(cur).base else {
+                break;
+            };
+            *uses.entry(b).or_default() += 1;
+            depth += 1;
+            if depth > pack::READ_CHAIN_LIMIT {
+                return Ok(None);
+            }
+            cur = b;
         }
     }
-    Ok(pruned)
+    let mut order: Vec<u32> = needed.into_iter().collect();
+    order.sort_by_key(|&r| index.entry(r).offset);
+    let Some(stream) = dst.read(&format!("{id}.pack")).await? else {
+        return Ok(None);
+    };
+    let mut ahead = Ahead {
+        stream,
+        buf: Vec::new(),
+        at: 0,
+    };
+    let mut bases: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(ranks.len());
+    for r in order {
+        let e = index.entry(r);
+        let Ok(len) = usize::try_from(e.stored_len) else {
+            return Ok(None);
+        };
+        let Some(frame) = ahead.frame(e.offset, len).await? else {
+            return Ok(None);
+        };
+        let base = match e.base {
+            Some(b) => match bases.get(&b) {
+                Some(d) => Some(d.as_slice()),
+                None => return Ok(None),
+            },
+            None => None,
+        };
+        let Ok(data) = pack::decompress(&frame, base, e.len) else {
+            return Ok(None);
+        };
+        if let Some(b) = e.base {
+            let n = uses.get_mut(&b).expect("counted");
+            *n -= 1;
+            if *n == 0 {
+                bases.remove(&b);
+            }
+        }
+        let hash = index.hash_at(r as usize);
+        if want.contains(&r) {
+            if !pack::object_intact(&hash, &data) {
+                return Ok(None);
+            }
+            let stored = match e.base {
+                None => frame,
+                Some(_) => pack::compress_whole(&data, RESCUE_LEVEL)?,
+            };
+            out.push((hash, stored, e.len, e.modified));
+        }
+        if uses.get(&r).is_some_and(|&n| n > 0) {
+            bases.insert(r, data);
+        }
+    }
+    Ok(Some(out))
+}
+
+/// A pack file read front to back, frame by frame, at rising offsets.
+struct Ahead {
+    stream: crate::packfiles::ByteStream,
+    buf: Vec<u8>,
+    /// The file offset of `buf[0]`.
+    at: u64,
+}
+
+impl Ahead {
+    /// The `len` bytes at `off`, at or past the end of the last frame read;
+    /// `None` if the file ends first.
+    async fn frame(&mut self, off: u64, len: usize) -> Result<Option<Vec<u8>>> {
+        if off < self.at {
+            return Ok(None);
+        }
+        loop {
+            let skip = ((off - self.at) as usize).min(self.buf.len());
+            self.buf.drain(..skip);
+            self.at += skip as u64;
+            if self.at == off && self.buf.len() >= len {
+                let f: Vec<u8> = self.buf.drain(..len).collect();
+                self.at += len as u64;
+                return Ok(Some(f));
+            }
+            match self.stream.next().await {
+                Some(chunk) => self.buf.extend_from_slice(&chunk?),
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+/// Write `objects` (hash, whole frame, length, write time) as one pack and
+/// publish it: the pack file, then its index. Returns its id and index.
+async fn write_whole_pack(
+    dst: &dyn PackFiles,
+    mut objects: Vec<(Hash, Vec<u8>, u64, i64)>,
+) -> Result<(String, PackIndex)> {
+    objects.sort_by_key(|o| o.0);
+    objects.dedup_by_key(|o| o.0);
+    let mut data = pack::PACK_MAGIC.to_vec();
+    let mut entries = Vec::with_capacity(objects.len());
+    for (hash, frame, len, modified) in objects {
+        entries.push(pack::IdxEntry {
+            hash,
+            offset: data.len() as u64,
+            stored_len: frame.len() as u64,
+            len,
+            base: None,
+            modified,
+        });
+        data.extend_from_slice(&frame);
+    }
+    let pack_hash = *blake3::hash(&data).as_bytes();
+    let idx = PackIndex::encode(data.len() as u64, pack_hash, &entries)?;
+    let id = pack::pack_id(&idx);
+    let index = PackIndex::decode(idx.clone())?;
+    if dst.len(&format!("{id}.idx")).await?.is_none() {
+        let data = bytes::Bytes::from(data);
+        dst.write(
+            &format!("{id}.pack"),
+            stream::once(async { Ok(data) }).boxed(),
+        )
+        .await?;
+        let idx = bytes::Bytes::from(idx);
+        dst.write(
+            &format!("{id}.idx"),
+            stream::once(async { Ok(idx) }).boxed(),
+        )
+        .await?;
+    }
+    Ok((id, index))
 }
 
 #[cfg(test)]
@@ -726,6 +1050,94 @@ mod tests {
             max_packs: 8,
         };
 
+        /// A source whose first listing of packs is one taken before a
+        /// repack replaced them: a backup slower than the fence.
+        struct Stale {
+            inner: FsPackFiles,
+            first: Mutex<Option<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl PackFiles for Stale {
+            async fn pack_ids(&self) -> Result<Vec<String>> {
+                let first = self.first.lock().unwrap().take();
+                match first {
+                    Some(ids) => Ok(ids),
+                    None => self.inner.pack_ids().await,
+                }
+            }
+            async fn len(&self, name: &str) -> Result<Option<u64>> {
+                self.inner.len(name).await
+            }
+            async fn read(&self, name: &str) -> Result<Option<crate::packfiles::ByteStream>> {
+                self.inner.read(name).await
+            }
+            async fn write(&self, name: &str, data: crate::packfiles::ByteStream) -> Result<u64> {
+                self.inner.write(name, data).await
+            }
+            async fn delete(&self, name: &str) -> Result<()> {
+                self.inner.delete(name).await
+            }
+            async fn tombstones(&self) -> Result<crate::packset::Tombstones> {
+                self.inner.tombstones().await
+            }
+            async fn add_tombstones(&self, add: &[(String, Hash)]) -> Result<()> {
+                self.inner.add_tombstones(add).await
+            }
+        }
+
+        /// The packs a backup listed were replaced before it read them: it
+        /// lists again and copies the pack that replaced them, instead of
+        /// leaving their objects to the loose copy.
+        #[tokio::test]
+        async fn packs_replaced_after_the_listing_are_copied_from_a_new_listing() {
+            let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let (src, _) = source(a.path()).await;
+            let before = FsPackFiles::new(a.path()).pack_ids().await.unwrap();
+            repack(&src, RepackMode::Full).await;
+            let after = FsPackFiles::new(a.path()).pack_ids().await.unwrap();
+            assert!(after.iter().all(|id| !before.contains(id)));
+            let sp = Stale {
+                inner: FsPackFiles::new(a.path()),
+                first: Mutex::new(Some(before.clone())),
+            };
+            let dp = FsPackFiles::new(b.path());
+            let r = sync_packs(&sp, &dp, PackSyncMode::Pool).await.unwrap();
+            assert_eq!(r.vanished, before.len() as u64, "{r:?}");
+            assert_eq!(r.copied, after.len() as u64, "{r:?}");
+            assert_eq!(dp.pack_ids().await.unwrap(), after);
+        }
+
+        /// What only a superseded pool pack holds is rescued however much
+        /// it is, in several packs of at most the cap each.
+        #[tokio::test]
+        async fn a_large_rescue_is_written_in_several_packs() {
+            let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let (src, hashes) = source(a.path()).await;
+            let (sp, dp) = (FsPackFiles::new(a.path()), FsPackFiles::new(b.path()));
+            sync_packs(&sp, &dp, PackSyncMode::Pool).await.unwrap();
+            for h in &hashes[5..15] {
+                src.delete(h).await.unwrap();
+            }
+            repack(&src, RepackMode::Full).await;
+            // Each object is about 20 stored bytes: a few to a pack.
+            let r = sync_packs_with(&sp, &dp, PackSyncMode::Pool, 64)
+                .await
+                .unwrap();
+            assert_eq!(r.rescued_objects, 11, "{r:?}");
+            assert!(r.rescue_packs >= 3, "{r:?}");
+            assert_eq!(r.pruned, 2, "{r:?}");
+            let pool = FsBlobStore::new(b.path());
+            for h in &hashes {
+                assert!(pool.get(h).await.unwrap().is_some(), "the pool keeps {h}");
+            }
+            // Nothing more to do.
+            let r = sync_packs_with(&sp, &dp, PackSyncMode::Pool, 64)
+                .await
+                .unwrap();
+            assert_eq!((r.rescued_objects, r.pruned), (0, 0), "{r:?}");
+        }
+
         async fn all(store: &dyn BlobStore) -> Vec<Hash> {
             let mut out = Vec::new();
             let mut after = None;
@@ -789,10 +1201,12 @@ mod tests {
             // The source merges its packs and the full repack drops the
             // deleted object. The pool gets the merged pack and drops the
             // small pack it covers; the big one still holds the deleted
-            // object, so it stays.
+            // object, so that one object is copied into a pool pack of its
+            // own (ADR 0107) and the big one goes too.
             repack(&src, RepackMode::Full).await;
             let r = sync_packs(&sp, &dp, PackSyncMode::Pool).await.unwrap();
-            assert_eq!((r.copied, r.pruned), (1, 1), "{r:?}");
+            assert_eq!((r.copied, r.pruned), (1, 2), "{r:?}");
+            assert_eq!((r.rescued_objects, r.rescue_packs), (1, 1), "{r:?}");
             assert_eq!(dp.pack_ids().await.unwrap().len(), 2);
             let fresh = FsBlobStore::new(b.path());
             for h in &hashes {
@@ -801,7 +1215,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_pool_pack_holding_something_no_other_pack_holds_is_kept() {
+        async fn what_only_a_pool_pack_holds_is_kept() {
             let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
             let (src, hashes) = source(a.path()).await;
             let (sp, dp) = (FsPackFiles::new(a.path()), FsPackFiles::new(b.path()));
@@ -811,17 +1225,18 @@ mod tests {
             src.delete(&hashes[5]).await.unwrap();
             repack(&src, RepackMode::Full).await;
             let r = sync_packs(&sp, &dp, PackSyncMode::Pool).await.unwrap();
-            assert_eq!((r.copied, r.pruned), (1, 1), "{r:?}");
+            assert_eq!((r.copied, r.pruned), (1, 2), "{r:?}");
+            assert_eq!(r.rescued_objects, 2, "{r:?}");
             let pool = FsBlobStore::new(b.path());
-            assert!(
-                pool.get(&hashes[5]).await.unwrap().is_some(),
-                "the pool keeps it"
-            );
+            for h in &hashes {
+                assert!(pool.get(h).await.unwrap().is_some(), "the pool keeps {h}");
+            }
         }
 
         /// A pool written before issue #155 was fixed carries tombstones. A
         /// tombstoned object never makes a pool pack prunable: its bytes may
-        /// be what an older snapshot needs.
+        /// be what an older snapshot needs. Nor is such a pack rescued, so
+        /// it reads exactly as before.
         #[tokio::test]
         async fn pool_tombstones_never_make_a_pack_prunable() {
             let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());

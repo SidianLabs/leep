@@ -31,6 +31,11 @@
 //! changeset (per search row for `content-v1`) and their share of what the
 //! rows took.
 //!
+//! Last, a server with the first flags again takes 48 wide lands, each
+//! editing the next file and paced so that each delta run stores the first
+//! version it sees at every path whole: once settled (the delta packs
+//! consolidated, ADR 0107) it checks the blob store bytes per wide land.
+//!
 //! The budgets keep 25% or more over the worst value measured when they were
 //! set (docs/PERFORMANCE.md, "Storage size guard"). If a change trips one on
 //! purpose, measure again and move the line in the same change, saying
@@ -202,9 +207,23 @@ const FLAGS: &[&str] = &[
     "1s",
     "--auto-repack-max-age",
     "2s",
+    "--auto-repack-consolidate-age",
+    "2s",
     "--auto-compact-interval",
     "2s",
 ];
+
+/// Wide lands after the paced ones: each edits the next file in turn, so
+/// each delta run stores the first version it sees at every path whole
+/// (its previous version is in an older pack) until a consolidation
+/// compresses them (ADR 0107). Paced so the delta runs split them.
+const WIDE_LANDS: usize = 48;
+const WIDE_PACE: Duration = Duration::from_millis(400);
+/// Blob store bytes per wide land, settled. Measured when set (ADR 0107,
+/// nine runs over both backends): 414-422, against 1,900 with
+/// consolidation off. The budget keeps 25% over the worst run and fails
+/// without consolidation.
+const WIDE_BLOB_PER_LAND: u64 = 530;
 
 struct Rng(u64);
 
@@ -280,6 +299,20 @@ impl Corpus {
             ),
             _ => "}".to_string(),
         }
+    }
+
+    /// Edit the `k`-th file in path order, as [`edit`](Self::edit) does.
+    fn edit_nth(&mut self, k: usize) -> Vec<(String, String)> {
+        let p = self.files.keys().nth(k % self.files.len()).unwrap().clone();
+        let at = self.rng.below(self.files[&p].len());
+        let changed = self.line();
+        let added: Vec<String> = (0..1 + self.rng.below(3)).map(|_| self.line()).collect();
+        let lines = self.files.get_mut(&p).unwrap();
+        lines[at] = changed;
+        for (j, l) in added.into_iter().enumerate() {
+            lines.insert(at + j, l);
+        }
+        vec![(p.clone(), self.content(&p))]
     }
 
     /// Edit `n` files: one line changed and one to three inserted near it.
@@ -774,6 +807,7 @@ fn storage_stays_within_its_budgets() {
     }
     // Not in Git's history below: what is compared is what `after` holds.
     let paced_patches = sizes(&stores).patches - after.patches;
+
     drop(server);
 
     // One GC with the servers stopped: its marks are segments in the blob
@@ -982,5 +1016,35 @@ fn storage_stays_within_its_budgets() {
     );
     let out = server_cmd(&stores, &["verify", "--full"]);
     assert_ok(&out, "leep-server verify --full");
+
+    // Wide lands, last so they change no measurement above: each the
+    // first edit of its file in its delta run (ADR 0107). The packs now
+    // hold the gc mark and derived segments too, and in a store this small
+    // an eighth of them is more than 48 lands gain: any 64th consolidates.
+    let mut wide_flags = FLAGS.to_vec();
+    wide_flags.extend(["--auto-repack-consolidate-ratio", "64"]);
+    let server = Server::start_with(free_port(), &stores, work, &wide_flags);
+    let wide_before = settle(&stores, &server, true);
+    for k in 0..WIDE_LANDS {
+        let files = corpus.edit_nth(k);
+        let msg = corpus.message(IMPORT_COMMITS + LANDS + PACED_LANDS + k);
+        tip = land(server.addr, tip, &files, &msg);
+        std::thread::sleep(WIDE_PACE);
+    }
+    let wide_after = settle(&stores, &server, true);
+    drop(server);
+    let wide_per_land = wide_after.blobs.saturating_sub(wide_before.blobs) / WIDE_LANDS as u64;
+    println!(
+        "[{backend}] wide lands: blobs {} -> {} ({wide_per_land} per land)",
+        wide_before.blobs, wide_after.blobs
+    );
+    assert!(
+        wide_per_land <= WIDE_BLOB_PER_LAND,
+        "blob store bytes per wide land over budget ({WIDE_BLOB_PER_LAND}): {} -> {}",
+        wide_before.blobs,
+        wide_after.blobs
+    );
+    let out = server_cmd(&stores, &["verify", "--full"]);
+    assert_ok(&out, "leep-server verify --full, after the wide lands");
     drop(pg);
 }

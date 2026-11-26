@@ -120,9 +120,13 @@ pub struct RepackOptions {
     /// objects in this set (a batch of the automatic delta repack, ADR
     /// 0100); `None` packs every loose object.
     pub loose_subset: Option<Arc<HashSet<Hash>>>,
-    /// Packs an [`RepackMode::Incremental`] repack must not fold in by its
-    /// geometric rule: whole packs a later batch compresses.
-    pub leave: Vec<String>,
+    /// For an [`RepackMode::Incremental`] repack: the only packs its
+    /// geometric rule may fold in besides `packs`; `None`, any searchable
+    /// pack. A caller that plans from a listing names the packs it knew
+    /// then, so a pack written since (a land pack written while it walked)
+    /// is never taken in unplanned, and `Some` of nothing merges exactly
+    /// `packs` (a consolidation, ADR 0107). Checked under the repack lock.
+    pub fold_only: Option<Vec<String>>,
     /// Record the new pack as already compressed by a delta repack (ADR
     /// 0100, `packs/considered`), so a pack with no delta record that it
     /// wrote is not taken for a whole pack again.
@@ -144,7 +148,7 @@ impl Default for RepackOptions {
             hook: None,
             packs: Vec::new(),
             loose_subset: None,
-            leave: Vec::new(),
+            fold_only: None,
             mark: false,
             full_interval: None,
         }
@@ -184,6 +188,10 @@ pub struct PackDetail {
     /// Bytes the records decode to, and the `.pack` size.
     pub logical_bytes: u64,
     pub bytes: u64,
+    /// Stored bytes of the frames written whole. In a pack a delta repack
+    /// wrote, an upper bound on what compressing them against their
+    /// previous versions can save (ADR 0107).
+    pub whole_bytes: u64,
     /// The earliest write time its records carry (unix seconds), to take
     /// the oldest packs first.
     pub oldest: i64,
@@ -191,9 +199,12 @@ pub struct PackDetail {
 
 impl PackDetail {
     pub(crate) fn of(id: &str, index: &pack::PackIndex) -> PackDetail {
-        let (mut deltas, mut logical, mut oldest) = (0u64, 0u64, i64::MAX);
+        let (mut deltas, mut logical, mut whole, mut oldest) = (0u64, 0u64, 0u64, i64::MAX);
         for e in index.iter() {
             deltas += u64::from(e.base.is_some());
+            if e.base.is_none() {
+                whole += e.stored_len;
+            }
             logical += e.len;
             oldest = oldest.min(e.modified);
         }
@@ -203,6 +214,7 @@ impl PackDetail {
             deltas,
             logical_bytes: logical,
             bytes: index.pack_len(),
+            whole_bytes: whole,
             oldest,
         }
     }
@@ -253,6 +265,9 @@ pub struct RepackReport {
     /// new pack by GC and uploaded again.
     pub loose_kept: u64,
     pub old_packs_removed: u64,
+    /// Replaced packs a later repack published again under the same id
+    /// (no longer retired), so the cleanup left them in place.
+    pub old_packs_kept: u64,
     /// Packs earlier repacks retired, deleted by the sweep this run began
     /// with because their fence had passed (ADR 0080).
     pub retired_removed: u64,
@@ -271,6 +286,8 @@ pub struct PublishedPack {
     /// (see [`stamp_of`]).
     from_loose: Vec<(Hash, i64)>,
     replaced: Vec<String>,
+    /// When `replaced` were retired (unix seconds, `packs/retired`).
+    retired_at: i64,
     opts: RepackOptions,
     /// The repack lock, unless [`unlock`](Self::unlock) let it go.
     lock: Option<File>,
@@ -365,7 +382,22 @@ impl PublishedPack {
             sync_dir(d)?;
         }
         let dir = store.packs.dir().to_path_buf();
+        // Only packs still retired. A later merge can publish a replaced
+        // pack again, byte for byte under the same id (a consolidation whose
+        // input lost exactly what this repack added to it), and
+        // `retire_for` then took it out of the record: it is the live copy
+        // now, and deleting it by name would lose everything it holds.
+        // Retired again since (published again, then replaced by a later
+        // repack) waits for that retirement's own fence, which the sweep
+        // keeps.
+        let retired = crate::retire::read_retired(&dir)?;
         for id in &self.replaced {
+            if !retired.get(id).is_some_and(|&at| at <= self.retired_at) {
+                if dir.join(format!("{id}.idx")).exists() {
+                    self.report.old_packs_kept += 1;
+                }
+                continue;
+            }
             // The index first: without it the pack is unpublished garbage.
             remove_if_present(&dir.join(format!("{id}.idx")))?;
             sync_dir(&dir)?;
@@ -489,6 +521,42 @@ pub(crate) fn rewrite_tombstones(dir: &Path) -> Result<()> {
     sync_dir(dir)
 }
 
+/// The tombstoned hashes of pack `id`.
+fn tombstones_of(dir: &Path, id: &str) -> Result<HashSet<Hash>> {
+    let text = match std::fs::read(dir.join(TOMBSTONES)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(e) => return Err(storage_err(e)),
+    };
+    Ok(parse_tombstones(&text).remove(id).unwrap_or_default())
+}
+
+/// Remove the tombstones of `hashes` in pack `id`, under the tombstone
+/// lock, keeping every other line (those appended meanwhile included).
+fn drop_tombstones(dir: &Path, id: &str, hashes: &HashSet<Hash>) -> Result<()> {
+    let _lock = lock_tombstones(dir)?;
+    let path = dir.join(TOMBSTONES);
+    let text = match std::fs::read(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(storage_err(e)),
+    };
+    let mut keep: Vec<(String, Hash)> = parse_tombstones(&text)
+        .into_iter()
+        .flat_map(|(p, hs)| hs.into_iter().map(move |h| (p.clone(), h)))
+        .filter(|(p, h)| p != id || !hashes.contains(h))
+        .collect();
+    keep.sort();
+    if keep.is_empty() {
+        remove_if_present(&path)?;
+        return sync_dir(dir);
+    }
+    let body: String = keep.iter().map(|(p, h)| tombstone_line(p, h)).collect();
+    let tmp = write_durably(dir, "tombstones", body.as_bytes())?;
+    std::fs::rename(&tmp, &path).map_err(storage_err)?;
+    sync_dir(dir)
+}
+
 pub(crate) fn write_durably(dir: &Path, ext: &str, bytes: &[u8]) -> Result<PathBuf> {
     let (path, mut f) = create_exclusive(dir, &format!(".{ext}")).map_err(storage_err)?;
     let res = f.write_all(bytes).and_then(|()| f.sync_all());
@@ -588,6 +656,12 @@ struct Sources {
     /// `pack << 32 | rank` of the packed copy in `packs`, or `u64::MAX`.
     packed: Vec<u64>,
     packs: Vec<Arc<Pack>>,
+    /// By pack, as `packs`: its whole frames are compressed again rather
+    /// than copied. Set for the packs written whole (land batches and
+    /// imports, at zstd level 1, ADR 0068; not those a delta repack wrote)
+    /// that an incremental repack names, so their first versions end at the
+    /// repack's level too.
+    recompress: Vec<bool>,
 }
 
 impl Sources {
@@ -622,6 +696,11 @@ impl PackSource for FsSource<'_> {
             return Ok(None);
         };
         let e = p.index.entry(rank);
+        if e.base.is_none()
+            && self.sources.recompress[(self.sources.packed[id as usize] >> 32) as usize]
+        {
+            return Ok(None);
+        }
         let base = e.base.map(|r| p.index.hash_at(r as usize));
         Ok(Some((p.frame(&e)?, base)))
     }
@@ -770,8 +849,10 @@ impl FsBlobStore {
                     .collect();
                 let extra: Vec<(String, u64)> =
                     sizes.extract_if(.., |(id, _)| named.contains(id)).collect();
-                let leave: HashSet<&String> = opts.leave.iter().collect();
-                sizes.retain(|(id, _)| !leave.contains(id));
+                if let Some(only) = &opts.fold_only {
+                    let only: HashSet<&String> = only.iter().collect();
+                    sizes.retain(|(id, _)| only.contains(id));
+                }
                 let new = loose.len() as u64 + extra.iter().map(|p| p.1).sum::<u64>();
                 plan_merge(&sizes, new, factor, max_packs)
                     .into_iter()
@@ -809,10 +890,29 @@ impl FsBlobStore {
         // loose listing at once; an object's id is its position.
         let most = loose.len() + merging.iter().map(|(_, p, _)| p.index.len()).sum::<usize>();
         let mut hashes: Vec<Hash> = Vec::with_capacity(most);
+        let named: HashSet<&String> = opts.packs.iter().collect();
+        // A delta repack wrote the considered ones, at its own level.
+        let considered = if named.is_empty() {
+            HashSet::new()
+        } else {
+            crate::considered::read_fs(&dir).unwrap_or_default()
+        };
+        let recompress = view
+            .packs
+            .iter()
+            .map(|(p, _)| {
+                matches!(opts.mode, RepackMode::Incremental { .. })
+                    && named.contains(&p.id)
+                    && !considered.contains(&p.id)
+                    && p.index.iter().all(|e| e.base.is_none())
+            })
+            .collect();
+        drop((named, considered));
         let mut sources = Sources {
             loose: Vec::with_capacity(most),
             packed: Vec::with_capacity(most),
             packs: view.packs.iter().map(|(p, _)| p.clone()).collect(),
+            recompress,
         };
         {
             let mut packed = merge_packs(&merging).peekable();
@@ -928,7 +1028,8 @@ impl FsBlobStore {
             remove_if_present(&tmp_pack.take())?;
             // Every object of the merged packs was deleted: nothing of
             // theirs is live, so they retire with no replacement.
-            crate::retire::append_retired(&dir, &replaced, now_secs())?;
+            let retired_at = now_secs();
+            crate::retire::append_retired(&dir, &replaced, retired_at)?;
             step(&opts, RepackStep::Retired)?;
             self.packs.supersede(&replaced);
             return Ok(PublishedPack {
@@ -936,6 +1037,7 @@ impl FsBlobStore {
                 report,
                 from_loose,
                 replaced,
+                retired_at,
                 opts,
                 lock: Some(lock),
             });
@@ -954,6 +1056,13 @@ impl FsBlobStore {
         tmp_pack.take();
         sync_dir(&dir)?;
         step(&opts, RepackStep::PackRenamed)?;
+        // A merge can write a pack that was published before, byte for byte
+        // (the id is the index's hash). Tombstones written for that earlier
+        // copy do not hold for this one, which holds only what was live when
+        // it was read: an object deleted then and uploaded again is live
+        // here. They are dropped once it is published; deletes since this
+        // run read its sources are added back below (`late_deletes`).
+        let earlier: HashSet<Hash> = tombstones_of(&dir, &id)?;
         let (tmp_idx, file) = create_exclusive(&dir, ".idx").map_err(storage_err)?;
         let mut tmp_idx = TempFile(Some(tmp_idx));
         {
@@ -980,6 +1089,9 @@ impl FsBlobStore {
         report.index_bytes = index_len;
         report.pack_id = Some(id.clone());
 
+        if !earlier.is_empty() {
+            drop_tombstones(&dir, &id, &earlier)?;
+        }
         // GC may have deleted objects after this run read them. Hide them in
         // the new pack too; a delete that starts from now on sees the pack.
         let late = self.late_deletes(&table, written.ids(), &sources)?;
@@ -992,7 +1104,8 @@ impl FsBlobStore {
         // they retire: durably, so no process scanning from now on, this
         // one after a restart included, searches or merges them again.
         let replaced: Vec<String> = replaced.into_iter().filter(|r| *r != id).collect();
-        crate::retire::retire_for(&dir, &replaced, &id, now_secs())?;
+        let retired_at = now_secs();
+        crate::retire::retire_for(&dir, &replaced, &id, retired_at)?;
         self.packs.unsupersede(&id);
         step(&opts, RepackStep::Retired)?;
         if opts.mark {
@@ -1013,6 +1126,7 @@ impl FsBlobStore {
             report,
             from_loose,
             replaced,
+            retired_at,
             opts,
             lock: Some(lock),
         })
@@ -1092,6 +1206,85 @@ impl FsBlobStore {
                 .iter()
                 .any(|(p, dead)| p.index.find(h).is_some() && !dead.contains(h))
         })
+    }
+
+    /// The stored size of `hash`'s frame if it has a live copy stored
+    /// whole in one of the packs `ids` names: what a consolidating repack
+    /// (ADR 0107) may compress against a previous version. An in-memory
+    /// lookup.
+    pub fn whole_in(
+        &self,
+        ids: &HashSet<String>,
+    ) -> Result<impl Fn(&Hash) -> Option<u64> + Send + Sync> {
+        let view = self.packs.view()?;
+        let packs: Vec<(Arc<Pack>, HashSet<Hash>)> = view
+            .packs
+            .iter()
+            .filter(|(p, _)| ids.contains(&p.id))
+            .cloned()
+            .collect();
+        Ok(move |h: &Hash| {
+            packs.iter().find_map(|(p, dead)| match p.index.find(h) {
+                Some(e) if e.base.is_none() && !dead.contains(h) => Some(e.stored_len),
+                _ => None,
+            })
+        })
+    }
+
+    /// How many deltas deep `hash`'s live copy in one of the packs `ids`
+    /// names is (0 for a whole frame): a frame based on one already
+    /// [`MAX_CHAIN`](crate::pack::MAX_CHAIN) deep is written whole, so a
+    /// consolidation (ADR 0107) gains nothing on it. An in-memory lookup.
+    pub fn depth_in(
+        &self,
+        ids: &HashSet<String>,
+    ) -> Result<impl Fn(&Hash) -> Option<usize> + Send + Sync> {
+        let view = self.packs.view()?;
+        let packs: Vec<(Arc<Pack>, HashSet<Hash>)> = view
+            .packs
+            .iter()
+            .filter(|(p, _)| ids.contains(&p.id))
+            .cloned()
+            .collect();
+        Ok(move |h: &Hash| {
+            packs.iter().find_map(|(p, dead)| {
+                let mut e = p.index.find(h).filter(|_| !dead.contains(h))?;
+                let mut depth = 0;
+                while let Some(b) = e.base {
+                    if depth > pack::READ_CHAIN_LIMIT {
+                        return None;
+                    }
+                    e = p.index.entry(b);
+                    depth += 1;
+                }
+                Some(depth)
+            })
+        })
+    }
+
+    /// Stored bytes of the tombstoned frames of the packs `ids` names: what
+    /// a merge of them drops (ADR 0107).
+    pub fn tombstoned_bytes(&self, ids: &HashSet<String>) -> Result<u64> {
+        let view = self.packs.view()?;
+        Ok(view
+            .packs
+            .iter()
+            .filter(|(p, _)| ids.contains(&p.id))
+            .flat_map(|(p, dead)| dead.iter().filter_map(|h| p.index.find(h)))
+            .map(|e| e.stored_len)
+            .sum())
+    }
+
+    /// When pack `id` was written (its `.pack` file's modification time,
+    /// unix seconds), or `None` if it is gone: a time that survives
+    /// restarts, for the consolidation's age rule (ADR 0107). A pack is
+    /// never written again in place, so this is when it was made.
+    pub fn pack_written(&self, id: &str) -> Result<Option<i64>> {
+        match std::fs::metadata(self.packs.dir().join(format!("{id}.pack"))) {
+            Ok(m) => Ok(m.modified().ok().and_then(unix_secs)),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(storage_err(e)),
+        }
     }
 
     /// Objects of the new pack whose source GC deleted while it was written:

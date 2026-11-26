@@ -686,6 +686,63 @@ fn run_crash_rounds_prepared(
     prepare: impl FnOnce(&Stores),
     after: impl FnOnce(&Stores),
 ) -> u64 {
+    run_crash_rounds_aimed(backend, meta_url, extra, None, prepare, after).0
+}
+
+/// Kills aimed at a step the server logs: after each round's seeded wait,
+/// the kill waits (up to [`AIM_WAIT`]) for a new `start` line in the
+/// server's log and comes at once. A kill landed inside the step when none
+/// of the `end` lines (it finished, or stopped) follows the last `start`.
+struct Aim {
+    rust_log: &'static str,
+    start: &'static str,
+    end: &'static [&'static str],
+}
+
+const AIM_WAIT: Duration = Duration::from_secs(15);
+
+/// The server's log from byte `from` on.
+fn log_from(path: &Path, from: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut bytes = Vec::new();
+    if let Ok(mut f) = std::fs::File::open(path) {
+        if f.seek(SeekFrom::Start(from)).is_ok() {
+            let _ = f.read_to_end(&mut bytes);
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Kill `server` as `aim` says; whether the kill landed inside the step.
+fn aimed_kill(server: &mut Server, aim: &Aim) -> bool {
+    let path = server.log_path().to_path_buf();
+    let from = std::fs::metadata(&path).map_or(0, |m| m.len());
+    let deadline = Instant::now() + AIM_WAIT;
+    while Instant::now() < deadline && !log_from(&path, from).contains(aim.start) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    server.kill();
+    let text = log_from(&path, from);
+    let hit = text
+        .rfind(aim.start)
+        .is_some_and(|i| !aim.end.iter().any(|e| text[i..].contains(e)));
+    if !hit {
+        let tail: Vec<&str> = text.lines().rev().take(6).collect();
+        progress!("missed the aimed step; the log ended with {tail:#?}");
+    }
+    hit
+}
+
+/// [`run_crash_rounds_prepared`] with the kills aimed by `aim`; also
+/// returns how many kills landed inside its step.
+fn run_crash_rounds_aimed(
+    backend: &str,
+    meta_url: Option<String>,
+    extra: &[&str],
+    aim: Option<&Aim>,
+    prepare: impl FnOnce(&Stores),
+    after: impl FnOnce(&Stores),
+) -> (u64, u64) {
     let _g = serial();
     let _w = Watchdog::start();
     let seed = env_u64("LEEP_CRASH_SEED", DEFAULT_SEED);
@@ -700,9 +757,18 @@ fn run_crash_rounds_prepared(
     };
     prepare(&stores);
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crash_rounds(backend, seed, rounds, http_agents, root, &stores, extra)
+        crash_rounds(
+            backend,
+            seed,
+            rounds,
+            http_agents,
+            root,
+            &stores,
+            extra,
+            aim,
+        )
     }));
-    let not_admitted = match outcome {
+    let (not_admitted, inside) = match outcome {
         Ok(n) => {
             after(&stores);
             n
@@ -716,12 +782,14 @@ fn run_crash_rounds_prepared(
         }
     };
     progress!(
-        "[{backend}] {rounds} kills, seed {seed:#x}, {not_admitted} lands not admitted, {:.1}s",
+        "[{backend}] {rounds} kills ({inside} aimed inside), seed {seed:#x}, {not_admitted} \
+         lands not admitted, {:.1}s",
         started.elapsed().as_secs_f64()
     );
-    not_admitted
+    (not_admitted, inside)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn crash_rounds(
     backend: &str,
     seed: u64,
@@ -730,11 +798,14 @@ fn crash_rounds(
     root: &Path,
     stores: &Stores,
     extra: &[&str],
-) -> u64 {
+    aim: Option<&Aim>,
+) -> (u64, u64) {
     let port = free_port();
     let mut server_args = vec!["--request-timeout", REQUEST_TIMEOUT];
     server_args.extend_from_slice(extra);
-    let mut server = Server::start_with(port, stores, root, &server_args);
+    let rust_log = aim.map_or("warn", |a| a.rust_log);
+    let mut server = Server::start_logged(port, stores, root, &server_args, rust_log);
+    let mut inside = 0u64;
     let client = Client::new(&server.url, &root.join("cache"));
     let addr = server.addr;
     let shared = Shared::default();
@@ -767,7 +838,18 @@ fn crash_rounds(
                 let st = gc.wait().unwrap();
                 assert!(st.success(), "[{tag}] live gc failed");
             }
-            server.kill();
+            match aim {
+                Some(a) => {
+                    // New work pauses while the kill waits: the store does
+                    // not grow meanwhile, and the trees of the last lands
+                    // are written, so the walk reaches them.
+                    shared.pause.store(true, Ordering::Relaxed);
+                    let hit = aimed_kill(&mut server, a);
+                    inside += u64::from(hit);
+                    progress!("[{tag}] the kill landed inside the aimed step: {hit}");
+                }
+                None => server.kill(),
+            }
             check_store(&format!("{tag}, after SIGKILL"), stores, &shared, false);
             verify_clean(&format!("{tag}, after SIGKILL"), stores, &[]);
 
@@ -802,7 +884,8 @@ fn crash_rounds(
                 _ => {}
             }
 
-            server = Server::start_with(port, stores, root, &server_args);
+            server = Server::start_logged(port, stores, root, &server_args, rust_log);
+            shared.pause.store(false, Ordering::Relaxed);
             if !planted.is_empty() {
                 // The killed collect's gc lease lapses after 60 s; agents
                 // pause meanwhile, so later rounds see the history they
@@ -853,7 +936,7 @@ fn crash_rounds(
     verify_clean(&tag, stores, &["--full", "--rehash"]);
     drop(server);
     let n = *shared.not_admitted.lock().unwrap();
-    n
+    (n, inside)
 }
 
 /// After a killed collect: finish it (once the killed run's gc lease has
@@ -1094,6 +1177,69 @@ fn killed_server_with_eager_auto_repack_loses_nothing_postgres() {
         return;
     };
     run_crash_rounds_with("postgres, auto repack", Some(db.url.clone()), AUTO_REPACK);
+    drop(db);
+}
+
+/// ADR 0107: the eager automatic repack with consolidation at any gain
+/// (the ratio's floor is a byte) and a short fence, so one follows nearly
+/// every delta run (the agents' tree nodes have bases in older packs), and
+/// each kill waits for the next to start: kills land
+/// while a consolidation walks or rewrites the delta packs (at least one
+/// must), or once it waits for its cleanup. Nothing is lost and every
+/// store verifies.
+const CONSOLIDATE: &[&str] = &[
+    "--background-repack-interval",
+    "1s",
+    "--auto-repack-objects",
+    "1",
+    "--auto-repack-check-interval",
+    "0",
+    "--auto-repack-consolidate-ratio",
+    "1000000000000",
+    // Cleanups wait out a short fence (above the 2 s request timeout), so
+    // they do not pile up past the pending cap and hold consolidations
+    // for a minute at a time.
+    "--background-repack-fence",
+    "3s",
+];
+
+const CONSOLIDATING: Aim = Aim {
+    rust_log: "warn,leep_server::background_repack=debug",
+    start: "starting a consolidation of delta packs",
+    // Published, or stopped: another repack held the store, or it failed.
+    end: &[
+        "consolidated delta packs",
+        "consolidation of delta packs skipped",
+        "consolidation of delta packs failed",
+    ],
+};
+
+fn consolidation_rounds(backend: &str, meta_url: Option<String>) {
+    let (_, inside) = run_crash_rounds_aimed(
+        backend,
+        meta_url,
+        CONSOLIDATE,
+        Some(&CONSOLIDATING),
+        |_| {},
+        |_| {},
+    );
+    assert!(
+        inside > 0,
+        "[{backend}] no kill landed inside a consolidation"
+    );
+}
+
+#[test]
+fn killed_server_with_eager_consolidation_loses_nothing_sqlite() {
+    consolidation_rounds("sqlite, consolidation", None);
+}
+
+#[test]
+fn killed_server_with_eager_consolidation_loses_nothing_postgres() {
+    let Some(db) = PgDb::create("leep_e2e") else {
+        return;
+    };
+    consolidation_rounds("postgres, consolidation", Some(db.url.clone()));
     drop(db);
 }
 

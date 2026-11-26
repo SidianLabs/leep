@@ -39,7 +39,12 @@
 //! them as deltas, the whole frames included. On an object store it runs a
 //! full repack instead, at most once per `object_store_interval`. Whole
 //! packs and delta packs are merged apart, so a whole frame is never hidden
-//! in a delta pack before it is compressed. Lands never wait for any of it.
+//! in a delta pack before it is compressed. A delta run can only use a base
+//! in the pack it writes, so on a filesystem store the task also
+//! consolidates its delta packs when that saves enough (ADR 0107): it
+//! merges them and compresses the frames the runs stored whole against
+//! their previous versions, now in the same pack. Lands never wait for any
+//! of it.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -136,6 +141,40 @@ pub struct AutoRepackOptions {
     /// (not on age: a full rewrite for a few objects is not worth it).
     pub object_store_share: f64,
     pub object_store_min_bytes: u64,
+    /// Consolidation of the delta packs (ADR 0107), on filesystem stores;
+    /// `None` turns it off.
+    pub consolidate: Option<ConsolidateOptions>,
+}
+
+/// When the background task consolidates its delta packs (ADR 0107): it
+/// merges them into one and compresses each frame they hold whole against
+/// the previous version the history walk names, now in the same pack. A
+/// delta run stores the first new version at each path whole, because its
+/// base is in an older pack (packs are self-contained, ADR 0039); this is
+/// what compresses those frames later, as `git gc` does.
+#[derive(Clone, Debug)]
+pub struct ConsolidateOptions {
+    /// It runs once the bytes it would save reach `1 / ratio` of the packs
+    /// it rewrites,
+    pub ratio: u64,
+    /// or reach `1/64` of them (at least `min_gain`) and have done so for
+    /// this long; `None` leaves only the ratio.
+    pub age: Option<Duration>,
+    pub min_gain: u64,
+    /// Delta packs larger than this are never rewritten in the background:
+    /// they are left to `leep-server repack --full`, and logged once.
+    pub max_bytes: u64,
+}
+
+impl Default for ConsolidateOptions {
+    fn default() -> Self {
+        ConsolidateOptions {
+            ratio: 8,
+            age: Some(Duration::from_secs(24 * 3600)),
+            min_gain: 64 << 10,
+            max_bytes: 2 << 30,
+        }
+    }
 }
 
 impl Default for AutoRepackOptions {
@@ -155,6 +194,7 @@ impl Default for AutoRepackOptions {
             object_store_interval: Duration::from_secs(24 * 3600),
             object_store_share: 0.25,
             object_store_min_bytes: 64 << 20,
+            consolidate: Some(ConsolidateOptions::default()),
         }
     }
 }
@@ -471,6 +511,70 @@ struct AutoState {
     corrupt: HashSet<Hash>,
     /// Loose bytes at the last check, for the pending cap.
     loose_bytes: u64,
+    /// What the last check's consolidation did, for the tick's report.
+    consolidated: ConsolidateOutcome,
+    /// For each largest delta pack a walk went through (all of history up
+    /// to the walk limit, once per pack and process): the bytes its own
+    /// whole frames would save. Later walks stop at that pack's history.
+    inside: HashMap<String, u64>,
+    /// What the last walk found: no walk again until the whole bytes of
+    /// the delta packs have grown enough since.
+    judged: Option<Judged>,
+    /// When this process first saw the gain reach the age rule's floor.
+    gain_since: Option<Instant>,
+    /// Delta packs left out (over `max_bytes`, or past the budget of one
+    /// consolidation), logged once each.
+    too_big: HashSet<String>,
+    /// Since when a due consolidation is held by the cleanups waiting:
+    /// delta runs wait for it, for two fences at most, so a busy store
+    /// still gets it and loose objects do not wait for long.
+    consolidation_held: Option<Instant>,
+    /// After a failed consolidation (a walk that failed would fail again
+    /// at once, and it may cover all of history), none is tried before
+    /// this; the wait doubles with each failure in a row.
+    retry_at: Option<Instant>,
+    failures: u32,
+}
+
+/// What a consolidation walk found, for the checks after it.
+struct Judged {
+    /// The largest pack it stopped at, and the whole bytes of the other
+    /// packs then.
+    largest: String,
+    whole_outside: u64,
+    /// What the frames whole outside the largest pack would save.
+    outside: u64,
+}
+
+/// The first wait after a failed consolidation (or the check interval, if
+/// longer), doubled per failure in a row up to the last.
+const RETRY_FIRST: Duration = Duration::from_secs(60);
+const RETRY_MOST: Duration = Duration::from_secs(6 * 3600);
+
+/// What the consolidation of delta packs (ADR 0107) did at a check.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum ConsolidateOutcome {
+    /// Off, not due for a check, or a delta run went first.
+    #[default]
+    NotChecked,
+    /// No delta pack the server may rewrite, or too few whole frames in
+    /// them to be worth a walk.
+    Nothing,
+    /// Walked (or remembered the last walk of the same packs): rewriting
+    /// them would save this many bytes, not enough yet. `walked` counts the
+    /// changesets the walks of this check went through (0 if remembered).
+    Below { gain: u64, walked: u64 },
+    /// Due, but cleanups wait on too many bytes, or another repack holds
+    /// the store.
+    Held(&'static str),
+    /// Published this pack; `gain` is what the walk expected to save.
+    Ran {
+        report: Box<RepackReport>,
+        gain: u64,
+        walked: u64,
+    },
+    /// Failed; logged, and tried again at the next check.
+    Failed(String),
 }
 
 /// What the automatic delta repack did in one tick.
@@ -508,6 +612,8 @@ pub struct TickReport {
     pub packs: usize,
     /// What the automatic delta repack did.
     pub auto: AutoOutcome,
+    /// What the consolidation of delta packs did.
+    pub consolidate: ConsolidateOutcome,
 }
 
 impl BackgroundRepack {
@@ -534,13 +640,25 @@ impl BackgroundRepack {
             for outcome in ["ran", "error"] {
                 metrics::counter!("leep_repack_auto_runs_total", "outcome" => outcome).increment(0);
             }
-            for reason in ["threshold", "pending", "interval", "busy"] {
+            for reason in ["threshold", "pending", "interval", "busy", "consolidation"] {
                 metrics::counter!("leep_repack_auto_skipped_total", "reason" => reason)
                     .increment(0);
             }
             metrics::counter!("leep_repack_auto_input_bytes_total").increment(0);
             metrics::counter!("leep_repack_auto_delta_bytes_total").increment(0);
             metrics::counter!("leep_repack_auto_objects_total").increment(0);
+            if self
+                .opts
+                .auto
+                .as_ref()
+                .is_some_and(|a| a.consolidate.is_some())
+            {
+                for outcome in ["ran", "error", "held"] {
+                    metrics::counter!("leep_repack_consolidate_runs_total", "outcome" => outcome)
+                        .increment(0);
+                }
+                metrics::counter!("leep_repack_consolidate_gain_bytes_total").increment(0);
+            }
         }
         self.repo = Some(repo);
         self
@@ -606,6 +724,7 @@ impl BackgroundRepack {
                 AutoOutcome::Failed(e.to_string())
             }
         };
+        report.consolidate = std::mem::take(&mut self.auto.consolidated);
         loop {
             let sizes = self.store.pack_sizes().await?;
             report.packs = sizes.len();
@@ -733,6 +852,13 @@ impl BackgroundRepack {
             .copied()
             .collect();
         drop(held);
+        // The walk of a consolidation passes through loose objects.
+        let consolidating = matches!(self.store, PackStore::Fs(_)) && auto.consolidate.is_some();
+        let loose_all: HashSet<Hash> = if consolidating {
+            listing.iter().map(|(h, _)| *h).collect()
+        } else {
+            HashSet::new()
+        };
         drop(listing);
         let mut whole: Vec<&PackSize> = sizes.iter().filter(|p| self.is_whole(&p.id)).collect();
         let loose_bytes: u64 = loose.iter().map(|(_, n)| n).sum();
@@ -758,6 +884,10 @@ impl BackgroundRepack {
         if objects == 0 {
             self.auto.waiting_since = None;
             self.auto.more = false;
+            if consolidating {
+                self.consolidate_now(&auto, &repo, &sizes, &loose_all, live)
+                    .await;
+            }
             return Ok(AutoOutcome::Nothing);
         }
         let since = *self.auto.waiting_since.get_or_insert(now);
@@ -775,7 +905,27 @@ impl BackgroundRepack {
         if !due {
             metrics::counter!("leep_repack_auto_skipped_total", "reason" => "threshold")
                 .increment(1);
+            if consolidating {
+                self.consolidate_now(&auto, &repo, &sizes, &loose_all, live)
+                    .await;
+            }
             return Ok(AutoOutcome::BelowThreshold { objects, bytes });
+        }
+        // Delta runs wait for a held consolidation for two fences at most:
+        // by then the cleanups that held it are done unless more keep
+        // coming, and loose objects must not wait for ever. Each delta run
+        // that goes through re-arms the hold.
+        let hold = self.opts.fence.saturating_mul(2);
+        let holding = |held: Option<Instant>| held.is_some_and(|t| now < t + hold);
+        if consolidating && holding(self.auto.consolidation_held) && !self.auto.more {
+            // A consolidation due first: no new cleanup while it waits.
+            self.consolidate_now(&auto, &repo, &sizes, &loose_all, live)
+                .await;
+            if holding(self.auto.consolidation_held) {
+                metrics::counter!("leep_repack_auto_skipped_total", "reason" => "consolidation")
+                    .increment(1);
+                return Ok(AutoOutcome::Held("consolidation"));
+            }
         }
         if self.pending_full(live) {
             metrics::counter!("leep_repack_auto_skipped_total", "reason" => "pending").increment(1);
@@ -874,7 +1024,16 @@ impl BackgroundRepack {
                         factor: auto.factor.max(2),
                         max_packs: auto.max_packs.max(1),
                     },
-                    leave: all_whole.difference(&batch_set).cloned().collect(),
+                    // Only the delta packs listed above: whole packs (this
+                    // listing's, and land packs written during the walk)
+                    // wait for a batch that compresses them.
+                    fold_only: Some(
+                        sizes
+                            .iter()
+                            .filter(|p| !all_whole.contains(&p.id))
+                            .map(|p| p.id.clone())
+                            .collect(),
+                    ),
                     packs: batch,
                     loose_subset: Some(Arc::new(subset)),
                     mark: true,
@@ -915,6 +1074,11 @@ impl BackgroundRepack {
         let report = pending.report().clone();
         self.auto.corrupt.extend(report.corrupt.iter().copied());
         self.auto.waiting_since = None;
+        // A delta run went through, so a hold of the consolidation starts
+        // again from its next check: delta runs wait up to two fences for
+        // it again, long enough for this run's own cleanup, instead of
+        // never waiting again once a first hold ran out.
+        self.auto.consolidation_held = None;
         // A batch that packed nothing (everything vanished meanwhile) does
         // not run again at once: the next check comes after the interval.
         let more = more && report.objects > 0;
@@ -958,7 +1122,377 @@ impl BackgroundRepack {
             loose: packed_loose,
             pending,
         });
+        // A busy store may never be below every threshold: judge the delta
+        // packs after the run too, unless more batches follow.
+        if consolidating && !more {
+            let sizes = self.store.pack_sizes().await?;
+            self.refresh_details(&sizes).await?;
+            self.auto.considered = self.store.considered().await?;
+            let live = sizes.iter().map(|p| p.bytes).sum::<u64>() + self.auto.loose_bytes;
+            self.consolidate_now(&auto, &repo, &sizes, &loose_all, live)
+                .await;
+        }
         Ok(AutoOutcome::Ran(Box::new(report)))
+    }
+
+    /// [`consolidate`](Self::consolidate), its error logged and reported.
+    /// After a failure none is tried for a while (doubling per failure in a
+    /// row), so a walk that fails is not repeated at every check.
+    async fn consolidate_now(
+        &mut self,
+        auto: &AutoRepackOptions,
+        repo: &Repo,
+        sizes: &[PackSize],
+        loose: &HashSet<Hash>,
+        live: u64,
+    ) {
+        let now = Instant::now();
+        if self.auto.retry_at.is_some_and(|t| now < t) {
+            self.auto.consolidation_held = None;
+            self.auto.consolidated = ConsolidateOutcome::NotChecked;
+            return;
+        }
+        let outcome = match self.consolidate(auto, repo, sizes, loose, live).await {
+            Ok(o) => {
+                self.auto.failures = 0;
+                self.auto.retry_at = None;
+                o
+            }
+            Err(e) => {
+                metrics::counter!("leep_repack_consolidate_runs_total", "outcome" => "error")
+                    .increment(1);
+                let first = RETRY_FIRST.max(auto.check_interval);
+                let wait = first
+                    .saturating_mul(1 << self.auto.failures.min(16))
+                    .min(RETRY_MOST.max(first));
+                self.auto.failures = self.auto.failures.saturating_add(1);
+                self.auto.retry_at = Some(Instant::now() + wait);
+                tracing::warn!(
+                    error = %e,
+                    failures = self.auto.failures,
+                    retry_in_s = wait.as_secs(),
+                    "consolidation of delta packs failed; trying again later"
+                );
+                ConsolidateOutcome::Failed(e.to_string())
+            }
+        };
+        if !matches!(outcome, ConsolidateOutcome::Ran { .. }) {
+            tracing::debug!(outcome = ?outcome, "consolidation of delta packs checked");
+        }
+        if outcome == ConsolidateOutcome::Held("pending") {
+            self.auto.consolidation_held.get_or_insert(now);
+        } else {
+            self.auto.consolidation_held = None;
+        }
+        self.auto.consolidated = outcome;
+    }
+
+    /// The consolidation of delta packs (ADR 0107), when nothing waits for
+    /// a delta run: if compressing the frames they hold whole against the
+    /// previous versions they also hold would save enough, merge them all
+    /// into one pack, giving each such frame the walk's base.
+    ///
+    /// The walk goes through the history written since the largest delta
+    /// pack and stops at changesets whose root tree is in it, so its cost is
+    /// that of the recent history; that pack is merged, so the frames the
+    /// walk lists find their bases in it. The walk runs again only once the
+    /// whole bytes outside the largest pack have changed by an eighth of the
+    /// ratio rule's floor, so the walks after delta runs stay linear in what
+    /// is written. The largest pack's own whole frames are judged once per
+    /// pack and process, by a walk through its history too: that finds the
+    /// frames that older merges (or older servers) left whole next to their
+    /// bases, so an upgraded store is compressed with no manual step. Packs
+    /// over `max_bytes` are left out (and the walks stop at them), and so
+    /// are the largest ones past half the cap on bytes waiting for cleanup.
+    async fn consolidate(
+        &mut self,
+        auto: &AutoRepackOptions,
+        repo: &Repo,
+        sizes: &[PackSize],
+        loose: &HashSet<Hash>,
+        live: u64,
+    ) -> Result<ConsolidateOutcome> {
+        let (Some(c), PackStore::Fs(fs)) = (auto.consolidate.clone(), self.store.clone()) else {
+            return Ok(ConsolidateOutcome::NotChecked);
+        };
+        let present: HashSet<&str> = sizes.iter().map(|p| p.id.as_str()).collect();
+        self.auto
+            .inside
+            .retain(|id, _| present.contains(id.as_str()));
+        self.auto.too_big.retain(|id| present.contains(id.as_str()));
+        drop(present);
+        let mut delta: Vec<&PackSize> = sizes.iter().filter(|p| !self.is_whole(&p.id)).collect();
+        // Smallest first, so the budget leaves out the largest packs.
+        delta.sort_by(|a, b| a.bytes.cmp(&b.bytes).then_with(|| a.id.cmp(&b.id)));
+        // The replaced packs wait for the fence: one consolidation holds at
+        // most half the cap on bytes waiting for cleanup (ADR 0107 section
+        // 5), so delta runs and merges keep room beside it.
+        let budget = self.opts.max_pending_bytes / 2;
+        let mut cand: Vec<&PackSize> = Vec::new();
+        let mut total = 0u64;
+        for p in delta {
+            if p.bytes <= c.max_bytes && total + p.bytes <= budget {
+                total += p.bytes;
+                cand.push(p);
+            } else if self.auto.too_big.insert(p.id.clone()) {
+                tracing::info!(
+                    pack = %p.id,
+                    bytes = p.bytes,
+                    max_bytes = c.max_bytes,
+                    budget,
+                    "a delta pack is larger than --auto-repack-consolidate-max-bytes, or than \
+                     what one consolidation may rewrite beside the smaller ones: the background \
+                     repack leaves it to `leep-server repack --full`"
+                );
+            }
+        }
+        let whole_of = |id: &str| self.auto.details.get(id).map_or(0, |d| d.whole_bytes);
+        let Some(largest) = cand.last().copied() else {
+            metrics::gauge!("leep_repack_whole_bytes_outside_largest").set(0.0);
+            return Ok(ConsolidateOutcome::Nothing);
+        };
+        let w_rest: u64 = cand
+            .iter()
+            .filter(|p| p.id != largest.id)
+            .map(|p| whole_of(&p.id))
+            .sum();
+        metrics::gauge!("leep_repack_whole_bytes_outside_largest").set(w_rest as f64);
+        let ratio_floor = (total / c.ratio.max(1)).max(1);
+        let age_floor = (total / 64).max(c.min_gain).max(1);
+        let floor = match c.age {
+            Some(_) => ratio_floor.min(age_floor),
+            None => ratio_floor,
+        };
+        let known_inside = self.auto.inside.get(&largest.id).copied();
+        // Objects GC deleted are dropped by the merge.
+        let dead = {
+            let fs = fs.clone();
+            let ids: HashSet<String> = cand.iter().map(|p| p.id.clone()).collect();
+            tokio::task::spawn_blocking(move || fs.tombstoned_bytes(&ids))
+                .await
+                .map_err(|e| Error::Storage(format!("pack task failed: {e}")))??
+        };
+        // The walk only finds gain in whole frames; too few, and it is not
+        // worth one.
+        let possible = dead + w_rest + known_inside.unwrap_or_else(|| whole_of(&largest.id));
+        if possible < floor {
+            self.auto.inside.entry(largest.id.clone()).or_insert(0);
+            self.auto.gain_since = None;
+            return Ok(ConsolidateOutcome::Nothing);
+        }
+        let mut ids: Vec<String> = cand.iter().map(|p| p.id.clone()).collect();
+        ids.sort();
+        let all: HashSet<String> = ids.iter().cloned().collect();
+        let whole_packs: HashSet<String> = sizes
+            .iter()
+            .filter(|p| self.is_whole(&p.id))
+            .map(|p| p.id.clone())
+            .collect();
+        let largest_id = largest.id.clone();
+        // The last walk's figure stands while the whole bytes written since
+        // (in packs it did not judge) stay under an eighth of the ratio
+        // floor: walking after every delta run would make the walks
+        // quadratic in the bytes written between consolidations.
+        let cached = match (&self.auto.judged, known_inside) {
+            (Some(j), Some(_)) if j.largest == largest_id => {
+                // By bytes, not pack ids: a delta run that folds judged packs
+                // into a new one moves their frames, it does not add any.
+                let new = w_rest.abs_diff(j.whole_outside);
+                (new.saturating_mul(8) < ratio_floor).then_some(j.outside)
+            }
+            _ => None,
+        };
+        let mut walked = None;
+        let mut walked_cs = 0u64;
+        tracing::debug!(
+            packs = ids.len(),
+            largest = %largest_id,
+            largest_bytes = largest.bytes,
+            whole_outside = w_rest,
+            dead,
+            known_inside = ?known_inside,
+            cached = ?cached,
+            "judging delta packs"
+        );
+        let outside = match cached {
+            Some(g) => g,
+            None => {
+                let deep = known_inside.is_none();
+                let w = consolidation_walk(
+                    &fs,
+                    repo,
+                    auto.walk_limit,
+                    auto.level,
+                    &all,
+                    &largest_id,
+                    deep,
+                    loose,
+                    &whole_packs,
+                )
+                .await?;
+                if deep {
+                    self.auto.inside.insert(largest_id.clone(), w.inside);
+                }
+                self.auto.judged = Some(Judged {
+                    largest: largest_id.clone(),
+                    whole_outside: w_rest,
+                    outside: w.outside,
+                });
+                walked_cs += w.order.changesets;
+                let g = w.outside;
+                walked = Some((w, deep));
+                g
+            }
+        };
+        let inside = self.auto.inside.get(&largest_id).copied().unwrap_or(0);
+        let gain = dead + inside + outside;
+        let now = Instant::now();
+        if gain >= age_floor {
+            self.auto.gain_since.get_or_insert(now);
+        } else {
+            self.auto.gain_since = None;
+        }
+        let aged = match (c.age, self.auto.gain_since) {
+            (Some(a), Some(since)) => {
+                // This process has seen the gain that long, or the packs
+                // holding it have waited that long, which a restart does
+                // not reset: the largest pack was written (its file's
+                // time) and the oldest record of the others is that old.
+                // Coarse (any old pack among the others counts), but never
+                // more than once per age: `L` must be that old too.
+                now >= since + a || {
+                    let fs = fs.clone();
+                    let id = largest_id.clone();
+                    let written = tokio::task::spawn_blocking(move || fs.pack_written(&id))
+                        .await
+                        .map_err(|e| Error::Storage(format!("pack task failed: {e}")))??;
+                    let oldest = cand
+                        .iter()
+                        .filter(|p| p.id != largest_id)
+                        .filter_map(|p| self.auto.details.get(&p.id))
+                        .map(|d| d.oldest)
+                        .min();
+                    let wall = jiff::Timestamp::now().as_second();
+                    written.is_some_and(|w| {
+                        let waited = oldest.map_or(w, |o| o.max(w));
+                        wall.saturating_sub(waited) >= a.as_secs() as i64
+                    })
+                }
+            }
+            _ => false,
+        };
+        if gain < ratio_floor && !aged {
+            return Ok(ConsolidateOutcome::Below {
+                gain,
+                walked: walked_cs,
+            });
+        }
+        // Past the cap when no cleanup but those of small merges waits: a
+        // store that is mostly one pack could never consolidate otherwise,
+        // and land packs keep merging under load. `total` is within half
+        // the cap's ceiling (the budget above).
+        let only_small = self
+            .pending
+            .iter()
+            .all(|w| w.loose.is_empty() && w.bytes <= self.opts.small_merge_bytes);
+        if !only_small && self.pending_bytes() + total > self.opts.pending_cap(live) {
+            metrics::counter!("leep_repack_consolidate_runs_total", "outcome" => "held")
+                .increment(1);
+            return Ok(ConsolidateOutcome::Held("pending"));
+        }
+        tracing::info!(
+            packs = ids.len(),
+            pack_bytes = total,
+            expected_gain = gain,
+            "starting a consolidation of delta packs"
+        );
+        let started = Instant::now();
+        // The largest pack's own frames need the walk through its history.
+        let order = match walked {
+            Some((w, deep)) if deep || inside == 0 => w.order,
+            _ => {
+                let w = consolidation_walk(
+                    &fs,
+                    repo,
+                    auto.walk_limit,
+                    auto.level,
+                    &all,
+                    &largest_id,
+                    inside > 0,
+                    loose,
+                    &whole_packs,
+                )
+                .await?;
+                walked_cs += w.order.changesets;
+                w.order
+            }
+        };
+        let walked_s = started.elapsed();
+        let opts = RepackOptions {
+            level: auto.level,
+            mode: RepackMode::Incremental {
+                factor: auto.factor.max(2),
+                max_packs: auto.max_packs.max(1),
+            },
+            // Exactly these packs: no loose object, no other pack, however
+            // many were written since the listing.
+            fold_only: Some(Vec::new()),
+            packs: ids,
+            loose_subset: Some(Arc::new(HashSet::new())),
+            mark: true,
+            threads: 1,
+            ..RepackOptions::default()
+        };
+        let pending = match self.store.publish_with(order.objects, opts).await {
+            Ok(p) => p,
+            Err(Error::Conflict(m)) => {
+                tracing::debug!(reason = %m, "consolidation of delta packs skipped");
+                metrics::counter!("leep_repack_consolidate_runs_total", "outcome" => "held")
+                    .increment(1);
+                return Ok(ConsolidateOutcome::Held("busy"));
+            }
+            Err(e) => return Err(e),
+        };
+        let took = started.elapsed();
+        let report = pending.report().clone();
+        if let Some(id) = &report.pack_id {
+            // Every frame it holds whole was listed by a walk or judged.
+            self.auto.inside.insert(id.clone(), 0);
+        }
+        self.auto.judged = None;
+        self.auto.gain_since = None;
+        let replaced = match &pending {
+            Pending::Fs(p) => replaced_bytes(sizes, p.replaced()),
+            Pending::Object(p) => replaced_bytes(sizes, p.replaced()),
+        };
+        metrics::counter!("leep_repack_consolidate_runs_total", "outcome" => "ran").increment(1);
+        metrics::counter!("leep_repack_consolidate_gain_bytes_total").increment(gain);
+        metrics::histogram!("leep_repack_consolidate_seconds").record(took.as_secs_f64());
+        tracing::info!(
+            changesets = order.changesets,
+            packs_merged = report.packs_merged,
+            objects = report.objects,
+            deltas = report.deltas,
+            whole = report.whole,
+            frames_reused = report.frames_reused,
+            pack_bytes_before = replaced,
+            pack_bytes = report.pack_bytes,
+            expected_gain = gain,
+            walk_seconds = walked_s.as_secs_f64(),
+            seconds = took.as_secs_f64(),
+            "consolidated delta packs"
+        );
+        self.pending.push_back(Waiting {
+            due: Instant::now() + self.opts.fence,
+            bytes: replaced,
+            loose: Vec::new(),
+            pending,
+        });
+        Ok(ConsolidateOutcome::Ran {
+            report: Box::new(report),
+            gain,
+            walked: walked_cs,
+        })
     }
 
     async fn merge(&mut self, sizes: &[PackSize]) -> Result<Option<RepackReport>> {
@@ -1039,6 +1573,123 @@ impl BackgroundRepack {
         });
         Ok(Some(report))
     }
+}
+
+/// A consolidation's walk and what it found.
+struct ConsolidationWalk {
+    order: leep_derive::pack_order::PackOrder,
+    /// What compressing the frames stored whole in the largest pack, and
+    /// in the other packs, against the walk's bases in the packs would
+    /// save: measured on a sample.
+    inside: u64,
+    outside: u64,
+}
+
+/// Frames compressed again to measure what a consolidation would save, at
+/// most: an evenly spread sample of them, by hash.
+const GAIN_SAMPLE: usize = 256;
+const GAIN_SAMPLE_BYTES: usize = 64 << 20;
+
+/// A frame stored whole, the base the walk names for it, and its size.
+struct Candidate {
+    hash: Hash,
+    base: Hash,
+    stored: u64,
+}
+
+/// What compressing `cands` against their bases would save, from a sample
+/// compressed at `level`. Not the stored size of the frames: a writer that
+/// had the base at hand already kept whole every frame its delta would
+/// not shrink (small tree nodes, rewritten files), and counting those
+/// would rewrite a pack for nothing.
+async fn measured_gain(fs: &FsBlobStore, mut cands: Vec<Candidate>, level: i32) -> Result<u64> {
+    if cands.is_empty() {
+        return Ok(0);
+    }
+    let total: u64 = cands.iter().map(|c| c.stored).sum();
+    cands.sort_unstable_by_key(|c| c.hash);
+    let step = cands.len().div_ceil(GAIN_SAMPLE);
+    let (mut sample, mut bytes) = (Vec::new(), 0usize);
+    for c in cands.iter().step_by(step) {
+        if bytes >= GAIN_SAMPLE_BYTES {
+            break;
+        }
+        // Deleted since the walk: it gains nothing.
+        let (Some(data), Some(base)) = (fs.get(&c.hash).await?, fs.get(&c.base).await?) else {
+            continue;
+        };
+        bytes += data.len() + base.len();
+        sample.push((data, base, c.stored));
+    }
+    let (saved, stored) = on_low_thread(move || {
+        let (mut saved, mut stored) = (0u64, 0u64);
+        for (data, base, n) in sample {
+            stored += n;
+            if let Some(d) = leep_store::pack::compress_delta(&base, &data, level)? {
+                saved += n.saturating_sub(d.len() as u64);
+            }
+        }
+        Ok((saved, stored))
+    })
+    .await?;
+    Ok(match stored {
+        0 => 0,
+        s => (u128::from(total) * u128::from(saved) / u128::from(s)) as u64,
+    })
+}
+
+/// Walk the history of the delta packs `all` but `largest` (and of
+/// `largest` too if `deep`), listing the objects they hold whole with the
+/// base each should be compressed against. The walk passes through loose
+/// objects and whole packs (history no delta run has taken yet) and stops
+/// at changesets whose root tree is elsewhere.
+#[allow(clippy::too_many_arguments)]
+async fn consolidation_walk(
+    fs: &FsBlobStore,
+    repo: &Repo,
+    limit: usize,
+    level: i32,
+    all: &HashSet<String>,
+    largest: &str,
+    deep: bool,
+    loose: &HashSet<Hash>,
+    whole_packs: &HashSet<String>,
+) -> Result<ConsolidationWalk> {
+    let walked: HashSet<String> = all
+        .iter()
+        .filter(|id| deep || *id != largest)
+        .cloned()
+        .collect();
+    let in_largest = fs.packed_in(&HashSet::from([largest.to_string()]))?;
+    let depth = fs.depth_in(all)?;
+    let in_walked = fs.packed_in(&walked)?;
+    let whole_walked = fs.whole_in(&walked)?;
+    let in_whole = fs.packed_in(whole_packs)?;
+    let wanted = |h: &Hash| whole_walked(h).is_some();
+    let through = |h: &Hash| loose.contains(h) || in_whole(h) || in_walked(h);
+    let order = leep_derive::pack_order::pack_order_where(repo, &wanted, &through, limit).await?;
+    let (mut inside, mut outside) = (Vec::new(), Vec::new());
+    for (hash, base) in order.objects.iter() {
+        let (Some(base), Some(stored)) = (base, whole_walked(&hash)) else {
+            continue;
+        };
+        // Not in the packs, or already as deep as a chain may go.
+        if !depth(&base).is_some_and(|d| d < leep_store::pack::MAX_CHAIN) {
+            continue;
+        }
+        let c = Candidate { hash, base, stored };
+        if in_largest(&hash) {
+            inside.push(c);
+        } else {
+            outside.push(c);
+        }
+    }
+    drop((in_largest, depth, in_walked, whole_walked, in_whole));
+    Ok(ConsolidationWalk {
+        inside: measured_gain(fs, inside, level).await?,
+        outside: measured_gain(fs, outside, level).await?,
+        order,
+    })
 }
 
 #[cfg(test)]

@@ -479,6 +479,30 @@ struct Args {
     /// reach a quarter of the store (at least 64 MiB), whatever their age.
     #[arg(long, env = "LEEP_AUTO_REPACK_OBJECT_STORE_INTERVAL", default_value = "24h", value_parser = parse_grace)]
     auto_repack_object_store_interval: std::time::Duration,
+    /// Consolidate the delta packs the automatic repack wrote (ADR 0107):
+    /// merge them into one and compress each frame a run had to store
+    /// whole (its previous version was in an older pack) against that
+    /// version. Filesystem stores, at the lowest CPU priority, when no
+    /// delta run is due. The largest pack's history is walked once per
+    /// process, so frames left whole by older merges or servers are
+    /// compressed after an upgrade with no manual step.
+    #[arg(long, env = "LEEP_AUTO_REPACK_CONSOLIDATE", value_enum, default_value_t = Switch::On)]
+    auto_repack_consolidate: Switch,
+    /// A consolidation runs once it would save this fraction (1/N) of the
+    /// pack bytes it rewrites.
+    #[arg(long, env = "LEEP_AUTO_REPACK_CONSOLIDATE_RATIO", default_value_t = 8, value_parser = clap::value_parser!(u64).range(1..))]
+    auto_repack_consolidate_ratio: u64,
+    /// A consolidation also runs once it would save 1/64 of those bytes (at
+    /// least 64 KiB) and the packs holding that saving are this old (their
+    /// files' and records' times, so restarts keep the clock), or this
+    /// process has seen it this long; `off` leaves only the ratio.
+    #[arg(long, env = "LEEP_AUTO_REPACK_CONSOLIDATE_AGE", default_value = "24h", value_parser = parse_duration_or_off)]
+    auto_repack_consolidate_age: DurationOrOff,
+    /// Delta packs larger than this are never rewritten by a consolidation
+    /// (logged once, left to `leep-server repack --full`). Bounds the time
+    /// of one consolidation and the disk it holds twice for the fence.
+    #[arg(long, env = "LEEP_AUTO_REPACK_CONSOLIDATE_MAX_BYTES", default_value = "2G", value_parser = parse_byte_size)]
+    auto_repack_consolidate_max_bytes: u64,
     /// Compress changeset rows with a dictionary trained on the store's own
     /// history in the background (ADR 0101), as `leep-server
     /// compact-changesets` does: a small dictionary from
@@ -2523,6 +2547,17 @@ async fn run() -> anyhow::Result<()> {
                     max_batch_bytes: args.auto_repack_batch_bytes,
                     level: args.auto_repack_level,
                     object_store_interval: args.auto_repack_object_store_interval,
+                    consolidate: (args.auto_repack_consolidate == Switch::On).then(|| {
+                        leep_server::background_repack::ConsolidateOptions {
+                            ratio: args.auto_repack_consolidate_ratio,
+                            age: match args.auto_repack_consolidate_age {
+                                DurationOrOff::For(d) => Some(d),
+                                DurationOrOff::Off => None,
+                            },
+                            max_bytes: args.auto_repack_consolidate_max_bytes,
+                            ..Default::default()
+                        }
+                    }),
                     ..Default::default()
                 }
             });
@@ -2557,6 +2592,14 @@ async fn run() -> anyhow::Result<()> {
                     "compressing new objects against their previous versions in the background \
                      (ADR 0100)"
                 );
+                if let Some(c) = &a.consolidate {
+                    tracing::info!(
+                        ratio = c.ratio,
+                        age_s = c.age.map(|d| d.as_secs_f64()),
+                        max_bytes = c.max_bytes,
+                        "consolidating delta packs in the background (ADR 0107)"
+                    );
+                }
             }
             let bg = leep_server::background_repack::BackgroundRepack::new(store, opts);
             let walk = bg.walk_repo(repo.meta().clone());
@@ -3359,6 +3402,23 @@ mod tests {
         assert_eq!(a.auto_repack_check_interval, Duration::from_secs(60));
         assert_eq!(a.auto_repack_level, 9);
         assert_eq!(a.auto_repack_batch_bytes, 1 << 30);
+        assert!(a.auto_repack_consolidate == Switch::On);
+        assert_eq!(a.auto_repack_consolidate_ratio, 8);
+        assert!(matches!(
+            a.auto_repack_consolidate_age,
+            DurationOrOff::For(d) if d == Duration::from_secs(24 * 3600)
+        ));
+        assert_eq!(a.auto_repack_consolidate_max_bytes, 2 << 30);
+        let c = parse_args([
+            "leep-server",
+            "--auto-repack-consolidate-age",
+            "off",
+            "--auto-repack-consolidate-max-bytes",
+            "512M",
+        ])
+        .unwrap();
+        assert!(matches!(c.auto_repack_consolidate_age, DurationOrOff::Off));
+        assert_eq!(c.auto_repack_consolidate_max_bytes, 512 << 20);
         let a = parse_args([
             "leep-server",
             "--auto-repack",
