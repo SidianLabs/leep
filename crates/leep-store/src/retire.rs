@@ -286,16 +286,29 @@ impl FsBlobStore {
             Err(Error::Conflict(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let mut r = sweep_locked(&dir, fence)?;
         // Under the lock, so no cleanup is in its window: a copy aside is a
         // leftover. Only the first sweep of a process walks the shards for
         // them: a kill leaves them, and a restarted server sweeps first; a
-        // cleanup that fails in process puts its copy back itself.
+        // cleanup that fails in process puts its copy back itself. Before
+        // the sweep, so a failure here never skips the rescan after packs
+        // were removed; it is logged and tried again by the next sweep.
         use std::sync::atomic::Ordering;
+        let mut restored = 0;
         if !self.asides_restored.load(Ordering::Acquire) {
-            r.asides_restored = crate::repack::restore_asides(self.root())?;
-            self.asides_restored.store(true, Ordering::Release);
+            match crate::repack::restore_asides(self.root()) {
+                Ok(n) => {
+                    restored = n;
+                    self.asides_restored.store(true, Ordering::Release);
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "putting back loose copies a killed repack left aside failed; the next \
+                     sweep tries again"
+                ),
+            }
         }
+        let mut r = sweep_locked(&dir, fence)?;
+        r.asides_restored = restored;
         if r.garbage_removed + r.retired_removed > 0 {
             self.packs.rescan(crate::packset::ScanReason::Repack)?;
         }
