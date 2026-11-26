@@ -580,6 +580,13 @@ pub async fn backup(
                 r.copied,
                 r.vanished
             ));
+            if r.vanished > 0 {
+                progress.info(&format!(
+                    "backup: WARNING: {} segment blob(s) the snapshot names were already gone \
+                     from the source; the check says whether the snapshot needs them",
+                    r.vanished
+                ));
+            }
             for h in &r.corrupt {
                 progress.info(&format!(
                     "backup: WARNING: segment blob {h} in the source does not hash to its name; \

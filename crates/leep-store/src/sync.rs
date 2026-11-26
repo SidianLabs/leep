@@ -186,7 +186,9 @@ async fn copy_one(
 /// snapshot names that garbage collection may delete while a long listing
 /// copy is still on its way to them (a backup's live segments, which a
 /// merge can retire and GC collect within the copy). Counts like
-/// [`sync_blobs`]; one not stored in `src` is `vanished`.
+/// [`sync_blobs`]; one not stored in `src` is `vanished`, after a second,
+/// exact read (`get_exact`), so a blob another process packed after this
+/// one cached its pack view is still copied.
 pub async fn copy_named(
     src: &dyn BlobStore,
     dst: &dyn BlobStore,
@@ -196,14 +198,25 @@ pub async fn copy_named(
     let mut report = SyncReport::default();
     let mut results = stream::iter(hashes.iter().map(|h| async move {
         if dst.contains(h).await? {
-            return Ok(None);
+            return Ok::<_, Error>(None);
         }
         let m = BlobMeta {
             hash: *h,
             size: 0,
             modified: None,
         };
-        copy_one(src, dst, m, false).await.map(Some)
+        match copy_one(src, dst, m, false).await? {
+            Outcome::Vanished => match src.get_exact(h).await? {
+                Some(data) if Hash::of_blob(&data) == *h => {
+                    let n = data.len() as u64;
+                    dst.put_with_hash(*h, data).await?;
+                    Ok(Some(Outcome::Copied(n, None)))
+                }
+                Some(_) => Ok(Some(Outcome::Corrupt(*h))),
+                None => Ok(Some(Outcome::Vanished)),
+            },
+            other => Ok(Some(other)),
+        }
     }))
     .buffer_unordered(concurrency.max(1));
     while let Some(r) = results.next().await {
@@ -1029,6 +1042,59 @@ mod tests {
         async fn delete(&self, h: &Hash) -> Result<()> {
             self.inner.delete(h).await
         }
+    }
+
+    /// A store whose `get` misses `hidden` (a cached pack view that does
+    /// not show a pack published a moment ago) and whose `get_exact` finds it.
+    struct Hiding {
+        inner: MemoryBlobStore,
+        hidden: Hash,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for Hiding {
+        async fn put_with_hash(&self, h: Hash, d: Bytes) -> Result<()> {
+            self.inner.put_with_hash(h, d).await
+        }
+        async fn get(&self, h: &Hash) -> Result<Option<Bytes>> {
+            if *h == self.hidden {
+                return Ok(None);
+            }
+            self.inner.get(h).await
+        }
+        async fn get_exact(&self, h: &Hash) -> Result<Option<Bytes>> {
+            self.inner.get(h).await
+        }
+        async fn list_page(&self, a: Option<Hash>, l: usize) -> Result<Vec<BlobMeta>> {
+            self.inner.list_page(a, l).await
+        }
+        async fn delete(&self, h: &Hash) -> Result<()> {
+            self.inner.delete(h).await
+        }
+    }
+
+    /// `copy_named` reads a miss again exactly before it counts a blob as
+    /// vanished.
+    #[tokio::test]
+    async fn copy_named_reads_a_miss_again_exactly() {
+        let inner = MemoryBlobStore::new();
+        let hashes = fill(&inner, 3, "seg").await;
+        let gone = Hash::of_blob(b"never stored");
+        let src = Hiding {
+            inner,
+            hidden: hashes[1],
+        };
+        let dst = MemoryBlobStore::new();
+        let mut named = hashes.clone();
+        named.push(gone);
+        let r = copy_named(&src, &dst, &named, 2).await.unwrap();
+        assert_eq!((r.listed, r.copied, r.vanished), (4, 3, 1));
+        for h in &hashes {
+            assert!(dst.contains(h).await.unwrap());
+        }
+        // Copied already: present.
+        let r = copy_named(&src, &dst, &hashes, 2).await.unwrap();
+        assert_eq!(r.present, 3);
     }
 
     #[tokio::test]

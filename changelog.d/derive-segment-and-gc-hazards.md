@@ -28,8 +28,8 @@
   keeps every blob that starts like a derived segment, collects the rest,
   and reports the family. A row written by a newer binary still stops it.
 - **Fixed.** `leep-server backup` copies the live derived and GC mark
-  segments its metadata snapshot names right after the snapshot, before
-  the listing copy: a merge could retire one and `gc` collect it while a
+  segments its metadata snapshot names right after the snapshot (a miss
+  read again exactly, and warned about), before the listing copy: a merge could retire one and `gc` collect it while a
   long copy was on its way, leaving a restore without the only copy of
   retired rows. The backup's check (and `backup verify`) counts a live
   derived segment missing from the copy as a problem once its family's
