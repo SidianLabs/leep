@@ -241,6 +241,20 @@ impl Family {
         }
         (1 << COL_BLOB_KEYFRAME) | (1 << COL_TREE_KEYFRAME)
     }
+
+    /// Bit `c` for every column a merge never leaves out, live or not
+    /// (`content-v1`): the keyframes, and the directory filters. A stored
+    /// directory filter must mean its whole subtree's filters are stored
+    /// (`search::index`, `tree_row_unstored`), and filters die from the root
+    /// down in no order a merge can follow, so a dead filter left out could
+    /// leave a stored ancestor (a row, or a value in a segment not
+    /// rewritten) over a subtree with no filter.
+    pub fn merge_kept_mask(&self) -> u64 {
+        if self.keys != Keys::Content {
+            return 0;
+        }
+        self.keyframe_mask() | (1 << COL_TREE_TRIGRAMS)
+    }
 }
 
 fn bytes_equal(a: &[u8], b: &[u8]) -> bool {
@@ -486,6 +500,11 @@ fn prefix(kind: &str) -> Vec<u8> {
     p.extend_from_slice(kind.as_bytes());
     p.push(0);
     p
+}
+
+/// Whether `data` starts like an index or data blob of a segment.
+pub fn has_segment_prefix(data: &[u8]) -> bool {
+    data.starts_with(&prefix(INDEX_KIND)) || data.starts_with(&prefix(DATA_KIND))
 }
 
 /// Whether `data` stored at `hash` is an index or data blob of a segment.

@@ -84,20 +84,41 @@ Accepted by the maintainer on 2026-11-15.
 - Keyframes are always sealed and never left out of a merge: a live patch
   may stand on the keyframe of a version no head holds, and retention
   never deletes them either.
-- A merge leaves out keys retention no longer keeps, and a segment of
-  which a third or more of the values are such keys (or values of a column
+- A merge leaves out blob rows retention no longer keeps, and a segment of
+  which a third or more of the values are such rows (or values of a column
   `repair drop` cleared) is rewritten alone. A sealed blob row that becomes
-  superseded therefore outlives its window until then. A directory filter
-  sealed while live is dropped by such a merge: a deletion neither ADR
-  0094 nor 0102 makes (they keep every directory filter), and part of the
-  maintainer's decision; the filter is derived again if a search needs it. Keys are left out only while the walk that judged them is current
-  (the newest ref log entry has not moved since), and the walk is redone
-  when the ref log moved (at most every `list_every`, 10 minutes) or
-  after an hour.
-- Dropping a sealed key is always safe: it reads as missing and is derived
+  superseded therefore outlives its window until then. Keys are left out
+  only while the walk that judged them is current: the newest ref log
+  entry is read again after each merge that leaves something out is
+  encoded, before its segment is stored, and if it moved, that merge is
+  redone keeping everything and nothing more is left out in the pass. A
+  ref that moves in the short window between that read and the manifest
+  swap can still find blob rows left out; retention's backfill derives
+  them (below), and directory filters are never left out. The walk is redone
+  when the ref log moved (at most every `list_every`, 10 minutes) or after
+  an hour.
+- Directory filters are never left out, live or not, like keyframes
+  (amended 2026-11-25). The first version of this ADR dropped a directory
+  filter sealed while live once it died. That broke the invariant that a
+  stored filter means its whole subtree's filters are stored, which
+  `derive_search`, the warmer and the bounded queries' checks rely on:
+  filters die from the root down, but merges rewrite segments in no such
+  order, and a filter dead when first listed is never sealed and stays a
+  row. A stored root (a row, or a value in a segment not rewritten) then
+  stood over a subdirectory with no filter anywhere. A ref created at that
+  revision (a hotfix branch, a revert) was taken for indexed, and under
+  `--indexing lease` or `off` a search of it answered `indexing` on every
+  retry. Directory filters are therefore kept as ADR 0094 and 0102 always
+  kept them: in rows, or in segments once sealed while live. A store whose
+  merges already left a filter out keeps any hole that made: a search
+  under `--indexing local` derives the missing filters it meets; under
+  `lease` or `off`, `repair drop --kind tree-trigrams-v2` empties the
+  filters (both columns) and the warmer derives the heads' again.
+- Dropping a sealed blob row is safe: it reads as missing and is derived
   again on demand. If a head returns to content just left out (a revert
-  racing a merge), retention's backfill derives its rows, as it does for
-  any head whose filters are stored and blob rows are not (ADR 0102).
+  racing a merge), retention's backfill derives its blob rows, as it does
+  for any head whose filters are stored and blob rows are not (ADR 0102);
+  its directory filters are all still stored.
 
 ### 4. Patches and keyframes together
 - A row is deleted only when the row and the segment's value stand for the
@@ -135,9 +156,14 @@ Accepted by the maintainer on 2026-11-15.
   512 KiB at level 17 2.82 MB, 1 MiB at level 17 2.62 MB (4.2 MB of rows,
   0.8 s of one core at level 17). A block and the zstd level are the
   writer's choice: the block directory says where each lies.
-- A seal reads a page a batch of keys at a time and closes a segment once
-  its rows reach four thirds of the cap, so a pass holds about one
-  segment's rows at once (a dense filter is 64 KiB). Encoding runs on the
+- A seal reads a page as many keys at a time as keep a read near 4 MiB of
+  rows (16 at first, halved after a read over it, doubled after one under a
+  quarter of it, at most the 1,000 of a batch; amended 2026-11-25: it read
+  1,000 keys of four columns whatever their size, up to 256 MB of dense
+  filters), and closes a segment once its rows reach four thirds of the
+  cap, so a pass holds about one segment's rows at once (a dense filter is
+  64 KiB). A retirement reads and deletes its rows in steps of the same
+  size. Encoding runs on the
   blocking pool, off the async workers.
 - Merges: the first run of two or more adjacent small segments (under half
   of both caps, 1 MiB and 16,384 keys), up to four, as far as they fit;

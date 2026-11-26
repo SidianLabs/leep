@@ -127,7 +127,9 @@ A pass runs every `--derived-segments-interval` (5 minutes) in the index
 lane (ADR 0073) under the store-wide lease `maintenance/derived-segments`,
 one server at a time. It loads the live segments' indexes itself, never
 through the shared read view (whose state a reader's transient error or a
-late read may have moved), lists the keys of both kinds (bounded pages;
+late read may have moved), lists the keys of both kinds (bounded pages,
+each joined against the segments' sorted keys in its range, keeping in
+memory only the keys a seal or a retirement needs, not every key listed;
 in mode `build` only once their estimated count grew by 1,024 since the
 last listing or 10 minutes passed, so a quiet store is not listed every
 pass), and:
@@ -160,8 +162,11 @@ pass), and:
    if it made progress (generations read, a page consumed, rows deleted or
    found unequal), so nothing can keep passes 5 s apart for ever.
 2. **Merges** runs of four adjacent live segments of one tier (`floor(log4(keys
-   / 1,024))`), the longest prefix of the run that fits the caps (two or
-   more), so a row is rewritten about three times at most. Adjacent, so a key
+   / 64))`, 64 the smallest seal, an idle one), the longest prefix of the run
+   that fits the caps (two or more), so a row is rewritten about four times
+   at most (amended 2026-11-25: tiers counted from 1,024 put idle seals and
+   their merges all in tier 0, where a growing segment was rewritten with
+   every three new seals, about 20 times). Adjacent, so a key
    in several segments still answers from the newest. Keys of changesets no
    longer stored (the changeset sweep, ADR 0059) are left out. The replaced
    segments are retired: still stored, collected by blob GC.
@@ -252,8 +257,9 @@ them; `leep_derived_segment_index_bytes` reports what they hold.
   older `gc` condemned them); retired ones are collected like orphans,
   through condemn, fence and collect, and reported apart (`derived
   segments`, `retired derived segment blobs condemned` and `deleted`). A
-  manifest that does not decode stops GC, which could not tell live
-  segments from orphans.
+  manifest that does not decode makes GC keep every blob that starts like
+  a segment, since it cannot tell live segments from orphans, and collect
+  everything else (amended 2026-11-25: it stopped all blob GC).
 - **The changeset sweep** still deletes rows; a swept changeset's entries
   stay in segments until a merge leaves them out. They are pure functions
   of the id, so they are right if the changeset is stored again.
@@ -325,7 +331,30 @@ the operating system only on `VACUUM FULL derived` (or `pg_repack`) and
   miss, as with ADR 0012's VM freeze.
 - A segment lost or damaged (address, prefix, version, structure): its keys
   read as rows or derive again, and the next pass drops it and seals again.
-  A transient read error never does: it fails the read or the pass.
+  Every "not stored" is exact (`get_exact`, ADR 0070), so a blob another
+  process packed a moment ago is never taken for lost.
+- A segment whose blob fails to read with any other error (an I/O error,
+  a failing object store key). Amended 2026-11-25: before, one such index
+  blob failed every miss of its family on every server, and every pass,
+  for as long as the error lasted. Now readers leave that segment alone
+  out of their view for a minute (its keys read as rows or derive again,
+  every other segment still answers) and try it again; a pass keeps it,
+  leaves it out of its merges and retirement, and drops it only once it
+  failed three passes in a row over at least
+  `--derived-segments-drop-failing-after` (a day; `off` never) while
+  another segment of the family reads whole in the same pass (a real read
+  of its data, not the existence check a segment read whole earlier gets:
+  a store can answer those while its reads fail; passes report it as
+  `failing`). A streak restarts when this process's last pass of the
+  family ended more than about two pass intervals ago, so a lease handoff
+  and one blip do not add up, and a pass longer than the interval does not
+  end it.
+  The default is long because after `retire` a dropped segment's rows
+  exist nowhere else, and a partial outage (a degraded node, timeouts on
+  large blobs only) can fail a good segment for hours. When no live
+  segment of the family reads whole (a family whose only live segment
+  fails included, which therefore fails every pass), the store is taken
+  to be failing: the pass fails and drops nothing.
 - `repair drop` and `repair rederive` hold the same lease as passes.
 - The land path, `cas_ref`, the ref log and the changeset transaction are
   not touched.
@@ -337,7 +366,7 @@ the operating system only on `VACUUM FULL derived` (or `pg_repack`) and
 - A cold read of a sealed key reads its segment's data blob once per process
   (at most 4 MiB: milliseconds on a filesystem, 50 to 150 ms on an object
   store), and a new manifest makes each process read the new index blobs.
-- Write amplification: a row is sealed once and merged about three times.
+- Write amplification: a row is sealed once and merged about four times.
 - Retired segments wait for the operator's `gc`: up to about twice the
   live segment bytes in the meantime.
 - In mode `build` a pass lists every key of both kinds whenever they grew

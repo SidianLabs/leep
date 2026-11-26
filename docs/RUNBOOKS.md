@@ -1638,7 +1638,9 @@ recompute every value):
   `--derived-segments-retire-families`), the next pass replaces it unless
   the family's store feature (`derived-segments`, `derived-segments-2`,
   `derived-segments-3`) is
-  recorded; otherwise passes refuse to, and `gc` refuses to run.
+  recorded; otherwise passes refuse to. Meanwhile `gc` keeps every derived
+  segment blob (its report lists the family and `kept`) and collects the
+  rest.
 - `a derived-segments-v1 row of a derived segment family this leep-server
   does not know`: a newer `leep-server` wrote a family this one cannot read.
   `gc` refuses to run with it; run the newer `gc`.
@@ -1651,10 +1653,25 @@ recompute every value):
   retired` (logged once per segment per process): a `gc` that cannot read
   the family (an older binary) condemned a live segment. Stop that `gc`'s
   schedule; the next collect deletes the segment and the next pass seals
-  the rows again, or keeps it.
+  the rows again, or finds it live and rescues it, and then its rows
+  retire.
+- `a derived segment's blobs cannot be read now; it is kept and skipped`:
+  one segment's blob fails to read (an I/O error, a failing object store
+  key). Readers leave just that segment out (its keys read as rows or
+  derive again) and try it again every minute; passes skip it, and drop it
+  (`failed to read in every pass for a while; dropping it`) once it failed
+  three passes in a row over `--derived-segments-drop-failing-after` (a
+  day by default) while another segment of the family reads. Fix the
+  store, or let the pass drop it (after `retire` its rows then derive
+  again). If the family's only live segment fails, every pass of the
+  family fails until the store reads it again or `repair drop` names the
+  family's kinds.
 - `bad_derived_segment`, or a note that a segment is not stored: a segment
-  blob was lost or damaged (a disk, a restore whose blob copy finished
-  before the segment was sealed, an older `gc` that collected it).
+  blob was lost or damaged (a disk, an older `gc` that collected it, or a
+  restore of a backup an older `leep-server` took: its listing copy could
+  reach a segment only after a merge retired it and `gc` collected it;
+  backups now copy the snapshot's segments first, and their check fails on
+  a missing one once the family's store feature is recorded).
 - `derived_mismatch` on `skiplist` or `history-tree-v4`: a row or a segment
   value is wrong. For the search kinds a pass compares a row with its
   segment value by the set or filter they stand for, so a mismatch there
@@ -2240,9 +2257,11 @@ unreferenced blobs and only GC reclaims them.
      same with `derived-segments` or `derived-segments-2`: a server runs
      `--derived-segments retire` (ADR 0104, 0105; an ADR 0104 binary refuses
      a store with `derived-segments-2`);
-   - `the derived-segments-v1 row does not decode, so garbage collection
-     cannot tell live derived segments from orphans`: see
-     [LeepDerivedSegmentPassesFailing](#leepderivedsegmentpassesfailing).
+   - `a derived-segments-v1 row ... was written by a newer one` or `... of
+     family ... was written by a newer leep-server`: run the newer `gc`.
+     (A row that does not decode no longer stops `gc`: it keeps every
+     derived segment blob and says so; see
+     [LeepDerivedSegmentPassesFailing](#leepderivedsegmentpassesfailing).)
 3. Is it simply slow or killed? Condemn and collect walk only changesets stored since
    the last run (`changesets walked` in the report; ADR 0033), but still list every
    changeset and blob, so they take longer as the store grows, and the first run

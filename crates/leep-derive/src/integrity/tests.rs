@@ -1393,6 +1393,7 @@ async fn kinds_history_cannot_regenerate_are_refused() {
         "blob-condemned-v1",
         "blob-rescue-v1",
         "blob-doom-v1",
+        "blob-doom-seen-v1",
         "history-node-v4",
         "ref_log",
         "unheard-of",

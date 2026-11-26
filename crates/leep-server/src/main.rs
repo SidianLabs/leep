@@ -568,6 +568,14 @@ struct Args {
     /// How often a derived segments pass runs (ADR 0104, 0105).
     #[arg(long, env = "LEEP_DERIVED_SEGMENTS_INTERVAL", default_value = "5m", value_parser = parse_interval)]
     derived_segments_interval: std::time::Duration,
+    /// A live derived segment whose blobs fail to read (an I/O error, a
+    /// failing object store key, not "not stored" or damage) while another
+    /// segment of its family reads whole is dropped once it failed three
+    /// passes in a row over at least this long; its keys then seal again
+    /// from rows or, after `retire`, derive again. `off` never drops one for
+    /// that (repair the store, or `repair drop` the family).
+    #[arg(long, env = "LEEP_DERIVED_SEGMENTS_DROP_FAILING_AFTER", default_value = "1d", value_parser = parse_duration_or_off)]
+    derived_segments_drop_failing_after: DurationOrOff,
     /// Testing only: when the first derived segments pass runs after start
     /// (default 2 minutes, plus up to 1 of jitter).
     #[arg(long, hide = true, value_parser = parse_interval)]
@@ -1356,6 +1364,14 @@ async fn run_gc(
             "retired derived segment blobs condemned: {}",
             r.derived_segments_condemned
         );
+        if !r.damaged_derived_manifests.is_empty() {
+            outln!(
+                "derived segment manifests that do not decode: {} (every derived segment blob \
+                 kept: {})",
+                r.damaged_derived_manifests.join(", "),
+                r.kept_derived_unknown
+            );
+        }
     }
     if let Some(r) = collect {
         let verb = if dry { "would delete" } else { "deleted" };
@@ -1373,6 +1389,17 @@ async fn run_gc(
             "collect: retired derived segment blobs deleted: {}",
             r.derived_segments_deleted
         );
+        outln!(
+            "collect: fence rows of long-deleted blobs pruned: {}",
+            r.fence_rows_pruned
+        );
+        if r.kept_derived_unknown > 0 {
+            outln!(
+                "collect: kept as possibly live derived segments (a manifest does not \
+                 decode): {}",
+                r.kept_derived_unknown
+            );
+        }
     }
     Ok(())
 }
@@ -1409,6 +1436,17 @@ fn start_derived_segments(args: &Args, repo: &Repo) {
         pass.lone_wait = std::time::Duration::ZERO;
         pass.retire_after = std::time::Duration::ZERO;
     }
+    if !args.debug_derived_segments_small {
+        pass.drop_failing_after = match args.derived_segments_drop_failing_after {
+            DurationOrOff::For(d) => Some(d),
+            DurationOrOff::Off => None,
+        };
+    }
+    // A failing segment's streak survives about two missed passes.
+    pass.failing_gap = args
+        .derived_segments_interval
+        .saturating_mul(2)
+        .max(pass.failing_gap);
     // `content-v1` seals only the search rows retention keeps (ADR 0106),
     // with this server's window.
     pass.content_keep = match args.search_retention {

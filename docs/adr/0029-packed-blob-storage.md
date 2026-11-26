@@ -148,7 +148,8 @@ silent, or where implementing it changed it:
   one that was packed and the new pack's copy is not tombstoned; otherwise it
   is put back. GC writes its tombstone before it unlinks, so an upload that
   rescues a blob GC deleted from the new pack keeps its loose copy. A
-  leftover `.repack-*` file is a whole object and the next repack puts it
+  leftover `.repack-*` file is a whole object and the next repack (or, since
+  2026-11-25, a server's first sweep, which also runs at start) puts it
   back.
 - **Deletes during a repack.** After publishing, repack tombstones in the new
   pack every object whose loose file GC removed, or whose old packed copy GC

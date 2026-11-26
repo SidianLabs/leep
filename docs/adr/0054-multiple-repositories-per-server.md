@@ -29,7 +29,8 @@ What the current code already gives us:
   attestation checked against the server's trusted keys, ADR 0010),
   `rebased-origin-v1`, the mirror maps `git-to-leep-v1`/`leep-to-git-v1`
   (ADR 0046), and the GC state `blob-claim-v1`, `blob-condemned-v1`,
-  `blob-rescue-v1`, `blob-doom-v1` and `gc-mark-v1` (ADR 0012, 0033).
+  `blob-rescue-v1`, `blob-doom-v1`, `blob-doom-seen-v1` and `gc-mark-v1`
+  (ADR 0012, 0033).
 - **Liveness is store-wide.** GC marks from every stored changeset, not
   from refs (ADR 0008), and changesets are never deleted.
 - **`Repo` is already "one repository".** Everything above the

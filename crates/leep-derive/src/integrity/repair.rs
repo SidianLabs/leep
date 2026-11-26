@@ -749,6 +749,13 @@ pub async fn drop_kinds(
         let mut ticks = Ticker::new(Duration::from_secs(10));
         let mut cursor: Option<Vec<u8>> = None;
         loop {
+            // A pass sealing the rows not reached yet while the lease is
+            // lost would let a segment answer with what this drop purges.
+            crate::gc_lease::check(&_lease.0).map_err(|e| {
+                Error::Conflict(format!(
+                    "repair drop lost the derived-segments lease part way ({e}); run it again"
+                ))
+            })?;
             let mut step = meta.delete_derived_step(&order, cursor.as_deref()).await?;
             for (n, d) in deleted.iter_mut().zip(&step.deleted) {
                 *n += d;

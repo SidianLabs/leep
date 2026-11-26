@@ -1197,8 +1197,9 @@ async fn gc_keeps_live_segments_and_collects_merged_ones() {
         };
         assert!(m.retired.is_empty(), "{:?}", m.retired);
     }
-    // A damaged manifest of either family stops GC: it cannot tell live
-    // segments from orphans.
+    // A damaged manifest of either family does not stop GC: it cannot tell
+    // that family's live segments from orphans, so it keeps every blob that
+    // starts like a segment, and collects the rest.
     for fam in FAMILIES
         .iter()
         .filter(|f| f.keys == super::Keys::Changesets)
@@ -1212,11 +1213,30 @@ async fn gc_keeps_live_segments_and_collects_merged_ones() {
             )
             .await
             .unwrap();
-        assert!(gc::run(&r, &opts, &clock).await.is_err(), "{}", fam.name);
+        let mut unnamed = leep_core::hash::OBJECT_DOMAIN.to_vec();
+        unnamed.extend_from_slice(codec::INDEX_KIND.as_bytes());
+        unnamed.extend_from_slice(b"\0 a segment no readable manifest names");
+        let unnamed = r.blobs().put(Bytes::from(unnamed)).await.unwrap();
+        let orphan = r
+            .blobs()
+            .put(Bytes::from(format!("an orphan {}", fam.name)))
+            .await
+            .unwrap();
+        let rep = gc::run(&r, &opts, &clock).await.unwrap();
+        assert_eq!(rep.condemn.damaged_derived_manifests, vec![fam.name]);
+        assert!(rep.condemn.kept_derived_unknown >= 1, "{rep:?}");
+        assert!(r.blobs().contains(&unnamed).await.unwrap());
+        assert!(!r.blobs().contains(&orphan).await.unwrap(), "{rep:?}");
+        for b in m.live_blobs() {
+            assert!(r.blobs().contains(&b).await.unwrap());
+        }
         r.row_meta()
             .put_derived(MANIFEST_KIND, &manifest_key(fam.id), good.unwrap())
             .await
             .unwrap();
+        // Fixed: the unnamed one is an orphan again.
+        gc::run(&r, &opts, &clock).await.unwrap();
+        assert!(!r.blobs().contains(&unnamed).await.unwrap());
     }
     assert!(gc::run(&r, &opts, &clock).await.is_ok());
     // So does a manifest row of a family this binary does not know: a
@@ -1539,9 +1559,10 @@ async fn a_newer_manifest_is_left_alone() {
     assert!(values(&r, &ids).await.iter().all(Option::is_some));
 }
 
-/// A pass probes segments itself: a transient read error fails the pass
-/// and drops nothing, whatever a reader marked broken; on a store with the
-/// feature recorded, a lost segment is dropped only when two passes agree.
+/// A pass probes segments itself: a transient read error drops nothing
+/// (before `drop_failing_after`), whatever a reader marked broken; on a
+/// store with the feature recorded, a lost segment is dropped only when two
+/// passes agree.
 #[tokio::test]
 async fn transient_errors_drop_nothing_and_losses_need_two_passes() {
     let blobs: Arc<dyn leep_core::BlobStore> = Arc::new(MemoryBlobStore::new());
@@ -1566,16 +1587,19 @@ async fn transient_errors_drop_nothing_and_losses_need_two_passes() {
         .get_derived(Skiplist::NAME, &ids[1].0)
         .await
         .ok();
-    // A new process's pass fails on the transient error, dropping nothing.
+    // A new process's pass keeps the segment through a transient error
+    // (others read), or fails when every segment fails; it drops nothing.
     let mut fresh_state = CompactState::default();
-    assert!(compact_pass(
-        &r,
-        &CompactOptions::small(Mode::Retire),
-        &mut fresh_state,
-        Some(&f)
-    )
-    .await
-    .is_err());
+    let slow = CompactOptions {
+        drop_failing_after: Some(Duration::from_secs(3600)),
+        ..CompactOptions::small(Mode::Retire)
+    };
+    for _ in 0..4 {
+        if let Ok(Some(p)) = compact_pass(&r, &slow, &mut fresh_state, Some(&f)).await {
+            assert_eq!(v1(&p).dropped, 0);
+            assert_eq!(v1(&p).failing, 1);
+        }
+    }
     assert_eq!(read_manifest(&r, FAMILY_CHANGESET).await.unwrap().0, before);
     flaky.failing.lock().unwrap().clear();
     // Lost for real: the first pass suspects it, the second drops it.
@@ -1888,11 +1912,12 @@ async fn a_backfill_reads_generations_over_several_passes() {
     assert!(gens.windows(2).all(|w| w[0].1 <= w[1].0), "{gens:?}");
 }
 
-/// Work carried across passes is forgotten when a live segment appears
-/// that it does not account for (another server's pass): the next pass
-/// lists again and seals nothing twice.
+/// Work carried across passes survives a live segment it does not account
+/// for (another server's seal): its keys are taken out of the carried
+/// candidates, the next pass goes on without listing, and nothing is
+/// sealed twice.
 #[tokio::test]
-async fn a_carried_backfill_is_dropped_when_another_server_seals() {
+async fn a_carried_backfill_survives_another_servers_seal() {
     let r = repo();
     let ids = build(&r, None).await;
     let opts = CompactOptions {
@@ -1909,7 +1934,7 @@ async fn a_carried_backfill_is_dropped_when_another_server_seals() {
     let p = v1(&pass(&r, &opts, &mut theirs, None).await);
     assert!(p.listed && p.sealed_keys == 8, "{p:?}");
     let p = v1(&pass(&r, &opts, &mut mine, None).await);
-    assert!(p.listed, "{p:?}");
+    assert!(!p.listed, "{p:?}");
     let mut sealed = 16 + p.sealed_keys;
     for _ in 0..20 {
         let p = v1(&pass(&r, &opts, &mut mine, None).await);
@@ -2068,4 +2093,225 @@ async fn a_retirement_step_stops_at_an_unreadable_value() {
     assert_eq!(blobs.gets.lock().unwrap().get(&seg.data), Some(&1));
     let p = v1(&pass(&r, &retire, &mut st, Some(&hook)).await);
     assert_eq!(p.dropped, 1, "{p:?}");
+}
+
+/// A listing keeps in memory only the keys a seal or a retirement needs:
+/// once every row is sealed in mode `build` (rows stay), none.
+#[tokio::test]
+async fn a_listing_keeps_only_keys_with_work() {
+    let r = repo();
+    let ids = build(&r, None).await;
+    let o = CompactOptions::small(Mode::Build);
+    let mut st = CompactState::default();
+    settle(&r, &o, &mut st, None).await;
+    assert_eq!(
+        r.row_meta().count_derived(Skiplist::NAME).await.unwrap(),
+        ids.len() as u64
+    );
+    let p = pass(&r, &o, &mut st, None).await;
+    assert!(p.listed, "{p:?}");
+    assert_eq!(p.listed_keys, 0, "{p:?}");
+    // A new changeset's rows are kept until sealed.
+    commit(
+        &r,
+        &[*ids.last().unwrap()],
+        &[("late", Some("late"))],
+        "late",
+    )
+    .await;
+    let p = pass(&r, &o, &mut st, None).await;
+    assert!(p.listed_keys > 0, "{p:?}");
+}
+
+/// Four segments on a store whose reads of chosen blobs fail.
+async fn four_flaky() -> (
+    Repo,
+    Arc<Flaky>,
+    Arc<dyn leep_core::BlobStore>,
+    Vec<SegmentRef>,
+) {
+    let blobs: Arc<dyn leep_core::BlobStore> = Arc::new(MemoryBlobStore::new());
+    let flaky = Arc::new(Flaky {
+        inner: blobs.clone(),
+        failing: Mutex::default(),
+    });
+    let r = Repo::new(flaky.clone(), Arc::new(MemoryMetaStore::new()));
+    let live = four_segments(&r, &mut CompactState::default()).await;
+    (r, flaky, blobs, live)
+}
+
+/// A failing segment is dropped only while another segment of the family
+/// reads whole: lost segments beside it do not count, and the pass fails,
+/// dropping nothing.
+#[tokio::test]
+async fn a_failing_segment_needs_a_sound_one_beside_it_to_be_dropped() {
+    let (r, flaky, blobs, live) = four_flaky().await;
+    flaky.failing.lock().unwrap().insert(live[0].data);
+    for s in &live[1..] {
+        blobs.delete(&s.data).await.unwrap();
+    }
+    let opts = CompactOptions {
+        fanout: 64,
+        ..CompactOptions::small(Mode::Build)
+    };
+    let before = read_manifest(&r, FAMILY_CHANGESET).await.unwrap().0;
+    let mut st = CompactState::default();
+    for _ in 0..4 {
+        assert!(compact_pass(&r, &opts, &mut st, None).await.is_err());
+    }
+    assert_eq!(read_manifest(&r, FAMILY_CHANGESET).await.unwrap().0, before);
+}
+
+/// A failing segment's streak restarts when its last failure is older than
+/// `failing_gap` (another server ran the passes, or none ran): passes on
+/// either side of a gap do not add up to a drop.
+#[tokio::test(start_paused = true)]
+async fn a_failing_streak_restarts_after_a_gap() {
+    let (r, flaky, _, live) = four_flaky().await;
+    flaky.failing.lock().unwrap().insert(live[1].data);
+    let opts = CompactOptions {
+        fanout: 64,
+        drop_failing_after: Some(Duration::ZERO),
+        failing_gap: Duration::from_secs(600),
+        ..CompactOptions::small(Mode::Build)
+    };
+    let mut st = CompactState::default();
+    let p = v1(&pass(&r, &opts, &mut st, None).await);
+    assert_eq!((p.failing, p.dropped), (1, 0));
+    tokio::time::advance(Duration::from_secs(601)).await;
+    for _ in 0..2 {
+        let p = v1(&pass(&r, &opts, &mut st, None).await);
+        assert_eq!((p.failing, p.dropped), (1, 0), "{p:?}");
+    }
+    // The third pass of the new streak drops it.
+    let p = v1(&pass(&r, &opts, &mut st, None).await);
+    assert_eq!(p.dropped, 1, "{p:?}");
+    // Never with `drop_failing_after` off.
+    let (r, flaky, _, live) = four_flaky().await;
+    flaky.failing.lock().unwrap().insert(live[1].data);
+    let off = CompactOptions {
+        drop_failing_after: None,
+        ..opts
+    };
+    let mut st = CompactState::default();
+    for _ in 0..6 {
+        let p = v1(&pass(&r, &off, &mut st, None).await);
+        assert_eq!(p.dropped, 0, "{p:?}");
+    }
+}
+
+/// A store whose reads fail once `fail` is set while its existence checks
+/// still answer (reads throttled while HEADs work).
+struct ReadsFail {
+    inner: Arc<dyn leep_core::BlobStore>,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl leep_core::BlobStore for ReadsFail {
+    async fn put_with_hash(&self, hash: Hash, data: Bytes) -> leep_core::Result<()> {
+        self.inner.put_with_hash(hash, data).await
+    }
+    async fn get(&self, hash: &Hash) -> leep_core::Result<Option<Bytes>> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(Error::Storage("read timed out".into()));
+        }
+        self.inner.get(hash).await
+    }
+    async fn get_exact(&self, hash: &Hash) -> leep_core::Result<Option<Bytes>> {
+        self.get(hash).await
+    }
+    async fn contains(&self, hash: &Hash) -> leep_core::Result<bool> {
+        self.inner.contains(hash).await
+    }
+    async fn list_page(
+        &self,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> leep_core::Result<Vec<leep_core::BlobMeta>> {
+        self.inner.list_page(after, limit).await
+    }
+    async fn delete(&self, hash: &Hash) -> leep_core::Result<()> {
+        self.inner.delete(hash).await
+    }
+}
+
+/// When every read fails but existence checks answer, segments this
+/// process read whole earlier (its own seals) do not count as sound
+/// neighbours: another server's failing segment is not dropped.
+#[tokio::test]
+async fn existence_checks_alone_never_vouch_for_a_drop() {
+    let store = Arc::new(ReadsFail {
+        inner: Arc::new(MemoryBlobStore::new()),
+        fail: std::sync::atomic::AtomicBool::new(false),
+    });
+    let r = Repo::new(store.clone(), Arc::new(MemoryMetaStore::new()));
+    // This process seals four segments; another server seals a fifth.
+    let mut mine = CompactState::default();
+    four_segments(&r, &mut mine).await;
+    let opts = CompactOptions {
+        fanout: 64,
+        drop_failing_after: Some(Duration::ZERO),
+        ..CompactOptions::small(Mode::Build)
+    };
+    let (_, ManifestRead::Read(m)) = read_manifest(&r, FAMILY_CHANGESET).await.unwrap() else {
+        panic!()
+    };
+    let mut tip = m.live.len();
+    let mut head = commit(&r, &[], &[("g", Some("0"))], "g").await;
+    for i in 0..4 {
+        head = commit(&r, &[head], &[("g", Some(&format!("{i}")))], "g").await;
+    }
+    derive::<HistoryTree>(&r, head).await.unwrap();
+    pass(&r, &opts, &mut CompactState::default(), None).await;
+    let before = read_manifest(&r, FAMILY_CHANGESET).await.unwrap().0;
+    let (_, ManifestRead::Read(m)) = read_manifest(&r, FAMILY_CHANGESET).await.unwrap() else {
+        panic!()
+    };
+    assert!(m.live.len() > tip, "{m:?}");
+    tip = m.live.len();
+    store.fail.store(true, Ordering::SeqCst);
+    for _ in 0..5 {
+        assert!(compact_pass(&r, &opts, &mut mine, None).await.is_err());
+    }
+    let after = read_manifest(&r, FAMILY_CHANGESET).await.unwrap();
+    assert_eq!(after.0, before);
+    let ManifestRead::Read(m) = after.1 else {
+        panic!()
+    };
+    assert_eq!(m.live.len(), tip);
+}
+
+/// A pass longer than the gap keeps a streak going: the gap counts from
+/// the end of the previous pass, not from the failure inside it.
+#[tokio::test(start_paused = true)]
+async fn a_long_pass_does_not_end_a_failing_streak() {
+    let (r, flaky, _, live) = four_flaky().await;
+    flaky.failing.lock().unwrap().insert(live[1].data);
+    let opts = CompactOptions {
+        fanout: 64,
+        drop_failing_after: Some(Duration::ZERO),
+        failing_gap: Duration::from_secs(600),
+        pause: Some(PauseHook(Arc::new(|at| {
+            Box::pin(async move {
+                if at == "seal-stored" {
+                    tokio::time::sleep(Duration::from_secs(700)).await;
+                }
+            })
+        }))),
+        ..CompactOptions::small(Mode::Build)
+    };
+    let mut st = CompactState::default();
+    let mut head = commit(&r, &[], &[("h", Some("0"))], "h").await;
+    let mut dropped = 0;
+    for p in 0..3 {
+        for i in 0..4 {
+            head = commit(&r, &[head], &[("h", Some(&format!("{p}.{i}")))], "h").await;
+        }
+        derive::<HistoryTree>(&r, head).await.unwrap();
+        let rep = v1(&pass(&r, &opts, &mut st, None).await);
+        assert!(rep.sealed_segments > 0, "{rep:?}");
+        dropped += rep.dropped;
+    }
+    assert_eq!(dropped, 1);
 }

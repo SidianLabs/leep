@@ -173,8 +173,24 @@ pub fn gc_rows(data: &[u8]) {
     let Some((&k, value)) = data.split_first() else {
         return;
     };
-    // Past the row kinds: the mark manifest and a mark segment (ADR 0103).
-    match k as usize % (kinds.len() + 2) {
+    // Past the row kinds: the mark manifest and a mark segment (ADR 0103),
+    // then the doom-seen row (ADR 0012, pruning).
+    match k as usize % (kinds.len() + 3) {
+        6 => {
+            let decoded = gc::decode_seen(value);
+            assert_eq!(
+                decoded.is_some(),
+                gc::decode_row(gc::BLOB_DOOM_SEEN, value).is_ok()
+            );
+            if let Some((epoch, at)) = decoded {
+                assert_eq!(
+                    &gc::seen_value(epoch, at)[..],
+                    value,
+                    "a decoded row is its bytes"
+                );
+            }
+            return;
+        }
         4 => {
             if let Ok(m) = leep_derive::gc_segments::Manifest::decode(value) {
                 assert_eq!(&m.encode()[..], value, "a decoded manifest is its bytes");

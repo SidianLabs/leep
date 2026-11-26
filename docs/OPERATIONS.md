@@ -2964,8 +2964,8 @@ Backups copy packs as files into the backup pool (ADR 0039; see "Backup and
 restore"), so restoring a packed store gives a packed store.
 
 Do not delete anything under `packs/` by hand, and do not delete
-`.repack-*` files in the shard directories: each is a whole object that the
-next repack puts back. `.tmp-*` files under `packs/` belong to a running
+`.repack-*` files in the shard directories: each is a whole object that a
+restarted server's first sweep (or the next repack) puts back. `.tmp-*` files under `packs/` belong to a running
 repack or pack write, or are leftovers the next sweep deletes.
 `packs/retired` is the record that keeps retired packs unread; deleting it
 makes them searched and merged again until a repack retires them anew.
@@ -3104,8 +3104,8 @@ history, trees and blobs first, derived rows after.
 | `bad_attestation`, `invalid_signature` | A signature or review row does not decode, does not belong to any changeset, or a signature does not verify | These are not derived from history and are never rewritten by `repair`. Restore the row from a backup, or delete it with SQL if it is junk, and have the author sign again |
 | `bad_rebased_origin`, `bad_gc_row` | Bookkeeping rows that are malformed or name changesets that do not exist (a rebased-origin row may name a swept original, but must agree with its copy's `leep.rebased_from`) | Restore from a backup. A bad GC row can be deleted with SQL while no `gc` runs; `repair` refuses to touch them |
 | `bad_gc_segment` | A GC mark segment the manifest names does not decode, or holds a different number of marks (ADR 0103). One that is not stored is only a note (normal after restoring a backup taken while `gc` ran) | Nothing is lost: the next `gc` trusts only the segments before it, walks the rest and stops naming it. Run `gc` (or `gc --full`) |
-| `bad_derived_manifest` | The `derived-segments-v1` row does not decode (ADR 0104). No derived segment is read (rows still are), and `gc` refuses to run, since it cannot tell live segments from orphans | In mode `build` every row is still stored: the next derived segments pass replaces the row. After `retire`, a pass refuses to; run `repair drop --kind skiplist --kind history-tree-v4` (it replaces the manifest with an empty one and drops the rows), then `repair rederive --kind history-tree-v4 --missing` or let reads derive them |
-| `bad_derived_segment` | A live derived segment's index or data does not decode (ADR 0104). One that is not stored is only a note (normal after restoring a backup whose blob copy finished before the segment was sealed) | Nothing wrong is read: its keys read as rows or derive again, and the next pass drops it from the manifest and seals the rows again. After `retire`, `repair rederive --kind skiplist --kind history-tree-v4 --missing` writes the rows at once |
+| `bad_derived_manifest` | The `derived-segments-v1` row does not decode (ADR 0104). No derived segment is read (rows still are), and `gc` keeps every blob that starts like a derived segment (it cannot tell live segments from orphans) while collecting the rest | In mode `build` every row is still stored: the next derived segments pass replaces the row. After `retire`, a pass refuses to; run `repair drop --kind skiplist --kind history-tree-v4` (it replaces the manifest with an empty one and drops the rows), then `repair rederive --kind history-tree-v4 --missing` or let reads derive them |
+| `bad_derived_segment` | A live derived segment's index or data does not decode (ADR 0104). One that is not stored is only a note (a lost blob, an older `gc` that collected it, or a backup taken by an older `leep-server`, whose listing copy could reach a segment after `gc` had collected it, a merge having retired it since the metadata snapshot) | Nothing wrong is read: its keys read as rows or derive again, and the next pass drops it from the manifest and seals the rows again. After `retire`, `repair rederive --kind skiplist --kind history-tree-v4 --missing` writes the rows at once |
 | `reflog_divergence` | A ref's newest ref log entry does not say where the ref is now | Someone changed the `refs` table or the log directly, or a restore mixed two points in time. Decide which is right: if the ref is right, the log is merely incomplete and nothing breaks; if the log is right, `leep undo`-style recovery is `POST /v1/refs/{name}` to the logged value. `repair` never edits either |
 | `reflog_chain_break` | An entry's `new` does not equal the next entry's `old`: an entry was removed or edited | The log is the record of what happened; restore it from a backup if you need it complete. Refs are unaffected |
 
@@ -3186,7 +3186,7 @@ their patches read.
 Kinds that cannot be rederived (and so are refused by `drop` with an
 explanation and exit status 2): `signature-v1`, `review-v1` and `review-source-v1` (clients wrote
 them), `rebased-origin-v1` (written by rebase; `land`'s retry detection depends
-on it), `blob-claim-v1`, `blob-condemned-v1`, `blob-rescue-v1`, `blob-doom-v1`, `gc-mark-v1`,
+on it), `blob-claim-v1`, `blob-condemned-v1`, `blob-rescue-v1`, `blob-doom-v1`, `blob-doom-seen-v1`, `gc-mark-v1`,
 `gc-mark-segments-v1` (the GC fence and marks, ADR 0012, 0033, 0103), `derived-segments-v1` (ADR 0104; drop `skiplist` or `history-tree-v4` instead), `history-node-v4` (or `-v3`, `-v2`, `-v1`) and
 `tree-trigrams-keyframe-v2` on their own, and the ref log. The full table
 with reasons is in ADR 0025. `blame-v2` can be dropped but not rederived: its rows
@@ -3249,7 +3249,8 @@ What a run does, in order, and why the order matters:
 
 1. **Metadata first**, in one read transaction (`REPEATABLE READ` on Postgres),
    written to `meta.db`. Its instant is the backup's recovery point.
-2. **Blobs second**: every blob the pool lacks is copied. Blobs are immutable and
+2. **Blobs second**: first the live derived and GC mark segments the snapshot's
+   manifests name (below), then every blob the pool lacks. Blobs are immutable and
    named by their content, so "already there" is proof it is right and the
    second backup copies only what is new (a store with nothing new costs two
    directory or bucket listings).
@@ -3261,8 +3262,15 @@ Metadata before blobs is the whole consistency argument. A blob that a stored
 changeset needs is never deleted (ADR 0012), so everything the snapshot needs
 is in the blob store when step 2 looks, no matter what lands or what GC deletes
 meanwhile; copying blobs first would miss blobs of changesets landed between
-the two. So there is **no need to stop servers or pause GC**, and no `gc
-collect` schedule has to avoid the backup window. If a backup's check ever
+the two. Segment blobs (ADR 0103, 0104) are the exception: a metadata row names
+them, not a changeset, and a compactor merge can retire a segment the snapshot
+names, after which `gc` may collect it while a long listing copy is still on
+its way to it. So the backup copies those first, right after the snapshot, and
+the check counts a live derived segment missing from the copy as a problem once
+its family's store feature is recorded (it may hold the only copy of retired
+rows); otherwise, and for GC mark segments, it is a note. So there is **no need
+to stop servers or pause GC**, and no `gc collect` schedule has to avoid the
+backup window. If a backup's check ever
 finds a missing blob (a GC bug, `gc --unsafe-no-fence` run under live servers, a
 store that was already damaged) the backup is sealed as failed, prints the
 problems, exits 1 and `restore` refuses it.
@@ -3565,8 +3573,9 @@ nothing removes them; delete those older than the request timeout if the
 space matters:
 `find /var/lib/leep/blobs -path '*/packs' -prune -o -name '.tmp-*' -mmin +60 -delete`.
 A killed repack leaves `.tmp-*` files in `packs/` and `.repack-*` files in the
-shard directories; leave them, the next repack deletes the first and puts the
-second (whole objects) back.
+shard directories; leave them, the next sweep deletes the first, and a
+server's first sweep after it starts (or the next repack) puts the second
+(whole objects) back.
 
 ## Soak tests
 
@@ -3836,10 +3845,11 @@ lease; every row with `off`), and every keyframe. **Run every server with
 the same `--search-retention`**: whichever holds the lease decides what is
 live. Superseded rows are not sealed: retention deletes superseded blob
 rows as before, and superseded directory filters (`tree-trigrams-v2`),
-which retention never deletes, stay rows as before. A sealed row that
-becomes superseded stays in its segment until a merge leaves it out (a
-segment is rewritten once a third of it is); that also drops a directory
-filter sealed while it was live, which derives again if a search needs it.
+which retention never deletes, stay rows as before. A sealed blob row
+that becomes superseded stays in its segment until a merge leaves it out (a
+segment is rewritten once a third of it is). A directory filter is never
+left out, as rows never lose one: a stored filter means its whole subtree's
+are, which the warmer and bounded searches rely on.
 A row and its segment value are compared by the trigram set or filter they
 stand for, not their bytes. Its segments hold at most 1 MiB of data, in 512 KiB blocks. On
 Leep's history plus 2,000 edits the search rows' about 4.4 MB (with
@@ -3858,6 +3868,7 @@ a store whose every land the warmer indexed keeps more search rows
 |---|---|---|
 | `--derived-segments off\|build\|retire` / `LEEP_DERIVED_SEGMENTS` | `build` | `build`: seal and merge in the background, keep every row. `retire`: also delete rows a live segment holds the same value for (the one-way door below). `off`: no passes; segments already written are still read. |
 | `--derived-segments-interval D` / `LEEP_DERIVED_SEGMENTS_INTERVAL` | `5m` | How often a pass runs (the first 2 to 3 minutes after start). |
+| `--derived-segments-drop-failing-after D\|off` / `LEEP_DERIVED_SEGMENTS_DROP_FAILING_AFTER` | `1d` | A live segment whose blobs fail to read (an I/O error, a failing object store key; not "not stored" or damage, which are dropped at once, or after two passes once the family's feature is recorded) is kept and skipped, and dropped once it failed three passes in a row over at least this long while another segment of its family reads whole in the same pass (a real read, not an existence check). A streak restarts when the server ran no pass of the family for about two intervals. After `retire` a dropped segment's rows exist nowhere else and derive again, so keep this long enough to ride out a partial outage; `off` never drops one for that. A family none of whose live segments reads whole fails its passes and drops nothing. |
 | `--derived-segments-retire-families LIST` / `LEEP_DERIVED_SEGMENTS_RETIRE_FAMILIES` | empty (`changeset-v1`) | In `retire`, the families whose one-way door this server may pass: comma-separated names (`changeset-v2`, `content-v1`) or `all`; `changeset-v1` always. A family not named deletes rows only once its store feature is already recorded (ADR 0105). |
 
 A pass holds the store-wide lease `maintenance` / `derived-segments`, so one

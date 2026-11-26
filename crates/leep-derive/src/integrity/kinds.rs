@@ -14,7 +14,7 @@ use crate::derived::{
     DerivedKind, Generation, HistoryTree, LastMerge, LogFilterIndex, RootTree, Skiplist,
     HISTORY_NODE_KIND, LOG_FILTER_NAME_KIND,
 };
-use crate::gc::{BLOB_CLAIM, BLOB_CONDEMNED, BLOB_DOOM, BLOB_RESCUE, GC_MARK};
+use crate::gc::{BLOB_CLAIM, BLOB_CONDEMNED, BLOB_DOOM, BLOB_DOOM_SEEN, BLOB_RESCUE, GC_MARK};
 use crate::gc_segments::GC_MARK_SEGMENTS;
 use crate::git_map::{GIT_BLOB_KIND, GIT_COMMIT_KIND, GIT_OID_KIND, GIT_STYLE_KIND, GIT_TREE_KIND};
 use crate::search::{
@@ -337,6 +337,13 @@ static KINDS: &[KindInfo] = &[
         name: BLOB_DOOM,
         class: KindClass::Bookkeeping,
         summary: "state of a blob's delete handshake",
+        rederive: Rederive::No("garbage collection state is not derived"),
+        drop: DropPolicy::Refused(GC_REFUSAL),
+    },
+    KindInfo {
+        name: BLOB_DOOM_SEEN,
+        class: KindClass::Bookkeeping,
+        summary: "when a collect first saw a blob deleted (its fence rows go 30 days later)",
         rederive: Rederive::No("garbage collection state is not derived"),
         drop: DropPolicy::Refused(GC_REFUSAL),
     },

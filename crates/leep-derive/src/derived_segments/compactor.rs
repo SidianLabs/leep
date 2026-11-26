@@ -30,7 +30,7 @@ use tokio::time::Instant;
 use super::codec::{
     self, Block, Equality, Family, Keys, Loc, Manifest, SealRow, SegmentData, SegmentRef, FAMILIES,
 };
-use super::view::{load_indexes, Live, ManifestRead};
+use super::view::{get_segment_blob, load_indexes, segment_blob_stored, Live, ManifestRead};
 use super::{lease_key, read_manifest, swap_manifest, MANIFEST_KIND};
 use crate::derived::{decode_u64, DerivedKind, Generation};
 use crate::gc_lease::{self, GcLease};
@@ -173,6 +173,21 @@ pub struct CompactOptions {
     /// For tests only: the time (Unix seconds) retention's window is judged
     /// at, instead of the clock.
     pub content_now: Option<i64>,
+    /// A live segment whose blobs fail to read (not "not stored", not
+    /// damage: an I/O error, a failing object store key) while another of
+    /// the family's segments reads whole is dropped once it failed
+    /// [`FAILING_PASSES`] passes in a row over at least this long: its keys
+    /// then seal again from rows or derive again (after `retire`, derive
+    /// again: its rows exist nowhere else), instead of the family keeping a
+    /// segment no pass can read. `None`: never dropped for that
+    /// (`--derived-segments-drop-failing-after`, default a day: a partial
+    /// outage of the store must not throw good segments away).
+    pub drop_failing_after: Option<Duration>,
+    /// A failing segment's streak of passes restarts when this process's
+    /// last pass of the family ended longer ago than this (about two pass
+    /// intervals): a lease handoff, or a quiet spell, then one blip does not
+    /// count as a streak.
+    pub failing_gap: Duration,
     /// For crash tests only.
     pub pause: Option<PauseHook>,
 }
@@ -202,6 +217,8 @@ impl Default for CompactOptions {
             content_max_bytes: 1 << 20,
             content_max_rows: 16_384,
             content_now: None,
+            drop_failing_after: Some(Duration::from_secs(86_400)),
+            failing_gap: Duration::from_secs(600),
             pause: None,
         }
     }
@@ -234,6 +251,8 @@ impl CompactOptions {
             content_max_bytes: 128 << 10,
             content_max_rows: 1_024,
             content_now: None,
+            drop_failing_after: Some(Duration::ZERO),
+            failing_gap: Duration::from_secs(3600),
             pause: None,
         }
     }
@@ -264,18 +283,58 @@ impl CompactOptions {
     }
 
     /// The tier of a segment of `rows` keys: `floor(log_fanout(rows /
-    /// seal_rows))`, so a seal is tier 0 and a merge of a tier's segments
-    /// lands about one tier up.
+    /// base))`, `base` the smallest seal (an idle one), so a merge of a
+    /// tier's segments lands about one tier up. Counted from the full seal
+    /// instead, idle seals and their merges all sat in tier 0 and a
+    /// growing segment there was rewritten with every three new seals,
+    /// about 20 times before it left the tier.
     fn tier(&self, rows: u32) -> u32 {
         let f = self.fanout.max(2) as u64;
+        let base = self.idle_rows.min(self.seal_rows).max(1) as u64;
         let mut t = 0;
-        let mut cap = (self.seal_rows.max(1) as u64).saturating_mul(f);
+        let mut cap = base.saturating_mul(f);
         while (rows as u64) >= cap && t < 16 {
             t += 1;
             cap = cap.saturating_mul(f);
         }
         t
     }
+}
+
+/// About the most row bytes a `content-v1` seal or retirement reads at once
+/// (a dense directory filter is 64 KiB, and a key has up to four columns):
+/// the keys read at once adapt to it.
+pub(crate) const READ_BYTES: usize = 4 << 20;
+
+/// Keys a `content-v1` seal or retirement reads at first, before it knows
+/// how large the family's rows are.
+const CONTENT_FIRST_STEP: usize = 16;
+
+/// Most keys a family's state remembers to skip (`unstored`, `bad`)
+/// between listings: past it they are forgotten at the next listing, which
+/// only costs looking at them again.
+pub(crate) const SKIPPED_CAP: usize = 65_536;
+
+/// Passes in a row a live segment must fail to read in before it is dropped
+/// (and [`CompactOptions::drop_failing_after`] must have passed).
+pub const FAILING_PASSES: u32 = 3;
+
+/// A failing segment's streak.
+#[derive(Clone, Copy, Debug)]
+struct Failing {
+    /// The first failure of the streak.
+    since: Instant,
+    /// Passes of the streak that failed to read it.
+    passes: u32,
+}
+
+/// What a probe of a live segment's blobs found.
+enum Probe {
+    Sound,
+    /// Not stored, or damaged: definite.
+    Lost,
+    /// A read failed with any other error, for now.
+    Failing(Error),
 }
 
 /// What a process remembers between passes, per family: carried work
@@ -328,6 +387,9 @@ struct FamilyState {
     /// with the feature recorded, a segment is dropped only when two passes
     /// in a row agree.
     suspect: HashSet<Hash>,
+    /// Live segments whose blobs failed to read (an error that is neither
+    /// "not stored" nor damage) in every pass of a streak.
+    failing: HashMap<Hash, Failing>,
     /// Rows found unequal to their holding segment's value, with that
     /// segment: not read and reported again while it holds them.
     mismatched: HashMap<(Hash, u8), Hash>,
@@ -340,12 +402,14 @@ struct FamilyState {
     reseal: HashSet<(Hash, u8)>,
     /// Keys with rows whose changeset is not stored (the changeset sweep
     /// was killed between rows and changeset): skipped until the next
-    /// listing after `list_every`.
+    /// listing after `list_every`, and at most [`SKIPPED_CAP`] of them.
     unstored: HashSet<Hash>,
     /// Rows whose value does not decode, by key and column: not sealed,
     /// and skipped like `unstored` (cleared with it), so they do not make
     /// every listing a backfill again.
     bad: HashSet<(Hash, u8)>,
+    /// When this process's last pass of the family ended.
+    last_pass_end: Option<Instant>,
     /// When `unstored` was last cleared.
     unstored_cleared: Option<Instant>,
     /// The last listing: when, and the estimated row count then.
@@ -426,6 +490,10 @@ pub struct PassReport {
     /// Live segments that could not be read and were dropped from the
     /// manifest (their rows seal again, or derive again).
     pub dropped: u64,
+    /// Live segments whose blobs failed to read in this pass with an error
+    /// that is neither "not stored" nor damage: kept, and left out of the
+    /// pass's merges and retirement.
+    pub failing: u64,
     /// Rows deleted (mode `retire`).
     pub retired_rows: u64,
     /// Rows found unequal to their segment's value, kept.
@@ -440,6 +508,9 @@ pub struct PassReport {
     pub newer_manifest: bool,
     /// Whether the rows were listed (in mode `build` only when they grew).
     pub listed: bool,
+    /// Keys a listing kept in memory: those with a row to seal, or (mode
+    /// `retire`) one a ripe segment holds; never every key listed.
+    pub listed_keys: u64,
     /// Whether the pass made progress and stopped with work left (a
     /// backfill's candidates beyond its pages or time, rows beyond its
     /// retire bound): the next pass should run soon.
@@ -456,6 +527,7 @@ impl PassReport {
         self.merges += r.merges;
         self.merged_away += r.merged_away;
         self.dropped += r.dropped;
+        self.failing += r.failing;
         self.retired_rows += r.retired_rows;
         self.mismatched += r.mismatched;
         self.bad_values += r.bad_values;
@@ -464,6 +536,7 @@ impl PassReport {
         self.damaged_manifest |= r.damaged_manifest;
         self.newer_manifest |= r.newer_manifest;
         self.listed |= r.listed;
+        self.listed_keys += r.listed_keys;
         self.more |= r.more;
     }
 
@@ -587,6 +660,9 @@ pub(crate) struct Pass<'a> {
     man: Manifest,
     /// Live segments whose index this pass loaded itself, by index hash.
     segs: HashMap<Hash, Arc<Live>>,
+    /// Live segments whose index blob failed to read in this pass, with
+    /// the error (neither "not stored" nor damage).
+    index_errors: HashMap<Hash, Error>,
     /// Data blobs and blocks this pass read (one segment at a time where it
     /// reads many).
     data: HashMap<Hash, Arc<SegmentData>>,
@@ -611,6 +687,9 @@ pub(crate) struct Pass<'a> {
     /// leaves keys out only then).
     live: Option<Arc<ContentLive>>,
     live_current: bool,
+    /// Keys read at once when sealing or retiring `content-v1` rows, kept
+    /// near [`READ_BYTES`] a read.
+    read_step: usize,
     report: PassReport,
 }
 
@@ -672,6 +751,7 @@ impl<'a> Pass<'a> {
             raw,
             man,
             segs: HashMap::new(),
+            index_errors: HashMap::new(),
             data: HashMap::new(),
             blocks: HashMap::new(),
             rows: None,
@@ -682,6 +762,10 @@ impl<'a> Pass<'a> {
             condemned: HashSet::new(),
             live: None,
             live_current: false,
+            read_step: match fam.keys {
+                Keys::Changesets => opts.batch.max(1),
+                Keys::Content => CONTENT_FIRST_STEP.min(opts.batch.max(1)),
+            },
             report,
         };
         if !p.report.newer_manifest {
@@ -692,7 +776,8 @@ impl<'a> Pass<'a> {
 
     /// Load the live segments' indexes itself, not through the shared read
     /// view (whose state a reader's transient error or a late read may
-    /// have moved). A transient read error fails the pass.
+    /// have moved). An index that fails to read is remembered for
+    /// [`Pass::check_live`]; the others are used.
     async fn load_segments(&mut self) -> Result<()> {
         // Decoded indexes the view already holds are reused: an index is
         // immutable and checked by address when loaded, so only the view's
@@ -729,9 +814,20 @@ impl<'a> Pass<'a> {
             .filter(|s| !self.segs.contains_key(&s.index))
             .copied()
             .collect();
-        for (h, idx) in load_indexes(&**self.repo.blobs(), self.fam.id, &missing).await? {
-            if let (Some(idx), Some(r)) = (idx, self.man.live.iter().find(|s| s.index == h)) {
-                self.segs.insert(h, Arc::new(Live { r: *r, idx }));
+        for (h, idx) in load_indexes(&**self.repo.blobs(), self.fam.id, &missing).await {
+            match idx {
+                Ok(Some(idx)) => {
+                    if let Some(r) = self.man.live.iter().find(|s| s.index == h) {
+                        self.index_errors.remove(&h);
+                        self.segs.insert(h, Arc::new(Live { r: *r, idx }));
+                    }
+                }
+                Ok(None) => {
+                    self.index_errors.remove(&h);
+                }
+                Err(e) => {
+                    self.index_errors.insert(h, e);
+                }
             }
         }
         // Column masks come from the manifest.
@@ -762,6 +858,7 @@ impl<'a> Pass<'a> {
             .get_or_insert_with(std::time::Instant::now);
         let fam_state = state.families.entry(self.fam.id).or_default();
         let r = self.run_family(fam_state).await;
+        fam_state.last_pass_end = Some(Instant::now());
         self.budget.retired_rows += self.report.retired_rows;
         state.budget = self.budget;
         r
@@ -787,7 +884,56 @@ impl<'a> Pass<'a> {
             .live
             .iter()
             .all(|s| state.known.get(&s.index) == Some(&s.columns));
-        if self.report.dropped > 0 || !accounted {
+        // Another server's pass only added segments (its seals): the carried
+        // work stays valid once their keys are taken out of it, so two
+        // servers taking turns do not each list every row again.
+        let only_added = !accounted
+            && self.report.dropped == 0
+            && state.known.iter().all(|(h, cols)| {
+                self.man
+                    .live
+                    .iter()
+                    .any(|s| s.index == *h && s.columns == *cols)
+            })
+            && self
+                .man
+                .live
+                .iter()
+                .filter(|s| !state.known.contains_key(&s.index))
+                .all(|s| self.segs.contains_key(&s.index));
+        if only_added {
+            let added: Vec<Arc<Live>> = self
+                .man
+                .live
+                .iter()
+                .filter(|s| !state.known.contains_key(&s.index))
+                .filter_map(|s| self.segs.get(&s.index).cloned())
+                .collect();
+            if let Some(bf) = state.backfill.as_mut() {
+                let held = |k: &Hash, m: u64| -> u64 {
+                    let mut m = m;
+                    for l in &added {
+                        for c in self.fam.columns {
+                            if m & bit(c.id) != 0 && l.r.has(c.id) && l.idx.has(k, c.id) {
+                                m &= !bit(c.id);
+                            }
+                        }
+                    }
+                    m
+                };
+                for (k, m) in bf.pending.iter_mut() {
+                    *m = held(k, *m);
+                }
+                bf.pending.retain(|(_, m)| *m != 0);
+                let next = bf.next.min(bf.order.len());
+                for (_, k, m) in bf.order[next..].iter_mut() {
+                    *m = held(k, *m);
+                }
+            }
+            for l in &added {
+                state.known.insert(l.r.index, l.r.columns);
+            }
+        } else if self.report.dropped > 0 || !accounted {
             if state.backfill.is_some() || state.retire_left.is_some() {
                 // List again now, not after `list_every`.
                 state.listed = None;
@@ -844,49 +990,159 @@ impl<'a> Pass<'a> {
         Ok(false)
     }
 
-    /// Whether `s`'s blobs read, probed by this pass itself: `Ok(false)`
-    /// only for definite loss or damage (not stored, address or structure
-    /// wrong, a read the store reports corrupt); any other error fails the
-    /// pass. A segment read whole once in this process is later only checked
-    /// for presence, as is an index taken from the read view.
-    async fn probe(&mut self, s: &SegmentRef, state: &mut FamilyState) -> Result<bool> {
+    /// Whether `s`'s blobs read, probed by this pass itself: `Lost` only
+    /// for definite loss or damage (not stored, address or structure wrong,
+    /// a read the store reports corrupt), `Failing` for any other read
+    /// error. A segment read whole once in this process is later only
+    /// checked for presence, as is an index taken from the read view. Every
+    /// "not stored" is exact (a blob packed a moment ago by another process
+    /// is not taken for lost).
+    async fn probe(&mut self, s: &SegmentRef, state: &mut FamilyState) -> Probe {
+        let blobs = self.repo.blobs().clone();
         let Some(live) = self.segs.get(&s.index).cloned() else {
-            // `load_indexes` gives `None` only for definite loss or damage.
-            return Ok(false);
+            return match self.index_errors.remove(&s.index) {
+                Some(e) => Probe::Failing(e),
+                // `load_indexes` gives `None` only for definite loss or damage.
+                None => Probe::Lost,
+            };
         };
-        if self.reused.contains(&s.index) && !self.repo.blobs().contains(&s.index).await? {
-            return Ok(false);
+        let present = |h: Hash| {
+            let blobs = blobs.clone();
+            async move {
+                match segment_blob_stored(&*blobs, &h).await {
+                    Ok(true) => Probe::Sound,
+                    Ok(false) => Probe::Lost,
+                    Err(e) => Probe::Failing(e),
+                }
+            }
+        };
+        if self.reused.contains(&s.index) {
+            match present(s.index).await {
+                Probe::Sound => {}
+                other => return other,
+            }
         }
         if state.verified.contains(&s.index) {
-            return self.repo.blobs().contains(&s.data).await;
+            return present(s.data).await;
         }
-        let bytes = match self.repo.blobs().get(&s.data).await {
+        let read = self.read_whole(&live).await;
+        if matches!(read, Probe::Sound) {
+            state.verified.insert(s.index);
+        }
+        read
+    }
+
+    /// Read `live`'s data blob whole and decode every value: a real read,
+    /// not an existence check.
+    async fn read_whole(&self, live: &Live) -> Probe {
+        let s = &live.r;
+        let bytes = match get_segment_blob(&**self.repo.blobs(), &s.data).await {
             Ok(Some(b)) => b,
-            Ok(None) => return Ok(false),
-            Err(e) if crate::gc_segments::segment_reads_corrupt(&e) => return Ok(false),
-            Err(e) => return Err(e),
+            Ok(None) => return Probe::Lost,
+            Err(e) if crate::gc_segments::segment_reads_corrupt(&e) => return Probe::Lost,
+            Err(e) => return Probe::Failing(e),
         };
-        let sound = codec::decode_data(&live.idx, &s.data, bytes)
-            .and_then(|d| codec::read_all(&live.idx, &d).map(|_| d));
-        match sound {
-            Ok(_) => {
-                state.verified.insert(s.index);
-                Ok(true)
-            }
-            Err(_) => Ok(false),
+        match codec::decode_data(&live.idx, &s.data, bytes)
+            .and_then(|d| codec::read_all(&live.idx, &d).map(|_| d))
+        {
+            Ok(_) => Probe::Sound,
+            Err(_) => Probe::Lost,
         }
     }
 
     /// Drop live segments that cannot be read (their keys then read as rows
     /// or derive again, and seal again), forget retired blobs no longer
     /// stored, and replace a manifest that did not decode. On a store with
-    /// the feature recorded a segment is dropped only when this pass and the
-    /// last both found it unreadable.
+    /// the feature recorded a lost segment is dropped only when this pass
+    /// and the last both found it unreadable. A segment whose blobs fail to
+    /// read is kept and left out of this pass's work, and dropped once it
+    /// failed [`FAILING_PASSES`] passes in a row over at least
+    /// [`CompactOptions::drop_failing_after`]; when no live segment reads
+    /// whole (a family whose only live segment fails included), the store
+    /// is taken to be failing and the pass fails, dropping nothing.
     async fn check_live(&mut self, state: &mut FamilyState) -> Result<()> {
         let mut bad = Vec::new();
+        let mut failing = Vec::new();
+        let mut sound: Vec<SegmentRef> = Vec::new();
+        let mut first_error = None;
         for s in self.man.live.clone() {
-            if !self.probe(&s, state).await? {
-                bad.push(s);
+            match self.probe(&s, state).await {
+                Probe::Sound => sound.push(s),
+                Probe::Lost => bad.push(s),
+                Probe::Failing(e) => {
+                    failing.push(s);
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        let now = Instant::now();
+        // Streaks end for segments that read again, and all of them when
+        // this process ran no pass of the family for longer than the gap
+        // (passes elsewhere, or none), measured from the end of its last
+        // pass, so a pass longer than the interval does not end them.
+        let recent = state
+            .last_pass_end
+            .is_some_and(|end| now.duration_since(end) <= self.opts.failing_gap);
+        state
+            .failing
+            .retain(|h, _| recent && failing.iter().any(|s| s.index == *h));
+        if let Some(e) = first_error {
+            // Only a family with a segment that reads whole in this pass
+            // tells a failing segment from a failing store: an existence
+            // check (a segment read whole earlier) is not enough, since a
+            // store can answer those while its reads fail. Otherwise (a
+            // lone live segment included) the pass fails and drops nothing.
+            let mut whole = false;
+            for s in &sound {
+                let Some(live) = self.segs.get(&s.index).cloned() else {
+                    continue;
+                };
+                if matches!(self.read_whole(&live).await, Probe::Sound) {
+                    whole = true;
+                    break;
+                }
+            }
+            if !whole {
+                return Err(e);
+            }
+            self.report.failing = failing.len() as u64;
+            for s in &failing {
+                let f = state.failing.entry(s.index).or_insert(Failing {
+                    since: now,
+                    passes: 0,
+                });
+                f.passes += 1;
+                let f = *f;
+                self.unreadable.insert(s.index);
+                state.verified.remove(&s.index);
+                metrics::counter!(
+                    "leep_derived_segment_errors_total",
+                    "what" => "failing", "family" => self.fam.name
+                )
+                .increment(1);
+                let due = self
+                    .opts
+                    .drop_failing_after
+                    .is_some_and(|after| now.duration_since(f.since) >= after);
+                if f.passes >= FAILING_PASSES && due {
+                    tracing::error!(
+                        segment = %s.index,
+                        family = self.fam.name,
+                        passes = f.passes,
+                        error = %e,
+                        "a derived segment's blobs failed to read in every pass for a while; \
+                         dropping it, its keys seal again from rows or derive again"
+                    );
+                    bad.push(*s);
+                } else {
+                    tracing::warn!(
+                        segment = %s.index,
+                        family = self.fam.name,
+                        passes = f.passes,
+                        error = %e,
+                        "a derived segment's blobs cannot be read now; it is kept and skipped"
+                    );
+                }
             }
         }
         let careful = !bad.is_empty()
@@ -895,7 +1151,11 @@ impl<'a> Pass<'a> {
         let mut gone = Vec::new();
         let mut suspect = HashSet::new();
         for s in bad {
-            if careful && !state.suspect.contains(&s.index) {
+            let failed = state
+                .failing
+                .get(&s.index)
+                .is_some_and(|f| f.passes >= FAILING_PASSES);
+            if careful && !failed && !state.suspect.contains(&s.index) {
                 tracing::warn!(
                     segment = %s.index,
                     family = self.fam.name,
@@ -909,7 +1169,9 @@ impl<'a> Pass<'a> {
         state.suspect = suspect;
         let mut retired = Vec::with_capacity(self.man.retired.len());
         for h in &self.man.retired {
-            if self.repo.blobs().contains(h).await? {
+            // Forgotten only once surely gone: a retired blob that fails to
+            // read stays listed (GC collects it as retired).
+            if self.repo.blobs().contains(h).await.unwrap_or(true) {
                 retired.push(*h);
             }
         }
@@ -1005,10 +1267,10 @@ impl<'a> Pass<'a> {
         Ok(l)
     }
 
-    /// The columns of `key` a seal may take and a merge keeps: every column
-    /// of a changeset family; in `content-v1` the keyframes always (a live
-    /// patch may stand on the keyframe of a version no head holds), and a
-    /// blob or tree row only while retention keeps it live.
+    /// The columns of `key` a seal may take: every column of a changeset
+    /// family; in `content-v1` the keyframes always (a live patch may stand
+    /// on the keyframe of a version no head holds), and a blob or tree row
+    /// only while retention keeps it live.
     fn keep_mask(&self, key: &Hash) -> u64 {
         match (self.fam.keys, &self.live) {
             (Keys::Changesets, _) => u64::MAX,
@@ -1016,6 +1278,25 @@ impl<'a> Pass<'a> {
             (Keys::Content, Some(_)) => self.fam.keyframe_mask(),
             (Keys::Content, None) => u64::MAX,
         }
+    }
+
+    /// The columns of `key` a merge keeps: [`Pass::keep_mask`], and in
+    /// `content-v1` every directory filter too, live or not
+    /// ([`Family::merge_kept_mask`]).
+    fn merge_keep_mask(&self, key: &Hash) -> u64 {
+        self.keep_mask(key) | self.fam.merge_kept_mask()
+    }
+
+    /// Whether the ref log has not moved since the walk this pass judges
+    /// liveness by: a merge leaves keys out only then. Read once a merge
+    /// that leaves keys out is encoded, before its segment is stored, so
+    /// a ref moving between this read and the swap is not seen; only blob
+    /// rows are left out, and retention's backfill derives those again.
+    async fn walk_still_current(&self) -> Result<bool> {
+        let Some(l) = &self.live else {
+            return Ok(false);
+        };
+        Ok(self.repo.newest_ref_seq().await? == l.seq)
     }
 
     /// The sort keys of `ids` in a segment of the family: the generations of
@@ -1112,11 +1393,16 @@ impl<'a> Pass<'a> {
         if let Some(d) = self.data.get(&live.r.data) {
             return Ok(Some(d.clone()));
         }
-        let bytes = match self.repo.blobs().get(&live.r.data).await {
+        let bytes = match get_segment_blob(&**self.repo.blobs(), &live.r.data).await {
             Ok(Some(b)) => b,
             Ok(None) => return Ok(None),
             Err(e) if crate::gc_segments::segment_reads_corrupt(&e) => return Ok(None),
-            Err(e) => return Err(e),
+            Err(e) => {
+                // Left out of the rest of the pass like a lost one; the next
+                // pass's probe decides about it.
+                tracing::warn!(segment = %live.r.index, error = %e, "a derived segment's data cannot be read now");
+                return Ok(None);
+            }
         };
         match codec::decode_data(&live.idx, &live.r.data, bytes) {
             Ok(d) => {
@@ -1197,6 +1483,7 @@ impl<'a> Pass<'a> {
         if state
             .unstored_cleared
             .is_none_or(|at| at.elapsed() >= self.opts.list_every)
+            || state.unstored.len() + state.bad.len() > SKIPPED_CAP
         {
             state.unstored.clear();
             state.bad.clear();
@@ -1204,6 +1491,33 @@ impl<'a> Pass<'a> {
         }
         state.listed = Some((Instant::now(), estimate));
         self.report.listed = true;
+        if self.fam.keys == Keys::Content && !self.man.live.is_empty() {
+            // Liveness decides which listed keys are kept, below.
+            self.content_live(state).await?;
+        }
+        // Segments whose rows a retirement would delete now.
+        let now = Instant::now();
+        let ripe: HashSet<u32> = if self.opts.mode == Mode::Retire {
+            self.man
+                .live
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| {
+                    state
+                        .live_since
+                        .get(&s.index)
+                        .is_some_and(|t| now.duration_since(*t) >= self.opts.retire_after)
+                })
+                .map(|(i, _)| i as u32)
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        // Only keys a seal or a retirement needs are kept: a row no live
+        // segment holds (or one to seal again) that the family keeps, or
+        // one a ripe segment holds in mode retire. In mode build every
+        // sealed row stays, so keeping them all would hold every key of the
+        // family in memory at each listing.
         let mut rows: HashMap<Hash, RowKey> = HashMap::new();
         for c in self.fam.columns {
             let (col, kind) = (c.id, c.kind);
@@ -1218,23 +1532,61 @@ impl<'a> Pass<'a> {
                     break;
                 };
                 after = Some(last);
-                for k in page {
-                    if !state.unstored.contains(&k) && !state.bad.contains(&(k, col)) {
-                        rows.entry(k)
-                            .or_insert(RowKey {
-                                have: 0,
-                                holder: [NONE; SLOTS],
-                            })
-                            .have |= bit(col);
+                let held = self.page_holders(&page, col);
+                for (k, at) in page.into_iter().zip(held) {
+                    if state.unstored.contains(&k) || state.bad.contains(&(k, col)) {
+                        continue;
                     }
+                    let open = at == NONE || state.reseal.contains(&(k, col));
+                    let wanted = (open && self.keep_mask(&k) & bit(col) != 0)
+                        || (at != NONE && ripe.contains(&at));
+                    if !wanted {
+                        continue;
+                    }
+                    let r = rows.entry(k).or_insert(RowKey {
+                        have: 0,
+                        holder: [NONE; SLOTS],
+                    });
+                    r.have |= bit(col);
+                    r.holder[slot(col)] = at;
                 }
             }
         }
         // Work still carried accounts for every live segment (`run` checked),
         // so it stays valid; from here on so does what this listing finds.
         state.known = self.man.live.iter().map(|s| (s.index, s.columns)).collect();
+        self.report.listed_keys = rows.len() as u64;
         self.rows = Some(rows);
         Ok(())
+    }
+
+    /// The newest live segment holding each of `page`'s keys (ascending, as
+    /// listed) for `col`, as its position in the live list: each segment's
+    /// keys in the page's range are walked once, so a whole listing costs
+    /// about the sealed keys plus a few searches per page and segment.
+    fn page_holders(&self, page: &[Hash], col: u8) -> Vec<u32> {
+        let mut out = vec![NONE; page.len()];
+        let (Some(lo), Some(hi)) = (page.first(), page.last()) else {
+            return out;
+        };
+        for (i, s) in self.man.live.iter().enumerate().rev() {
+            if !s.has(col) {
+                continue;
+            }
+            let Some(l) = self.segs.get(&s.index) else {
+                continue;
+            };
+            let keys = l.idx.keys();
+            let start = keys.partition_point(|k| k < lo);
+            for k in keys[start..].iter().take_while(|k| *k <= hi) {
+                if let Ok(j) = page.binary_search(k) {
+                    if out[j] == NONE && l.idx.has(k, col) {
+                        out[j] = i as u32;
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// The keys to seal from a fresh listing, once there are enough of
@@ -1272,10 +1624,9 @@ impl<'a> Pass<'a> {
                     open |= bit(col);
                 }
             }
-            // `content-v1` seals only what retention keeps (ADR 0106); a key
-            // with nothing it keeps is skipped like an unstored one until the
-            // next listing after `list_every`, so mode retire does not
-            // handle the never-sealed rows again every pass.
+            // `content-v1` seals only what retention keeps (ADR 0106); the
+            // listing already left out keys with nothing it keeps, so they
+            // cost no memory between listings.
             let kept = open & self.keep_mask(k);
             if open != 0 && kept == 0 {
                 dead_now.push(*k);
@@ -1314,7 +1665,6 @@ impl<'a> Pass<'a> {
             let dead: HashSet<&Hash> = dead_now.iter().collect();
             state.reseal.retain(|(k, _)| !dead.contains(k));
         }
-        state.unstored.extend(dead_now);
         state.lone_since.retain(|k, _| lone_now.contains(k));
         self.report.unsealed_rows = unsealed_rows;
         if keyed > state.last_unsealed || state.last_growth.is_none() {
@@ -1414,22 +1764,34 @@ impl<'a> Pass<'a> {
     /// Read the rows of one page and seal them, in segments that fit
     /// `max_bytes`. A row gone meanwhile is left out; one whose value does
     /// not decode is remembered and not listed again for a while. A page of
-    /// `content-v1` (rows of up to 64 KiB) is read a batch of keys at a time
-    /// and sealed once its rows reach about the cap, so a pass holds about
-    /// one segment's rows at once.
+    /// `content-v1` (rows of up to 64 KiB, four columns) is read a few keys
+    /// at a time, as many as keep a read near [`READ_BYTES`], and sealed
+    /// once its rows reach about the cap, so a pass holds about one
+    /// segment's rows at once.
     async fn seal_page(
         &mut self,
         page: &[(u64, Hash, u64)],
         state: &mut FamilyState,
     ) -> Result<()> {
-        let (step, cut) = match self.fam.keys {
+        let (mut step, cut) = match self.fam.keys {
             Keys::Changesets => (page.len().max(1), usize::MAX),
-            Keys::Content => (self.opts.batch.max(1), self.max_bytes() / 3 * 4),
+            Keys::Content => (self.read_step, self.max_bytes() / 3 * 4),
         };
         let mut seal: Vec<SealRow> = Vec::new();
         let mut raw = 0usize;
-        for part in page.chunks(step) {
-            for row in self.read_seal_rows(part).await? {
+        let mut at = 0;
+        while at < page.len() {
+            let part = &page[at..(at + step).min(page.len())];
+            at += part.len();
+            let rows = self.read_seal_rows(part).await?;
+            if self.fam.keys == Keys::Content {
+                let read: usize = rows
+                    .iter()
+                    .flat_map(|r| r.values.iter().map(|(_, v)| v.len()))
+                    .sum();
+                step = self.adapt_step(read);
+            }
+            for row in rows {
                 raw += row.values.iter().map(|(_, v)| v.len()).sum::<usize>();
                 seal.push(row);
                 if raw >= cut {
@@ -1439,6 +1801,20 @@ impl<'a> Pass<'a> {
             }
         }
         self.seal_rows(seal, state).await
+    }
+
+    /// The keys to read at once next, after a read of `read` bytes: halved
+    /// past [`READ_BYTES`], doubled (up to the batch) under a quarter of it.
+    /// Changeset rows are small; this only steers `content-v1`.
+    fn adapt_step(&mut self, read: usize) -> usize {
+        let batch = self.opts.batch.max(1);
+        if read > READ_BYTES {
+            self.read_step = (self.read_step / 2).max(1);
+        } else if read < READ_BYTES / 4 {
+            self.read_step = (self.read_step * 2).min(batch);
+        }
+        self.read_step = self.read_step.min(batch);
+        self.read_step
     }
 
     /// The rows of `part` (keys with the columns to seal), as stored now.
@@ -1546,7 +1922,7 @@ impl<'a> Pass<'a> {
     /// third is such rows is rewritten alone (ADR 0106).
     async fn merge(&mut self, state: &mut FamilyState) -> Result<()> {
         let f = self.opts.fanout.max(2);
-        let omit = if self.fam.keys == Keys::Content && !self.man.live.is_empty() {
+        let mut omit = if self.fam.keys == Keys::Content && !self.man.live.is_empty() {
             self.content_live(state).await?;
             self.live_current
         } else {
@@ -1651,9 +2027,11 @@ impl<'a> Pass<'a> {
                 self.mark_unreadable(index, state);
                 continue;
             }
+            let before = values.len();
             if omit {
-                values.retain(|(key, col), _| self.keep_mask(key) & bit(*col) != 0);
+                values.retain(|(key, col), _| self.merge_keep_mask(key) & bit(*col) != 0);
             }
+            let omitted = values.len() != before;
             let mut keys: Vec<Hash> = values.keys().map(|(k, _)| *k).collect();
             keys.sort_unstable();
             keys.dedup();
@@ -1683,6 +2061,17 @@ impl<'a> Pass<'a> {
                 state.oversize.insert(run.iter().map(|s| s.index).collect());
                 continue;
             }
+            // Keys are left out only while the walk that judged them is
+            // current: a ref that moved meanwhile (a revert, a branch at an
+            // old revision) may hold them again. Then nothing more is left
+            // out in this pass, and this run is merged again keeping
+            // everything.
+            if omitted && !self.walk_still_current().await? {
+                omit = false;
+                self.live_current = false;
+                dead.clear();
+                continue;
+            }
             if enc.seg.rows > 0 {
                 self.store(&enc).await?;
             }
@@ -1697,6 +2086,9 @@ impl<'a> Pass<'a> {
             self.write().await?;
             if enc.seg.rows > 0 {
                 state.known.insert(enc.seg.index, enc.seg.columns);
+            }
+            for s in &run {
+                state.known.remove(&s.index);
             }
             state.live_since.insert(enc.seg.index, Instant::now());
             state.verified.insert(enc.seg.index);
@@ -1782,7 +2174,7 @@ impl<'a> Pass<'a> {
             }
             for k in l.idx.keys_with(c.id) {
                 total += 1;
-                if by_liveness && self.keep_mask(k) & bit(c.id) == 0 {
+                if by_liveness && self.merge_keep_mask(k) & bit(c.id) == 0 {
                     dead += 1;
                 }
             }
@@ -1855,7 +2247,7 @@ impl<'a> Pass<'a> {
                 }
                 let col = cands[i].1;
                 let mut j = i;
-                while j < cands.len() && j - i < self.opts.batch.max(1) && cands[j].1 == col {
+                while j < cands.len() && j - i < self.read_step && cands[j].1 == col {
                     j += 1;
                 }
                 let chunk: Vec<(Hash, Loc)> = cands[i..j]
@@ -1879,19 +2271,29 @@ impl<'a> Pass<'a> {
         Ok(())
     }
 
-    /// Whether either blob of `l` carries a blob GC condemnation. A blob GC
-    /// of a binary that cannot read this family (one that started before
-    /// the family's feature was recorded) may have condemned the segment as
-    /// an orphan: its rows are not deleted while it does. They go after the
-    /// next collect, or stay with the segment dropped and sealed again.
+    /// Whether either blob of `l` carries a blob GC condemnation that
+    /// stands (not rescued since, or a delete in flight). A blob GC of a
+    /// binary that cannot read this family (one that started before the
+    /// family's feature was recorded) may have condemned the segment as an
+    /// orphan: its rows are not deleted while it does. They go once a
+    /// collect rescues the segment (its condemnation row stays, answered by
+    /// a rescue row), or stay with the segment dropped and sealed again.
     /// Logged once per segment per process.
     async fn condemned(&mut self, l: &Live, state: &mut FamilyState) -> Result<bool> {
+        let hashes = [l.r.index, l.r.data];
         let marks = self
             .repo
             .row_meta()
-            .get_derived_many(crate::gc::BLOB_CONDEMNED, &[l.r.index, l.r.data])
+            .get_derived_many(crate::gc::BLOB_CONDEMNED, &hashes)
             .await?;
-        if !marks.iter().any(Option::is_some) {
+        let mut stands = false;
+        for (h, m) in hashes.iter().zip(&marks) {
+            if m.is_some() && self.repo.blob_condemned_now(h).await? {
+                stands = true;
+                break;
+            }
+        }
+        if !stands {
             return Ok(false);
         }
         self.condemned.insert(l.r.index);
@@ -1963,6 +2365,10 @@ impl<'a> Pass<'a> {
         let started = std::time::Instant::now();
         let ks: Vec<Hash> = chunk.iter().map(|(k, _)| *k).collect();
         let got = self.repo.row_meta().get_derived_many(kind, &ks).await?;
+        if self.fam.keys == Keys::Content {
+            let read: usize = got.iter().flatten().map(|v| v.len()).sum();
+            self.adapt_step(read);
+        }
         let mut pairs = Vec::with_capacity(ks.len());
         for ((k, loc), row) in chunk.iter().zip(got) {
             let Some(row) = row else { continue };

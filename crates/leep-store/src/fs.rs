@@ -68,6 +68,9 @@ pub struct FsBlobStore {
     /// Whether this process has synced the root since it saw `packs/`, so
     /// the directory's own entry survives a power loss.
     packs_dir_synced: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether a sweep of this handle has put back loose copies a killed
+    /// repack cleanup left moved aside: done once per process.
+    pub(crate) asides_restored: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for FsBlobStore {
@@ -98,6 +101,7 @@ impl FsBlobStore {
             group,
             writes: PackWrites::default(),
             packs_dir_synced: Arc::default(),
+            asides_restored: Arc::default(),
         }
     }
 
