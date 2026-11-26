@@ -340,10 +340,17 @@ the operating system only on `VACUUM FULL derived` (or `pg_repack`) and
   out of their view for a minute (its keys read as rows or derive again,
   every other segment still answers) and try it again; a pass keeps it,
   leaves it out of its merges and retirement, and drops it only once it
-  failed three passes in a row over at least an hour while the family's
-  other segments read (`--derived-segments` passes report it as
-  `failing`). When every live segment of the family fails, the store is
-  taken to be failing: the pass fails and drops nothing.
+  failed three passes in a row over at least
+  `--derived-segments-drop-failing-after` (a day; `off` never) while
+  another segment of the family reads whole (passes report it as
+  `failing`). A streak restarts when its last failure is more than about
+  two pass intervals old, so a lease handoff and one blip do not add up.
+  The default is long because after `retire` a dropped segment's rows
+  exist nowhere else, and a partial outage (a degraded node, timeouts on
+  large blobs only) can fail a good segment for hours. When no live
+  segment of the family reads whole (a family whose only live segment
+  fails included, which therefore fails every pass), the store is taken
+  to be failing: the pass fails and drops nothing.
 - `repair drop` and `repair rederive` hold the same lease as passes.
 - The land path, `cas_ref`, the ref log and the changeset transaction are
   not touched.

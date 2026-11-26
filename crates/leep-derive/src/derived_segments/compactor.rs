@@ -174,12 +174,19 @@ pub struct CompactOptions {
     /// at, instead of the clock.
     pub content_now: Option<i64>,
     /// A live segment whose blobs fail to read (not "not stored", not
-    /// damage: an I/O error, a failing object store key) while the
-    /// family's other segments read is dropped once it failed
+    /// damage: an I/O error, a failing object store key) while another of
+    /// the family's segments reads whole is dropped once it failed
     /// [`FAILING_PASSES`] passes in a row over at least this long: its keys
-    /// then seal again from rows or derive again, instead of the family
-    /// keeping a segment no pass can read.
-    pub drop_failing_after: Duration,
+    /// then seal again from rows or derive again (after `retire`, derive
+    /// again: its rows exist nowhere else), instead of the family keeping a
+    /// segment no pass can read. `None`: never dropped for that
+    /// (`--derived-segments-drop-failing-after`, default a day: a partial
+    /// outage of the store must not throw good segments away).
+    pub drop_failing_after: Option<Duration>,
+    /// A failing segment's streak of passes restarts when its last failure
+    /// is older than this (about two pass intervals): a lease handoff, or a
+    /// quiet spell, then one blip does not count as a streak.
+    pub failing_gap: Duration,
     /// For crash tests only.
     pub pause: Option<PauseHook>,
 }
@@ -209,7 +216,8 @@ impl Default for CompactOptions {
             content_max_bytes: 1 << 20,
             content_max_rows: 16_384,
             content_now: None,
-            drop_failing_after: Duration::from_secs(3600),
+            drop_failing_after: Some(Duration::from_secs(86_400)),
+            failing_gap: Duration::from_secs(600),
             pause: None,
         }
     }
@@ -242,7 +250,8 @@ impl CompactOptions {
             content_max_bytes: 128 << 10,
             content_max_rows: 1_024,
             content_now: None,
-            drop_failing_after: Duration::ZERO,
+            drop_failing_after: Some(Duration::ZERO),
+            failing_gap: Duration::from_secs(3600),
             pause: None,
         }
     }
@@ -309,6 +318,17 @@ pub(crate) const SKIPPED_CAP: usize = 65_536;
 /// (and [`CompactOptions::drop_failing_after`] must have passed).
 pub const FAILING_PASSES: u32 = 3;
 
+/// A failing segment's streak.
+#[derive(Clone, Copy, Debug)]
+struct Failing {
+    /// The first failure of the streak.
+    since: Instant,
+    /// The latest failure.
+    last: Instant,
+    /// Passes of the streak that failed to read it.
+    passes: u32,
+}
+
 /// What a probe of a live segment's blobs found.
 enum Probe {
     Sound,
@@ -369,9 +389,8 @@ struct FamilyState {
     /// in a row agree.
     suspect: HashSet<Hash>,
     /// Live segments whose blobs failed to read (an error that is neither
-    /// "not stored" nor damage) in every pass since the first, with when
-    /// that was and in how many passes.
-    failing: HashMap<Hash, (Instant, u32)>,
+    /// "not stored" nor damage) in every pass of a streak.
+    failing: HashMap<Hash, Failing>,
     /// Rows found unequal to their holding segment's value, with that
     /// segment: not read and reported again while it holds them.
     mismatched: HashMap<(Hash, u8), Hash>,
@@ -1028,16 +1047,17 @@ impl<'a> Pass<'a> {
     /// and the last both found it unreadable. A segment whose blobs fail to
     /// read is kept and left out of this pass's work, and dropped once it
     /// failed [`FAILING_PASSES`] passes in a row over at least
-    /// [`CompactOptions::drop_failing_after`]; when every live segment
-    /// fails, the store is taken to be failing and the pass fails, dropping
-    /// nothing.
+    /// [`CompactOptions::drop_failing_after`]; when no live segment reads
+    /// whole (a family whose only live segment fails included), the store
+    /// is taken to be failing and the pass fails, dropping nothing.
     async fn check_live(&mut self, state: &mut FamilyState) -> Result<()> {
         let mut bad = Vec::new();
         let mut failing = Vec::new();
+        let mut sound = 0usize;
         let mut first_error = None;
         for s in self.man.live.clone() {
             match self.probe(&s, state).await {
-                Probe::Sound => {}
+                Probe::Sound => sound += 1,
                 Probe::Lost => bad.push(s),
                 Probe::Failing(e) => {
                     failing.push(s);
@@ -1046,17 +1066,29 @@ impl<'a> Pass<'a> {
             }
         }
         let now = Instant::now();
-        state
-            .failing
-            .retain(|h, _| failing.iter().any(|s| s.index == *h));
+        let gap = self.opts.failing_gap;
+        // Streaks of segments that read again, or whose last failure is
+        // older than the gap (passes elsewhere, or none), end.
+        state.failing.retain(|h, f| {
+            failing.iter().any(|s| s.index == *h) && now.duration_since(f.last) <= gap
+        });
         if let Some(e) = first_error {
-            if failing.len() == self.man.live.len() {
+            // Only a family with a segment that reads whole tells a failing
+            // segment from a failing store: otherwise (a lone live segment
+            // included) the pass fails and drops nothing.
+            if sound == 0 {
                 return Err(e);
             }
             self.report.failing = failing.len() as u64;
             for s in &failing {
-                let entry = state.failing.entry(s.index).or_insert((now, 0));
-                entry.1 += 1;
+                let f = state.failing.entry(s.index).or_insert(Failing {
+                    since: now,
+                    last: now,
+                    passes: 0,
+                });
+                f.last = now;
+                f.passes += 1;
+                let f = *f;
                 self.unreadable.insert(s.index);
                 state.verified.remove(&s.index);
                 metrics::counter!(
@@ -1064,14 +1096,15 @@ impl<'a> Pass<'a> {
                     "what" => "failing", "family" => self.fam.name
                 )
                 .increment(1);
-                let (since, passes) = *entry;
-                if passes >= FAILING_PASSES
-                    && now.duration_since(since) >= self.opts.drop_failing_after
-                {
+                let due = self
+                    .opts
+                    .drop_failing_after
+                    .is_some_and(|after| now.duration_since(f.since) >= after);
+                if f.passes >= FAILING_PASSES && due {
                     tracing::error!(
                         segment = %s.index,
                         family = self.fam.name,
-                        passes,
+                        passes = f.passes,
                         error = %e,
                         "a derived segment's blobs failed to read in every pass for a while; \
                          dropping it, its keys seal again from rows or derive again"
@@ -1081,7 +1114,7 @@ impl<'a> Pass<'a> {
                     tracing::warn!(
                         segment = %s.index,
                         family = self.fam.name,
-                        passes,
+                        passes = f.passes,
                         error = %e,
                         "a derived segment's blobs cannot be read now; it is kept and skipped"
                     );
@@ -1097,7 +1130,7 @@ impl<'a> Pass<'a> {
             let failed = state
                 .failing
                 .get(&s.index)
-                .is_some_and(|(_, n)| *n >= FAILING_PASSES);
+                .is_some_and(|f| f.passes >= FAILING_PASSES);
             if careful && !failed && !state.suspect.contains(&s.index) {
                 tracing::warn!(
                     segment = %s.index,

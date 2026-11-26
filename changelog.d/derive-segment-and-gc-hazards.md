@@ -4,8 +4,10 @@
   family on every server, lands included, and every compactor pass. Now
   just that segment is left out (its keys read as rows or derive again)
   and tried again each minute; passes skip it and drop it once it failed
-  three passes in a row over at least an hour while the family's other
-  segments read.
+  three passes in a row over at least
+  `--derived-segments-drop-failing-after` (new flag, default a day, `off`
+  never) while another segment of the family reads whole. A family whose
+  only live segment fails still fails its passes.
 - **Fixed.** Derived segment blobs are read with an exact miss
   (`get_exact` after a `get` miss): a segment another process packed a
   moment ago is no longer dropped by a pass (mode `build`) or hidden from

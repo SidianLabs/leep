@@ -1591,7 +1591,7 @@ async fn transient_errors_drop_nothing_and_losses_need_two_passes() {
     // (others read), or fails when every segment fails; it drops nothing.
     let mut fresh_state = CompactState::default();
     let slow = CompactOptions {
-        drop_failing_after: Duration::from_secs(3600),
+        drop_failing_after: Some(Duration::from_secs(3600)),
         ..CompactOptions::small(Mode::Retire)
     };
     for _ in 0..4 {
@@ -2121,4 +2121,81 @@ async fn a_listing_keeps_only_keys_with_work() {
     .await;
     let p = pass(&r, &o, &mut st, None).await;
     assert!(p.listed_keys > 0, "{p:?}");
+}
+
+/// Four segments on a store whose reads of chosen blobs fail.
+async fn four_flaky() -> (
+    Repo,
+    Arc<Flaky>,
+    Arc<dyn leep_core::BlobStore>,
+    Vec<SegmentRef>,
+) {
+    let blobs: Arc<dyn leep_core::BlobStore> = Arc::new(MemoryBlobStore::new());
+    let flaky = Arc::new(Flaky {
+        inner: blobs.clone(),
+        failing: Mutex::default(),
+    });
+    let r = Repo::new(flaky.clone(), Arc::new(MemoryMetaStore::new()));
+    let live = four_segments(&r, &mut CompactState::default()).await;
+    (r, flaky, blobs, live)
+}
+
+/// A failing segment is dropped only while another segment of the family
+/// reads whole: lost segments beside it do not count, and the pass fails,
+/// dropping nothing.
+#[tokio::test]
+async fn a_failing_segment_needs_a_sound_one_beside_it_to_be_dropped() {
+    let (r, flaky, blobs, live) = four_flaky().await;
+    flaky.failing.lock().unwrap().insert(live[0].data);
+    for s in &live[1..] {
+        blobs.delete(&s.data).await.unwrap();
+    }
+    let opts = CompactOptions {
+        fanout: 64,
+        ..CompactOptions::small(Mode::Build)
+    };
+    let before = read_manifest(&r, FAMILY_CHANGESET).await.unwrap().0;
+    let mut st = CompactState::default();
+    for _ in 0..4 {
+        assert!(compact_pass(&r, &opts, &mut st, None).await.is_err());
+    }
+    assert_eq!(read_manifest(&r, FAMILY_CHANGESET).await.unwrap().0, before);
+}
+
+/// A failing segment's streak restarts when its last failure is older than
+/// `failing_gap` (another server ran the passes, or none ran): passes on
+/// either side of a gap do not add up to a drop.
+#[tokio::test(start_paused = true)]
+async fn a_failing_streak_restarts_after_a_gap() {
+    let (r, flaky, _, live) = four_flaky().await;
+    flaky.failing.lock().unwrap().insert(live[1].data);
+    let opts = CompactOptions {
+        fanout: 64,
+        drop_failing_after: Some(Duration::ZERO),
+        failing_gap: Duration::from_secs(600),
+        ..CompactOptions::small(Mode::Build)
+    };
+    let mut st = CompactState::default();
+    let p = v1(&pass(&r, &opts, &mut st, None).await);
+    assert_eq!((p.failing, p.dropped), (1, 0));
+    tokio::time::advance(Duration::from_secs(601)).await;
+    for _ in 0..2 {
+        let p = v1(&pass(&r, &opts, &mut st, None).await);
+        assert_eq!((p.failing, p.dropped), (1, 0), "{p:?}");
+    }
+    // The third pass of the new streak drops it.
+    let p = v1(&pass(&r, &opts, &mut st, None).await);
+    assert_eq!(p.dropped, 1, "{p:?}");
+    // Never with `drop_failing_after` off.
+    let (r, flaky, _, live) = four_flaky().await;
+    flaky.failing.lock().unwrap().insert(live[1].data);
+    let off = CompactOptions {
+        drop_failing_after: None,
+        ..opts
+    };
+    let mut st = CompactState::default();
+    for _ in 0..6 {
+        let p = v1(&pass(&r, &off, &mut st, None).await);
+        assert_eq!(p.dropped, 0, "{p:?}");
+    }
 }

@@ -1660,8 +1660,12 @@ recompute every value):
   key). Readers leave just that segment out (its keys read as rows or
   derive again) and try it again every minute; passes skip it, and drop it
   (`failed to read in every pass for a while; dropping it`) once it failed
-  three passes in a row over an hour. Fix the store, or let the pass drop
-  it.
+  three passes in a row over `--derived-segments-drop-failing-after` (a
+  day by default) while another segment of the family reads. Fix the
+  store, or let the pass drop it (after `retire` its rows then derive
+  again). If the family's only live segment fails, every pass of the
+  family fails until the store reads it again or `repair drop` names the
+  family's kinds.
 - `bad_derived_segment`, or a note that a segment is not stored: a segment
   blob was lost or damaged (a disk, an older `gc` that collected it, or a
   restore of a backup an older `leep-server` took: its listing copy could
