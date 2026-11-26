@@ -28,6 +28,7 @@ meta.
 | `blob-condemned-v1` | unix seconds, 8 bytes big-endian, from the GC host's clock | condemn |
 | `blob-rescue-v1` | the condemnation time the writer observed, 8 bytes big-endian | uploads of a condemned blob; collect, for blobs a changeset references |
 | `blob-doom-v1` | condemnation time (8 bytes big-endian), then one state byte: 0 deleting, 1 abandoned, 2 deleted | collect |
+| `blob-doom-seen-v1` | the condemnation time a `deleted` doom answers, then when a collect first saw it (8 bytes big-endian each; added 2026-11-25, see "Pruning") | collect |
 | `blob-claim-v1` | unchanged (ADR 0008); now also written by every upload | `missing_blobs`, `put_blob` |
 
 A blob is **condemned** iff its condemnation time is strictly greater than its
@@ -182,7 +183,10 @@ steps back.
   in a `blob-doom-seen-v1` row (the condemnation time the doom answers,
   then the collect's start time), when it first sees a blob's doom say
   `deleted` for the condemnation that stands; never in the run that
-  deleted it. Once that is 30 days old, a collect deletes the condemnation,
+  deleted it, which also drops any seen row left from an earlier delete of
+  the same blob (stored again without its condemnation answered, then
+  collected for that same condemnation), so a sighting always starts at
+  the latest delete. Once that is 30 days old, a collect deletes the condemnation,
   rescue, doom and doom-seen rows: the condemnation first, so a reader in
   between finds none, as it does after. The age counts from the delete, not
   the condemnation: a blob condemned long ago keeps its rows through the

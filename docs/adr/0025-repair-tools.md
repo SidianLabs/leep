@@ -74,7 +74,7 @@ and the ref log is replayed.
 | `blame` | decodes; has one entry per line of the file at the tip with that line's text; credits only stored changesets. A recomputation that credits lines differently is a note, not a problem: blame diffs run under a time limit (blame.rs), so two correct answers can differ |
 | `signature-v1`, `review-v1` | decode; a signature's key id matches its public key. With `--full`, each row is matched to its changeset (by hashing every stored changeset with every key id and reviewer found in a row: the row key hashes them in) and signatures are verified with Ed25519. A row that matches no changeset is `bad_attestation`. Whether a key is trusted is server configuration, not store data, so it is not checked |
 | `rebased-origin-v1` | 32 bytes, naming two stored changesets |
-| `blob-claim-v1`, `blob-condemned-v1`, `blob-rescue-v1`, `blob-doom-v1` | decode (`gc::decode_row`) |
+| `blob-claim-v1`, `blob-condemned-v1`, `blob-rescue-v1`, `blob-doom-v1`, `blob-doom-seen-v1` | decode (`gc::decode_row`) |
 | ref log | newest first, each entry's `new` equals the next newer entry's `old` (`reflog_chain_break`), and the newest entry of each ref equals the ref (`reflog_divergence`). A ref with no entries is counted, not reported: refs that moved before ADR 0018 have none. A divergence is looked at again, up to three times, before it is reported, so a ref that moved while `verify` ran is not a finding |
 
 **Recomputation is local, in history order, with substitution.** A row is
@@ -155,7 +155,7 @@ its node.
 |---|---|
 | `signature-v1`, `review-v1` | attestations clients and reviewers submitted; nothing in history contains them |
 | `rebased-origin-v1` | written by `rebase` to link a server-made copy to its original; the copy's `extra` does not say which changeset the server rebased (a client can forge `leep.rebased_from`), and `land`'s retry detection (ADR 0021) and signature `via` depend on it |
-| `blob-claim-v1`, `blob-condemned-v1`, `blob-rescue-v1`, `blob-doom-v1` | the GC fence (ADR 0012). Dropping a rescue or doom row, or a claim a client relied on, can let a collect delete a blob a client was just told it may reuse |
+| `blob-claim-v1`, `blob-condemned-v1`, `blob-rescue-v1`, `blob-doom-v1`, `blob-doom-seen-v1` | the GC fence (ADR 0012). Dropping a rescue or doom row, or a claim a client relied on, can let a collect delete a blob a client was just told it may reuse; dropping doom-seen rows would only delay pruning, but they are fence bookkeeping too |
 | `history-node-v1` alone | `history-tree-v1` rows point at these nodes; drop `history-tree-v1`, which removes both |
 | the ref log | not derived: the only record of how refs moved |
 | any other name | unknown to this version, possibly written by a newer one |

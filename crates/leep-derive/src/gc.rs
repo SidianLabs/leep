@@ -1546,14 +1546,18 @@ async fn collect_leased(
 /// the same bytes afterwards finds no condemnation and stores them as new.
 pub const FENCE_ROW_RETENTION: Duration = Duration::from_secs(30 * 86_400);
 
-/// A [`BLOB_DOOM_SEEN`] value.
-fn seen_value(epoch: i64, at: i64) -> Bytes {
+/// A [`BLOB_DOOM_SEEN`] value. Public only for the fuzz harness.
+#[doc(hidden)]
+pub fn seen_value(epoch: i64, at: i64) -> Bytes {
     let mut v = epoch.to_be_bytes().to_vec();
     v.extend_from_slice(&at.to_be_bytes());
     Bytes::from(v)
 }
 
-fn decode_seen(v: &[u8]) -> Option<(i64, i64)> {
+/// A [`BLOB_DOOM_SEEN`] value's condemnation time and when it was seen.
+/// Public only for the fuzz harness.
+#[doc(hidden)]
+pub fn decode_seen(v: &[u8]) -> Option<(i64, i64)> {
     let (e, t) = v.split_at_checked(8)?;
     Some((
         i64::from_be_bytes(e.try_into().ok()?),
@@ -1582,6 +1586,16 @@ async fn prune_fence_rows(
     deleted_now: &HashSet<Hash>,
 ) -> Result<u64> {
     let before = now.saturating_sub(secs(FENCE_ROW_RETENTION));
+    // A blob deleted again (stored again without its condemnation being
+    // answered, then collected for the same condemnation) starts a new
+    // sighting: a seen row from its earlier delete must not count.
+    let again: Vec<Hash> = deleted_now.iter().copied().collect();
+    for chunk in again.chunks(PRUNE_PAGE) {
+        crate::gc_lease::check(lease)?;
+        repo.meta()
+            .delete_derived_keys(&[BLOB_DOOM_SEEN], chunk)
+            .await?;
+    }
     let mut pruned = 0;
     let mut after = None;
     loop {
@@ -1640,6 +1654,11 @@ async fn prune_fence_rows(
                 repo.meta()
                     .delete_derived_keys(&[BLOB_CONDEMNED], &done)
                     .await?;
+                // One statement on the SQL stores, so a seen row never
+                // outlives its doom there. A crash between the two calls
+                // leaves rescue, doom and seen rows without a condemnation:
+                // the next collect finds the doom answering no standing
+                // condemnation and its seen row old, and finishes.
                 repo.meta()
                     .delete_derived_keys(&[BLOB_RESCUE, BLOB_DOOM, BLOB_DOOM_SEEN], &done)
                     .await?;
@@ -2447,6 +2466,86 @@ mod tests {
         assert_eq!(r.missing_blobs(&[orphan]).await.unwrap(), [orphan]);
         blobs.put(Bytes::from("pruned")).await.unwrap();
         assert!(r.missing_blobs(&[orphan]).await.unwrap().is_empty());
+
+        // The later orphan: its delete is seen, then it is uploaded again
+        // (through the rescue path), orphaned and condemned anew. Its stale
+        // seen row (the old condemnation) is not trusted: the collect that
+        // deletes it again prunes nothing, and the next one records the new
+        // delete as seen from then.
+        let t2 = seen + retention + FENCE;
+        collect(&r, &opts(1, false), &TestClock::at(t2))
+            .await
+            .unwrap();
+        let seen_of = |r: Repo, h: Hash| async move {
+            decode_seen(
+                &r.meta()
+                    .get_derived(BLOB_DOOM_SEEN, &h)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let (old_epoch, _) = seen_of(r.clone(), late).await;
+        r.rescue(late, Bytes::from("later"), old_epoch)
+            .await
+            .unwrap();
+        assert!(blobs.contains(&late).await.unwrap());
+        age_all(&blobs).await;
+        let t3 = t2 + 2 * retention;
+        let again = gc_at(&r, 1, false, t3).await;
+        assert!(!blobs.contains(&late).await.unwrap());
+        assert_eq!(again.collect.fence_rows_pruned, 0, "{again:?}");
+        let rep = collect(&r, &opts(1, false), &TestClock::at(t3 + 2 * FENCE))
+            .await
+            .unwrap();
+        assert_eq!(rep.fence_rows_pruned, 0);
+        let (epoch, at) = seen_of(r.clone(), late).await;
+        assert!(epoch > old_epoch, "rewritten for the new condemnation");
+        assert_eq!(at, t3 + 2 * FENCE);
+
+        // Stored again with no rescue (bypassing the fence) and deleted for
+        // the same condemnation: the earlier sighting does not count.
+        let (epoch_now, seen_at) = seen_of(r.clone(), late).await;
+        blobs.put(Bytes::from("later")).await.unwrap();
+        age_all(&blobs).await;
+        let t4 = seen_at + retention + FENCE;
+        let rep = collect(&r, &opts(1, false), &TestClock::at(t4))
+            .await
+            .unwrap();
+        // (The first orphan, uploaded and deleted again earlier, goes now.)
+        assert_eq!(rep.deleted, 1, "{rep:?}");
+        assert!(!blobs.contains(&late).await.unwrap());
+        assert!(r
+            .meta()
+            .get_derived(BLOB_CONDEMNED, &late)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(r
+            .meta()
+            .get_derived(BLOB_DOOM_SEEN, &late)
+            .await
+            .unwrap()
+            .is_none());
+        let rep = collect(&r, &opts(1, false), &TestClock::at(t4 + FENCE))
+            .await
+            .unwrap();
+        assert_eq!(rep.fence_rows_pruned, 0);
+        assert_eq!(seen_of(r.clone(), late).await, (epoch_now, t4 + FENCE));
+        let at = t4 + FENCE;
+
+        // A prune killed between its two deletes: the condemnation is gone,
+        // the doom and seen rows are left. The next collect finishes.
+        r.meta()
+            .delete_derived_keys(&[BLOB_CONDEMNED], &[late])
+            .await
+            .unwrap();
+        let rep = collect(&r, &opts(1, false), &TestClock::at(at + retention))
+            .await
+            .unwrap();
+        assert_eq!(rep.fence_rows_pruned, 1);
+        assert_eq!(rows(r.clone(), late).await, 0);
     }
 
     #[tokio::test]

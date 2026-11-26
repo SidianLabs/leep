@@ -331,6 +331,14 @@ fn rows(out: &mut Out) {
         7,
     );
     out.add("gc_rows", "mark-segment", with_prefix(5, &segment));
+    out.add(
+        "gc_rows",
+        "doom-seen",
+        with_prefix(
+            6,
+            &leep_derive::gc::seen_value(1_760_000_000, 1_760_000_600),
+        ),
+    );
 
     {
         use leep_derive::derived_segments::codec;
