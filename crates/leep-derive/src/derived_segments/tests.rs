@@ -2199,3 +2199,119 @@ async fn a_failing_streak_restarts_after_a_gap() {
         assert_eq!(p.dropped, 0, "{p:?}");
     }
 }
+
+/// A store whose reads fail once `fail` is set while its existence checks
+/// still answer (reads throttled while HEADs work).
+struct ReadsFail {
+    inner: Arc<dyn leep_core::BlobStore>,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl leep_core::BlobStore for ReadsFail {
+    async fn put_with_hash(&self, hash: Hash, data: Bytes) -> leep_core::Result<()> {
+        self.inner.put_with_hash(hash, data).await
+    }
+    async fn get(&self, hash: &Hash) -> leep_core::Result<Option<Bytes>> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(Error::Storage("read timed out".into()));
+        }
+        self.inner.get(hash).await
+    }
+    async fn get_exact(&self, hash: &Hash) -> leep_core::Result<Option<Bytes>> {
+        self.get(hash).await
+    }
+    async fn contains(&self, hash: &Hash) -> leep_core::Result<bool> {
+        self.inner.contains(hash).await
+    }
+    async fn list_page(
+        &self,
+        after: Option<Hash>,
+        limit: usize,
+    ) -> leep_core::Result<Vec<leep_core::BlobMeta>> {
+        self.inner.list_page(after, limit).await
+    }
+    async fn delete(&self, hash: &Hash) -> leep_core::Result<()> {
+        self.inner.delete(hash).await
+    }
+}
+
+/// When every read fails but existence checks answer, segments this
+/// process read whole earlier (its own seals) do not count as sound
+/// neighbours: another server's failing segment is not dropped.
+#[tokio::test]
+async fn existence_checks_alone_never_vouch_for_a_drop() {
+    let store = Arc::new(ReadsFail {
+        inner: Arc::new(MemoryBlobStore::new()),
+        fail: std::sync::atomic::AtomicBool::new(false),
+    });
+    let r = Repo::new(store.clone(), Arc::new(MemoryMetaStore::new()));
+    // This process seals four segments; another server seals a fifth.
+    let mut mine = CompactState::default();
+    four_segments(&r, &mut mine).await;
+    let opts = CompactOptions {
+        fanout: 64,
+        drop_failing_after: Some(Duration::ZERO),
+        ..CompactOptions::small(Mode::Build)
+    };
+    let (_, ManifestRead::Read(m)) = read_manifest(&r, FAMILY_CHANGESET).await.unwrap() else {
+        panic!()
+    };
+    let mut tip = m.live.len();
+    let mut head = commit(&r, &[], &[("g", Some("0"))], "g").await;
+    for i in 0..4 {
+        head = commit(&r, &[head], &[("g", Some(&format!("{i}")))], "g").await;
+    }
+    derive::<HistoryTree>(&r, head).await.unwrap();
+    pass(&r, &opts, &mut CompactState::default(), None).await;
+    let before = read_manifest(&r, FAMILY_CHANGESET).await.unwrap().0;
+    let (_, ManifestRead::Read(m)) = read_manifest(&r, FAMILY_CHANGESET).await.unwrap() else {
+        panic!()
+    };
+    assert!(m.live.len() > tip, "{m:?}");
+    tip = m.live.len();
+    store.fail.store(true, Ordering::SeqCst);
+    for _ in 0..5 {
+        assert!(compact_pass(&r, &opts, &mut mine, None).await.is_err());
+    }
+    let after = read_manifest(&r, FAMILY_CHANGESET).await.unwrap();
+    assert_eq!(after.0, before);
+    let ManifestRead::Read(m) = after.1 else {
+        panic!()
+    };
+    assert_eq!(m.live.len(), tip);
+}
+
+/// A pass longer than the gap keeps a streak going: the gap counts from
+/// the end of the previous pass, not from the failure inside it.
+#[tokio::test(start_paused = true)]
+async fn a_long_pass_does_not_end_a_failing_streak() {
+    let (r, flaky, _, live) = four_flaky().await;
+    flaky.failing.lock().unwrap().insert(live[1].data);
+    let opts = CompactOptions {
+        fanout: 64,
+        drop_failing_after: Some(Duration::ZERO),
+        failing_gap: Duration::from_secs(600),
+        pause: Some(PauseHook(Arc::new(|at| {
+            Box::pin(async move {
+                if at == "seal-stored" {
+                    tokio::time::sleep(Duration::from_secs(700)).await;
+                }
+            })
+        }))),
+        ..CompactOptions::small(Mode::Build)
+    };
+    let mut st = CompactState::default();
+    let mut head = commit(&r, &[], &[("h", Some("0"))], "h").await;
+    let mut dropped = 0;
+    for p in 0..3 {
+        for i in 0..4 {
+            head = commit(&r, &[head], &[("h", Some(&format!("{p}.{i}")))], "h").await;
+        }
+        derive::<HistoryTree>(&r, head).await.unwrap();
+        let rep = v1(&pass(&r, &opts, &mut st, None).await);
+        assert!(rep.sealed_segments > 0, "{rep:?}");
+        dropped += rep.dropped;
+    }
+    assert_eq!(dropped, 1);
+}

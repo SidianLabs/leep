@@ -183,9 +183,10 @@ pub struct CompactOptions {
     /// (`--derived-segments-drop-failing-after`, default a day: a partial
     /// outage of the store must not throw good segments away).
     pub drop_failing_after: Option<Duration>,
-    /// A failing segment's streak of passes restarts when its last failure
-    /// is older than this (about two pass intervals): a lease handoff, or a
-    /// quiet spell, then one blip does not count as a streak.
+    /// A failing segment's streak of passes restarts when this process's
+    /// last pass of the family ended longer ago than this (about two pass
+    /// intervals): a lease handoff, or a quiet spell, then one blip does not
+    /// count as a streak.
     pub failing_gap: Duration,
     /// For crash tests only.
     pub pause: Option<PauseHook>,
@@ -323,8 +324,6 @@ pub const FAILING_PASSES: u32 = 3;
 struct Failing {
     /// The first failure of the streak.
     since: Instant,
-    /// The latest failure.
-    last: Instant,
     /// Passes of the streak that failed to read it.
     passes: u32,
 }
@@ -409,6 +408,8 @@ struct FamilyState {
     /// and skipped like `unstored` (cleared with it), so they do not make
     /// every listing a backfill again.
     bad: HashSet<(Hash, u8)>,
+    /// When this process's last pass of the family ended.
+    last_pass_end: Option<Instant>,
     /// When `unstored` was last cleared.
     unstored_cleared: Option<Instant>,
     /// The last listing: when, and the estimated row count then.
@@ -857,6 +858,7 @@ impl<'a> Pass<'a> {
             .get_or_insert_with(std::time::Instant::now);
         let fam_state = state.families.entry(self.fam.id).or_default();
         let r = self.run_family(fam_state).await;
+        fam_state.last_pass_end = Some(Instant::now());
         self.budget.retired_rows += self.report.retired_rows;
         state.budget = self.budget;
         r
@@ -1023,19 +1025,27 @@ impl<'a> Pass<'a> {
         if state.verified.contains(&s.index) {
             return present(s.data).await;
         }
-        let bytes = match get_segment_blob(&*blobs, &s.data).await {
+        let read = self.read_whole(&live).await;
+        if matches!(read, Probe::Sound) {
+            state.verified.insert(s.index);
+        }
+        read
+    }
+
+    /// Read `live`'s data blob whole and decode every value: a real read,
+    /// not an existence check.
+    async fn read_whole(&self, live: &Live) -> Probe {
+        let s = &live.r;
+        let bytes = match get_segment_blob(&**self.repo.blobs(), &s.data).await {
             Ok(Some(b)) => b,
             Ok(None) => return Probe::Lost,
             Err(e) if crate::gc_segments::segment_reads_corrupt(&e) => return Probe::Lost,
             Err(e) => return Probe::Failing(e),
         };
-        let sound = codec::decode_data(&live.idx, &s.data, bytes)
-            .and_then(|d| codec::read_all(&live.idx, &d).map(|_| d));
-        match sound {
-            Ok(_) => {
-                state.verified.insert(s.index);
-                Probe::Sound
-            }
+        match codec::decode_data(&live.idx, &s.data, bytes)
+            .and_then(|d| codec::read_all(&live.idx, &d).map(|_| d))
+        {
+            Ok(_) => Probe::Sound,
             Err(_) => Probe::Lost,
         }
     }
@@ -1053,11 +1063,11 @@ impl<'a> Pass<'a> {
     async fn check_live(&mut self, state: &mut FamilyState) -> Result<()> {
         let mut bad = Vec::new();
         let mut failing = Vec::new();
-        let mut sound = 0usize;
+        let mut sound: Vec<SegmentRef> = Vec::new();
         let mut first_error = None;
         for s in self.man.live.clone() {
             match self.probe(&s, state).await {
-                Probe::Sound => sound += 1,
+                Probe::Sound => sound.push(s),
                 Probe::Lost => bad.push(s),
                 Probe::Failing(e) => {
                     failing.push(s);
@@ -1066,27 +1076,41 @@ impl<'a> Pass<'a> {
             }
         }
         let now = Instant::now();
-        let gap = self.opts.failing_gap;
-        // Streaks of segments that read again, or whose last failure is
-        // older than the gap (passes elsewhere, or none), end.
-        state.failing.retain(|h, f| {
-            failing.iter().any(|s| s.index == *h) && now.duration_since(f.last) <= gap
-        });
+        // Streaks end for segments that read again, and all of them when
+        // this process ran no pass of the family for longer than the gap
+        // (passes elsewhere, or none), measured from the end of its last
+        // pass, so a pass longer than the interval does not end them.
+        let recent = state
+            .last_pass_end
+            .is_some_and(|end| now.duration_since(end) <= self.opts.failing_gap);
+        state
+            .failing
+            .retain(|h, _| recent && failing.iter().any(|s| s.index == *h));
         if let Some(e) = first_error {
-            // Only a family with a segment that reads whole tells a failing
-            // segment from a failing store: otherwise (a lone live segment
-            // included) the pass fails and drops nothing.
-            if sound == 0 {
+            // Only a family with a segment that reads whole in this pass
+            // tells a failing segment from a failing store: an existence
+            // check (a segment read whole earlier) is not enough, since a
+            // store can answer those while its reads fail. Otherwise (a
+            // lone live segment included) the pass fails and drops nothing.
+            let mut whole = false;
+            for s in &sound {
+                let Some(live) = self.segs.get(&s.index).cloned() else {
+                    continue;
+                };
+                if matches!(self.read_whole(&live).await, Probe::Sound) {
+                    whole = true;
+                    break;
+                }
+            }
+            if !whole {
                 return Err(e);
             }
             self.report.failing = failing.len() as u64;
             for s in &failing {
                 let f = state.failing.entry(s.index).or_insert(Failing {
                     since: now,
-                    last: now,
                     passes: 0,
                 });
-                f.last = now;
                 f.passes += 1;
                 let f = *f;
                 self.unreadable.insert(s.index);

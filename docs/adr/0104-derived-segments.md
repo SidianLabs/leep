@@ -342,9 +342,13 @@ the operating system only on `VACUUM FULL derived` (or `pg_repack`) and
   leaves it out of its merges and retirement, and drops it only once it
   failed three passes in a row over at least
   `--derived-segments-drop-failing-after` (a day; `off` never) while
-  another segment of the family reads whole (passes report it as
-  `failing`). A streak restarts when its last failure is more than about
-  two pass intervals old, so a lease handoff and one blip do not add up.
+  another segment of the family reads whole in the same pass (a real read
+  of its data, not the existence check a segment read whole earlier gets:
+  a store can answer those while its reads fail; passes report it as
+  `failing`). A streak restarts when this process's last pass of the
+  family ended more than about two pass intervals ago, so a lease handoff
+  and one blip do not add up, and a pass longer than the interval does not
+  end it.
   The default is long because after `retire` a dropped segment's rows
   exist nowhere else, and a partial outage (a degraded node, timeouts on
   large blobs only) can fail a good segment for hours. When no live
