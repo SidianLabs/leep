@@ -886,16 +886,25 @@ impl BackgroundRepack {
             .filter(|(h, _)| !self.auto.sniffed.contains_key(h))
             .copied()
             .collect();
-        let matched: HashSet<Hash> = self
+        // A file that cannot be read is counted as waiting, not cached, and
+        // read again at the next check: one bad file must not stop every
+        // check (a run that reads it reports it, as before).
+        match self
             .store
             .loose_matching(unsniffed.clone(), &auto.leave_loose)
-            .await?
-            .into_iter()
-            .collect();
-        for (h, _) in unsniffed {
-            self.auto.sniffed.insert(h, matched.contains(&h));
+            .await
+        {
+            Ok(matched) => {
+                let matched: HashSet<Hash> = matched.into_iter().collect();
+                for (h, _) in unsniffed {
+                    self.auto.sniffed.insert(h, matched.contains(&h));
+                }
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "reading the first bytes of loose objects failed; they count as waiting"
+            ),
         }
-        drop(matched);
         let segments: HashSet<Hash> = self
             .auto
             .sniffed
@@ -1082,13 +1091,11 @@ impl BackgroundRepack {
                         out
                     };
                 if !segments.is_empty() {
-                    subset.extend(
-                        order
-                            .objects
-                            .iter()
-                            .map(|(h, _)| h)
-                            .filter(|h| segments.contains(h)),
-                    );
+                    // Not those a pending cleanup or an operator holds.
+                    let held: HashSet<&Hash> = self.pending.iter().flat_map(|w| &w.loose).collect();
+                    subset.extend(order.objects.iter().map(|(h, _)| h).filter(|h| {
+                        segments.contains(h) && !held.contains(h) && !self.auto.corrupt.contains(h)
+                    }));
                 }
                 let opts = RepackOptions {
                     level: auto.level,

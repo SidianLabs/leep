@@ -9,8 +9,8 @@
 //! background work runs: the automatic delta repack (ADR 0100) checks every
 //! second and takes objects 2 s old, the fence is 3 s, and the automatic
 //! changeset compaction (ADR 0101) looks every 2 s. Once the blob store and
-//! the database stop changing (every loose object packed, every retired
-//! pack swept, every changeset row compressed), it checks:
+//! the database stop changing (every loose object but segment blobs packed,
+//! every retired pack swept, every changeset row compressed), it checks:
 //!
 //! - blob store bytes per land and database bytes per land, settled;
 //! - all storage (database above an empty one, plus blobs) against Git's
@@ -385,7 +385,10 @@ fn dir_bytes(dir: &Path) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Sizes {
     blobs: u64,
+    /// Loose objects that a repack packs, and loose segment blobs, which
+    /// stay loose until GC deletes them (ADR 0108).
     loose: usize,
+    segments: usize,
     retired: usize,
     db: u64,
     /// Changeset rows not compressed, and dictionaries stored.
@@ -404,10 +407,18 @@ fn blobs_dir(stores: &Stores) -> std::path::PathBuf {
 fn sizes(stores: &Stores) -> Sizes {
     use sqlx::Connection;
     let dir = blobs_dir(stores);
-    let mut loose = 0;
+    let prefixes = leep_derive::segment_blob_prefixes();
+    let (mut loose, mut segments) = (0, 0);
     for shard in fs::read_dir(&dir).unwrap().flatten() {
         if shard.file_name().len() == 2 {
-            loose += fs::read_dir(shard.path()).unwrap().flatten().count();
+            for f in fs::read_dir(shard.path()).unwrap().flatten() {
+                match fs::read(f.path()) {
+                    Ok(b) if prefixes.iter().any(|p| b.starts_with(p)) => segments += 1,
+                    Ok(_) => loose += 1,
+                    // Packed and unlinked since the listing.
+                    Err(_) => {}
+                }
+            }
         }
     }
     let retired = fs::read_to_string(dir.join("packs/retired"))
@@ -496,6 +507,7 @@ fn sizes(stores: &Stores) -> Sizes {
     Sizes {
         blobs: dir_bytes(&dir),
         loose,
+        segments,
         retired,
         db,
         plain_rows,
@@ -505,8 +517,9 @@ fn sizes(stores: &Stores) -> Sizes {
     }
 }
 
-/// Wait until every loose object is packed, every retired pack swept, the
-/// rows compressed (with `compacted`), and nothing changes for 2 s.
+/// Wait until every loose object but segment blobs is packed (ADR 0108),
+/// every retired pack swept, the rows compressed (with `compacted`), and
+/// nothing changes for 2 s.
 fn settle(stores: &Stores, server: &Server, compacted: bool) -> Sizes {
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut last = sizes(stores);

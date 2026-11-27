@@ -82,3 +82,14 @@ repack, so a crash at any step leaves it where it was.
 - A store with many loose segment blobs and nothing else loose never runs
   a delta repack for them; `leep-server verify` and backups see them as the
   loose objects they are.
+- A file that starts with a segment prefix and that history names is not
+  counted as waiting either, so on an old store that holds one it is packed
+  only by a run something else starts (or by `leep-server repack`); one
+  past the walk limit stays loose.
+- A repack no longer reads a loose segment blob, so it no longer reports a
+  damaged one whose first bytes still match as corrupt; `leep-server verify
+  --full --rehash` and readers still find it.
+- A full repack's `loose_after` counts the segment blobs it left loose
+  (`left_loose`), so it is no longer zero on a server that writes them.
+- A loose file the task cannot read counts as waiting, is logged, and is
+  read again at the next check.
