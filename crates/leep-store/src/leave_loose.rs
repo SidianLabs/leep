@@ -67,22 +67,40 @@ pub(crate) fn file_matches(path: &Path, leave: &LeaveLoose) -> Result<bool> {
     Ok(leave.matches(&head))
 }
 
-/// The loose objects among `hashes` that start with one of the prefixes.
-pub(crate) fn matching<'a>(
+/// For each of `hashes`, whether its loose file starts with one of the
+/// prefixes, or why it could not be read: one failure never hides the
+/// answers for the others.
+pub(crate) fn sniff<'a>(
     hashes: impl IntoIterator<Item = &'a Hash>,
     leave: &LeaveLoose,
     path_for: impl Fn(&Hash) -> std::path::PathBuf,
-) -> Result<Vec<Hash>> {
-    let mut out = Vec::new();
+) -> Vec<(Hash, Result<bool>)> {
     if leave.is_empty() {
-        return Ok(out);
+        return hashes.into_iter().map(|h| (*h, Ok(false))).collect();
     }
-    for h in hashes {
-        if file_matches(&path_for(h), leave)? {
-            out.push(*h);
+    hashes
+        .into_iter()
+        .map(|h| (*h, file_matches(&path_for(h), leave)))
+        .collect()
+}
+
+/// What a repack leaves loose of `sniffed`: those that match. One that
+/// could not be read is packed (or reported) as before, and logged.
+pub(crate) fn left_of(sniffed: Vec<(Hash, Result<bool>)>) -> Vec<Hash> {
+    let mut out = Vec::new();
+    for (h, r) in sniffed {
+        match r {
+            Ok(true) => out.push(h),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                hash = %h,
+                error = %e,
+                "reading the first bytes of a loose object failed; the repack takes it"
+            ),
         }
     }
-    Ok(out)
+    out.sort_unstable();
+    out
 }
 
 #[cfg(test)]

@@ -150,6 +150,10 @@ pub struct AutoRepackOptions {
     /// ([`leep_derive::segment_blob_prefixes`]), which GC then deletes
     /// outright.
     pub leave_loose: LeaveLoose,
+    /// Loose objects whose first bytes one check reads at most, to tell
+    /// segment blobs apart (one short read each; a ranged GET on an object
+    /// store). The rest count as waiting until a later check reads them.
+    pub sniff_per_check: usize,
 }
 
 /// When the background task consolidates its delta packs (ADR 0107): it
@@ -202,6 +206,7 @@ impl Default for AutoRepackOptions {
             object_store_min_bytes: 64 << 20,
             consolidate: Some(ConsolidateOptions::default()),
             leave_loose: LeaveLoose::new(leep_derive::segment_blob_prefixes()),
+            sniff_per_check: 4096,
         }
     }
 }
@@ -354,24 +359,24 @@ impl PackStore {
         }
     }
 
-    /// Which of `objects` (from [`loose_listing`](Self::loose_listing))
-    /// start with one of the prefixes: a short read of each, off the async
-    /// workers.
-    async fn loose_matching(
+    /// For each of `objects` (from [`loose_listing`](Self::loose_listing)),
+    /// whether it starts with one of the prefixes, or why it could not be
+    /// read: a short read of each, off the async workers.
+    async fn loose_sniff(
         &self,
         objects: Vec<(Hash, u64)>,
         leave: &LeaveLoose,
-    ) -> Result<Vec<Hash>> {
+    ) -> Result<Vec<(Hash, Result<bool>)>> {
         if objects.is_empty() || leave.is_empty() {
-            return Ok(Vec::new());
+            return Ok(objects.into_iter().map(|(h, _)| (h, Ok(false))).collect());
         }
         match self {
             PackStore::Fs(s) => {
                 let (s, leave) = (s.clone(), leave.clone());
                 let hashes: Vec<Hash> = objects.into_iter().map(|(h, _)| h).collect();
-                on_low_thread(move || s.loose_matching(&hashes, &leave)).await
+                on_low_thread(move || Ok(s.loose_sniff(&hashes, &leave))).await
             }
-            PackStore::Object(s) => s.loose_matching(&objects, leave).await,
+            PackStore::Object(s) => Ok(s.loose_sniff(&objects, leave).await),
         }
     }
 
@@ -881,29 +886,38 @@ impl BackgroundRepack {
         self.auto
             .sniffed
             .retain(|h, _| listing.binary_search_by_key(h, |(l, _)| *l).is_ok());
+        // At most `sniff_per_check` reads a check, so a large backlog (or a
+        // slow bucket) never holds the merges after this for long; objects
+        // not read yet count as waiting, and are read at later checks. A
+        // read that fails is logged and tried again later: the others'
+        // answers are kept.
         let unsniffed: Vec<(Hash, u64)> = listing
             .iter()
             .filter(|(h, _)| !self.auto.sniffed.contains_key(h))
+            .take(auto.sniff_per_check)
             .copied()
             .collect();
-        // A file that cannot be read is counted as waiting, not cached, and
-        // read again at the next check: one bad file must not stop every
-        // check (a run that reads it reports it, as before).
-        match self
-            .store
-            .loose_matching(unsniffed.clone(), &auto.leave_loose)
-            .await
-        {
-            Ok(matched) => {
-                let matched: HashSet<Hash> = matched.into_iter().collect();
-                for (h, _) in unsniffed {
-                    self.auto.sniffed.insert(h, matched.contains(&h));
+        let mut failed = 0u64;
+        for (h, r) in self.store.loose_sniff(unsniffed, &auto.leave_loose).await? {
+            match r {
+                Ok(m) => {
+                    self.auto.sniffed.insert(h, m);
+                }
+                Err(e) => {
+                    if failed == 0 {
+                        tracing::warn!(
+                            hash = %h,
+                            error = %e,
+                            "reading the first bytes of a loose object failed; it counts as \
+                             waiting until a later check reads it"
+                        );
+                    }
+                    failed += 1;
                 }
             }
-            Err(e) => tracing::warn!(
-                error = %e,
-                "reading the first bytes of loose objects failed; they count as waiting"
-            ),
+        }
+        if failed > 1 {
+            tracing::warn!(failed, "reading the first bytes of loose objects failed");
         }
         let segments: HashSet<Hash> = self
             .auto
@@ -912,6 +926,13 @@ impl BackgroundRepack {
             .filter(|(_, &m)| m)
             .map(|(h, _)| *h)
             .collect();
+        let segment_bytes: u64 = listing
+            .iter()
+            .filter(|(h, _)| segments.contains(h))
+            .map(|(_, n)| n)
+            .sum();
+        metrics::gauge!("leep_repack_left_loose_objects").set(segments.len() as f64);
+        metrics::gauge!("leep_repack_left_loose_bytes").set(segment_bytes as f64);
         let held: HashSet<&Hash> = self.pending.iter().flat_map(|w| &w.loose).collect();
         let loose: Vec<(Hash, u64)> = listing
             .iter()

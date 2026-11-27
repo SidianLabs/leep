@@ -909,7 +909,9 @@ impl FsBlobStore {
                 .iter()
                 .map(|o| &o.hash)
                 .filter(|h| !listed.contains(h));
-            let left = leave_loose::matching(unlisted, &opts.leave_loose, |h| self.path_for(h))?;
+            let left = leave_loose::left_of(leave_loose::sniff(unlisted, &opts.leave_loose, |h| {
+                self.path_for(h)
+            }));
             if !left.is_empty() {
                 let set: HashSet<&Hash> = left.iter().collect();
                 loose.retain(|o| !set.contains(&o.hash));
@@ -1258,11 +1260,24 @@ impl FsBlobStore {
         count_loose(self.root())
     }
 
-    /// The loose objects among `hashes` whose bytes start with one of the
-    /// prefixes, reading only that many bytes of each: what a repack given
-    /// `leave_loose` leaves loose when no walk lists them (ADR 0108).
+    /// For each of `hashes`, whether its loose file starts with one of the
+    /// prefixes (reading only that many bytes), or why it could not be
+    /// read: what a repack given `leave_loose` leaves loose when no walk
+    /// lists it (ADR 0108). A file that is gone does not match.
+    pub fn loose_sniff(&self, hashes: &[Hash], leave: &LeaveLoose) -> Vec<(Hash, Result<bool>)> {
+        leave_loose::sniff(hashes, leave, |h| self.path_for(h))
+    }
+
+    /// The loose objects among `hashes` that start with one of the
+    /// prefixes; the first read that fails is the error.
     pub fn loose_matching(&self, hashes: &[Hash], leave: &LeaveLoose) -> Result<Vec<Hash>> {
-        leave_loose::matching(hashes, leave, |h| self.path_for(h))
+        let mut out = Vec::new();
+        for (h, r) in self.loose_sniff(hashes, leave) {
+            if r? {
+                out.push(h);
+            }
+        }
+        Ok(out)
     }
 
     /// Every loose object with its size, in hash order: one listing of

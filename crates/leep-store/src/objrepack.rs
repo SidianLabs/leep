@@ -111,38 +111,41 @@ pub(crate) async fn list_all_loose(store: &dyn ObjectStore) -> Result<BTreeMap<H
     Ok(out)
 }
 
-/// The loose objects among `objects` (hash and size) whose bytes start
-/// with one of the prefixes, by a ranged read of that many bytes of each
-/// (ADR 0108). One that is gone does not.
-pub(crate) async fn loose_matching(
+/// For each of `objects` (hash and size), whether its bytes start with
+/// one of the prefixes, by a ranged read of that many bytes (ADR 0108),
+/// or why the read failed. One that is gone (or empty) does not match,
+/// and one failed read never hides the answers for the others.
+pub(crate) async fn loose_sniff(
     store: &Arc<dyn ObjectStore>,
     objects: Vec<(Hash, u64)>,
     leave: &LeaveLoose,
-) -> Result<Vec<Hash>> {
+) -> Vec<(Hash, Result<bool>)> {
     if leave.is_empty() {
-        return Ok(Vec::new());
+        return objects.into_iter().map(|(h, _)| (h, Ok(false))).collect();
     }
     let n = leave.head_len() as u64;
-    let objects: Vec<(Hash, u64)> = objects.into_iter().filter(|(_, size)| *size > 0).collect();
-    let found: Vec<Option<Hash>> = futures::stream::iter(objects)
+    futures::stream::iter(objects)
         .map(|(hash, size)| {
             let store = store.clone();
             let leave = leave.clone();
             async move {
-                match store
+                if size == 0 {
+                    return (hash, Ok(false));
+                }
+                let r = match store
                     .get_range(&ObjectBlobStore::key(&hash), 0..n.min(size))
                     .await
                 {
-                    Ok(head) => Ok(leave.matches(&head).then_some(hash)),
-                    Err(object_store::Error::NotFound { .. }) => Ok(None),
+                    Ok(head) => Ok(leave.matches(&head)),
+                    Err(object_store::Error::NotFound { .. }) => Ok(false),
                     Err(e) => Err(storage_err(e)),
-                }
+                };
+                (hash, r)
             }
         })
         .buffer_unordered(16)
-        .try_collect()
-        .await?;
-    Ok(found.into_iter().flatten().collect())
+        .collect()
+        .await
 }
 
 /// Delete many keys with the backend's bulk delete. Absent keys are fine.
@@ -703,16 +706,34 @@ impl ObjectBlobStore {
             .collect())
     }
 
-    /// The loose objects among `objects` (hash and size, as
-    /// [`loose_listing`](Self::loose_listing) gives them) whose bytes start
-    /// with one of the prefixes: what a repack given `leave_loose` leaves
-    /// loose when no walk lists them (ADR 0108). A ranged read of each.
+    /// For each of `objects` (hash and size, as
+    /// [`loose_listing`](Self::loose_listing) gives them), whether its bytes
+    /// start with one of the prefixes, or why the read failed: what a
+    /// repack given `leave_loose` leaves loose when no walk lists it (ADR
+    /// 0108). A ranged read of each, 16 at a time.
+    pub async fn loose_sniff(
+        &self,
+        objects: &[(Hash, u64)],
+        leave: &LeaveLoose,
+    ) -> Vec<(Hash, Result<bool>)> {
+        loose_sniff(&self.store, objects.to_vec(), leave).await
+    }
+
+    /// The loose objects among `objects` that start with one of the
+    /// prefixes; the first read that fails is the error.
     pub async fn loose_matching(
         &self,
         objects: &[(Hash, u64)],
         leave: &LeaveLoose,
     ) -> Result<Vec<Hash>> {
-        loose_matching(&self.store, objects.to_vec(), leave).await
+        let mut out = Vec::new();
+        for (h, r) in self.loose_sniff(objects, leave).await {
+            if r? {
+                out.push(h);
+            }
+        }
+        out.sort_unstable();
+        Ok(out)
     }
 
     /// Packs a delta repack already compressed (ADR 0100,
@@ -800,8 +821,9 @@ impl ObjectBlobStore {
                 .filter(|(h, _)| !listed.contains(h))
                 .map(|(h, s)| (*h, s.size))
                 .collect();
-            let mut left = loose_matching(&self.store, unlisted, &opts.leave_loose).await?;
-            left.sort_unstable();
+            let left = crate::leave_loose::left_of(
+                loose_sniff(&self.store, unlisted, &opts.leave_loose).await,
+            );
             for h in &left {
                 loose.remove(h);
             }

@@ -488,6 +488,11 @@ struct Args {
     /// compressed after an upgrade with no manual step.
     #[arg(long, env = "LEEP_AUTO_REPACK_CONSOLIDATE", value_enum, default_value_t = Switch::On)]
     auto_repack_consolidate: Switch,
+    /// Leave derived-data and GC mark segment blobs loose instead of
+    /// packing them (ADR 0108): GC then deletes their bytes at once, and
+    /// they never count as waiting. `off` packs them like any loose object.
+    #[arg(long, env = "LEEP_REPACK_LEAVE_SEGMENTS_LOOSE", value_enum, default_value_t = Switch::On)]
+    repack_leave_segments_loose: Switch,
     /// A consolidation runs once it would save this fraction (1/N) of the
     /// pack bytes it rewrites.
     #[arg(long, env = "LEEP_AUTO_REPACK_CONSOLIDATE_RATIO", default_value_t = 8, value_parser = clap::value_parser!(u64).range(1..))]
@@ -659,6 +664,15 @@ struct Args {
 enum Coordination {
     On,
     Off,
+}
+
+/// The prefixes of the segment blobs repacks leave loose (ADR 0108), or
+/// none when turned off.
+fn leave_segments_loose(s: Switch) -> leep_store::LeaveLoose {
+    match s {
+        Switch::On => leep_store::LeaveLoose::new(leep_derive::segment_blob_prefixes()),
+        Switch::Off => leep_store::LeaveLoose::default(),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -2585,6 +2599,7 @@ async fn run() -> anyhow::Result<()> {
                     max_batch_bytes: args.auto_repack_batch_bytes,
                     level: args.auto_repack_level,
                     object_store_interval: args.auto_repack_object_store_interval,
+                    leave_loose: leave_segments_loose(args.repack_leave_segments_loose),
                     consolidate: (args.auto_repack_consolidate == Switch::On).then(|| {
                         leep_server::background_repack::ConsolidateOptions {
                             ratio: args.auto_repack_consolidate_ratio,
@@ -3442,6 +3457,11 @@ mod tests {
         assert_eq!(a.auto_repack_batch_bytes, 1 << 30);
         assert!(a.auto_repack_consolidate == Switch::On);
         assert_eq!(a.auto_repack_consolidate_ratio, 8);
+        assert!(a.repack_leave_segments_loose == Switch::On);
+        assert!(!leave_segments_loose(Switch::On).is_empty());
+        assert!(leave_segments_loose(Switch::Off).is_empty());
+        let off = parse_args(["leep-server", "--repack-leave-segments-loose", "off"]).unwrap();
+        assert!(off.repack_leave_segments_loose == Switch::Off);
         assert!(matches!(
             a.auto_repack_consolidate_age,
             DurationOrOff::For(d) if d == Duration::from_secs(24 * 3600)

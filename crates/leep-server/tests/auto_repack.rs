@@ -2040,3 +2040,49 @@ async fn deleted_bytes_under_the_ratio_are_dropped_after_the_age() {
         }
     }
 }
+
+/// A check reads the first bytes of at most `sniff_per_check` loose
+/// objects; those not read yet count as waiting until a later check reads
+/// them, and one that cannot be read (here a directory where a loose file
+/// should be) is tried again at each check without keeping the others'
+/// answers from being kept.
+#[tokio::test]
+async fn segment_sniffs_are_capped_per_check_and_survive_a_failed_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = fs_store(dir.path());
+    let meta = Arc::new(MemoryMetaStore::new());
+    for i in 0..7 {
+        let b = format!("leep:gc-mark-segment-v1\0{}", format!("{i} ").repeat(40));
+        store.put(Bytes::from(b)).await.unwrap();
+    }
+    let bad = Hash::of_blob(b"unreadable");
+    let hex = bad.to_hex();
+    std::fs::create_dir_all(dir.path().join(&hex[..2]).join(&hex[2..])).unwrap();
+    let auto = AutoRepackOptions {
+        objects: u64::MAX,
+        bytes: u64::MAX,
+        max_age: None,
+        consolidate: None,
+        sniff_per_check: 2,
+        ..eager()
+    };
+    let mut bg = task(&store, &meta, opts(auto));
+    let mut waiting = Vec::new();
+    for _ in 0..8 {
+        match bg.tick().await.unwrap().auto {
+            AutoOutcome::BelowThreshold { objects, .. } => waiting.push(objects),
+            other => panic!("{other:?}"),
+        }
+    }
+    // Eight loose objects; each check reads two at most (the unreadable one
+    // among them until it sorts last), so the count falls by two at most.
+    assert!(waiting[0] >= 6, "{waiting:?}");
+    for w in waiting.windows(2) {
+        assert!(w[0] >= w[1] && w[0] - w[1] <= 2, "{waiting:?}");
+    }
+    assert_eq!(
+        *waiting.last().unwrap(),
+        1,
+        "only the unreadable one: {waiting:?}"
+    );
+}

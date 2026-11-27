@@ -1395,8 +1395,11 @@ walk lists whose bytes start with one of
 `leep_derive::segment_blob_prefixes()`, passed as data since `leep-store`
 does not know the kinds), and GC deletes their bytes at once instead of
 tombstoning them in a pack. The task reads the first bytes of each new
-loose object once and does not count those as waiting, so they never
-start a run. A file a walk lists is packed whatever its bytes.
+loose object once (at most 4,096 a check; a failed read is retried later
+and the object counts as waiting meanwhile) and does not count those as
+waiting, so they never start a run. A file a walk lists is packed whatever
+its bytes. GC bounds them (gauges `leep_repack_left_loose_objects` /
+`_bytes`); `--repack-leave-segments-loose off` packs them as before.
 `cargo test -p leep-e2e --test storage_size` (ADR 0101) holds a default
 server's settled size per land and its ratio to Git under budgets in CI,
 and `leep-soak --max-blob-store-ratio` bounds `leep_blob_store_size_ratio`

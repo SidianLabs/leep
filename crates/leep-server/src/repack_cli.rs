@@ -55,6 +55,10 @@ pub struct RepackArgs {
     /// Print the report as one JSON object.
     #[arg(long)]
     json: bool,
+    /// Leave derived-data and GC mark segment blobs loose (ADR 0108), as
+    /// the server's background repack does; `off` packs them too.
+    #[arg(long, env = "LEEP_REPACK_LEAVE_SEGMENTS_LOOSE", value_enum, default_value_t = super::Switch::On)]
+    repack_leave_segments_loose: super::Switch,
 }
 
 /// The blob stores that can hold packs.
@@ -185,7 +189,7 @@ pub async fn run_repack(meta: &str, blobs: &str, args: RepackArgs) -> anyhow::Re
         packs: whole,
         mark: true,
         // Segment blobs stay loose, where GC deletes them outright (ADR 0108).
-        leave_loose: leep_store::LeaveLoose::new(leep_derive::segment_blob_prefixes()),
+        leave_loose: super::leave_segments_loose(args.repack_leave_segments_loose),
         ..RepackOptions::default()
     };
     let changesets = order.changesets;

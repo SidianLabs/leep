@@ -712,6 +712,8 @@ async fn a_reader_with_an_old_index_finds_objects_in_the_new_pack() {
 struct Counting {
     inner: InMemory,
     counts: Mutex<HashMap<&'static str, u64>>,
+    /// Ranged reads of these keys fail.
+    fail_range: Mutex<Vec<Path>>,
 }
 
 impl Counting {
@@ -763,6 +765,12 @@ impl ObjectStore for Counting {
         } else {
             "GET"
         });
+        if options.range.is_some() && self.fail_range.lock().unwrap().contains(location) {
+            return Err(object_store::Error::Generic {
+                store: "Counting",
+                source: "injected ranged read failure".into(),
+            });
+        }
         self.inner.get_opts(location, options).await
     }
     async fn get_ranges(
@@ -810,6 +818,7 @@ async fn request_counts() {
     let counting = Arc::new(Counting {
         inner: InMemory::new(),
         counts: Mutex::default(),
+        fail_range: Mutex::default(),
     });
     let objects: Arc<dyn ObjectStore> = counting.clone();
     let store = handle(&objects);
@@ -953,4 +962,82 @@ async fn a_full_repack_leaves_segment_blobs_loose() {
         );
         check_blob_store_contract(&fresh(&objects)).await;
     }
+}
+
+/// A ranged read that fails for one loose object does not hide the answers
+/// for the others (ADR 0108): the sniff reports that one's error and the
+/// rest's matches, and a full repack given `leave_loose` packs the one it
+/// could not read (as before) and leaves the segments loose.
+#[tokio::test]
+async fn a_failed_sniff_of_one_object_keeps_the_others() {
+    let counting = Arc::new(Counting {
+        inner: InMemory::new(),
+        counts: Mutex::default(),
+        fail_range: Mutex::default(),
+    });
+    let objects: Arc<dyn ObjectStore> = counting.clone();
+    let store = handle(&objects);
+    let leave = crate::LeaveLoose::new([b"leep:gc-mark-segment-v1\0".to_vec()]);
+    let mut segs = Vec::new();
+    for i in 0..4 {
+        let b = format!("leep:gc-mark-segment-v1\0{}", format!("{i} ").repeat(40));
+        segs.push((
+            store.put(Bytes::from(b.clone())).await.unwrap(),
+            b.len() as u64,
+        ));
+    }
+    let plain = Bytes::from_static(b"an ordinary loose object\n");
+    let plain_hash = store.put(plain.clone()).await.unwrap();
+    counting
+        .fail_range
+        .lock()
+        .unwrap()
+        .push(ObjectBlobStore::key(&segs[1].0));
+    let mut ask = segs.clone();
+    ask.push((plain_hash, plain.len() as u64));
+    let got: HashMap<Hash, Result<bool, String>> = store
+        .loose_sniff(&ask, &leave)
+        .await
+        .into_iter()
+        .map(|(h, r)| (h, r.map_err(|e| e.to_string())))
+        .collect();
+    assert_eq!(got.len(), 5);
+    assert!(got[&segs[1].0].is_err(), "{got:?}");
+    for (h, _) in segs.iter().filter(|(h, _)| *h != segs[1].0) {
+        assert_eq!(got[h], Ok(true));
+    }
+    assert_eq!(got[&plain_hash], Ok(false));
+    assert!(store.loose_matching(&ask, &leave).await.is_err());
+
+    let r = store
+        .repack_publish(
+            Vec::<(Hash, Option<Hash>)>::new(),
+            RepackOptions {
+                leave_loose: leave,
+                ..RepackOptions::default()
+            },
+        )
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    let mut left: Vec<Hash> = segs
+        .iter()
+        .map(|(h, _)| *h)
+        .filter(|h| *h != segs[1].0)
+        .collect();
+    left.sort();
+    assert_eq!(r.left_loose, left, "{r:?}");
+    assert_eq!(
+        r.objects, 2,
+        "the plain object and the unread segment: {r:?}"
+    );
+    assert_eq!(loose_count(&*objects).await, 3);
+    counting.fail_range.lock().unwrap().clear();
+    let reader = fresh(&objects);
+    for (h, _) in &segs {
+        assert!(reader.contains(h).await.unwrap());
+    }
+    assert_eq!(reader.get(&plain_hash).await.unwrap().unwrap(), plain);
 }

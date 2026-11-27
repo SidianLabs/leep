@@ -36,14 +36,22 @@ ranged GET on an object store).
 segment kinds: the server passes `leep_derive::segment_blob_prefixes()` to
 the delta runs, the object store's scheduled full repack and
 `leep-server repack`. Merges of packs alone take no loose object and are
-unchanged. Segment blobs packed before this change stay in their packs
+unchanged. `--repack-leave-segments-loose off` (server and `leep-server
+repack`) passes no prefixes, which restores the old behaviour. Segment blobs packed before this change stay in their packs
 until GC deletes them and a merge drops them (section 3).
 
 ### 2. They never wait
 The background task reads the first bytes of each loose object once (its
 bytes never change; the classification is kept while the object is
 listed) and leaves those that start with a prefix out of the objects and
-bytes waiting for a delta run, as it does corrupt loose objects. So segment
+bytes waiting for a delta run, as it does corrupt loose objects. A check
+reads at most 4,096 objects, so a backlog (or a slow bucket) never holds
+the merges after it for long; a read that fails is logged and tried again
+at a later check, and the others' answers are kept. Objects not read yet
+count as waiting, as before this change. The gauges
+`leep_repack_left_loose_objects` and `leep_repack_left_loose_bytes` show
+what is left loose; GC is what bounds it. A repack that cannot read an
+object's first bytes packs it, as before. So segment
 blobs alone never start a run, on a threshold or on `max_age`. For a run
 that starts anyway, the walk's `wanted` includes them, and those it lists
 join the batch.
