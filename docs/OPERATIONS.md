@@ -153,6 +153,7 @@ measured until the response head is ready, not until the body is streamed.
 | `leep_repack_auto_objects_total` | counter | none | Objects the automatic runs wrote. |
 | `leep_repack_auto_waiting_objects` / `leep_repack_auto_waiting_bytes` | gauge | none | Objects (and their bytes on disk) waiting to be compressed at the last check: loose, or in packs written whole. Falls to near zero after each run; climbing past the thresholds means runs are held or failing. |
 | `leep_repack_consolidate_runs_total` | counter | `outcome` = `ran`, `error`, `held` | Consolidations of the delta packs (ADR 0107). `held`: due, but other cleanups wait on too many bytes, or another repack holds the store. An error is logged and retried at the next check. |
+| `leep_repack_left_loose_objects`, `leep_repack_left_loose_bytes` | gauge | | Segment blobs (derived-data and GC mark segments) loose at the last check, left out of packing (ADR 0108). GC is what bounds them: they grow between GC runs and fall when GC deletes retired segments. |
 | `leep_repack_consolidate_gain_bytes_total` | counter | none | Bytes the consolidations that ran expected to save (measured on a sample before each run). |
 | `leep_repack_consolidate_seconds` | histogram | none | Time of each consolidation: walk, write and publish. |
 | `leep_repack_whole_bytes_outside_largest` | gauge | none | Stored bytes of whole frames in the delta packs other than the largest, at the last check: an upper bound on what a consolidation could find there. Climbs between consolidations, falls after one. |
@@ -2769,6 +2770,25 @@ compresses them again; deleting that file only costs one more pass.
 Corrupt loose objects it meets stay in place, are logged in its report,
 and are not counted again (run `leep-server verify --full --rehash`).
 
+**Segment blobs stay loose** (ADR 0108). The blobs of derived-data
+segments and GC mark segments (bytes starting `leep:derived-segment-index-v1`,
+`leep:derived-segment-data-v1` or `leep:gc-mark-segment-v1`) are never
+packed by the delta runs, an object store's full repack or `leep-server
+repack`, and never count as waiting, so they start no run: GC deletes their
+bytes outright when it retires them. Expect some loose files at rest (one
+per live segment; `left_loose` in `repack --json` output counts those a run
+skipped), and a few more between a compaction or mark and the next GC.
+Segment blobs packed before the upgrade leave the packs as GC deletes them
+and a consolidation drops their bytes.
+GC is what bounds them: nothing else deletes a segment blob, so with no
+`gc` scheduled they accumulate (one or two per derived seal and GC
+checkpoint). Watch `leep_repack_left_loose_objects` and
+`leep_repack_left_loose_bytes`; they should fall after each GC run. A check
+reads the first bytes of at most 4,096 new loose objects (on an object
+store, one ranged GET each), so a large backlog is classified over several
+checks; objects not read yet, or whose read failed (logged), count as
+waiting meanwhile. `--repack-leave-segments-loose off` packs them again.
+
 **Consolidation** (ADR 0107). A delta run can only compress an object
 against a base in the pack it writes, so the first new version at each
 path in each run is stored whole (its previous version is in an older
@@ -2829,6 +2849,7 @@ those.
 | `--auto-repack-consolidate-ratio N` / `LEEP_AUTO_REPACK_CONSOLIDATE_RATIO` | `8` | Consolidate once it would save `1/N` of the bytes of the packs it rewrites. |
 | `--auto-repack-consolidate-age D` / `LEEP_AUTO_REPACK_CONSOLIDATE_AGE` | `24h` | Also consolidate once it would save a 64th of those bytes (at least 64 KiB) and the packs holding that saving are this old (the largest pack's file time and the other packs' oldest records), or this process has seen it this long; `off` leaves only the ratio. |
 | `--auto-repack-consolidate-max-bytes B` / `LEEP_AUTO_REPACK_CONSOLIDATE_MAX_BYTES` | `2G` | Never rewrite a delta pack larger than this in the background; logged once, left to `repack --full`. |
+| `--repack-leave-segments-loose on\|off` / `LEEP_REPACK_LEAVE_SEGMENTS_LOOSE` | `on` | Leave derived-data and GC mark segment blobs loose (ADR 0108), in the background repack and in `leep-server repack` (which takes the same flag). `off` packs them like any loose object, as before. |
 
 What operators no longer need: the nightly or hourly incremental `repack`
 cron, the loose-object count job, and (since ADR 0107) the weekly

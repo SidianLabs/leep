@@ -41,19 +41,36 @@ fn blobs_dir(stores: &Stores) -> std::path::PathBuf {
     stores.blobs.strip_prefix("file://").unwrap().into()
 }
 
-/// Loose objects: files named by their hash in a shard directory.
+/// Loose objects a repack packs: files named by their hash in a shard
+/// directory, segment blobs left out (they stay loose, ADR 0108).
 fn loose(stores: &Stores) -> usize {
-    let mut n = 0;
+    loose_split(stores).0
+}
+
+/// Loose segment blobs, which a repack leaves loose (ADR 0108).
+fn loose_segments(stores: &Stores) -> usize {
+    loose_split(stores).1
+}
+
+fn loose_split(stores: &Stores) -> (usize, usize) {
+    let prefixes = leep_derive::segment_blob_prefixes();
+    let (mut plain, mut segments) = (0, 0);
     for shard in fs::read_dir(blobs_dir(stores)).unwrap().flatten() {
         if shard.file_name().len() == 2 {
-            n += fs::read_dir(shard.path())
-                .unwrap()
-                .flatten()
-                .filter(|f| f.file_name().len() == 62)
-                .count();
+            for f in fs::read_dir(shard.path()).unwrap().flatten() {
+                if f.file_name().len() != 62 {
+                    continue;
+                }
+                let b = fs::read(f.path()).unwrap();
+                if prefixes.iter().any(|p| b.starts_with(p)) {
+                    segments += 1;
+                } else {
+                    plain += 1;
+                }
+            }
         }
     }
-    n
+    (plain, segments)
 }
 
 fn pack_files(stores: &Stores) -> Vec<String> {
@@ -182,7 +199,11 @@ fn repack_beside_a_server_changes_no_answer() {
         r["pack_bytes"].as_u64().unwrap() < r["logical_bytes"].as_u64().unwrap() / 2,
         "{r}"
     );
-    assert_eq!(r["loose_after"], 0, "{r}");
+    assert_eq!(
+        r["loose_after"].as_u64().unwrap(),
+        loose_segments(&stores) as u64,
+        "{r}"
+    );
     assert_eq!(loose(&stores), 0);
     assert_eq!(pack_files(&stores).len(), 2);
     assert_eq!(
@@ -315,7 +336,11 @@ fn killed_repack_loses_nothing() {
     // incremental run keeps packs that already grow geometrically, and how
     // many the kills left depends on timing.
     let r = repack(&stores, &["--full", "--unsafe-no-fence"]);
-    assert_eq!(r["loose_after"], 0, "{r}");
+    assert_eq!(
+        r["loose_after"].as_u64().unwrap(),
+        loose_segments(&stores) as u64,
+        "{r}"
+    );
     assert_eq!(pack_files(&stores).len(), 2, "{:?}", pack_files(&stores));
     let leftovers: Vec<_> = fs::read_dir(blobs_dir(&stores).join("packs"))
         .unwrap()

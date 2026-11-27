@@ -9,8 +9,8 @@
 //! background work runs: the automatic delta repack (ADR 0100) checks every
 //! second and takes objects 2 s old, the fence is 3 s, and the automatic
 //! changeset compaction (ADR 0101) looks every 2 s. Once the blob store and
-//! the database stop changing (every loose object packed, every retired
-//! pack swept, every changeset row compressed), it checks:
+//! the database stop changing (every loose object but segment blobs packed,
+//! every retired pack swept, every changeset row compressed), it checks:
 //!
 //! - blob store bytes per land and database bytes per land, settled;
 //! - all storage (database above an empty one, plus blobs) against Git's
@@ -385,7 +385,10 @@ fn dir_bytes(dir: &Path) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Sizes {
     blobs: u64,
+    /// Loose objects that a repack packs, and loose segment blobs, which
+    /// stay loose until GC deletes them (ADR 0108).
     loose: usize,
+    segments: usize,
     retired: usize,
     db: u64,
     /// Changeset rows not compressed, and dictionaries stored.
@@ -404,10 +407,18 @@ fn blobs_dir(stores: &Stores) -> std::path::PathBuf {
 fn sizes(stores: &Stores) -> Sizes {
     use sqlx::Connection;
     let dir = blobs_dir(stores);
-    let mut loose = 0;
+    let prefixes = leep_derive::segment_blob_prefixes();
+    let (mut loose, mut segments) = (0, 0);
     for shard in fs::read_dir(&dir).unwrap().flatten() {
         if shard.file_name().len() == 2 {
-            loose += fs::read_dir(shard.path()).unwrap().flatten().count();
+            for f in fs::read_dir(shard.path()).unwrap().flatten() {
+                match fs::read(f.path()) {
+                    Ok(b) if prefixes.iter().any(|p| b.starts_with(p)) => segments += 1,
+                    Ok(_) => loose += 1,
+                    // Packed and unlinked since the listing.
+                    Err(_) => {}
+                }
+            }
         }
     }
     let retired = fs::read_to_string(dir.join("packs/retired"))
@@ -496,6 +507,7 @@ fn sizes(stores: &Stores) -> Sizes {
     Sizes {
         blobs: dir_bytes(&dir),
         loose,
+        segments,
         retired,
         db,
         plain_rows,
@@ -505,8 +517,9 @@ fn sizes(stores: &Stores) -> Sizes {
     }
 }
 
-/// Wait until every loose object is packed, every retired pack swept, the
-/// rows compressed (with `compacted`), and nothing changes for 2 s.
+/// Wait until every loose object but segment blobs is packed (ADR 0108),
+/// every retired pack swept, the rows compressed (with `compacted`), and
+/// nothing changes for 2 s.
 fn settle(stores: &Stores, server: &Server, compacted: bool) -> Sizes {
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut last = sizes(stores);
@@ -821,6 +834,17 @@ fn storage_stays_within_its_budgets() {
         "leep-server gc",
     );
     let post_gc = sizes(&stores);
+    // Segment blobs stay loose (ADR 0108): none before the first mark, and
+    // after a GC no more than the live segments' blobs.
+    assert_eq!(
+        after.segments, 0,
+        "loose segment blobs before any: {after:?}"
+    );
+    assert!(
+        post_gc.segments <= live_segment_blobs(&stores),
+        "loose segment blobs after gc: {post_gc:?}, live {}",
+        live_segment_blobs(&stores)
+    );
     let (mark_rows, manifest) = gc_record(&stores);
     let manifest = manifest.expect("a mark manifest after gc");
     let marks: u64 = manifest.live.iter().map(|s| s.marks).sum();
@@ -1018,9 +1042,22 @@ fn storage_stays_within_its_budgets() {
     assert_ok(&out, "leep-server verify --full");
 
     // Wide lands, last so they change no measurement above: each the
-    // first edit of its file in its delta run (ADR 0107). The packs now
-    // hold the gc mark and derived segments too, and in a store this small
-    // an eighth of them is more than 48 lands gain: any 64th consolidates.
+    // first edit of its file in its delta run (ADR 0107). The gc mark and
+    // derived segments stay loose (ADR 0108), but in a store this small an
+    // eighth of the delta packs is still more than 48 lands gain (at the
+    // default ratio this phase measured 679 bytes a land): any 64th
+    // consolidates.
+    // A full repack first, with no server running: it drops the bytes the
+    // gc above deleted from the packs, which a consolidation would
+    // otherwise drop at a moment `settle` cannot see (before or during the
+    // lands), moving the baseline by more than the lands add.
+    assert_ok(
+        &server_cmd(
+            &stores,
+            &["repack", "--full", "--fence", "0s", "--unsafe-no-fence"],
+        ),
+        "leep-server repack --full, before the wide lands",
+    );
     let mut wide_flags = FLAGS.to_vec();
     wide_flags.extend(["--auto-repack-consolidate-ratio", "64"]);
     let server = Server::start_with(free_port(), &stores, work, &wide_flags);
@@ -1046,5 +1083,37 @@ fn storage_stays_within_its_budgets() {
     );
     let out = server_cmd(&stores, &["verify", "--full"]);
     assert_ok(&out, "leep-server verify --full, after the wide lands");
+
+    // Loose segment blobs are bounded by GC (ADR 0108): a last GC leaves
+    // no more than the live derived segments' two blobs each and the live
+    // mark segments, and adds at most its own new mark segment.
+    let pre_last_gc = sizes(&stores);
+    assert_ok(
+        &server_cmd(
+            &stores,
+            &["gc", "--grace", "0", "--fence", "0s", "--unsafe-no-fence"],
+        ),
+        "leep-server gc, last",
+    );
+    let last_gc = sizes(&stores);
+    let live = live_segment_blobs(&stores);
+    println!(
+        "[{backend}] loose segment blobs: {} before the last gc, {} after, {live} live",
+        pre_last_gc.segments, last_gc.segments
+    );
+    assert!(
+        last_gc.segments <= live && last_gc.segments <= pre_last_gc.segments + 1,
+        "loose segment blobs after the last gc: {} (before {}, live {live})",
+        last_gc.segments,
+        pre_last_gc.segments
+    );
     drop(pg);
+}
+
+/// Blobs of the live segments: two for each derived segment (index and
+/// data, ADR 0104) and one for each GC mark segment (ADR 0103).
+fn live_segment_blobs(stores: &Stores) -> usize {
+    let derived: usize = derived_segment_bytes(stores).iter().map(|f| f.3 * 2).sum();
+    let marks = gc_record(stores).1.map_or(0, |m| m.live.len());
+    derived + marks
 }

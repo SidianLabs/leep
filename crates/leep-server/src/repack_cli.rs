@@ -55,6 +55,10 @@ pub struct RepackArgs {
     /// Print the report as one JSON object.
     #[arg(long)]
     json: bool,
+    /// Leave derived-data and GC mark segment blobs loose (ADR 0108), as
+    /// the server's background repack does; `off` packs them too.
+    #[arg(long, env = "LEEP_REPACK_LEAVE_SEGMENTS_LOOSE", value_enum, default_value_t = super::Switch::On)]
+    repack_leave_segments_loose: super::Switch,
 }
 
 /// The blob stores that can hold packs.
@@ -184,6 +188,8 @@ pub async fn run_repack(meta: &str, blobs: &str, args: RepackArgs) -> anyhow::Re
         threads: args.threads,
         packs: whole,
         mark: true,
+        // Segment blobs stay loose, where GC deletes them outright (ADR 0108).
+        leave_loose: super::leave_segments_loose(args.repack_leave_segments_loose),
         ..RepackOptions::default()
     };
     let changesets = order.changesets;
@@ -239,6 +245,7 @@ fn json(r: &RepackReport, full: bool, changesets: u64, t: &Timing) -> serde_json
         "index_bytes": r.index_bytes,
         "dropped_tombstoned": r.dropped_tombstoned,
         "corrupt": r.corrupt.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
+        "left_loose": r.left_loose.len(),
         "vanished": r.vanished,
         "late_tombstones": r.late_tombstones,
         "garbage_removed": r.garbage_removed,

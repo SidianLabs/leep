@@ -303,5 +303,6 @@ already compresses every head. Lands never wait for any of it.
 - Follow-ups: derived and GC-mark segment blobs could stay loose instead
   of being packed (they are compressed already, never a base, and
   short-lived; GC would then delete their bytes at once), which is the
-  second stage of storage PR 7; and an incremental repack for object
-  stores.
+  second stage of storage PR 7, decided in
+  [ADR 0108](0108-segment-blobs-stay-loose.md); and an incremental repack
+  for object stores.

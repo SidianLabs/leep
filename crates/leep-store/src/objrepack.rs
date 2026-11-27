@@ -39,7 +39,7 @@ use crate::packset::{self, PackSet, ScanReason, DEFAULT_DECODED_CACHE};
 use crate::packwrite::{hint_ids, write_order, write_pack, ObjectTable, PackSource, SourceRead};
 use crate::repack::step;
 use crate::retire::{past_fence, SweepReport};
-use crate::{storage_err, ObjectBlobStore, RepackOptions, RepackReport, RepackStep};
+use crate::{storage_err, LeaveLoose, ObjectBlobStore, RepackOptions, RepackReport, RepackStep};
 use leep_core::intern::PackHints;
 
 /// A loaded pack with its tombstoned hashes.
@@ -109,6 +109,43 @@ pub(crate) async fn list_all_loose(store: &dyn ObjectStore) -> Result<BTreeMap<H
         );
     }
     Ok(out)
+}
+
+/// For each of `objects` (hash and size), whether its bytes start with
+/// one of the prefixes, by a ranged read of that many bytes (ADR 0108),
+/// or why the read failed. One that is gone (or empty) does not match,
+/// and one failed read never hides the answers for the others.
+pub(crate) async fn loose_sniff(
+    store: &Arc<dyn ObjectStore>,
+    objects: Vec<(Hash, u64)>,
+    leave: &LeaveLoose,
+) -> Vec<(Hash, Result<bool>)> {
+    if leave.is_empty() {
+        return objects.into_iter().map(|(h, _)| (h, Ok(false))).collect();
+    }
+    let n = leave.head_len() as u64;
+    futures::stream::iter(objects)
+        .map(|(hash, size)| {
+            let store = store.clone();
+            let leave = leave.clone();
+            async move {
+                if size == 0 {
+                    return (hash, Ok(false));
+                }
+                let r = match store
+                    .get_range(&ObjectBlobStore::key(&hash), 0..n.min(size))
+                    .await
+                {
+                    Ok(head) => Ok(leave.matches(&head)),
+                    Err(object_store::Error::NotFound { .. }) => Ok(false),
+                    Err(e) => Err(storage_err(e)),
+                };
+                (hash, r)
+            }
+        })
+        .buffer_unordered(16)
+        .collect()
+        .await
 }
 
 /// Delete many keys with the backend's bulk delete. Absent keys are fine.
@@ -669,6 +706,36 @@ impl ObjectBlobStore {
             .collect())
     }
 
+    /// For each of `objects` (hash and size, as
+    /// [`loose_listing`](Self::loose_listing) gives them), whether its bytes
+    /// start with one of the prefixes, or why the read failed: what a
+    /// repack given `leave_loose` leaves loose when no walk lists it (ADR
+    /// 0108). A ranged read of each, 16 at a time.
+    pub async fn loose_sniff(
+        &self,
+        objects: &[(Hash, u64)],
+        leave: &LeaveLoose,
+    ) -> Vec<(Hash, Result<bool>)> {
+        loose_sniff(&self.store, objects.to_vec(), leave).await
+    }
+
+    /// The loose objects among `objects` that start with one of the
+    /// prefixes; the first read that fails is the error.
+    pub async fn loose_matching(
+        &self,
+        objects: &[(Hash, u64)],
+        leave: &LeaveLoose,
+    ) -> Result<Vec<Hash>> {
+        let mut out = Vec::new();
+        for (h, r) in self.loose_sniff(objects, leave).await {
+            if r? {
+                out.push(h);
+            }
+        }
+        out.sort_unstable();
+        Ok(out)
+    }
+
     /// Packs a delta repack already compressed (ADR 0100,
     /// `packs/.considered`).
     pub async fn considered_packs(&self) -> Result<HashSet<String>> {
@@ -742,11 +809,26 @@ impl ObjectBlobStore {
             ),
             _ => (view.packs.iter().collect(), true),
         };
-        let loose = if with_loose {
+        let mut loose = if with_loose {
             list_all_loose(&*self.store).await?
         } else {
             BTreeMap::new()
         };
+        if !opts.leave_loose.is_empty() && !loose.is_empty() {
+            let listed: HashSet<Hash> = hints.iter().map(|(h, _)| h).collect();
+            let unlisted: Vec<(Hash, u64)> = loose
+                .iter()
+                .filter(|(h, _)| !listed.contains(h))
+                .map(|(h, s)| (*h, s.size))
+                .collect();
+            let left = crate::leave_loose::left_of(
+                loose_sniff(&self.store, unlisted, &opts.leave_loose).await,
+            );
+            for h in &left {
+                loose.remove(h);
+            }
+            report.left_loose = left;
+        }
         let mut sources: HashMap<Hash, Source> = HashMap::new();
         report.packs_before = view.packs.len() as u64;
         report.packs_merged = merging.len() as u64;

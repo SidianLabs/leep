@@ -1815,3 +1815,274 @@ async fn unreachable_loose_objects_over_the_cap_are_packed_in_batches() {
         "every abandoned upload packed"
     );
 }
+
+/// Loose objects whose bytes start like a segment blob.
+fn loose_segments(store: &FsBlobStore, root: &Path) -> Vec<Hash> {
+    let prefixes = leep_derive::segment_blob_prefixes();
+    store
+        .loose_listing()
+        .unwrap()
+        .into_iter()
+        .map(|(h, _)| h)
+        .filter(|h| {
+            let hex = h.to_hex();
+            let b = std::fs::read(root.join(&hex[..2]).join(&hex[2..])).unwrap();
+            prefixes.iter().any(|p| b.starts_with(p))
+        })
+        .collect()
+}
+
+/// Segment blobs (GC's mark segments here, and one shaped like a derived
+/// segment) stay loose through delta runs (ADR 0108): no run packs them,
+/// they never count as waiting, so they trigger no run (even with every
+/// object past its age), and GC deletes their bytes at once. A file a
+/// changeset names that starts the same way (stored before ADR 0041 refused
+/// such uploads) is still packed and reads back byte for byte.
+#[tokio::test]
+async fn segment_blobs_stay_loose_and_never_trigger_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = fs_store(dir.path());
+    let meta = Arc::new(MemoryMetaStore::new());
+    let repo = Repo::new(Arc::new(store.clone()), meta.clone());
+    import(&repo, &meta, 4).await;
+    // A file on main that starts like a derived segment, written past the
+    // upload check as an old store might hold it.
+    let odd = format!(
+        "leep:derived-segment-data-v1\0{}",
+        "not a segment ".repeat(30)
+    );
+    store.put(Bytes::from(odd.clone())).await.unwrap();
+    let head = meta.get_ref("main").await.unwrap();
+    let tip = commit(&repo, head, &[("odd.bin", odd.clone())]).await;
+    assert!(meta.cas_ref("main", head, Some(tip)).await.unwrap());
+    let odd_hash = Hash::of_blob(odd.as_bytes());
+    // GC writes its mark segments loose.
+    gc::condemn(&repo, &gc_opts(), &Ahead).await.unwrap();
+    gc::collect(&repo, &gc_opts(), &Ahead).await.unwrap();
+    let derived = Bytes::from(format!(
+        "leep:derived-segment-index-v1\0{}",
+        "rows ".repeat(80)
+    ));
+    let derived_hash = store.put(derived).await.unwrap();
+    let segs = loose_segments(&store, dir.path());
+    assert!(segs.len() >= 3, "a mark segment too: {segs:?}");
+    assert!(segs.contains(&derived_hash) && segs.contains(&odd_hash));
+
+    let auto = AutoRepackOptions {
+        max_age: Some(Duration::ZERO),
+        ..eager()
+    };
+    let mut bg = task(&store, &meta, opts(auto));
+    let r = ran(bg.tick().await.unwrap().auto);
+    let expect: Vec<Hash> = segs.iter().copied().filter(|h| *h != odd_hash).collect();
+    // Never read, so never reported: the task left them out of the batch.
+    assert!(r.left_loose.is_empty(), "{r:?}");
+    bg.finish_all().await.unwrap();
+    assert!(!store.is_loose(&odd_hash), "the file main names is packed");
+    let fresh = FsBlobStore::new(dir.path());
+    assert_eq!(
+        fresh.get(&odd_hash).await.unwrap().unwrap(),
+        Bytes::from(odd.clone())
+    );
+    let (loose, _) = store.loose_stats().unwrap();
+    assert_eq!(loose as usize, expect.len());
+    assert_eq!(loose_segments(&store, dir.path()), expect);
+    for _ in 0..3 {
+        assert_eq!(bg.tick().await.unwrap().auto, AutoOutcome::Nothing);
+    }
+    // A new segment does not trigger a run either, not even once.
+    let more = Bytes::from(format!("leep:gc-mark-segment-v1\0{}", "m".repeat(64)));
+    let more_hash = store.put(more).await.unwrap();
+    assert_eq!(bg.tick().await.unwrap().auto, AutoOutcome::Nothing);
+    // A full repack given the server's prefixes (as `leep-server repack`
+    // is) leaves them loose as well.
+    let order = leep_derive::pack_order::pack_order(&repo).await.unwrap();
+    let full = leep_store::RepackOptions {
+        leave_loose: leep_store::LeaveLoose::new(leep_derive::segment_blob_prefixes()),
+        ..leep_store::RepackOptions::default()
+    };
+    let p = store.repack_publish(order.objects, full).await.unwrap();
+    let r = p.finish().await.unwrap();
+    let mut all = expect.clone();
+    all.push(more_hash);
+    all.sort();
+    assert_eq!(r.left_loose, all, "{r:?}");
+    assert!(store.is_loose(&more_hash));
+    // GC's delete unlinks them: their bytes leave the store at once.
+    let before = store_bytes(dir.path());
+    let mut sizes = 0;
+    for h in expect.iter().chain([&more_hash]) {
+        sizes += store.get(h).await.unwrap().unwrap().len() as u64;
+        store.delete(h).await.unwrap();
+    }
+    assert_eq!(store_bytes(dir.path()), before - sizes);
+    assert_eq!(store.loose_stats().unwrap(), (0, 0));
+    assert_main_readable(Arc::new(FsBlobStore::new(dir.path())), &meta, "segments").await;
+}
+
+/// An object store's full repack, run by the task, leaves segment blobs
+/// loose (ADR 0108), and they do not count toward the bytes waiting, so
+/// they never bring the next full repack nearer.
+#[tokio::test]
+async fn an_object_stores_full_repack_leaves_segment_blobs_loose() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ObjectBlobStore::local(dir.path())
+        .unwrap()
+        .with_pack_writes(PackWrites {
+            min_objects: 4,
+            ..PackWrites::default()
+        });
+    let meta = Arc::new(MemoryMetaStore::new());
+    let repo = Repo::new(Arc::new(store.clone()), meta.clone());
+    import(&repo, &meta, 10).await;
+    let mut segs = Vec::new();
+    for (i, kind) in ["gc-mark-segment-v1", "derived-segment-data-v1"]
+        .iter()
+        .enumerate()
+    {
+        let b = Bytes::from(format!("leep:{kind}\0{}", format!("{i} ").repeat(100)));
+        segs.push(store.put(b).await.unwrap());
+    }
+    segs.sort();
+    let auto = AutoRepackOptions {
+        object_store_interval: Duration::ZERO,
+        object_store_min_bytes: 0,
+        ..eager()
+    };
+    let bg = BackgroundRepack::new(PackStore::Object(store.clone()), opts(auto));
+    let walk = bg.walk_repo(meta.clone());
+    let mut bg = bg.with_repo(walk);
+    let r = ran(bg.tick().await.unwrap().auto);
+    assert_eq!(r.left_loose, segs, "{r:?}");
+    bg.finish_all().await.unwrap();
+    assert_eq!(store.loose_stats().await.unwrap().0, 2);
+    // Only segments are loose: nothing waits, with no threshold at all.
+    for _ in 0..2 {
+        assert_eq!(bg.tick().await.unwrap().auto, AutoOutcome::Nothing);
+    }
+    for h in &segs {
+        store.delete(h).await.unwrap();
+    }
+    assert_eq!(store.loose_stats().await.unwrap(), (0, 0));
+    let fresh = ObjectBlobStore::local(dir.path()).unwrap();
+    assert_main_readable(Arc::new(fresh.clone()), &meta, "object store").await;
+    check_blob_store_contract(&fresh).await;
+}
+
+/// Bytes GC deleted from delta packs that stay under the ratio rule are
+/// still dropped once they pass the age rule's floor and have waited the
+/// age (ADR 0107 section 4): a store's deleted history and dead segments
+/// leave the packs in bounded time, not only at `repack --full`. Without
+/// the age rule they would wait.
+#[tokio::test]
+async fn deleted_bytes_under_the_ratio_are_dropped_after_the_age() {
+    for age in [None, Some(Duration::from_secs(2))] {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, meta, repo) = heads_world(dir.path(), 0).await;
+        // Uploads no ref reaches, hard to compress, packed by a delta run.
+        let junk: Vec<Bytes> = (0..40u32)
+            .map(|i| {
+                let s: String = (0..40u32)
+                    .map(|j| Hash::of_blob(&(i * 1000 + j).to_be_bytes()).to_hex())
+                    .collect();
+                Bytes::from(s)
+            })
+            .collect();
+        let hashes = repo.put_blobs(junk).await.unwrap();
+        let aged = AutoRepackOptions {
+            consolidate: Some(ConsolidateOptions {
+                // The ratio rule would need the whole packs back.
+                ratio: 1,
+                age,
+                min_gain: 1,
+                ..ConsolidateOptions::default()
+            }),
+            ..eager()
+        };
+        let mut bg = task(&store, &meta, opts(aged));
+        ran(bg.tick().await.unwrap().auto);
+        bg.finish_all().await.unwrap();
+        for h in &hashes {
+            store.delete(h).await.unwrap();
+        }
+        let tick = bg.tick().await.unwrap();
+        let packs: u64 = store.pack_sizes().unwrap().iter().map(|p| p.bytes).sum();
+        match (age, tick.consolidate) {
+            (Some(_), ConsolidateOutcome::Below { gain, .. }) => {
+                assert!(gain >= packs / 64 && gain < packs, "{gain} of {packs}")
+            }
+            (None, ConsolidateOutcome::Nothing | ConsolidateOutcome::Below { .. }) => {}
+            (_, other) => panic!("{age:?}: {other:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        let tick = bg.tick().await.unwrap();
+        match age {
+            None => assert!(
+                matches!(
+                    tick.consolidate,
+                    ConsolidateOutcome::Nothing | ConsolidateOutcome::Below { .. }
+                ),
+                "{:?}",
+                tick.consolidate
+            ),
+            Some(_) => {
+                let (r, _, _) = consolidated(tick.consolidate);
+                assert_eq!(r.dropped_tombstoned, 40, "{r:?}");
+                bg.finish_all().await.unwrap();
+                let fresh = FsBlobStore::new(dir.path());
+                for h in &hashes {
+                    assert!(!fresh.contains(h).await.unwrap());
+                }
+                let ids = store.pack_sizes().unwrap().into_iter().map(|p| p.id);
+                assert_eq!(store.tombstoned_bytes(&ids.collect()).unwrap(), 0);
+                assert_main_readable(Arc::new(fresh), &meta, "dropped").await;
+            }
+        }
+    }
+}
+
+/// A check reads the first bytes of at most `sniff_per_check` loose
+/// objects; those not read yet count as waiting until a later check reads
+/// them, and one that cannot be read (here a directory where a loose file
+/// should be) is tried again at each check without keeping the others'
+/// answers from being kept.
+#[tokio::test]
+async fn segment_sniffs_are_capped_per_check_and_survive_a_failed_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = fs_store(dir.path());
+    let meta = Arc::new(MemoryMetaStore::new());
+    for i in 0..7 {
+        let b = format!("leep:gc-mark-segment-v1\0{}", format!("{i} ").repeat(40));
+        store.put(Bytes::from(b)).await.unwrap();
+    }
+    let bad = Hash::of_blob(b"unreadable");
+    let hex = bad.to_hex();
+    std::fs::create_dir_all(dir.path().join(&hex[..2]).join(&hex[2..])).unwrap();
+    let auto = AutoRepackOptions {
+        objects: u64::MAX,
+        bytes: u64::MAX,
+        max_age: None,
+        consolidate: None,
+        sniff_per_check: 2,
+        ..eager()
+    };
+    let mut bg = task(&store, &meta, opts(auto));
+    let mut waiting = Vec::new();
+    for _ in 0..8 {
+        match bg.tick().await.unwrap().auto {
+            AutoOutcome::BelowThreshold { objects, .. } => waiting.push(objects),
+            other => panic!("{other:?}"),
+        }
+    }
+    // Eight loose objects; each check reads two at most (the unreadable one
+    // among them until it sorts last), so the count falls by two at most.
+    assert!(waiting[0] >= 6, "{waiting:?}");
+    for w in waiting.windows(2) {
+        assert!(w[0] >= w[1] && w[0] - w[1] <= 2, "{waiting:?}");
+    }
+    assert_eq!(
+        *waiting.last().unwrap(),
+        1,
+        "only the unreadable one: {waiting:?}"
+    );
+}

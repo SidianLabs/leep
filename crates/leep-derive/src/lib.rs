@@ -131,6 +131,28 @@ pub use repo::{
 pub use search::{SearchIndexReport, SearchQuery};
 pub use signatures::{LandPolicy, PolicySet, REBASED_ORIGIN_KIND};
 
+/// The byte prefixes of the segment blobs this crate writes to the blob
+/// store (`leep:<kind>\0` of derived-segment index and data blobs and of
+/// GC mark segments). The server's repacks leave loose objects that start
+/// with one of them loose when no walk lists them (ADR 0108): compressed
+/// already, never a delta base and short-lived, so GC deletes their bytes
+/// at once instead of tombstoning them in a pack.
+pub fn segment_blob_prefixes() -> Vec<Vec<u8>> {
+    [
+        gc_segments::SEGMENT_KIND,
+        derived_segments::codec::INDEX_KIND,
+        derived_segments::codec::DATA_KIND,
+    ]
+    .iter()
+    .map(|kind| {
+        let mut p = leep_core::hash::OBJECT_DOMAIN.to_vec();
+        p.extend_from_slice(kind.as_bytes());
+        p.push(0);
+        p
+    })
+    .collect()
+}
+
 /// The benches' synthetic late-Linux-shaped history, for tests.
 #[cfg(test)]
 #[path = "../benches/support/wide_history.rs"]

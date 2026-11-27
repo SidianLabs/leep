@@ -878,6 +878,10 @@ mod tests {
         assert_eq!(&data[head..head + 32], &[1u8; 32]);
         assert_eq!(decode_segment(&addr, &data).unwrap(), vec![h(1), h(2)]);
         assert!(is_segment(&addr, &data));
+        // Repacks leave it loose by this prefix (ADR 0108).
+        assert!(crate::segment_blob_prefixes()
+            .iter()
+            .any(|p| data.starts_with(p)));
         // The address of a blob, and of the object after the prefix; an
         // upload of these bytes is refused (ADR 0041).
         assert_eq!(addr, Hash::of_blob(&data));

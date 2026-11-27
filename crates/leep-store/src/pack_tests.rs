@@ -1729,3 +1729,116 @@ async fn packs_written_after_the_plan_are_not_merged() {
     check_world(dir.path(), &w, "after the delta run").await;
     check_blob_store_contract(&FsBlobStore::new(dir.path())).await;
 }
+
+/// Prefixes as the server passes them (ADR 0108), and objects shaped like
+/// its segment blobs.
+fn segment_like() -> (crate::LeaveLoose, Vec<Bytes>) {
+    let prefixes = [
+        b"leep:gc-mark-segment-v1\0".to_vec(),
+        b"leep:derived-segment-data-v1\0".to_vec(),
+    ];
+    let blobs = (0..3)
+        .map(|i| {
+            let mut b = prefixes[i % 2].clone();
+            b.extend_from_slice(format!("segment {i} ").repeat(40).as_bytes());
+            Bytes::from(b)
+        })
+        .collect();
+    (crate::LeaveLoose::new(prefixes), blobs)
+}
+
+/// Loose objects that start with a `leave_loose` prefix and that the hints
+/// do not list stay loose through a full and an incremental repack, read
+/// back as before, and a delete removes their bytes at once (no tombstone);
+/// one the hints list (a file a changeset names that starts the same way)
+/// is packed and reads back byte for byte.
+#[tokio::test]
+async fn segment_blobs_stay_loose_and_a_delete_removes_their_bytes() {
+    for mode in [RepackMode::Full, INCREMENTAL] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path());
+        let (leave, segs) = segment_like();
+        let mut seg_hashes = Vec::new();
+        for s in &segs {
+            seg_hashes.push(store.put(s.clone()).await.unwrap());
+        }
+        seg_hashes.sort();
+        let mut file = segs[0].to_vec();
+        file.extend_from_slice(b"but a file a changeset names\n");
+        let file = Bytes::from(file);
+        let file_hash = store.put(file.clone()).await.unwrap();
+        let plain: Vec<Hash> = {
+            let mut v = Vec::new();
+            for b in versions(10) {
+                v.push(store.put(b).await.unwrap());
+            }
+            v
+        };
+        let mut hints = chain_hints(&plain);
+        hints.push((file_hash, None));
+        assert_eq!(
+            store
+                .loose_matching(&[seg_hashes[0], plain[0], file_hash], &leave)
+                .unwrap(),
+            vec![seg_hashes[0], file_hash]
+        );
+        let opts = RepackOptions {
+            mode,
+            leave_loose: leave.clone(),
+            ..RepackOptions::default()
+        };
+        let r = store
+            .repack_publish(hints.clone(), opts.clone())
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        assert_eq!(r.left_loose, seg_hashes, "{mode:?}: {r:?}");
+        assert_eq!(r.objects, 11, "{mode:?}: {r:?}");
+        assert_eq!(r.loose_after, 3, "{mode:?}: {r:?}");
+        assert!(
+            !store.is_loose(&file_hash),
+            "{mode:?}: the listed file is packed"
+        );
+        let fresh = FsBlobStore::new(dir.path());
+        assert_eq!(fresh.get(&file_hash).await.unwrap().unwrap(), file);
+        for (h, b) in seg_hashes.iter().zip({
+            let mut s = segs.clone();
+            s.sort_by_key(|b| Hash::of_blob(b));
+            s
+        }) {
+            assert!(fresh.is_loose(h), "{mode:?}");
+            assert_eq!(fresh.get(h).await.unwrap().unwrap(), b);
+        }
+        // A second repack leaves them too, and packs nothing new.
+        let r = store
+            .repack_publish(hints, opts)
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        assert_eq!(r.left_loose, seg_hashes, "{mode:?}: {r:?}");
+        assert_eq!(r.loose_before, 0, "{mode:?}: {r:?}");
+        // A delete (GC's) unlinks them: their bytes are gone at once.
+        let (_, before) = store.loose_stats().unwrap();
+        let sizes: u64 = segs.iter().map(|b| b.len() as u64).sum();
+        for h in &seg_hashes {
+            store.delete(h).await.unwrap();
+        }
+        assert_eq!(store.loose_stats().unwrap(), (0, before - sizes));
+        for h in &seg_hashes {
+            assert!(!FsBlobStore::new(dir.path()).contains(h).await.unwrap());
+        }
+        let tombs = dir
+            .path()
+            .join(crate::packset::PACKS_DIR)
+            .join("tombstones");
+        assert!(
+            std::fs::read(tombs).map_or(true, |b| b.is_empty()),
+            "{mode:?}"
+        );
+        check_blob_store_contract(&FsBlobStore::new(dir.path())).await;
+    }
+}

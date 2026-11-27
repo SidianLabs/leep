@@ -379,6 +379,10 @@ fn golden_bytes() {
     assert!(codec::is_segment_blob(ih, index));
     assert!(codec::is_segment_blob(dh, data));
     assert!(!codec::is_segment_blob(&Hash::of_blob(b"x"), b"x"));
+    // Repacks leave both loose by these prefixes (ADR 0108).
+    let prefixes = crate::segment_blob_prefixes();
+    assert!(prefixes.iter().any(|p| index.starts_with(p)));
+    assert!(prefixes.iter().any(|p| data.starts_with(p)));
     // Key 3's skiplist row: two entries, key 2 one back (0) and 7 the
     // first external id (1), generation 2 then 2 - 1.
     let (idx, d) = decode_both(&enc);
