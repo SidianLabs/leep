@@ -26,6 +26,7 @@ use leep_core::intern::{PackHints, NO_ID};
 use leep_core::{Error, Hash, Result};
 
 use crate::fs::unix_secs;
+use crate::leave_loose::{self, LeaveLoose};
 use crate::pack::{self, MAX_CHAIN};
 use crate::packset::{
     lock_tombstones, parse_tombstones, published_ids, sync_dir, tombstone_line, Pack, ScanReason,
@@ -136,6 +137,11 @@ pub struct RepackOptions {
     /// the lease, and record this one's time (`packs/.last-full`) before
     /// the lease is let go (ADR 0100).
     pub full_interval: Option<std::time::Duration>,
+    /// Loose objects that start with one of these prefixes and that the
+    /// hints do not list are not packed: they stay loose, where GC deletes
+    /// their bytes at once (the server's segment blobs, ADR 0108). Every
+    /// mode that packs loose objects honours it.
+    pub leave_loose: LeaveLoose,
 }
 
 impl Default for RepackOptions {
@@ -151,6 +157,7 @@ impl Default for RepackOptions {
             fold_only: None,
             mark: false,
             full_interval: None,
+            leave_loose: LeaveLoose::default(),
         }
     }
 }
@@ -251,6 +258,8 @@ pub struct RepackReport {
     pub dropped_tombstoned: u64,
     /// Loose files whose bytes do not match their name; left in place.
     pub corrupt: Vec<Hash>,
+    /// Loose objects left loose by [`RepackOptions::leave_loose`].
+    pub left_loose: Vec<Hash>,
     /// Listed, then deleted (by GC) before they were read.
     pub vanished: u64,
     /// Deleted by GC while this repack ran, and tombstoned in the new pack.
@@ -894,6 +903,19 @@ impl FsBlobStore {
         if let (RepackMode::Incremental { .. }, Some(only)) = (opts.mode, &opts.loose_subset) {
             loose.retain(|o| only.contains(&o.hash));
         }
+        if !opts.leave_loose.is_empty() && !loose.is_empty() {
+            let listed: HashSet<Hash> = hints.iter().map(|(h, _)| h).collect();
+            let unlisted = loose
+                .iter()
+                .map(|o| &o.hash)
+                .filter(|h| !listed.contains(h));
+            let left = leave_loose::matching(unlisted, &opts.leave_loose, |h| self.path_for(h))?;
+            if !left.is_empty() {
+                let set: HashSet<&Hash> = left.iter().collect();
+                loose.retain(|o| !set.contains(&o.hash));
+                report.left_loose = left;
+            }
+        }
         let named: HashSet<&String> = opts.packs.iter().collect();
         report.leftovers_restored = leftovers.restored;
         report.garbage_removed += leftovers.removed;
@@ -1234,6 +1256,13 @@ impl FsBlobStore {
     /// would pack. Lists every shard directory.
     pub fn loose_stats(&self) -> Result<(u64, u64)> {
         count_loose(self.root())
+    }
+
+    /// The loose objects among `hashes` whose bytes start with one of the
+    /// prefixes, reading only that many bytes of each: what a repack given
+    /// `leave_loose` leaves loose when no walk lists them (ADR 0108).
+    pub fn loose_matching(&self, hashes: &[Hash], leave: &LeaveLoose) -> Result<Vec<Hash>> {
+        leave_loose::matching(hashes, leave, |h| self.path_for(h))
     }
 
     /// Every loose object with its size, in hash order: one listing of

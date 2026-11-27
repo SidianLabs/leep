@@ -890,3 +890,67 @@ async fn request_counts() {
     println!("exact miss: {exact:?}");
     assert_eq!(exact.get("LIST"), Some(&1), "one forced listing: {exact:?}");
 }
+
+/// An object store's full repack leaves loose objects that start with a
+/// `leave_loose` prefix and that the hints do not list (segment blobs, ADR
+/// 0108): they read back as before and a delete removes them; one the hints
+/// list is packed.
+#[tokio::test]
+async fn a_full_repack_leaves_segment_blobs_loose() {
+    for (name, objects, _dir) in backends() {
+        let store = handle(&objects);
+        let leave = crate::LeaveLoose::new([b"leep:derived-segment-index-v1\0".to_vec()]);
+        let seg = Bytes::from(format!(
+            "leep:derived-segment-index-v1\0{}",
+            "rows ".repeat(50)
+        ));
+        let seg_hash = store.put(seg.clone()).await.unwrap();
+        let listed = Bytes::from(format!(
+            "leep:derived-segment-index-v1\0{}",
+            "file ".repeat(9)
+        ));
+        let listed_hash = store.put(listed.clone()).await.unwrap();
+        let plain: Vec<Hash> = {
+            let mut v = Vec::new();
+            for b in versions(8) {
+                v.push(store.put(b).await.unwrap());
+            }
+            v
+        };
+        assert_eq!(
+            store
+                .loose_matching(&[(seg_hash, seg.len() as u64), (plain[0], 1)], &leave)
+                .await
+                .unwrap(),
+            vec![seg_hash]
+        );
+        let mut hints = chain_hints(&plain);
+        hints.push((listed_hash, None));
+        let r = store
+            .repack_publish(
+                hints,
+                RepackOptions {
+                    leave_loose: leave,
+                    ..RepackOptions::default()
+                },
+            )
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        assert_eq!(r.left_loose, vec![seg_hash], "{name}: {r:?}");
+        assert_eq!(r.objects, 9, "{name}: {r:?}");
+        assert_eq!(loose_count(&*objects).await, 1, "{name}");
+        let reader = fresh(&objects);
+        assert_eq!(reader.get(&seg_hash).await.unwrap().unwrap(), seg);
+        assert_eq!(reader.get(&listed_hash).await.unwrap().unwrap(), listed);
+        store.delete(&seg_hash).await.unwrap();
+        assert_eq!(loose_count(&*objects).await, 0, "{name}");
+        assert!(
+            !fresh(&objects).contains(&seg_hash).await.unwrap(),
+            "{name}"
+        );
+        check_blob_store_contract(&fresh(&objects)).await;
+    }
+}

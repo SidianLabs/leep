@@ -7,6 +7,7 @@ mod considered;
 mod dirsync;
 mod fs;
 mod groupsync;
+mod leave_loose;
 mod object;
 #[cfg(test)]
 mod objpack_tests;
@@ -36,6 +37,7 @@ use leep_core::{BlobStore, Error, Result};
 
 pub use cache::{CacheStats, CachedBlobStore};
 pub use fs::FsBlobStore;
+pub use leave_loose::LeaveLoose;
 pub use object::{ObjectBlobStore, S3Config};
 pub use objrepack::PublishedObjectPack;
 pub use packfiles::{FsPackFiles, ObjectPackFiles, PackFiles};

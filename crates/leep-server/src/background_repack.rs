@@ -54,8 +54,8 @@ use leep_core::intern::PackHints;
 use leep_core::{BlobStore, Error, Hash, Result};
 use leep_derive::Repo;
 use leep_store::{
-    FsBlobStore, ObjectBlobStore, PackDetail, PackSize, PublishedObjectPack, PublishedPack,
-    RepackMode, RepackOptions, RepackReport, SweepReport,
+    FsBlobStore, LeaveLoose, ObjectBlobStore, PackDetail, PackSize, PublishedObjectPack,
+    PublishedPack, RepackMode, RepackOptions, RepackReport, SweepReport,
 };
 use tokio::time::Instant;
 
@@ -144,6 +144,12 @@ pub struct AutoRepackOptions {
     /// Consolidation of the delta packs (ADR 0107), on filesystem stores;
     /// `None` turns it off.
     pub consolidate: Option<ConsolidateOptions>,
+    /// Loose objects that start with one of these prefixes and that no
+    /// walk lists are never packed nor counted as waiting (ADR 0108): by
+    /// default the segment blobs of derived data and GC marks
+    /// ([`leep_derive::segment_blob_prefixes`]), which GC then deletes
+    /// outright.
+    pub leave_loose: LeaveLoose,
 }
 
 /// When the background task consolidates its delta packs (ADR 0107): it
@@ -195,6 +201,7 @@ impl Default for AutoRepackOptions {
             object_store_share: 0.25,
             object_store_min_bytes: 64 << 20,
             consolidate: Some(ConsolidateOptions::default()),
+            leave_loose: LeaveLoose::new(leep_derive::segment_blob_prefixes()),
         }
     }
 }
@@ -344,6 +351,27 @@ impl PackStore {
                 on_low_thread(move || s.loose_listing()).await
             }
             PackStore::Object(s) => s.loose_listing().await,
+        }
+    }
+
+    /// Which of `objects` (from [`loose_listing`](Self::loose_listing))
+    /// start with one of the prefixes: a short read of each, off the async
+    /// workers.
+    async fn loose_matching(
+        &self,
+        objects: Vec<(Hash, u64)>,
+        leave: &LeaveLoose,
+    ) -> Result<Vec<Hash>> {
+        if objects.is_empty() || leave.is_empty() {
+            return Ok(Vec::new());
+        }
+        match self {
+            PackStore::Fs(s) => {
+                let (s, leave) = (s.clone(), leave.clone());
+                let hashes: Vec<Hash> = objects.into_iter().map(|(h, _)| h).collect();
+                on_low_thread(move || s.loose_matching(&hashes, &leave)).await
+            }
+            PackStore::Object(s) => s.loose_matching(&objects, leave).await,
         }
     }
 
@@ -509,6 +537,10 @@ struct AutoState {
     /// Loose objects a run found corrupt: left in place for an operator
     /// (`verify --rehash`), never counted as waiting again.
     corrupt: HashSet<Hash>,
+    /// For each loose object of the last listing, whether it starts with
+    /// one of `leave_loose`'s prefixes (a segment blob, ADR 0108): read
+    /// once per object, since its bytes never change. Those never wait.
+    sniffed: HashMap<Hash, bool>,
     /// Loose bytes at the last check, for the pending cap.
     loose_bytes: u64,
     /// What the last check's consolidation did, for the tick's report.
@@ -845,10 +877,38 @@ impl BackgroundRepack {
         self.auto.loose_bytes = loose_bytes_all;
         // Loose copies an earlier run packed stay on disk until its
         // cleanup, and corrupt ones until an operator acts: neither waits.
+        // Segment blobs stay loose (ADR 0108), so they do not wait either.
+        self.auto
+            .sniffed
+            .retain(|h, _| listing.binary_search_by_key(h, |(l, _)| *l).is_ok());
+        let unsniffed: Vec<(Hash, u64)> = listing
+            .iter()
+            .filter(|(h, _)| !self.auto.sniffed.contains_key(h))
+            .copied()
+            .collect();
+        let matched: HashSet<Hash> = self
+            .store
+            .loose_matching(unsniffed.clone(), &auto.leave_loose)
+            .await?
+            .into_iter()
+            .collect();
+        for (h, _) in unsniffed {
+            self.auto.sniffed.insert(h, matched.contains(&h));
+        }
+        drop(matched);
+        let segments: HashSet<Hash> = self
+            .auto
+            .sniffed
+            .iter()
+            .filter(|(_, &m)| m)
+            .map(|(h, _)| *h)
+            .collect();
         let held: HashSet<&Hash> = self.pending.iter().flat_map(|w| &w.loose).collect();
         let loose: Vec<(Hash, u64)> = listing
             .iter()
-            .filter(|(h, _)| !held.contains(h) && !self.auto.corrupt.contains(h))
+            .filter(|(h, _)| {
+                !held.contains(h) && !self.auto.corrupt.contains(h) && !segments.contains(h)
+            })
             .copied()
             .collect();
         drop(held);
@@ -978,7 +1038,10 @@ impl BackgroundRepack {
                 let in_batch = self.store.packed_in(&batch_set).await?;
                 let in_whole = self.store.packed_in(&all_whole).await?;
                 let loose_set: HashSet<Hash> = loose.iter().map(|(h, _)| *h).collect();
-                let wanted = |h: &Hash| loose_set.contains(h) || in_batch(h);
+                // Segment-looking loose objects too, so one a changeset names
+                // (a file stored before ADR 0041) is listed and packed.
+                let wanted =
+                    |h: &Hash| loose_set.contains(h) || segments.contains(h) || in_batch(h);
                 let through = |h: &Hash| loose_set.contains(h) || in_whole(h);
                 let order = leep_derive::pack_order::pack_order_where(
                     &repo,
@@ -989,7 +1052,7 @@ impl BackgroundRepack {
                 .await?;
                 let room_objects = auto.max_batch_objects.saturating_sub(b_objects);
                 let room_bytes = auto.max_batch_bytes.saturating_sub(b_bytes);
-                let subset: HashSet<Hash> =
+                let mut subset: HashSet<Hash> =
                     if loose.len() as u64 <= room_objects && loose_bytes <= room_bytes {
                         loose_set.clone()
                     } else {
@@ -1018,6 +1081,15 @@ impl BackgroundRepack {
                         }
                         out
                     };
+                if !segments.is_empty() {
+                    subset.extend(
+                        order
+                            .objects
+                            .iter()
+                            .map(|(h, _)| h)
+                            .filter(|h| segments.contains(h)),
+                    );
+                }
                 let opts = RepackOptions {
                     level: auto.level,
                     mode: RepackMode::Incremental {
@@ -1038,6 +1110,7 @@ impl BackgroundRepack {
                     loose_subset: Some(Arc::new(subset)),
                     mark: true,
                     threads: 1,
+                    leave_loose: auto.leave_loose.clone(),
                     ..RepackOptions::default()
                 };
                 (order, opts, more)
@@ -1054,6 +1127,7 @@ impl BackgroundRepack {
                     // replica may have run one since the check above.
                     full_interval: Some(auto.object_store_interval),
                     threads: 1,
+                    leave_loose: auto.leave_loose.clone(),
                     ..RepackOptions::default()
                 };
                 (order, opts, false)
@@ -1073,6 +1147,9 @@ impl BackgroundRepack {
         let took = started.elapsed();
         let report = pending.report().clone();
         self.auto.corrupt.extend(report.corrupt.iter().copied());
+        for h in &report.left_loose {
+            self.auto.sniffed.insert(*h, true);
+        }
         self.auto.waiting_since = None;
         // A delta run went through, so a hold of the consolidation starts
         // again from its next check: delta runs wait up to two fences for

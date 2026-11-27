@@ -184,6 +184,8 @@ pub async fn run_repack(meta: &str, blobs: &str, args: RepackArgs) -> anyhow::Re
         threads: args.threads,
         packs: whole,
         mark: true,
+        // Segment blobs stay loose, where GC deletes them outright (ADR 0108).
+        leave_loose: leep_store::LeaveLoose::new(leep_derive::segment_blob_prefixes()),
         ..RepackOptions::default()
     };
     let changesets = order.changesets;
@@ -239,6 +241,7 @@ fn json(r: &RepackReport, full: bool, changesets: u64, t: &Timing) -> serde_json
         "index_bytes": r.index_bytes,
         "dropped_tombstoned": r.dropped_tombstoned,
         "corrupt": r.corrupt.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
+        "left_loose": r.left_loose.len(),
         "vanished": r.vanished,
         "late_tombstones": r.late_tombstones,
         "garbage_removed": r.garbage_removed,

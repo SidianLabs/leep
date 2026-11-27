@@ -2769,6 +2769,17 @@ compresses them again; deleting that file only costs one more pass.
 Corrupt loose objects it meets stay in place, are logged in its report,
 and are not counted again (run `leep-server verify --full --rehash`).
 
+**Segment blobs stay loose** (ADR 0108). The blobs of derived-data
+segments and GC mark segments (bytes starting `leep:derived-segment-index-v1`,
+`leep:derived-segment-data-v1` or `leep:gc-mark-segment-v1`) are never
+packed by the delta runs, an object store's full repack or `leep-server
+repack`, and never count as waiting, so they start no run: GC deletes their
+bytes outright when it retires them. Expect some loose files at rest (one
+per live segment; `left_loose` in `repack --json` output counts those a run
+skipped), and a few more between a compaction or mark and the next GC.
+Segment blobs packed before the upgrade leave the packs as GC deletes them
+and a consolidation drops their bytes.
+
 **Consolidation** (ADR 0107). A delta run can only compress an object
 against a base in the pack it writes, so the first new version at each
 path in each run is stored whole (its previous version is in an older
